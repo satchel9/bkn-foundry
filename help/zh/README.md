@@ -11,6 +11,7 @@ BKN Foundry 为**纯后台**平台，请通过 CLI、各语言 SDK 或 HTTP API 
 | 文档 | 说明 |
 | --- | --- |
 | [安装与部署](install.md) | 环境要求、`deploy.sh` 安装与安装后检查 |
+| 🚚 [混部部署手册](manual/hybrid-deploy.md) | 在既有 K8s 集群上只装应用层：中间件全外置 + 复用既有 ingress（含故障速查） |
 | [快速开始](quick-start.md) | 从部署到首次 BKN 与智能体操作的端到端路径 |
 | 📒 [Cookbook](cookbook/README.md) | 场景化、可复制可执行的操作手册 |
 
