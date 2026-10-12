@@ -16,6 +16,7 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/bkntrace"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
+	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/rest"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/kncypher"
@@ -25,6 +26,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knrunsql"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knsearch"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/objectpermission"
+	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permissionguide"
 )
 
 const (
@@ -81,13 +83,14 @@ func buildSearchSchemaReqFromMCP(req mcp.CallToolRequest, authCtx *interfaces.Ac
 }
 
 // handleSearchInstance returns a tool handler for search_instance.
-func handleSearchInstance(knSearchService knsearch.KnSearchService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleSearchInstance(knSearchService knsearch.KnSearchService,
+	guide *permissionguide.Guide) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		authCtx, _ := common.GetAccountAuthContextFromCtx(ctx)
 
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		instanceReq := &interfaces.SearchInstanceReq{}
@@ -104,6 +107,9 @@ func handleSearchInstance(knSearchService knsearch.KnSearchService) func(ctx con
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		resp.PermissionGuidance = permissionGuidancesForObjectImpacts(ctx, guide,
+			instanceReq.ResolvedKnID(), resp.PermissionImpacts)
+		resp.PermissionImpacts = nil
 
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
@@ -114,16 +120,20 @@ func handleSearchInstance(knSearchService knsearch.KnSearchService) func(ctx con
 }
 
 // handleQueryObjectInstance handles query_object_instance tool calls.
-func handleQueryObjectInstance(ontologyQuery interfaces.DrivenOntologyQuery) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+//
+// A refusal or a masked / row-filtered result carries permission_guidance so
+// the agent can say what was withheld and where to request access.
+func handleQueryObjectInstance(ontologyQuery interfaces.DrivenOntologyQuery,
+	guide *permissionguide.Guide) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		queryReq := &interfaces.QueryObjectInstancesReq{}
 		if err := bindPreciseArguments(req, queryReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		queryReq.KnID = getStringArg(req, "kn_id", queryReq.KnID)
@@ -137,18 +147,22 @@ func handleQueryObjectInstance(ontologyQuery interfaces.DrivenOntologyQuery) fun
 			queryReq.Limit = 10
 		}
 		if queryReq.KnID == "" || queryReq.OtID == "" {
-			return mcp.NewToolResultError("kn_id and ot_id are required"), nil
+			return inputValidationToolError(ctx, "kn_id and ot_id are required"), nil
 		}
 		if err := validator.New().Struct(queryReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		resp, err := ontologyQuery.QueryObjectInstances(ctx, queryReq)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return toolErrorWithPermissionGuidance(err,
+				guide.ForObjectTypeError(ctx, err, queryReq.KnID, queryReq.OtID)), nil
 		}
 		bkntrace.EmitQueryObjectInstanceEvents(ctx, nil, queryReq, resp)
 		resp.ObjectConcept = nil
+		resp.PermissionGuidance = guide.ForObjectQuery(ctx, queryReq.KnID, queryReq.OtID, queryReq.Properties,
+			resp.EffectivePermissions, resp.RowFilterApplied)
+		resp.RowFilterApplied = false // Restated by the guidance.
 		// Pure structured filtering has no relevance score; strip the constant _score to avoid misleading callers.
 		// Keep real relevance scores from knn/match (#236).
 		if !queryReq.HasScoringOperator() {
@@ -167,12 +181,12 @@ func handleQueryInstanceSubgraph(service logicsKqs.KnQuerySubgraphService) func(
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		subgraphReq := &interfaces.QueryInstanceSubgraphReq{}
 		if err := bindPreciseArguments(req, subgraphReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		subgraphReq.KnID = getStringArg(req, "kn_id", subgraphReq.KnID)
@@ -181,10 +195,10 @@ func handleQueryInstanceSubgraph(service logicsKqs.KnQuerySubgraphService) func(
 		}
 		subgraphReq.IncludeLogicParams = req.GetBool("include_logic_params", subgraphReq.IncludeLogicParams)
 		if subgraphReq.RelationTypePaths == nil {
-			return mcp.NewToolResultError("relation_type_paths is required"), nil
+			return inputValidationToolError(ctx, "relation_type_paths is required"), nil
 		}
 		if subgraphReq.KnID == "" {
-			return mcp.NewToolResultError("kn_id is required"), nil
+			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
 
 		resp, err := service.QueryInstanceSubgraph(ctx, subgraphReq)
@@ -204,12 +218,12 @@ func handleExploreSubgraph(service logicsKqs.KnQuerySubgraphService) func(ctx co
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		exploreReq := &interfaces.ExploreSubgraphReq{}
 		if err := bindPreciseArguments(req, exploreReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		exploreReq.KnID = getStringArg(req, "kn_id", exploreReq.KnID)
@@ -230,14 +244,14 @@ func handleExploreSubgraph(service logicsKqs.KnQuerySubgraphService) func(ctx co
 			{exploreReq.Direction == "", "direction"},
 		} {
 			if missing.empty {
-				return mcp.NewToolResultError(missing.name + " is required"), nil
+				return inputValidationToolError(ctx, missing.name+" is required"), nil
 			}
 		}
 		// The value range of path_length is controlled downstream (>3 back to 400), but 0 has to be blocked here: it is int.
 		// With a zero value, it is unclear whether "no transmission" or "0 was passed", and the downstream does not report an error for 0, but only returns an empty subgraph.
 		// Let the caller think "nothing is connected".
 		if exploreReq.PathLength <= 0 {
-			return mcp.NewToolResultError("path_length is required and must be at least 1"), nil
+			return inputValidationToolError(ctx, "path_length is required and must be at least 1"), nil
 		}
 
 		resp, err := service.ExploreSubgraph(ctx, exploreReq)
@@ -253,7 +267,8 @@ func handleExploreSubgraph(service logicsKqs.KnQuerySubgraphService) func(ctx co
 }
 
 // handleGetLogicPropertiesValues handles get_logic_properties_values tool calls.
-func handleGetLogicPropertiesValues(service interfaces.IKnLogicPropertyResolverService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleGetLogicPropertiesValues(service interfaces.IKnLogicPropertyResolverService,
+	guide *permissionguide.Guide) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		authCtx, ok := common.GetAccountAuthContextFromCtx(ctx)
 		if !ok {
@@ -286,8 +301,11 @@ func handleGetLogicPropertiesValues(service interfaces.IKnLogicPropertyResolverS
 
 		resp, err := service.ResolveLogicProperties(ctx, resolveReq)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return toolErrorWithPermissionGuidance(err,
+				guide.ForObjectTypeDenial(ctx, err, resolveReq.KnID, resolveReq.OtID)), nil
 		}
+		resp.PermissionGuidance = guide.ForObjectQuery(ctx, resolveReq.KnID, resolveReq.OtID,
+			resolveReq.Properties, resp.EffectivePermissions, false)
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -483,12 +501,12 @@ func handleRunSQL(svc knrunsql.KnRunSQLService) func(ctx context.Context, req mc
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		sqlReq := &knrunsql.RunSQLReq{}
 		if err := bindArguments(req, sqlReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		resp, err := svc.RunSQL(ctx, sqlReq)
@@ -509,11 +527,12 @@ func handleRunSQL(svc knrunsql.KnRunSQLService) func(ctx context.Context, req mc
 // query against the object and relation types and runs the SQL it produces.
 // A refusal names the construct it refused, so it is returned to the caller
 // verbatim rather than folded into a generic failure.
-func handleRunCypher(svc kncypher.KnCypherService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleRunCypher(svc kncypher.KnCypherService,
+	guide *permissionguide.Guide) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		// Precise binding: parameters carry the caller's own values, and a
@@ -521,13 +540,16 @@ func handleRunCypher(svc kncypher.KnCypherService) func(ctx context.Context, req
 		// was meant to select.
 		cypherReq := &kncypher.RunCypherReq{}
 		if err := bindPreciseArguments(req, cypherReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		resp, err := svc.RunCypher(ctx, cypherReq)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return toolErrorWithPermissionGuidances(err, permissionGuidancesForObjectImpacts(ctx, guide,
+				cypherReq.KnID, cypherPermissionImpactsFromError(err))), nil
 		}
+		resp.PermissionGuidance = permissionGuidancesForObjectImpacts(ctx, guide, cypherReq.KnID, resp.PermissionImpacts)
+		resp.PermissionImpacts = nil
 
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
@@ -535,6 +557,35 @@ func handleRunCypher(svc kncypher.KnCypherService) func(ctx context.Context, req
 		}
 		return result, nil
 	}
+}
+
+func permissionGuidancesForObjectImpacts(ctx context.Context, guide *permissionguide.Guide, knID string,
+	impacts []interfaces.ObjectPermissionImpact) []*interfaces.PermissionGuidance {
+	merged := make(map[string]interfaces.ObjectPermissionImpact, len(impacts))
+	order := make([]string, 0, len(impacts))
+	for _, impact := range impacts {
+		if impact.ObjectTypeID == "" {
+			continue
+		}
+		current, exists := merged[impact.ObjectTypeID]
+		if !exists {
+			current.ObjectTypeID = impact.ObjectTypeID
+			order = append(order, impact.ObjectTypeID)
+		}
+		current.Properties = append(current.Properties, impact.Properties...)
+		current.RowFilterApplied = current.RowFilterApplied || impact.RowFilterApplied
+		merged[impact.ObjectTypeID] = current
+	}
+	guidance := make([]*interfaces.PermissionGuidance, 0, len(merged))
+	for _, objectTypeID := range order {
+		impact := merged[objectTypeID]
+		entry := guide.ForObjectTypeImpact(ctx, knID, objectTypeID,
+			impact.Properties, impact.RowFilterApplied)
+		if entry != nil {
+			guidance = append(guidance, entry)
+		}
+	}
+	return guidance
 }
 
 // handleListResources handles list_resources tool calls.
@@ -598,28 +649,38 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 		knID := getStringArg(req, "kn_id", "")
 		if knID == "" {
 			knID = getKnIDFromHeader(req)
 		}
 		if knID == "" {
-			return mcp.NewToolResultError("kn_id is required"), nil
+			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
 
 		resp, err := bkn.GetKnowledgeNetworkDetail(ctx, knID)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		resp.ObjectTypes, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, resp.ObjectTypes)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		// Counts only: which object types have metrics worth drilling into, without
-		// carrying the metric list itself at this level.
-		if err := metrics.AttachRelatedMetricCounts(ctx, knID, resp.ObjectTypes); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		// A network too large to answer with its concept model narrows to its navigation
+		// shell, and does so here -- before the two steps below, which each cost a
+		// downstream call per object type of a list this answer will not carry (#1877).
+		if resp.NeedsNavigationShell() {
+			resp.ReduceToNavigationShell()
+			resp.Notice = infraErr.LocalizedDetail(ctx, resp.NavigationShellNoticeKey(),
+				resp.ObjectTypeCount, resp.RelationTypeCount,
+				interfaces.MaxSummaryObjectTypes, interfaces.MaxSummaryRelationTypes)
+		} else {
+			resp.ObjectTypes, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, resp.ObjectTypes)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			// Counts only: which object types have metrics worth drilling into, without
+			// carrying the metric list itself at this level.
+			if err := metrics.AttachRelatedMetricCounts(ctx, knID, resp.ObjectTypes); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
 		// The mounted Skills and tools, counted the same way — but gated first.
 		//
@@ -648,7 +709,7 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 		// After the snapshot, which records permissions as they are: the evidence
 		// keeps every entry, only the answer drops the ones that say nothing.
 		if detailLevel != interfaces.DetailLevelFull {
-			omitUnrestrictedPermissions(resp.ObjectTypes)
+			objectpermission.OmitUnrestrictedPermissions(resp.ObjectTypes)
 		}
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
@@ -663,6 +724,15 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 type knDrillArgs struct {
 	KnID string   `json:"kn_id"`
 	IDs  []string `json:"ids"`
+}
+
+// knObjectTypesArgs is knDrillArgs plus the window a caller walks with when it
+// has no ids. The two paging fields are meaningless with ids and are ignored
+// there rather than refused: naming ids is already the precise request.
+type knObjectTypesArgs struct {
+	knDrillArgs
+	Offset int `json:"offset"`
+	Limit  int `json:"limit"`
 }
 
 func (a *knDrillArgs) resolveKnID(req mcp.CallToolRequest) string {
@@ -680,44 +750,81 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
-		args := &knDrillArgs{}
+		args := &knObjectTypesArgs{}
 		if err := bindArguments(req, args); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 		knID := args.resolveKnID(req)
 		if knID == "" {
-			return mcp.NewToolResultError("kn_id is required"), nil
+			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
+
+		// No ids means the caller has none to give. That happens on a network past
+		// get_kn_detail's caps, where the concept arrays are withheld and nothing
+		// else on this surface enumerates them (#1889), so this reads a page instead
+		// of refusing. Named ids stay the primary path and ignore the paging inputs.
+		var (
+			matched    []*interfaces.ObjectType
+			totalCount int64
+			nextOffset *int
+			offset     int
+			notice     string
+		)
 		if len(args.IDs) == 0 {
-			return mcp.NewToolResultError("ids is required (object type ids from get_kn_detail)"), nil
+			var (
+				limit   int
+				clamped bool
+			)
+			offset, limit, clamped = interfaces.ResolveObjectTypePage(args.Offset, args.Limit)
+			page, err := bkn.ListObjectTypes(ctx, knID, offset, limit)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			matched, totalCount = page.Entries, page.TotalCount
+			nextOffset = interfaces.NextObjectTypeOffset(offset, page.Scanned, totalCount)
+			if clamped {
+				notice = infraErr.LocalizedDetail(ctx, "ObjectTypePageLimitClamped",
+					args.Limit, interfaces.MaxObjectTypePageSize, limit)
+			}
+		} else {
+			// Prioritize the endpoint that retrieves details by id: the export view only lists object types, does not enrich the data source, and does not enrich the data source.
+			// condition_operations is always empty, and the caller uses this to determine whether the field can match / knn.
+			//
+			// Omitted IDs are not reported as missing because an omission may be an
+			// authorization filter.
+			matched, err = bkn.GetObjectTypeDetail(ctx, knID, args.IDs, true)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
+		// The index carries no properties, so there is no property plan to apply to
+		// it and no operator to trim; and it is an index, so it does not carry the
+		// metrics a caller drills for. Running either over it would be a downstream
+		// call per object type for a field the answer does not have -- which is what
+		// made a page of this cost a second an object type.
+		if len(args.IDs) > 0 {
+			matched, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, matched)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			// The same rule as search_schema: only emit underivable operators. Comparison operators (==/in/like/range…)
+			// Determined by the attribute type, repeating each attribute for more than ten times is pure noise - the object type is small and it still occupies the context.
+			objectpermission.TrimObjectTypesToIndexBackedOps(matched)
 
-		// Prioritize the endpoint that retrieves details by id: the export view only lists object types, does not enrich the data source, and does not enrich the data source.
-		// condition_operations is always empty, and the caller uses this to determine whether the field can match / knn.
-		//
-		// Omitted IDs are not reported as missing because an omission may be an
-		// authorization filter.
-		matched, err := bkn.GetObjectTypeDetail(ctx, knID, args.IDs, true)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			// Step 2 of the OT-first metric path: a metric that is not bound to a logic
+			// property is unreachable from the object type without this.
+			if err := metrics.AttachRelatedMetrics(ctx, knID, matched); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
-		matched, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, matched)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		// The same rule as search_schema: only emit underivable operators. Comparison operators (==/in/like/range…)
-		// Determined by the attribute type, repeating each attribute for more than ten times is pure noise - the object type is small and it still occupies the context.
-		objectpermission.TrimObjectTypesToIndexBackedOps(matched)
-
-		// Step 2 of the OT-first metric path: a metric that is not bound to a logic
-		// property is unreachable from the object type without this.
-		if err := metrics.AttachRelatedMetrics(ctx, knID, matched); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "object", knID, schemaObjectTypeIDs(matched), matched, len(matched) == len(args.IDs))
-		resp := &interfaces.ObjectTypesResp{KnID: knID, ObjectTypes: matched}
+		// A listed page is complete for what it asked: nothing was requested by name,
+		// so nothing can be missing from it.
+		complete := len(args.IDs) == 0 || len(matched) == len(args.IDs)
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "object", knID, schemaObjectTypeIDs(matched), matched, complete)
+		resp := &interfaces.ObjectTypesResp{KnID: knID, ObjectTypes: matched,
+			TotalCount: totalCount, NextOffset: nextOffset, Notice: notice}
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -732,18 +839,18 @@ func handleGetRelationTypes(bkn interfaces.BknBackendAccess) func(ctx context.Co
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 		args := &knDrillArgs{}
 		if err := bindArguments(req, args); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 		knID := args.resolveKnID(req)
 		if knID == "" {
-			return mcp.NewToolResultError("kn_id is required"), nil
+			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
 		if len(args.IDs) == 0 {
-			return mcp.NewToolResultError("ids is required (relation type ids from get_kn_detail)"), nil
+			return inputValidationToolError(ctx, "ids is required (relation type ids from get_kn_detail)"), nil
 		}
 
 		matched, err := bkn.GetRelationTypeDetail(ctx, knID, args.IDs, true)
@@ -830,12 +937,12 @@ func handleQueryMetric(service knmetrics.KnMetricsService) func(ctx context.Cont
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 
 		args := &interfaces.QueryMetricReq{}
 		if err := bindPreciseArguments(req, args); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return inputValidationToolError(ctx, err.Error()), nil
 		}
 		if args.KnID == "" {
 			args.KnID = getKnIDFromHeader(req)
@@ -874,28 +981,9 @@ func missingObjectTypeIDs(requested []string, matched []*interfaces.ObjectType) 
 	return missing
 }
 
-// omitUnrestrictedPermissions drops an object type's effective_permissions
-// when every property in it is full.
-//
-// The map lists every property of every object type, so on a network the
-// caller may read in full it repeated "full" for each one: a fifth of a
-// summary on the supply sample, carried again in every later model turn. A
-// map with any schema, masked or none entry is the one that tells the caller
-// something, and it is kept whole.
-func omitUnrestrictedPermissions(objectTypes []*interfaces.ObjectType) {
-	for _, objectType := range objectTypes {
-		if objectType == nil || len(objectType.EffectivePermissions) == 0 {
-			continue
-		}
-		restricted := false
-		for _, level := range objectType.EffectivePermissions {
-			if level != interfaces.PropertyAccessFull {
-				restricted = true
-				break
-			}
-		}
-		if !restricted {
-			objectType.EffectivePermissions = nil
-		}
-	}
+// inputValidationToolError preserves the public MCP result while retaining a
+// producer-owned classification for the managed attempt's terminal fact.
+func inputValidationToolError(ctx context.Context, message string) *mcp.CallToolResult {
+	bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+	return mcp.NewToolResultError(message)
 }

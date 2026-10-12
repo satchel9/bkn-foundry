@@ -71,7 +71,7 @@ const (
 	SearchAfter_Limit = 10000
 
 	// Default use of cached persistent data for object-type queries.
-	DEFAULT_IGNORING_STORE_CACHE = "false"
+	DEFAULT_IGNORE_LOCAL_INDEX = "false"
 )
 
 const (
@@ -116,5 +116,7 @@ type PageQuery struct {
 	// ResourceCursor is the opaque Vega continuation state restored from Cursor.
 	// It must never be accepted from or exposed to API callers directly.
 	ResourceCursor string `json:"-"`
+	// ResourceOffset is the stateless resource continuation restored from Cursor.
+	ResourceOffset int `json:"-"`
 	SearchAfterParams
 }

@@ -8,11 +8,11 @@ package observabilityvo
 import "testing"
 
 func TestRegisteredLogEventsRejectUnknownAndCategoryMismatch(t *testing.T) {
-	if !IsRegisteredLogEvent(CategoryRuntimeBusiness, "knowledge.read.completed") {
-		t.Fatal("registered business event was rejected")
+	if !IsRegisteredLogEvent(CategoryRuntimeBusiness, "conversation.created") {
+		t.Fatal("user-started conversation event was rejected")
 	}
-	if IsRegisteredLogEvent(CategoryRuntimeSystem, "knowledge.read.completed") {
-		t.Fatal("registered event was accepted under the wrong category")
+	if IsRegisteredEventName("operation.executed") {
+		t.Fatal("internal Trace operation was exposed as a log event")
 	}
 	if IsRegisteredLogEvent(CategoryRuntimeSystem, "plugin.custom.event") {
 		t.Fatal("unregistered extension event was accepted")
@@ -22,5 +22,18 @@ func TestRegisteredLogEventsRejectUnknownAndCategoryMismatch(t *testing.T) {
 func TestRegisteredLogEventsIncludeVoluntaryLogout(t *testing.T) {
 	if !IsRegisteredLogEvent(CategoryAccessUser, "logout.succeeded") {
 		t.Fatal("registered voluntary logout event was rejected")
+	}
+}
+
+func TestRegisteredLogEventsIncludeUnifiedCaptureControlAudit(t *testing.T) {
+	for _, name := range []string{
+		"trace_evidence.configuration_change_requested",
+		"trace_evidence.operation_succeeded",
+		"trace_evidence.operation_failed",
+		"trace_evidence.rollback_completed",
+	} {
+		if !IsRegisteredLogEvent(CategoryAuditAdmin, name) {
+			t.Fatalf("frozen control Audit event %s is not publicly queryable", name)
+		}
 	}
 }

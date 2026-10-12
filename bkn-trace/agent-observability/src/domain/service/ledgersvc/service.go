@@ -37,8 +37,14 @@ func IsCode(err error, code ErrorCode) bool {
 }
 
 type Service struct {
-	store   ievidenceledger.Store
-	metrics icoremetrics.Recorder
+	store           ievidenceledger.Store
+	metrics         icoremetrics.Recorder
+	durableObserver func(context.Context, ledgervo.Event) error
+}
+
+// SetDurableObserver binds the internal confirmation path before serving starts.
+func (s *Service) SetDurableObserver(observer func(context.Context, ledgervo.Event) error) {
+	s.durableObserver = observer
 }
 
 func New(store ievidenceledger.Store) *Service {
@@ -71,12 +77,50 @@ func (s *Service) Ingest(ctx context.Context, event ledgervo.Event) (ledgervo.Du
 		return ledgervo.DurableAck{}, &DomainError{
 			Code: CodeInvalidEvent, Message: "event causality is cyclic or crosses its trusted interaction scope",
 		}
+	case errors.Is(err, ievidenceledger.ErrMissingScope), errors.Is(err, ievidenceledger.ErrOwnerMismatch):
+		return ledgervo.DurableAck{}, &DomainError{Code: CodeInvalidEvent, Message: err.Error()}
 	case err != nil:
 		return ledgervo.DurableAck{}, err
 	default:
 		s.metrics.Increment(icoremetrics.EvidenceIngestTotal)
+		if ack.Durable && s.durableObserver != nil {
+			if err := s.durableObserver(ctx, event); err != nil {
+				return ack, err
+			}
+		}
 		return ack, nil
 	}
+}
+
+// IngestKafka is the C1 terminal-decision path. Conflict evidence and its
+// Kafka coordinate are committed with the ledger decision in one store tx.
+func (s *Service) IngestKafka(ctx context.Context, event ledgervo.Event, coordinate ievidenceledger.KafkaCoordinate) (ievidenceledger.KafkaResult, error) {
+	if err := validateEvent(event); err != nil {
+		return ievidenceledger.KafkaResult{}, err
+	}
+	store, ok := s.store.(ievidenceledger.KafkaStore)
+	if !ok {
+		return ievidenceledger.KafkaResult{}, errors.New("evidence store does not support atomic Kafka terminal decisions")
+	}
+	result, err := store.CommitKafka(ctx, event, coordinate)
+	if errors.Is(err, ievidenceledger.ErrOwnerMismatch) {
+		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: "evidence owner does not match trusted conversation owner"}
+	}
+	if errors.Is(err, ievidenceledger.ErrMissingScope) {
+		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: ievidenceledger.ErrMissingScope.Error()}
+	}
+	if err != nil {
+		return result, err
+	}
+	if result.Decision == ievidenceledger.KafkaAccepted {
+		s.metrics.Increment(icoremetrics.EvidenceIngestTotal)
+	}
+	if (result.Decision == ievidenceledger.KafkaAccepted || result.Decision == ievidenceledger.KafkaDeduplicated) && result.Ack.Durable && s.durableObserver != nil {
+		if err := s.durableObserver(ctx, event); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
 }
 
 func validateEvent(event ledgervo.Event) error {

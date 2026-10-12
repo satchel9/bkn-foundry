@@ -514,6 +514,34 @@ func Test_KnowledgeNetworkRestHandler_GetKN(t *testing.T) {
 			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
 		})
 
+		Convey("Export returns JSON with a download filename\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), knID, interfaces.MAIN_BRANCH, interfaces.Mode_Export).
+				Return(&interfaces.KN{KNID: knID, KNName: "orders-network"}, nil)
+
+			req := httptest.NewRequest(http.MethodGet, url+"?mode=export", nil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+
+			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+			So(w.Header().Get("Content-Type"), ShouldEqual, "application/json")
+			So(w.Header().Get("Content-Disposition"), ShouldContainSubstring, "orders-network.json")
+			So(w.Body.String(), ShouldContainSubstring, `"name":"orders-network"`)
+		})
+
+		Convey("Export returns an ASCII fallback and UTF-8 filename for a Chinese network name\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), knID, interfaces.MAIN_BRANCH, interfaces.Mode_Export).
+				Return(&interfaces.KN{KNID: knID, KNName: "订单网络"}, nil)
+
+			req := httptest.NewRequest(http.MethodGet, url+"?mode=export", nil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+
+			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+			So(w.Header().Get("Content-Disposition"), ShouldEqual,
+				`attachment; filename="kn1.json"; filename*=utf-8''%E8%AE%A2%E5%8D%95%E7%BD%91%E7%BB%9C.json`)
+			So(w.Body.String(), ShouldContainSubstring, `"name":"订单网络"`)
+		})
+
 		Convey("KN not found\n", func() {
 			err := &rest.HTTPError{
 				HTTPCode: http.StatusNotFound,
@@ -913,4 +941,36 @@ func Test_KnowledgeNetworkRestHandler_DeleteKN_extraCases(t *testing.T) {
 			So(w.Result().StatusCode, ShouldEqual, http.StatusInternalServerError)
 		})
 	})
+}
+
+func TestKnowledgeNetworkMutationSummaryIsBoundedAndDoesNotContainDefinitions(t *testing.T) {
+	secretDefinition := "sensitive-business-definition"
+	summary := knowledgeNetworkMutationSummary(&interfaces.KN{
+		KNID:   "kn-1",
+		KNName: secretDefinition,
+		ObjectTypes: []*interfaces.ObjectType{{
+			ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot-1", OTName: secretDefinition},
+		}},
+		ConceptGroups: []*interfaces.ConceptGroup{{
+			CGID: "cg-1", ObjectTypeIDs: []string{"ot-1", "ot-2"},
+		}},
+	}, interfaces.ImportMode_Overwrite, "preserve", 4096)
+
+	if strings.Contains(summary, secretDefinition) {
+		t.Fatalf("summary leaked a business definition: %s", summary)
+	}
+	for _, expected := range []string{
+		"operation_kind=knowledge_network_import",
+		"kn_id=kn-1",
+		"branch=main",
+		"request_bytes=4096",
+		"import_mode=overwrite",
+		"object_types=1",
+		"concept_groups=1",
+		"member_references=2",
+	} {
+		if !strings.Contains(summary, expected) {
+			t.Fatalf("summary %q does not contain %q", summary, expected)
+		}
+	}
 }

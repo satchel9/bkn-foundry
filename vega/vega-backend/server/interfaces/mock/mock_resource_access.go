@@ -86,17 +86,17 @@ func (mr *MockResourceAccessMockRecorder) DeleteByCatalogID(ctx, tx, catalogID a
 }
 
 // DeleteByIDs mocks base method.
-func (m *MockResourceAccess) DeleteByIDs(ctx context.Context, ids []string) error {
+func (m *MockResourceAccess) DeleteByIDs(ctx context.Context, ids []string, onlyIfStale bool) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeleteByIDs", ctx, ids)
+	ret := m.ctrl.Call(m, "DeleteByIDs", ctx, ids, onlyIfStale)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DeleteByIDs indicates an expected call of DeleteByIDs.
-func (mr *MockResourceAccessMockRecorder) DeleteByIDs(ctx, ids any) *gomock.Call {
+func (mr *MockResourceAccessMockRecorder) DeleteByIDs(ctx, ids, onlyIfStale any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteByIDs", reflect.TypeOf((*MockResourceAccess)(nil).DeleteByIDs), ctx, ids)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteByIDs", reflect.TypeOf((*MockResourceAccess)(nil).DeleteByIDs), ctx, ids, onlyIfStale)
 }
 
 // GetByCatalogID mocks base method.
@@ -306,6 +306,21 @@ func (m *MockResourceAccess) UpdateLocalIndexState(ctx context.Context, tx *sql.
 func (mr *MockResourceAccessMockRecorder) UpdateLocalIndexState(ctx, tx, id, localIndexStatus, localIndexName, syncMark any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateLocalIndexState", reflect.TypeOf((*MockResourceAccess)(nil).UpdateLocalIndexState), ctx, tx, id, localIndexStatus, localIndexName, syncMark)
+}
+
+// UpdateRowCount mocks base method.
+func (m *MockResourceAccess) UpdateRowCount(ctx context.Context, tx *sql.Tx, resource *interfaces.Resource, expectedUpdateTime int64) (int64, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateRowCount", ctx, tx, resource, expectedUpdateTime)
+	ret0, _ := ret[0].(int64)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UpdateRowCount indicates an expected call of UpdateRowCount.
+func (mr *MockResourceAccessMockRecorder) UpdateRowCount(ctx, tx, resource, expectedUpdateTime any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateRowCount", reflect.TypeOf((*MockResourceAccess)(nil).UpdateRowCount), ctx, tx, resource, expectedUpdateTime)
 }
 
 // UpdateSemanticMetadata mocks base method.

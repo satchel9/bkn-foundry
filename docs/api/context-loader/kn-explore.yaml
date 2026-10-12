@@ -104,6 +104,23 @@ paths:
         顶层带 `mounted_capabilities`：该网络已挂载的 Skill 与工具按类型计数。两个
         `detail_level` 都会返回——它是网络的形状，不是可以剥掉的细节。同样只给计数：
         要具体能力用 `search_capabilities`。
+
+        **超过 200 个对象类、或超过 600 个关系类的网络只返回导航壳**，两个 `detail_level` 都是：此时
+        `object_types` / `relation_types` / `action_types` **均回 `null`**，改由
+        `object_type_count` / `relation_type_count` / `action_type_count` 给出数量，
+        `notice` 说明原因与下一步。概念组与 `mounted_capabilities` 照常返回。
+
+        **该网络没划概念组时**（存在这种网：一千个对象类、零个概念组），`concept_groups`
+        为空，`notice` 改为让调用方直接调 `search_schema` 按语义召回——把人指向一个空字段
+        等于没给出路。
+
+        这不是分页。一张一千对象类的网，summary 也有一兆多，翻页只是把同样的体积分几次
+        搬运；而按名称序翻页等于对知识模型做线性扫描。该规模下的路径是：从 `concept_groups`
+        选出 1-3 个相关分组，用 [schema-search.yaml](schema-search.yaml) 的 `search_schema`
+        配合 `search_scope.concept_groups` 收敛，再用 `get_object_types` 按 ID 取细节。
+
+        收窄发生在逐对象类的属性授权读取之前：那一步每个对象类一次下游调用，为一份
+        不会返回的列表付这个代价没有意义。
       parameters:
         - $ref: '#/components/parameters/ResponseFormat'
         - $ref: '#/components/parameters/XKnID'
@@ -168,6 +185,21 @@ paths:
         `ids` 里既可以传对象类 ID，也可以传对象类名（ID 优先，名称仅作兜底）；
         匹配不到的 ID 原样回填在 `missing` 里，不报错。属性的 `display_name`
         （纯 UI 标签）在本接口也会被去掉。
+
+        **不传 `ids` 就是列举对象类索引**：按名称升序返回一页，每条只有
+        `id` / `name` / `comment` / `tags` / `data_source`，**没有 `data_properties`、
+        `logic_properties` 与 `related_metrics`**。`limit` 默认 50、上限 200，响应带
+        `total_count`（当前账号可见总数）与 `next_offset`（走完最后一页即不再出现，
+        别自己用 `offset + len` 推）。
+
+        这是给拿不到 ID 的调用方准备的——`get_kn_detail` 对超过上限的网络只回导航壳，
+        那条路给不出 ID。挑好之后把 ID 传回本接口取完整定义。传了 `ids` 则
+        `offset` / `limit` 无效。
+
+        索引而非定义，是因为完整定义在大网络上一条约 60KB：一页 20 条就超过一兆，
+        正是导航壳要避免的那种返回值；而且每条还要付一次属性级授权读取。索引条目
+        只有几百字节，且一次下游读取就能取回整页。
+
       parameters:
         - $ref: '#/components/parameters/ResponseFormat'
         - $ref: '#/components/parameters/XKnID'
@@ -176,7 +208,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DrillRequest'
+              $ref: '#/components/schemas/ObjectTypesRequest'
             examples:
               下钻两个对象类:
                 value:
@@ -184,6 +216,14 @@ paths:
                   ids:
                     - ot_drug
                     - ot_manufacturer
+              列举第一页:
+                value:
+                  kn_id: kn_medical
+              续走下一页:
+                value:
+                  kn_id: kn_medical
+                  offset: 20
+                  limit: 20
       responses:
         '200':
           description: 对象类完整定义
@@ -195,7 +235,7 @@ paths:
               schema:
                 type: string
         '400':
-          description: 缺少 `kn_id` 或 `ids` 为空
+          description: 缺少 `kn_id`
           content:
             application/json:
               schema:
@@ -301,8 +341,6 @@ components:
   schemas:
     ListKnRequest:
       type: object
-      required:
-        - bkn_context
       properties:
         bkn_context:
           $ref: '../_shared/common.yaml#/components/schemas/BKNContext'
@@ -358,8 +396,6 @@ components:
 
     GetKnDetailRequest:
       type: object
-      required:
-        - bkn_context
       properties:
         bkn_context:
           $ref: '../_shared/common.yaml#/components/schemas/BKNContext'
@@ -377,7 +413,6 @@ components:
     DrillRequest:
       type: object
       required:
-        - bkn_context
         - ids
       properties:
         bkn_context:
@@ -392,6 +427,41 @@ components:
           description: |
             要下钻的概念 ID 列表（取自 `get_kn_detail`）。也接受概念名称作为兜底匹配。
             为空时返回 400。
+
+    ObjectTypesRequest:
+      type: object
+      description: |
+        `get_object_types` 的入参。`ids` 可选：传了就是按 ID 取完整定义，不传就是按
+        `offset` / `limit` 列举对象类索引。两种模式的条目形状**不同**——索引条目不含
+        字段、逻辑属性与指标；列举还会额外带 `total_count` 与 `next_offset`。
+      properties:
+        bkn_context:
+          $ref: '../_shared/common.yaml#/components/schemas/BKNContext'
+        kn_id:
+          type: string
+          description: 知识网络 ID。与 `x-kn-id` 头二选一，本字段优先。
+        ids:
+          type: array
+          items:
+            type: string
+          description: |
+            要下钻的对象类 ID 列表（取自 `get_kn_detail` 或本接口的列举模式）。也接受
+            名称作为兜底匹配。**留空即切换到列举模式**，不再返回 400。
+        offset:
+          type: integer
+          minimum: 0
+          default: 0
+          description: 列举的起始位置。仅在不传 `ids` 时有效；续页请用响应里的 `next_offset`。
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+          description: |
+            列举的单页条数，默认 50、上限 200。仅在不传 `ids` 时有效。索引条目只有
+            几百字节，所以比按 ID 取定义时能装得多。超过上限不报错，按上限返回，
+            并在响应的 `notice` 里说明——一页比你要的短却什么都不说，会被读成
+            「这张网就这么大」。
 
     KnowledgeNetworkDetail:
       type: object
@@ -421,6 +491,23 @@ components:
             $ref: '#/components/schemas/ActionType'
         mounted_capabilities:
           $ref: '#/components/schemas/MountedCapabilityCounts'
+        object_type_count:
+          type: integer
+          description: |
+            该网络的对象类总数。**仅在导航壳返回时出现**——其余情况下 `object_types`
+            数组本身就是数量，再给一个数只会多一个可能对不上的地方。
+        relation_type_count:
+          type: integer
+          description: 该网络的关系类总数。出现条件同 `object_type_count`。
+        action_type_count:
+          type: integer
+          description: 该网络的行动类总数。出现条件同 `object_type_count`。
+        notice:
+          type: string
+          description: |
+            本次返回被收窄的原因与下一步指引。**出现时 `object_types` /
+            `relation_types` / `action_types` 都回 `null`**，这不表示该网络没有这些概念：
+            数量见三个 `*_count` 字段。
 
     MountedCapabilityCounts:
       type: object
@@ -460,11 +547,33 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ObjectType'
+          description: |
+            传了 `ids` 时是完整定义；**列举模式下是索引条目**，只有 `id` / `name` /
+            `comment` / `tags` / `data_source`，`data_properties` / `logic_properties` /
+            `related_metrics` 一概不下发。要它们把 `id` 传回本接口。
         missing:
           type: array
           items:
             type: string
           description: 请求里没匹配到任何对象类的 ID；全部命中时该字段不返回。
+        total_count:
+          type: integer
+          description: |
+            该网络中当前账号可见的对象类总数。**仅列举模式返回**，用来判断这一页在
+            全量里的位置。授权过滤发生在分页之前，所以这个数是「你能看到多少」，
+            不是「这张网有多少」。
+        next_offset:
+          type: integer
+          description: |
+            续走本次列举的下一个 `offset`。**仅列举模式返回，且走完最后一页即不再出现**
+            ——这是走完的信号。不要用 `offset + object_types.length` 自行推算：总数可能
+            在一次遍历中间变化，服务端说停才是停。
+        notice:
+          type: string
+          description: |
+            本次请求没有被原样兑现时的说明。目前只有一种情形：`limit` 超过上限，
+            按上限返回了。它出现时这一页比请求的短，**但不代表列举到头了**——
+            是否还有下一页只看 `next_offset`。
 
     RelationTypesResponse:
       type: object
@@ -553,6 +662,14 @@ components:
             `data_properties` / `primary_keys` 里的条目一起被剔除，不会出现在响应里。
             对象类没有绑定已发布资源时不下发本字段，同时 `data_properties` 为空——
             对象类仍可被发现，但没有属性可用。
+
+            **`detail_level=summary` 下，整张表全是 `full` 时不下发本字段。** 把调用者
+            自己的权限一条条读回给他并不提供信息，而在一张一千对象类的网上它是响应的
+            六成。有任何 `schema` / `masked` 条目的表整张保留——那张表才有信息。
+            `detail_level=full` 原样下发。
+
+            所以字段缺席只有一个含义：**对你没有受限属性**。两种来源（未绑资源、全 `full`）
+            靠旁边的 `data_properties` 区分——未绑资源的对象类不下发任何属性。
         data_source_metadata_unavailable:
           type: boolean
           description: |

@@ -9,7 +9,6 @@ package driveradapters
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +26,7 @@ const (
 	headerBKNRequestID         = "bkn-request-id"
 	headerLegacyRequestID      = "x-request-id"
 	headerBKNInteractionID     = "bkn-interaction-id"
+	headerBKNConversationID    = "bkn-conversation-id"
 	headerBKNOperationID       = "bkn-operation-id"
 	headerBKNParentOperationID = "bkn-parent-operation-id"
 	headerBKNCausationEventID  = "bkn-causation-event-id"
@@ -58,7 +58,9 @@ func bknTraceRequestContext(c *gin.Context, vis hydra.Visitor) (bkntrace.Request
 	if err == nil && parsedAttempt >= 1 && parsedAttempt <= 1000 {
 		attempt = uint32(parsedAttempt)
 	}
+	conversationID := strings.TrimSpace(c.GetHeader(headerBKNConversationID))
 	interactionID := strings.TrimSpace(c.GetHeader(headerBKNInteractionID))
+	sessionScopePresent := conversationID != "" && interactionID != ""
 	if interactionID == "" {
 		id, err := uuid.NewV7()
 		if err != nil {
@@ -67,6 +69,7 @@ func bknTraceRequestContext(c *gin.Context, vis hydra.Visitor) (bkntrace.Request
 		interactionID = "int_" + id.String()
 	}
 	operationID := strings.TrimSpace(c.GetHeader(headerBKNOperationID))
+	operationScopePresent := operationID != ""
 	if operationID == "" {
 		id, err := uuid.NewV7()
 		if err != nil {
@@ -86,12 +89,14 @@ func bknTraceRequestContext(c *gin.Context, vis hydra.Visitor) (bkntrace.Request
 		RequestID:              requestID,
 		AccountID:              accountID,
 		AccountType:            accountType,
-		ApplicationPrincipalID: strings.TrimSpace(os.Getenv("BKN_TRACE_APPLICATION_PRINCIPAL_ID")),
-		EffectiveSubjectID:     accountID,
-		EffectiveSubjectType:   bknTraceSubjectType(accountType),
-		DelegationID:           strings.TrimSpace(c.GetHeader("x-bkn-delegation-id")),
+		ApplicationPrincipalID: strings.TrimSpace(vis.ClientID),
+		EffectiveSubjectID:     strings.TrimSpace(vis.ID),
+		EffectiveSubjectType:   bknTraceSubjectType(string(vis.Type)),
+		ConversationID:         conversationID,
 		InteractionID:          interactionID,
+		SessionScopePresent:    sessionScopePresent,
 		OperationID:            operationID,
+		OperationScopePresent:  operationScopePresent,
 		ParentOperationID:      strings.TrimSpace(c.GetHeader(headerBKNParentOperationID)),
 		CausationEventID:       strings.TrimSpace(c.GetHeader(headerBKNCausationEventID)),
 		ClaimID:                strings.TrimSpace(c.GetHeader(headerBKNClaimID)),

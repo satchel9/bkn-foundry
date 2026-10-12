@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"log"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -20,18 +21,27 @@ import (
 )
 
 const (
-	finishTimeout       = 5 * time.Second
 	finishRetryAttempts = 3
 	finishRetryBase     = 20 * time.Millisecond
 )
 
 type BusinessContext struct {
-	ConversationID    string        `json:"conversation_id"`
-	InteractionID     string        `json:"interaction_id"`
-	OperationKey      string        `json:"operation_key"`
-	ParentOperationID string        `json:"parent_operation_id,omitempty"`
-	CausationEventIDs []string      `json:"causation_event_ids,omitempty"`
-	BusinessRefs      []BusinessRef `json:"business_refs,omitempty"`
+	ConversationID    string   `json:"conversation_id"`
+	InteractionID     string   `json:"interaction_id"`
+	OperationKey      string   `json:"operation_key"`
+	ParentOperationID string   `json:"parent_operation_id,omitempty"`
+	CausationEventIDs []string `json:"causation_event_ids,omitempty"`
+	// BusinessRefs are what the server derived from the validated request.
+	// They are authoritative: together with the refs evidence observes, they
+	// are what the receipt records and what decides the recorded scope.
+	BusinessRefs []BusinessRef `json:"business_refs,omitempty"`
+	// DeclaredBusinessRefs are what the caller sent. A model asked to fill
+	// this field in has been observed inventing a version, an object type and
+	// an instance it never read, and the old merge let the invented version
+	// overwrite the observed one. They are a diagnostic input only: they never
+	// reach a receipt and never widen the recorded scope. Unparsable ones are
+	// still refused, so a programmatic integration hears about its defect.
+	DeclaredBusinessRefs []BusinessRef `json:"-"`
 }
 
 type GuardIntent struct {
@@ -44,8 +54,9 @@ type GuardIntent struct {
 }
 
 type GuardState struct {
-	Result       OperationResult
-	ArtifactRefs []string
+	CaptureDisabled bool
+	Result          OperationResult
+	ArtifactRefs    []string
 }
 
 type GuardDisposition string
@@ -69,11 +80,16 @@ func (g *Guard) Begin(
 	ctx context.Context,
 	intent GuardIntent,
 ) (context.Context, GuardState, GuardDisposition, *APIError, error) {
+	if CaptureDisabled() {
+		return ClearManagedTraceContext(ctx), GuardState{CaptureDisabled: true}, GuardExecute, nil, nil
+	}
+	ctx = WithTraceAvailability(ctx)
 	ctx, err := EnsureTraceCorrelation(ctx)
 	if err != nil {
 		return ctx, GuardState{}, "", nil, err
 	}
-	result, apiErr, err := g.client.EnsureOperation(ctx, EnsureOperationInput{
+	ioctx, release := TraceIOContext(ctx, "pre")
+	result, apiErr, err := g.client.EnsureOperation(ioctx, EnsureOperationInput{
 		ConversationID:    intent.Context.ConversationID,
 		InteractionID:     intent.Context.InteractionID,
 		OperationKey:      intent.Context.OperationKey,
@@ -85,6 +101,10 @@ func (g *Guard) Begin(
 		CausationEventIDs: intent.Context.CausationEventIDs,
 		CapabilityProfile: intent.CapabilityProfile,
 	})
+	release()
+	if IsCaptureDisabledError(apiErr) {
+		return ClearManagedTraceContext(ctx), GuardState{CaptureDisabled: true}, GuardExecute, nil, nil
+	}
 	if err != nil || apiErr != nil {
 		return ctx, GuardState{}, "", apiErr, err
 	}
@@ -106,7 +126,8 @@ func (g *Guard) Begin(
 	ctx = common.SetTraceContextToCtx(ctx, traceContext)
 	ctx = common.SetAuthoritativeObservedAtIfMissing(ctx, result.Operation.CreatedAt)
 	trustedRefs := append([]BusinessRef(nil), intent.Context.BusinessRefs...)
-	return withDeclaredBusinessRefs(withEvidenceOutcome(ctx), trustedRefs), state, GuardExecute, nil, nil
+	recordIgnoredDeclaredRefs(ctx, intent)
+	return withRequestDerivedBusinessRefs(withEvidenceOutcome(ctx), trustedRefs), state, GuardExecute, nil, nil
 }
 
 // EnsureTraceCorrelation preserves an incoming W3C trace when present and
@@ -137,6 +158,9 @@ func (g *Guard) Finish(
 	failed bool,
 	retryable bool,
 ) (OperationResult, *APIError, error) {
+	if state.CaptureDisabled {
+		return state.Result, nil, nil
+	}
 	ctx, err := EnsureTraceCorrelation(ctx)
 	if err != nil {
 		return OperationResult{}, nil, err
@@ -165,28 +189,41 @@ func (g *Guard) Finish(
 	} else {
 		input.Output = rawPayload
 	}
-	// Declared references are part of the caller's governed operation context,
-	// not a by-product of evidence delivery. Keep them in the receipt even while
-	// observed evidence is still awaiting a durable acknowledgement.
-	input.BusinessRefs = declaredBusinessRefsFromContext(ctx)
-	attempted, durable, evidenceRefs, businessRefs := snapshotEvidenceOutcome(ctx)
+	// Request refs and targets identified during execution belong to the
+	// governed attempt, independently of event delivery. Freeze before reading
+	// them so retries cannot acquire targets from late callbacks.
+	// What the caller declared is not here: see BusinessContext.
+	input.EvidenceExpectation = freezeEvidenceExpectation(ctx)
+	input.BusinessRefs = mergeBusinessRefs(retainedBusinessRefs(ctx), requestDerivedBusinessRefsFromContext(ctx))
+	attempted, accepted := snapshotEvidenceOutcome(ctx)
 	switch {
-	case durable:
-		input.EvidenceDurability = "durable"
-		input.ObservedEvidenceRefs = evidenceRefs
-		input.BusinessRefs = mergeBusinessRefs(input.BusinessRefs, businessRefs)
 	case attempted:
-		input.EvidenceDurability = "failed"
-	default:
-		if evidenceIngestURL() == "" {
+		if accepted {
 			input.EvidenceDurability = "pending"
 		} else {
-			// The receipt is itself the durable record for tools that do not emit a
-			// separate business-evidence event and for rejected downstream calls.
+			input.EvidenceDurability = "failed"
+		}
+	default:
+		if EvidenceEnabled() {
+			// The lifecycle receipt is the durable record for tools that do not emit
+			// a separate business-evidence event.
 			input.EvidenceDurability = "durable"
+		} else {
+			input.EvidenceDurability = "pending"
 		}
 	}
-	finishContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), finishTimeout)
+	if input.EvidenceExpectation != nil {
+		// A planned set determines enqueue durability. An empty set keeps the
+		// conservative receipt-only policy above; Core validates its profile.
+		if len(input.EvidenceExpectation.Events) > 0 || !input.EvidenceExpectation.Closed {
+			input.EvidenceDurability = evidenceExpectationDurability(input.EvidenceExpectation)
+		}
+		if reason := evidenceExpectationFailureReason(ctx); reason != "" {
+			input.PartialReasons = append(input.PartialReasons, reason)
+		}
+	}
+	input.PartialReasons = append(input.PartialReasons, TracePartialReasons(ctx)...)
+	finishContext, cancel := TraceIOContext(WithTraceAvailability(context.WithoutCancel(ctx)), "post")
 	defer cancel()
 
 	lastResult := state.Result
@@ -262,10 +299,47 @@ func guardPayloadJSON(payload any) (json.RawMessage, error) {
 	return raw, err
 }
 
-func mergeBusinessRefs(preferred, observed []BusinessRef) []BusinessRef {
-	merged := make([]BusinessRef, 0, len(preferred)+len(observed))
-	seen := make(map[string]struct{}, len(preferred)+len(observed))
-	for _, refs := range [][]BusinessRef{preferred, observed} {
+// recordIgnoredDeclaredRefs reports what a caller declared and the server did
+// not derive. Nothing is refused over it: the point is to be able to see, per
+// tool, how often a caller's declaration disagrees with the request.
+func recordIgnoredDeclaredRefs(ctx context.Context, intent GuardIntent) {
+	if len(intent.Context.DeclaredBusinessRefs) == 0 {
+		return
+	}
+	derived := make(map[string]struct{}, len(intent.Context.BusinessRefs))
+	for _, ref := range intent.Context.BusinessRefs {
+		derived[ref.RefType+"\x00"+ref.RefID] = struct{}{}
+	}
+	ignored := 0
+	for _, ref := range intent.Context.DeclaredBusinessRefs {
+		if _, authoritative := derived[ref.RefType+"\x00"+ref.RefID]; !authoritative {
+			ignored++
+		}
+	}
+	if ignored == 0 {
+		return
+	}
+	telemetry.SetSpanAttributes(ctx, map[string]interface{}{
+		"bkn.business_refs.declared": len(intent.Context.DeclaredBusinessRefs),
+		"bkn.business_refs.ignored":  ignored,
+	})
+	log.Printf(
+		"INFO: business refs declared by the caller were not derived from the request and are ignored: tool=%s declared=%d ignored=%d",
+		intent.ToolName, len(intent.Context.DeclaredBusinessRefs), ignored,
+	)
+}
+
+// mergeBusinessRefs keeps one entry per ref_type and ref_id, with the earlier
+// list winning. Callers pass the observed refs first: what evidence saw
+// outranks what the request implied, so an observed version is never replaced
+// by a version the request only assumed.
+func mergeBusinessRefs(observed, derived []BusinessRef) []BusinessRef {
+	if len(observed) == 0 && len(derived) == 0 {
+		return nil
+	}
+	merged := make([]BusinessRef, 0, len(observed)+len(derived))
+	seen := make(map[string]struct{}, len(observed)+len(derived))
+	for _, refs := range [][]BusinessRef{observed, derived} {
 		for _, ref := range refs {
 			key := ref.RefType + "\x00" + ref.RefID
 			if _, exists := seen[key]; exists {

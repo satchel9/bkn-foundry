@@ -7,6 +7,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 
 	"github.com/openbkn-ai/licverify"
 
@@ -121,11 +124,21 @@ func TestSearchHonoursTheLimit(t *testing.T) {
 
 // Search returns short cards, never schemas: five candidates must stay well
 // below what one schema costs.
+//
+// The cards are weighed without the ready call, which is a schema by design and
+// is bounded on its own by maxReadySchemaBytes. Weighing the whole envelope made
+// this a test of whether the top hit happened to tie for first -- change a
+// keyword and an unrelated budget turns red, which says nothing about the cards.
 func TestSearchResultStaysSmall(t *testing.T) {
 	for _, locale := range []string{"zh-CN", "en-US"} {
 		catalog := catalogForLocale(t, locale)
 		result := catalog.search(context.Background(), "对象类 关系类 子图 行动 逻辑属性 执行结果 执行历史 探索", searchMaxLimit)
-		raw, err := json.Marshal(result)
+		if result.Ready != nil && len(result.Ready.ArgumentsSchema) > maxReadySchemaBytes {
+			t.Errorf("%s: the ready schema takes %d bytes", locale, len(result.Ready.ArgumentsSchema))
+		}
+		cards := result
+		cards.Ready = nil
+		raw, err := json.Marshal(cards)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -134,7 +147,9 @@ func TestSearchResultStaysSmall(t *testing.T) {
 		}
 		// The no-match listing names every target with its summary: the whole
 		// catalogue in one short answer.
-		noMatch, _ := json.Marshal(catalog.search(context.Background(), "hello", searchDefaultLimit))
+		listing := catalog.search(context.Background(), "hello", searchDefaultLimit)
+		listing.Ready = nil
+		noMatch, _ := json.Marshal(listing)
 		if len(noMatch) > 3500 {
 			t.Errorf("%s: the no-match listing takes %d bytes", locale, len(noMatch))
 		}
@@ -255,5 +270,134 @@ func TestSearchNormalizationAndKeywordWeight(t *testing.T) {
 		if got := keywordWeight(keyword); got != want {
 			t.Errorf("keywordWeight(%q) = %d, want %d", keyword, got, want)
 		}
+	}
+}
+
+// An answered search is worth a turn only if the model can act on it. When one
+// candidate clearly wins, the search carries that candidate's arguments schema
+// and call template, so the common two-hop search → describe → execute becomes
+// one hop. These tests pin when that happens and, more importantly, that what
+// it hands back is exactly what describe_native_tool would have said.
+
+func TestSearchIsReadyOnAnUnambiguousHit(t *testing.T) {
+	for _, locale := range []string{"zh-CN", "en-US"} {
+		catalog := catalogForLocale(t, locale)
+		result := catalog.search(context.Background(), "用 run_cypher 查一下", searchDefaultLimit)
+		if result.Ready == nil {
+			t.Fatalf("%s: naming one tool must come back ready, got %v", locale, candidateNames(result))
+		}
+		if result.Ready.Name != toolKeyRunCypher {
+			t.Fatalf("%s: ready on %s", locale, result.Ready.Name)
+		}
+		// Byte-identical to describe_native_tool, or a caller that trusts the
+		// shortcut builds a call the executor then judges by another schema.
+		described, err := catalog.describe(context.Background(), toolKeyRunCypher, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(result.Ready.ArgumentsSchema, described.ArgumentsSchema) {
+			t.Errorf("%s: the ready schema differs from describe_native_tool's", locale)
+		}
+		gotTemplate, _ := json.Marshal(result.Ready.CallTemplate)
+		wantTemplate, _ := json.Marshal(described.CallTemplate)
+		if !bytes.Equal(gotTemplate, wantTemplate) {
+			t.Errorf("%s: call template = %s, describe_native_tool says %s", locale, gotTemplate, wantTemplate)
+		}
+	}
+}
+
+// A ready call has to be runnable as handed over: the template it carries
+// must pass the schema it carries.
+func TestReadyCallTemplatesPassTheirOwnSchema(t *testing.T) {
+	catalog := catalogForLocale(t, "zh-CN")
+	ready := 0
+	for _, name := range catalog.order {
+		result := catalog.search(context.Background(), "用 "+name+" 查一下", searchDefaultLimit)
+		if result.Ready == nil {
+			continue
+		}
+		ready++
+		schema, err := compileExecutableSchema(result.Ready.ArgumentsSchema)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		template, err := jsonschema.UnmarshalJSON(bytes.NewReader(result.Ready.CallTemplate.Arguments))
+		if err != nil {
+			t.Fatalf("%s: template is not JSON: %v", name, err)
+		}
+		if err := schema.Validate(template); err != nil {
+			t.Errorf("%s: the ready template does not pass the ready schema: %v", name, err)
+		}
+	}
+	if ready == 0 {
+		t.Fatal("no target came back ready: the shortcut is dead code")
+	}
+	t.Logf("%d of %d targets come back ready when named outright", ready, len(catalog.order))
+}
+
+// Two candidates that score the same leave the model a choice to make, and
+// attaching one schema would weigh that choice by sort order alone.
+func TestSearchIsNotReadyOnATie(t *testing.T) {
+	catalog := catalogForLocale(t, "zh-CN")
+	result := catalog.search(context.Background(), "实例", searchDefaultLimit)
+	if len(result.Candidates) < 2 {
+		t.Skipf("no tie to test: %v", candidateNames(result))
+	}
+	scores := map[string]bool{}
+	for _, name := range []string{result.Candidates[0].Name, result.Candidates[1].Name} {
+		scores[name] = true
+	}
+	// Rebuild the scores the search used, to assert this really is a tie.
+	first, second := scoreOf(t, catalog, "实例", result.Candidates[0].Name), scoreOf(t, catalog, "实例", result.Candidates[1].Name)
+	if first != second {
+		t.Skipf("not a tie: %s=%d %s=%d", result.Candidates[0].Name, first, result.Candidates[1].Name, second)
+	}
+	if result.Ready != nil {
+		t.Fatalf("a tie came back ready on %s", result.Ready.Name)
+	}
+}
+
+func scoreOf(t *testing.T, catalog *nativeCatalog, query, name string) int {
+	t.Helper()
+	tool, _, ok := catalog.lookup(context.Background(), name)
+	if !ok {
+		t.Fatalf("%s is not a target", name)
+	}
+	return matchScore(normalizeSearchText(query), catalog.targetMeta(name, tool))
+}
+
+// The schema is spent on every ready search, including the ones where the
+// model would not have asked for it, so the largest schemas keep costing a
+// describe_native_tool call rather than being carried to everyone.
+func TestSearchIsNotReadyOnAnOversizedSchema(t *testing.T) {
+	catalog := catalogForLocale(t, "zh-CN")
+	oversized := 0
+	for _, name := range catalog.order {
+		described, err := catalog.describe(context.Background(), name, false)
+		if err != nil {
+			continue
+		}
+		if len(described.ArgumentsSchema) <= maxReadySchemaBytes {
+			continue
+		}
+		oversized++
+		result := catalog.search(context.Background(), "用 "+name+" 查一下", searchDefaultLimit)
+		if result.Ready != nil {
+			t.Errorf("%s has a %d-byte schema and still came back ready", name, len(described.ArgumentsSchema))
+		}
+	}
+	if oversized == 0 {
+		t.Skip("no target is over the budget")
+	}
+}
+
+func TestSearchWithoutAMatchIsNeverReady(t *testing.T) {
+	catalog := catalogForLocale(t, "zh-CN")
+	result := catalog.search(context.Background(), "你好", searchDefaultLimit)
+	if !result.NoMatch {
+		t.Fatalf("expected no match, got %v", candidateNames(result))
+	}
+	if result.Ready != nil {
+		t.Fatalf("a no-match answer came back ready on %s", result.Ready.Name)
 	}
 }

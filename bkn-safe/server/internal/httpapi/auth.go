@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -27,17 +28,34 @@ import (
 // pages are server-rendered (no SPA), styled to match the BKN Studio console:
 // device shows the user_code to confirm, consent shows the requesting client +
 // requested scopes with explicit Authorize/Decline.
-func registerAuth(r *gin.Engine, p *auth.Provider, h *auth.HydraAdmin, accessStore *accesslog.Store) {
+const ctxHydraBrowserPublicURL = "hydra_browser_public_url"
+
+func registerAuth(r *gin.Engine, p *auth.Provider, h *auth.HydraAdmin, accessStore accesslog.Recorder, browserPublicURL string) {
 	r.GET(openBKNLogoPath, serveOpenBKNLogo)
 	r.GET(loginBackgroundPath, serveLoginBackground)
 	r.GET("/login", func(c *gin.Context) { showLogin(c, h) })
-	r.POST("/login", func(c *gin.Context) { doLogin(c, p, accessStore) })
+	r.POST("/login", func(c *gin.Context) {
+		c.Set(ctxHydraBrowserPublicURL, browserPublicURL)
+		doLogin(c, p, accessStore)
+	})
 	r.GET("/change-password", showChangePassword)
-	r.POST("/change-password", func(c *gin.Context) { doChangePassword(c, p, accessStore) })
-	r.GET("/consent", func(c *gin.Context) { showConsent(c, p) })
-	r.POST("/consent", func(c *gin.Context) { doConsent(c, p) })
+	r.POST("/change-password", func(c *gin.Context) {
+		c.Set(ctxHydraBrowserPublicURL, browserPublicURL)
+		doChangePassword(c, p, accessStore)
+	})
+	r.GET("/consent", func(c *gin.Context) {
+		c.Set(ctxHydraBrowserPublicURL, browserPublicURL)
+		showConsent(c, p)
+	})
+	r.POST("/consent", func(c *gin.Context) {
+		c.Set(ctxHydraBrowserPublicURL, browserPublicURL)
+		doConsent(c, p)
+	})
 	r.GET("/device", showDevice)
-	r.POST("/device", func(c *gin.Context) { doDevice(c, h) })
+	r.POST("/device", func(c *gin.Context) {
+		c.Set(ctxHydraBrowserPublicURL, browserPublicURL)
+		doDevice(c, h)
+	})
 	r.GET("/device/success", showDeviceSuccess)
 }
 
@@ -354,7 +372,7 @@ func showLogin(c *gin.Context, h *auth.HydraAdmin) {
 	renderHTML(c, loginPage, data)
 }
 
-func doLogin(c *gin.Context, p *auth.Provider, accessStore *accesslog.Store) {
+func doLogin(c *gin.Context, p *auth.Provider, accessStore accesslog.Recorder) {
 	applyAuthLocale(c, "")
 	challenge := c.PostForm("login_challenge")
 	account := c.PostForm("account")
@@ -374,7 +392,7 @@ func doLogin(c *gin.Context, p *auth.Provider, accessStore *accesslog.Store) {
 			return
 		}
 		if errors.Is(err, auth.ErrInvalidCredentials) || errors.Is(err, auth.ErrUserDisabled) {
-			recordLogin(c, accessStore, nil, account, "failure", loginFailureCode(err))
+			recordLogin(c, p, accessStore, nil, account, "failure", loginFailureCode(err))
 			// Re-render the login form with an inline error instead of a bare
 			// error page, keeping the entered account and the same challenge.
 			data := loginAuthPageData(c, challenge)
@@ -394,8 +412,8 @@ func doLogin(c *gin.Context, p *auth.Provider, accessStore *accesslog.Store) {
 		replyLocalizedAuthText(c, http.StatusInternalServerError, "BknSafe.InternalError.Description")
 		return
 	}
-	recordLogin(c, accessStore, user, account, "success", "")
-	c.Redirect(http.StatusFound, redirectTo)
+	recordLogin(c, p, accessStore, user, account, "success", "")
+	redirectToHydra(c, redirectTo)
 }
 
 // showChangePassword renders the change-password form. Reached via the forced
@@ -414,7 +432,7 @@ func showChangePassword(c *gin.Context) {
 
 // doChangePassword re-verifies the current password, sets the new one, and
 // completes the hydra login. Validation errors re-render the page with a note.
-func doChangePassword(c *gin.Context, p *auth.Provider, accessStore *accesslog.Store) {
+func doChangePassword(c *gin.Context, p *auth.Provider, accessStore accesslog.Recorder) {
 	applyAuthLocale(c, "")
 	challenge := c.PostForm("login_challenge")
 	account := resolveChangePasswordAccount(c, c.PostForm("account"))
@@ -441,7 +459,7 @@ func doChangePassword(c *gin.Context, p *auth.Provider, accessStore *accesslog.S
 	redirectTo, user, err := p.ChangePassword(c.Request.Context(), challenge, account, oldPw, newPw, false)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) || errors.Is(err, auth.ErrUserDisabled) {
-			recordLogin(c, accessStore, nil, account, "failure", loginFailureCode(err))
+			recordLogin(c, p, accessStore, nil, account, "failure", loginFailureCode(err))
 			reRender("CurrentPasswordInvalid")
 			return
 		}
@@ -454,13 +472,19 @@ func doChangePassword(c *gin.Context, p *auth.Provider, accessStore *accesslog.S
 		replyLocalizedAuthText(c, http.StatusInternalServerError, "BknSafe.InternalError.Description")
 		return
 	}
-	recordLogin(c, accessStore, user, account, "success", "")
+	recordLogin(c, p, accessStore, user, account, "success", "")
 	clearChangePasswordAccount(c)
-	c.Redirect(http.StatusFound, redirectTo)
+	redirectToHydra(c, redirectTo)
 }
 
-func recordLogin(c *gin.Context, store *accesslog.Store, user *model.User, account, outcome, failureCode string) {
+func recordLogin(c *gin.Context, provider *auth.Provider, store accesslog.Recorder, user *model.User, account, outcome, failureCode string) {
 	if store == nil {
+		return
+	}
+	if user == nil {
+		user = provider.AccessActor(c.Request.Context(), account)
+	}
+	if user == nil {
 		return
 	}
 	actorID, actorName := "", strings.TrimSpace(account)
@@ -521,7 +545,7 @@ func showConsent(c *gin.Context, p *auth.Provider) {
 			replyLocalizedAuthText(c, http.StatusInternalServerError, "BknSafe.InternalError.Description")
 			return
 		}
-		c.Redirect(http.StatusFound, redirectTo)
+		redirectToHydra(c, redirectTo)
 		return
 	}
 	name := cr.ClientName
@@ -556,7 +580,7 @@ func doConsent(c *gin.Context, p *auth.Provider) {
 		replyLocalizedAuthText(c, http.StatusInternalServerError, "BknSafe.InternalError.Description")
 		return
 	}
-	c.Redirect(http.StatusFound, redirectTo)
+	redirectToHydra(c, redirectTo)
 }
 
 func showDevice(c *gin.Context) {
@@ -599,5 +623,58 @@ func doDevice(c *gin.Context, h *auth.HydraAdmin) {
 		replyLocalizedAuthText(c, http.StatusBadRequest, authMessagePrefix+"InvalidDeviceCode")
 		return
 	}
-	c.Redirect(http.StatusFound, redirectTo)
+	redirectToHydra(c, redirectTo)
+}
+
+// redirectToHydra converts only redirects to the configured canonical Hydra
+// browser origin into origin-relative locations. The browser then keeps the
+// host it used to reach bkn-safe (internal IP, external IP, or proxy host).
+// Cross-origin redirects and malformed values are left untouched.
+func redirectToHydra(c *gin.Context, target string) {
+	publicURL := c.GetString(ctxHydraBrowserPublicURL)
+	c.Redirect(http.StatusFound, relativeHydraRedirect(target, publicURL))
+}
+
+func relativeHydraRedirect(target, publicURL string) string {
+	if target == "" || publicURL == "" {
+		return target
+	}
+	targetURL, err := url.Parse(target)
+	if err != nil || !targetURL.IsAbs() {
+		return target
+	}
+	baseURL, err := url.Parse(publicURL)
+	if err != nil || !baseURL.IsAbs() || !sameOrigin(targetURL, baseURL) {
+		return target
+	}
+	relative := targetURL.EscapedPath()
+	if relative == "" {
+		relative = "/"
+	}
+	if targetURL.RawQuery != "" {
+		relative += "?" + targetURL.RawQuery
+	}
+	if targetURL.Fragment != "" {
+		relative += "#" + targetURL.EscapedFragment()
+	}
+	return relative
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return "80"
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return ""
 }

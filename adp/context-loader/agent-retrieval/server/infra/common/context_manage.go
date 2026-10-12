@@ -208,6 +208,7 @@ func CopyRequestScopedValues(from, onto context.Context) context.Context {
 		interfaces.KeyAccountAuthContext,
 		interfaces.KeyResponseFormat,
 		interfaces.IsPublic,
+		interfaces.KeyPublicOrigin,
 		// PTC's run_code is executed in the MCP session context and cannot obtain the gin request context;
 		// If you omit this item, the tool side will not be able to get the caller token and can only downgrade to the server identity.
 		interfaces.KeyToken,
@@ -342,7 +343,7 @@ func sanitizeBusinessTraceID(value string) string {
 // GetHeaderForChildOperation forks a deterministic child operation without changing the direct cause.
 func GetHeaderForChildOperation(ctx context.Context, operationName string, callOrdinal int) map[string]string {
 	traceContext, ok := GetTraceContextFromCtx(ctx)
-	if !ok {
+	if !ok || traceContext.OperationID == "" {
 		return GetHeaderFromCtx(ctx)
 	}
 	parentOperationID := traceContext.OperationID
@@ -355,7 +356,7 @@ func GetHeaderForChildOperation(ctx context.Context, operationName string, callO
 // concrete downstream operation. identity must remain stable across retries.
 func GetHeaderForChildOperationIdentity(ctx context.Context, operationName, identity string) map[string]string {
 	traceContext, ok := GetTraceContextFromCtx(ctx)
-	if !ok {
+	if !ok || traceContext.OperationID == "" {
 		return GetHeaderFromCtx(ctx)
 	}
 	parentOperationID := traceContext.OperationID

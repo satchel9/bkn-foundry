@@ -38,7 +38,12 @@ func registerLicenseAdmin(g *gin.RouterGroup, svc *license.Service, e *authz.Enf
 
 	// GET /license — current license detail (weak judgement; modules gate by
 	// verifying the signature themselves).
+	//
+	// Opening the page is also when an admin expects to see an issuer-side
+	// unbind or revoke, so it asks the issuer first (throttled, short timeout;
+	// no answer changes nothing).
 	g.GET("/license", RequirePermission(e, "admin-license", "view"), func(c *gin.Context) {
+		svc.CheckBindingIfStale(c.Request.Context())
 		c.JSON(http.StatusOK, licenseDetail(svc))
 	})
 
@@ -58,6 +63,7 @@ func registerLicenseAdmin(g *gin.RouterGroup, svc *license.Service, e *authz.Enf
 			return
 		}
 		_ = snap
+		setAuditOperation(c, "activate", "license:cluster", "cluster license")
 		c.JSON(http.StatusOK, licenseDetail(svc))
 	})
 
@@ -90,6 +96,7 @@ func registerLicenseAdmin(g *gin.RouterGroup, svc *license.Service, e *authz.Enf
 			replyPublicError(c, http.StatusInternalServerError)
 			return
 		}
+		setAuditOperation(c, "remove", "license:cluster", "cluster license")
 		c.Status(http.StatusNoContent)
 	})
 }
@@ -123,6 +130,7 @@ func importLicense(c *gin.Context, svc *license.Service) {
 		c.JSON(status, gin.H{"stored": true, "error": actErr.Error(), "license": licenseDetail(svc)})
 		return
 	}
+	setAuditOperation(c, "", "license:cluster", "cluster license")
 	c.JSON(http.StatusOK, licenseDetail(svc))
 }
 
@@ -209,6 +217,11 @@ func licenseStatus(svc *license.Service) gin.H {
 	h := gin.H{
 		"state":     string(snap.State),
 		"activated": svc.Activated(),
+	}
+	if b := svc.Binding(); b != "" {
+		// "unbound" / "revoked": the issuer took this certificate back, which
+		// is why state reads unlicensed although the signature still verifies.
+		h["binding"] = b
 	}
 	if snap.Err != nil {
 		h["error"] = snap.Err.Error()

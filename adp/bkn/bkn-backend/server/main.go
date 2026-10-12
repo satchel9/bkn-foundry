@@ -8,9 +8,10 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"net/http"
 	"os"
+	"strings"
 
 	// _ "net/http/pprof"
 	"os/signal"
@@ -20,7 +21,7 @@ import (
 	_ "unicode/utf8"
 
 	"github.com/gin-gonic/gin"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 	libdb "github.com/openbkn-ai/bkn-foundry/comm-go/db"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel"
@@ -29,7 +30,6 @@ import (
 
 	"bkn-backend/common"
 	"bkn-backend/common/bkntrace"
-	"bkn-backend/common/bkntrace/outbox"
 	"bkn-backend/common/operationaudit"
 	"bkn-backend/drivenadapters/action_execution"
 	"bkn-backend/drivenadapters/action_schedule"
@@ -56,13 +56,16 @@ import (
 )
 
 type mgrService struct {
-	appSetting     *common.AppSetting
-	otelProviders  *otel.Providers
-	restHandler    driveradapters.RestHandler
-	conceptSyncer  *worker.ConceptSyncer
-	scheduleWorker *worker.ScheduleWorker
-	traceOutbox    *outbox.Worker
-	outboxDB       *sql.DB
+	appSetting       *common.AppSetting
+	otelProviders    *otel.Providers
+	restHandler      driveradapters.RestHandler
+	conceptSyncer    *worker.ConceptSyncer
+	scheduleWorker   *worker.ScheduleWorker
+	proxySyncWorker  *worker.ProxySyncWorker
+	evidenceRuntime  *evidencepublisher.PublisherRuntime
+	evidenceProducer interface{ Close() error }
+	auditRuntime     *operationaudit.KafkaRuntime
+	auditTelemetry   *operationaudit.PublishTelemetry
 }
 
 func (server *mgrService) start() {
@@ -76,20 +79,28 @@ func (server *mgrService) start() {
 
 	// Create the Gin engine and register APIs.
 	engine := gin.New()
+	engine.GET("/metrics", gin.WrapH(server.auditTelemetry))
 
 	server.restHandler.RegisterPublic(engine)
 	logger.Info("Server Register API Success")
 
 	go server.conceptSyncer.Start()
 	go server.scheduleWorker.Start()
-	if server.traceOutbox != nil {
-		server.traceOutbox.Start()
-	}
+	server.proxySyncWorker.Start()
 
 	// Listen for interrupt signals (SIGINT and SIGTERM).
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	// Receiving a signal triggers ctx.Done. stop stops receiving registered signals and releases those resources.
 	defer stop()
+	var runtimeDone <-chan error
+	var flusher evidenceFlusher
+	if server.evidenceRuntime != nil {
+		flusher = server.evidenceRuntime
+		done := make(chan error, 1)
+		runtimeDone = done
+		go func() { done <- server.evidenceRuntime.Run(ctx) }()
+	}
+	flushDone := startEvidenceFlushLoop(ctx, flusher, time.Second)
 
 	// Initialize the HTTP service.
 	s := &http.Server{
@@ -115,24 +126,63 @@ func (server *mgrService) start() {
 	// Set the system's last processed time.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	<-flushDone
+	if runtimeDone != nil {
+		<-runtimeDone
+	}
 
 	// Stop the HTTP service.
 	logger.Info("Server Start Shutdown")
 	if err := s.Shutdown(ctx); err != nil {
 		logger.Fatalf("Server Shutdown:%v", err)
 	}
-	if server.traceOutbox != nil {
-		if err := server.traceOutbox.Stop(ctx); err != nil {
-			logger.Warnf("BKN Trace outbox shutdown: %v", err)
+	// Stop accepting mutations and let in-flight handlers finish before the
+	// outbox workers are canceled. Otherwise a request can enqueue work after
+	// every local worker has already exited.
+	server.proxySyncWorker.Stop()
+	if server.evidenceRuntime != nil {
+		if _, err := server.evidenceRuntime.Close(ctx); err != nil {
+			logger.Warnf("Evidence publisher runtime close failed: %v", err)
 		}
 	}
-	if server.outboxDB != nil {
-		_ = server.outboxDB.Close()
+	if server.evidenceProducer != nil {
+		if err := bkntrace.CloseEvidenceProducer(server.evidenceProducer); err != nil {
+			logger.Warnf("Evidence Kafka producer close failed: %v", err)
+		}
+	}
+	if err := server.auditRuntime.Close(); err != nil {
+		logger.Warnf("Audit Kafka producer close failed: %v", err)
 	}
 
 	server.otelProviders.Shutdown(ctx)
 
 	logger.Info("Server Exited")
+}
+
+type evidenceFlusher interface {
+	Flush(context.Context) evidencepublisher.DrainResult
+}
+
+func startEvidenceFlushLoop(ctx context.Context, publisher evidenceFlusher, interval time.Duration) <-chan struct{} {
+	done := make(chan struct{})
+	if publisher == nil {
+		close(done)
+		return done
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		defer close(done)
+		for {
+			select {
+			case <-ticker.C:
+				publisher.Flush(context.Background())
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return done
 }
 
 func main() {
@@ -165,28 +215,35 @@ func main() {
 	// Initialize the database connection.
 	db := libdb.NewDB(&appSetting.DBSetting)
 	logics.SetDB(db)
-	outboxDB, err := bkntrace.OpenProducerOutboxDB(appSetting.DBSetting)
-	if err != nil {
-		logger.Fatalf("Failed to open BKN Trace producer outbox database: %v", err)
-	}
-	traceOutbox, err := bkntrace.ConfigureProducerOutbox(outboxDB)
-	if err != nil {
-		logger.Fatalf("Failed to configure BKN Trace producer outbox: %v", err)
-	}
-	if bkntrace.ProducerOutboxCleanupOnly() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		result, err := bkntrace.CleanupProducerOutbox(ctx)
+	var publisherRuntime *bkntrace.EvidencePublisherRuntime
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("BKN_TRACE_EVIDENCE_PUBLISHER_ENABLED")), "true") {
+		publisherRuntime, err = bkntrace.NewEvidencePublisherRuntime()
 		if err != nil {
-			logger.Fatalf("Failed to clean BKN Trace producer outbox: %v", err)
+			if errors.Is(err, bkntrace.ErrInvalidEvidencePublisherConfiguration) {
+				logger.Fatalf("Failed to initialize enabled Evidence Kafka publisher: %v", err)
+				return
+			}
+			logger.Warnf("Evidence Kafka publisher unavailable; evidence will be dropped until Kafka recovers: %v", err)
+		} else {
+			bkntrace.SetEvidencePublisher(publisherRuntime.Runtime)
 		}
-		logger.Infof("BKN Trace producer outbox cleanup complete: delivered=%d abandoned=%d audits=%d", result.Delivered, result.Abandoned, result.Audits)
-		_ = outboxDB.Close()
-		otelProviders.Shutdown(ctx)
-		return
+	} else {
+		logger.Warn("BKN Trace Evidence Kafka publisher is disabled; workload is not 0.2-ready and evidence events will be dropped")
 	}
 
-	audit.Init(&appSetting.MQSetting)
+	auditTelemetry := operationaudit.NewPublishTelemetry()
+	var auditRuntime *operationaudit.KafkaRuntime
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("BKN_AUDIT_KAFKA_ENABLED")), "true") {
+		auditRuntime, err = operationaudit.NewKafkaRuntimeFromEnv(auditTelemetry)
+		if err != nil {
+			if errors.Is(err, operationaudit.ErrInvalidKafkaConfiguration) {
+				logger.Fatalf("Audit Kafka publisher enabled but invalid: %v", err)
+			}
+			logger.Warnf("Audit Kafka publisher unavailable; audit coverage_gap: %v", err)
+		}
+	} else {
+		logger.Warn("Audit Kafka publisher is disabled; management Audit coverage_gap")
+	}
 
 	// Authentication, authorization, and managed-proxy enforcement are mandatory.
 	bknSafeURL, err := common.NormalizeBknSafeURL(os.Getenv("BKN_SAFE_URL"))
@@ -204,6 +261,15 @@ func main() {
 	logics.SetConceptGroupAccess(concept_group.NewConceptGroupAccess(appSetting))
 	logics.SetKNAccess(knowledge_network.NewKNAccess(appSetting))
 	logics.SetKNProxyAccess(kn_proxy.NewAccess(db))
+	proxyOutboxAccess := kn_proxy.NewOutboxAccess(db)
+	if appSetting.ServerSetting.ProxySyncWorkerEnabled {
+		logics.SetKNProxyOutboxAccess(proxyOutboxAccess)
+	} else {
+		// A disabled consumer must not leave producers accepting writes into an
+		// undrained queue. A nil outbox keeps the existing synchronous publication
+		// path active during a stopped upgrade or an operator kill switch.
+		logics.SetKNProxyOutboxAccess(nil)
+	}
 	logics.SetCapabilityBindingAccess(capability_binding.NewCapabilityBindingAccess(appSetting))
 	logics.SetMetricAccess(metric.NewMetricAccess(appSetting))
 	logics.SetModelFactoryAccess(model_factory.NewModelFactoryAccess(appSetting))
@@ -214,14 +280,25 @@ func main() {
 	logics.SetVegaBackendAccess(vega_backend.NewVegaBackendAccess(appSetting))
 
 	// Create and start the service.
+	var auditRecorder interface {
+		Record(context.Context, operationaudit.Entry) error
+	} = operationaudit.NewKafkaRecorder(nil, os.Getenv("BKN_AUDIT_ENVIRONMENT"), auditTelemetry)
+	if auditRuntime != nil {
+		auditRecorder = operationaudit.NewKafkaRecorder(auditRuntime.Publisher, os.Getenv("BKN_AUDIT_ENVIRONMENT"), auditTelemetry)
+	}
 	server := &mgrService{
-		appSetting:     appSetting,
-		otelProviders:  otelProviders,
-		restHandler:    driveradapters.NewRestHandler(appSetting, operationaudit.NewStore(outboxDB, "")),
-		conceptSyncer:  worker.NewConceptSyncer(appSetting),
-		scheduleWorker: worker.NewScheduleWorker(appSetting),
-		traceOutbox:    traceOutbox,
-		outboxDB:       outboxDB,
+		appSetting:      appSetting,
+		otelProviders:   otelProviders,
+		restHandler:     driveradapters.NewRestHandler(appSetting, auditRecorder),
+		auditRuntime:    auditRuntime,
+		auditTelemetry:  auditTelemetry,
+		conceptSyncer:   worker.NewConceptSyncer(appSetting),
+		scheduleWorker:  worker.NewScheduleWorker(appSetting),
+		proxySyncWorker: worker.NewProxySyncWorker(appSetting, proxyOutboxAccess, logics.MPA),
+	}
+	if publisherRuntime != nil {
+		server.evidenceRuntime = publisherRuntime.Runtime
+		server.evidenceProducer = publisherRuntime.Producer
 	}
 	server.start()
 }

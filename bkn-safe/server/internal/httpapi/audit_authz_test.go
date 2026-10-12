@@ -15,6 +15,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/decisionlog"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
 
@@ -36,7 +38,7 @@ func serviceReq(t *testing.T, r *gin.Engine, method, path string, body any, call
 	return w
 }
 
-func TestTokenlessPolicyWritesAreAuditedAsServiceActor(t *testing.T) {
+func TestTokenlessPolicyWritesDoNotCreateAuditFactsWithoutAnActor(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
 	grant := map[string]any{
 		"accessor_id": adminSub,
@@ -52,32 +54,16 @@ func TestTokenlessPolicyWritesAreAuditedAsServiceActor(t *testing.T) {
 		t.Fatalf("revoke: want 204, got %d (%s)", w.Code, w.Body.String())
 	}
 
-	var rows []model.AuditLog
-	if err := db.Where("resource = ?", "policies").Order("seq ASC").Find(&rows).Error; err != nil {
+	var count int64
+	if err := db.Model(&model.AuditLog{}).Where("resource = ?", "policies").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("policy audit rows = %d, want 2: %+v", len(rows), rows)
-	}
-	grantRow, revokeRow := rows[0], rows[1]
-	if grantRow.Action != "grant" || grantRow.Method != http.MethodPost || grantRow.Status != http.StatusNoContent || grantRow.TargetID != "kn-334" {
-		t.Fatalf("grant row facts: %+v", grantRow)
-	}
-	if grantRow.ActorID != "" || grantRow.ActorType != "service" || grantRow.AuthMethod != "network" || grantRow.SourceChannel != "internal" {
-		t.Fatalf("grant row actor must be the unnamed service peer: %+v", grantRow)
-	}
-	if !strings.Contains(grantRow.Detail, `"_caller_service":"bkn-backend"`) || !strings.Contains(grantRow.Detail, `"accessor_id":"`+adminSub+`"`) {
-		t.Fatalf("grant row detail lacks caller/body facts: %s", grantRow.Detail)
-	}
-	if revokeRow.Action != "revoke" || revokeRow.Method != http.MethodDelete || revokeRow.TargetID != "kn-334" || strings.Contains(revokeRow.Detail, "_caller_service") {
-		t.Fatalf("revoke row facts: %+v", revokeRow)
-	}
-	if grantRow.Seq == nil || revokeRow.Seq == nil || revokeRow.PrevHash != grantRow.RowHash {
-		t.Fatalf("service rows are not chained: %+v -> %+v", grantRow, revokeRow)
+	if count != 0 {
+		t.Fatalf("tokenless policy writes created %d audit facts, want 0", count)
 	}
 }
 
-func TestTokenlessPolicyWriteRefusalIsAudited(t *testing.T) {
+func TestTokenlessPolicyWriteRefusalDoesNotCreateAuditFact(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
 	w := serviceReq(t, r, http.MethodPost, "/api/safe/v1/authz/policies", map[string]any{
 		"accessor_id": adminSub, "resource": map[string]any{"type": "*", "id": "x"}, "operations": []string{"view_detail"},
@@ -85,16 +71,16 @@ func TestTokenlessPolicyWriteRefusalIsAudited(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("wildcard grant: want 400, got %d", w.Code)
 	}
-	var row model.AuditLog
-	if err := db.Where("resource = ? AND status = ?", "policies", http.StatusBadRequest).First(&row).Error; err != nil {
-		t.Fatalf("refused service write not audited: %v", err)
+	var count int64
+	if err := db.Model(&model.AuditLog{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
 	}
-	if row.Action != "grant" || row.ActorType != "service" {
-		t.Fatalf("refused row facts: %+v", row)
+	if count != 0 {
+		t.Fatalf("refused service write created %d audit facts, want 0", count)
 	}
 }
 
-func TestAuthenticationFailuresAreAuditedAndThrottled(t *testing.T) {
+func TestAuthenticationFailuresDoNotCreateAuditFacts(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
 	for i := 0; i < 3; i++ {
 		if w := tokReq(t, r, http.MethodGet, "/api/safe/v1/admin/roles", nil, ""); w.Code != http.StatusUnauthorized {
@@ -108,38 +94,21 @@ func TestAuthenticationFailuresAreAuditedAndThrottled(t *testing.T) {
 	if err := db.Where("status = ?", http.StatusUnauthorized).Find(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("401 rows = %d, want 1 (same client+route within the window is throttled): %+v", len(rows), rows)
+	if len(rows) != 0 {
+		t.Fatalf("401 rows = %d, want 0: %+v", len(rows), rows)
 	}
-	row := rows[0]
-	if row.ActorID != "" || row.ActorType != "anonymous" || row.AuthMethod != "none" || row.Resource != "roles" || row.Method != http.MethodGet {
-		t.Fatalf("401 row facts: %+v", row)
-	}
-	if row.RequestID == "" {
-		t.Fatalf("401 row has no request id: %+v", row)
-	}
-	// The client received the same id, so the refusal can be matched to its
-	// row from either side. The header must be set before the gate writes
-	// the response, or it never leaves the server.
-	if w := tokReq(t, r, http.MethodGet, "/api/safe/v1/me", nil, ""); w.Header().Get("x-request-id") == "" {
-		t.Fatal("refused request carries no x-request-id header")
-	}
-	if !strings.Contains(row.Detail, `"_gate":"authn"`) {
-		t.Fatalf("401 row must name the gate: %s", row.Detail)
-	}
-	// A different route is a different key and gets its own row.
 	if w := tokReq(t, r, http.MethodGet, "/api/safe/v1/me", nil, ""); w.Code != http.StatusUnauthorized {
 		t.Fatalf("me without token: want 401, got %d", w.Code)
 	}
 	var n int64
 	db.Model(&model.AuditLog{}).Where("status = ?", http.StatusUnauthorized).Count(&n)
-	if n != 2 {
-		t.Fatalf("401 rows after a second route = %d, want 2", n)
+	if n != 0 {
+		t.Fatalf("401 rows after a second route = %d, want 0", n)
 	}
 }
 
-func TestAuthorizationRefusalsAreAuditedWithSubjectAndDecision(t *testing.T) {
-	r, _, db, users := newAdminServer(t)
+func TestAuthorizationRefusalsDoNotCreateAuditFacts(t *testing.T) {
+	r, _, db, users, collector := newAdminServerWithDecisions(t)
 	const outsider = "user-outsider"
 	if err := users.CreateLocalUser(t.Context(), &model.User{ID: outsider, Account: outsider, Name: "Out Sider", Enabled: true}, "pw-init0"); err != nil {
 		t.Fatal(err)
@@ -148,14 +117,11 @@ func TestAuthorizationRefusalsAreAuditedWithSubjectAndDecision(t *testing.T) {
 	if w := tokReq(t, r, http.MethodGet, "/api/safe/v1/admin/roles", nil, outsider); w.Code != http.StatusForbidden {
 		t.Fatalf("outsider read: want 403, got %d", w.Code)
 	}
-	// A write refused at the admin gate: exactly one row, from the failure
-	// recorder (the mutation audit never ran).
+	// A write refused at the admin gate does not create an audit fact either.
 	if w := tokReq(t, r, http.MethodPost, "/api/safe/v1/admin/departments", map[string]any{"id": "d-x", "name": "X"}, outsider); w.Code != http.StatusForbidden {
 		t.Fatalf("outsider write: want 403, got %d", w.Code)
 	}
-	// The same account looping over the same route is one row per window,
-	// not one per request: the chain must not become a write amplifier for
-	// whoever holds a valid but unprivileged token.
+	// Repeated denied reads remain business-noise-free.
 	for i := 0; i < 5; i++ {
 		if w := tokReq(t, r, http.MethodGet, "/api/safe/v1/admin/roles", nil, outsider); w.Code != http.StatusForbidden {
 			t.Fatalf("outsider repeat read: want 403, got %d", w.Code)
@@ -165,38 +131,29 @@ func TestAuthorizationRefusalsAreAuditedWithSubjectAndDecision(t *testing.T) {
 	if err := db.Where("actor_id = ?", outsider).Order("seq ASC").Find(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 2 {
-		t.Fatalf("403 rows for outsider = %d, want 2 (repeats within the window folded): %+v", len(rows), rows)
-	}
-	for _, row := range rows {
-		if row.Status != http.StatusForbidden || row.ActorType != "user" || row.AuthMethod != "oauth" || row.ActorNameSnapshot != "Out Sider" {
-			t.Fatalf("403 row facts: %+v", row)
-		}
-		if !strings.Contains(row.Detail, `"_gate":"authz"`) {
-			t.Fatalf("403 row must name the gate: %s", row.Detail)
-		}
-	}
-	if rows[0].Resource != "roles" || rows[0].Method != http.MethodGet || rows[1].Resource != "departments" || rows[1].Method != http.MethodPost || rows[1].Action != "create" {
-		t.Fatalf("403 rows must keep what was attempted: %+v", rows)
+	if len(rows) != 0 {
+		t.Fatalf("403 rows for outsider = %d, want 0: %+v", len(rows), rows)
 	}
 	// Every refusal is also a decision (decisions are not throttled): safe_admin
 	// console manage, denied — 2 distinct requests + 5 repeats.
-	var decisions []model.AuthzDecision
-	if err := db.Where("accessor_id = ?", outsider).Find(&decisions).Error; err != nil {
-		t.Fatal(err)
+	var decisions []decisionlog.Entry
+	for _, entry := range collector.Snapshot() {
+		if entry.AccessorID == outsider {
+			decisions = append(decisions, entry)
+		}
 	}
 	if len(decisions) != 7 {
 		t.Fatalf("outsider decisions = %d, want 7: %+v", len(decisions), decisions)
 	}
 	for _, d := range decisions {
-		if d.Source != decisionSourceAdmin || d.ResourceType != "safe_admin" || d.ResourceID != "console" || d.Operation != "manage" || d.Decision != "deny" || d.Basis == "" {
+		if d.Source != decisionSourceAdmin || d.ResourceType != "safe_admin" || d.ResourceID != "console" || d.Operation != "manage" || d.Decision != "deny" || d.Basis == "" || d.VerifiedActorID != outsider || d.RequestID == "" {
 			t.Fatalf("admin gate decision facts: %+v", d)
 		}
 	}
 }
 
-func TestPermissionPointRefusalOnMutationIsRecordedOnceWithGate(t *testing.T) {
-	r, e, db, users := newAdminServer(t)
+func TestPermissionPointRefusalOnMutationDoesNotCreateAuditFact(t *testing.T) {
+	r, e, db, users, collector := newAdminServerWithDecisions(t)
 	// A console administrator without the department create point.
 	const limited = "user-limited"
 	if err := users.CreateLocalUser(t.Context(), &model.User{ID: limited, Account: limited, Name: limited, Enabled: true}, "pw-init0"); err != nil {
@@ -212,15 +169,14 @@ func TestPermissionPointRefusalOnMutationIsRecordedOnceWithGate(t *testing.T) {
 	if err := db.Where("actor_id = ?", limited).Find(&rows).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("refused mutation rows = %d, want exactly 1: %+v", len(rows), rows)
+	if len(rows) != 0 {
+		t.Fatalf("refused mutation rows = %d, want 0: %+v", len(rows), rows)
 	}
-	if rows[0].Status != http.StatusForbidden || rows[0].Resource != "departments" || !strings.Contains(rows[0].Detail, `"_gate":"permission"`) || !strings.Contains(rows[0].Detail, `"name":"Y"`) {
-		t.Fatalf("refused mutation row must carry the body and the gate: %+v", rows[0])
-	}
-	var decision model.AuthzDecision
-	if err := db.Where("accessor_id = ? AND resource_type = ?", limited, "admin-dept").First(&decision).Error; err != nil {
-		t.Fatalf("permission point decision not recorded: %v", err)
+	var decision decisionlog.Entry
+	for _, entry := range collector.Snapshot() {
+		if entry.AccessorID == limited && entry.ResourceType == "admin-dept" {
+			decision = entry
+		}
 	}
 	if decision.Operation != "create" || decision.Decision != "deny" || decision.Source != decisionSourceAdmin {
 		t.Fatalf("permission point decision facts: %+v", decision)
@@ -228,7 +184,7 @@ func TestPermissionPointRefusalOnMutationIsRecordedOnceWithGate(t *testing.T) {
 }
 
 func TestCheckRecordsDecisionsForActiveInactiveAndUnknownAccessors(t *testing.T) {
-	r, _, db, users := newAdminServer(t)
+	r, _, _, users, collector := newAdminServerWithDecisions(t)
 	const plain = "user-plain"
 	if err := users.CreateLocalUser(t.Context(), &model.User{ID: plain, Account: plain, Name: plain, Enabled: true}, "pw-init0"); err != nil {
 		t.Fatal(err)
@@ -257,18 +213,23 @@ func TestCheckRecordsDecisionsForActiveInactiveAndUnknownAccessors(t *testing.T)
 	if body := check("nobody"); body["allowed"] != false {
 		t.Fatalf("unknown check = %v", body)
 	}
-	var rows []model.AuthzDecision
-	if err := db.Where("source = ?", decisionSourceCheck).Order("request_id ASC").Find(&rows).Error; err != nil {
-		t.Fatal(err)
+	var rows []decisionlog.Entry
+	for _, entry := range collector.Snapshot() {
+		if entry.Source == decisionSourceCheck {
+			rows = append(rows, entry)
+		}
 	}
 	if len(rows) != 3 {
 		t.Fatalf("check decisions = %d, want 3: %+v", len(rows), rows)
 	}
-	byAccessor := map[string]model.AuthzDecision{}
+	byAccessor := map[string]decisionlog.Entry{}
 	for _, row := range rows {
 		byAccessor[row.AccessorID] = row
 		if row.ResourceType != "knowledge_network" || row.ResourceID != "kn-1" || row.Operation != "view_detail" || row.Scope != "effective" {
 			t.Fatalf("check decision target facts: %+v", row)
+		}
+		if row.VerifiedActorID != row.AccessorID {
+			t.Fatalf("check decision actor = %q, want evaluated user %q: %+v", row.VerifiedActorID, row.AccessorID, row)
 		}
 		if row.RequestID != "req-"+row.AccessorID || row.TraceID != "0af7651916cd43dd8448eb211c80319c" || row.ClientIP == "" {
 			t.Fatalf("check decision correlation facts: %+v", row)
@@ -286,16 +247,18 @@ func TestCheckRecordsDecisionsForActiveInactiveAndUnknownAccessors(t *testing.T)
 }
 
 func TestResourceFilterRecordsOneRowPerCall(t *testing.T) {
-	r, _, db, _ := newAdminServer(t)
+	r, _, _, _, collector := newAdminServerWithDecisions(t)
 	if w := do(t, r, http.MethodPost, "/api/safe/v1/authz/resource-filter", map[string]any{
 		"accessor_id": adminSub, "resource_type": "knowledge_network", "resource_ids": []string{"kn-1", "kn-2", "kn-3"},
 		"visibility_operations": []string{"view_detail"}, "include_operations": true,
 	}); w.Code != http.StatusOK {
 		t.Fatalf("resource-filter: want 200, got %d (%s)", w.Code, w.Body.String())
 	}
-	var filters []model.AuthzDecision
-	if err := db.Where("source = ?", decisionSourceFilter).Find(&filters).Error; err != nil {
-		t.Fatal(err)
+	var filters []decisionlog.Entry
+	for _, entry := range collector.Snapshot() {
+		if entry.Source == decisionSourceFilter {
+			filters = append(filters, entry)
+		}
 	}
 	if len(filters) != 1 {
 		t.Fatalf("resource-filter decisions = %d, want exactly 1 for a 3-resource batch", len(filters))
@@ -303,12 +266,13 @@ func TestResourceFilterRecordsOneRowPerCall(t *testing.T) {
 	if filters[0].ResourceType != "knowledge_network" || filters[0].Operation != "view_detail" || !strings.Contains(filters[0].Detail, `"requested":3`) {
 		t.Fatalf("resource-filter decision facts: %+v", filters[0])
 	}
+	if filters[0].VerifiedActorID != adminSub {
+		t.Fatalf("resource-filter decision actor = %q, want evaluated user %q: %+v", filters[0].VerifiedActorID, adminSub, filters[0])
+	}
 }
 
-func TestDecisionReadEndpointListsAnAccountsDecisionsInAWindow(t *testing.T) {
+func TestDecisionReadEndpointIsRetiredButHistoryRemains(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
-	// A permission-point decision from the request itself plus two planted
-	// rows on either side of the window.
 	old := model.AuthzDecision{ID: "old", AccessorID: "acct-x", Decision: "deny", Source: "check", CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	in := model.AuthzDecision{ID: "in", AccessorID: "acct-x", Decision: "allow", Source: "check", CreatedAt: time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)}
 	for _, row := range []model.AuthzDecision{old, in} {
@@ -317,73 +281,43 @@ func TestDecisionReadEndpointListsAnAccountsDecisionsInAWindow(t *testing.T) {
 		}
 	}
 	w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/authz-decisions?accessor_id=acct-x&from=2026-05-01T00:00:00Z&to=2026-07-01T00:00:00Z", nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list: want 200, got %d (%s)", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("retired local query: want 404, got %d (%s)", w.Code, w.Body.String())
 	}
-	var body struct {
-		Decisions []model.AuthzDecision `json:"decisions"`
-		Total     int64                 `json:"total"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+	var count int64
+	if err := db.Model(&model.AuthzDecision{}).Where("accessor_id = ?", "acct-x").Count(&count).Error; err != nil {
 		t.Fatal(err)
 	}
-	if body.Total != 1 || len(body.Decisions) != 1 || body.Decisions[0].ID != "in" {
-		t.Fatalf("window list = %+v", body)
-	}
-	if w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/authz-decisions?from=not-a-time", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad from: want 400, got %d", w.Code)
-	}
-	// The read itself passed a permission point, which is a decision too.
-	var mine model.AuthzDecision
-	if err := db.Where("accessor_id = ? AND resource_type = ? AND operation = ?", adminSub, "admin-audit", "view").First(&mine).Error; err != nil {
-		t.Fatalf("permission point decision for the read: %v", err)
-	}
-	if mine.Decision != "allow" {
-		t.Fatalf("read decision: %+v", mine)
+	if count != 2 {
+		t.Fatalf("historical decisions lost: %d", count)
 	}
 }
 
-func TestAuditChainEndpointsReportHeadAndDetectTampering(t *testing.T) {
+func TestHistoricalAuditChainRemainsVerifiableWithoutHTTPRoutes(t *testing.T) {
 	r, _, db, _ := newAdminServer(t)
 	adminReq(t, r, http.MethodPost, "/api/safe/v1/admin/departments", map[string]any{"id": "d-1", "name": "Root"})
 	adminReq(t, r, http.MethodPut, "/api/safe/v1/admin/departments/d-1", map[string]any{"name": "Renamed"})
 
-	w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-chain", nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("chain head: want 200, got %d (%s)", w.Code, w.Body.String())
+	store := audit.New(db)
+	head, err := store.Verify(t.Context(), 0, 0, 1)
+	if err != nil || head.Head == nil || head.Head.Seq != 2 || len(head.Head.RowHash) != 64 || head.UnchainedRows != 0 {
+		t.Fatalf("historical chain head = %+v, %v", head, err)
 	}
-	var head struct {
-		Head *struct {
-			Seq     uint64 `json:"seq"`
-			RowHash string `json:"row_hash"`
-		} `json:"head"`
-		Unchained int64 `json:"unchained_rows"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &head); err != nil {
-		t.Fatal(err)
-	}
-	if head.Head == nil || head.Head.Seq != 2 || len(head.Head.RowHash) != 64 || head.Unchained != 0 {
-		t.Fatalf("chain head = %s", w.Body.String())
-	}
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-chain/verify", nil)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":true`) || !strings.Contains(w.Body.String(), `"checked":2`) {
-		t.Fatalf("verify intact: %d %s", w.Code, w.Body.String())
+	intact, err := store.Verify(t.Context(), 0, 0, 0)
+	if err != nil || !intact.OK || intact.Checked != 2 {
+		t.Fatalf("historical chain verification = %+v, %v", intact, err)
 	}
 	if err := db.Model(&model.AuditLog{}).Where("seq = ?", 1).Update("target_name", "Forged").Error; err != nil {
 		t.Fatal(err)
 	}
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-chain/verify", nil)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":false`) || !strings.Contains(w.Body.String(), `"broken_seq":1`) || !strings.Contains(w.Body.String(), `"reason":"hash_mismatch"`) {
-		t.Fatalf("verify tampered: %d %s", w.Code, w.Body.String())
+	broken, err := store.Verify(t.Context(), 0, 0, 0)
+	if err != nil || broken.OK || broken.BrokenSeq == nil || *broken.BrokenSeq != 1 || broken.Reason != "hash_mismatch" {
+		t.Fatalf("tampered historical chain = %+v, %v", broken, err)
 	}
-	if w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-chain/verify?from_seq=x", nil); w.Code != http.StatusBadRequest {
-		t.Fatalf("bad from_seq: want 400, got %d", w.Code)
-	}
-	// Chain reads are GETs: they left no audit rows of their own.
-	var n int64
-	db.Model(&model.AuditLog{}).Where("resource = ?", "audit-chain").Count(&n)
-	if n != 0 {
-		t.Fatalf("chain reads produced %d audit rows", n)
+	for _, path := range []string{"/api/safe/v1/admin/audit-chain", "/api/safe/v1/admin/audit-chain/verify"} {
+		if w := adminReq(t, r, http.MethodGet, path, nil); w.Code != http.StatusNotFound {
+			t.Fatalf("retired audit endpoint %s = %d, want 404", path, w.Code)
+		}
 	}
 }
 
@@ -474,8 +408,8 @@ func TestAuditDetailFromPrefixKeepsLeadingFieldsAndSkipsArrays(t *testing.T) {
 	}
 }
 
-func TestOneRequestIDTiesResponseAuditAndDecisions(t *testing.T) {
-	r, _, db, _ := newAdminServer(t)
+func TestOneRequestIDTiesResponseAndCommittedAudit(t *testing.T) {
+	r, _, db, _, _ := newAdminServerWithDecisions(t)
 	w := adminReq(t, r, http.MethodPost, "/api/safe/v1/admin/departments", map[string]any{"id": "d-rid", "name": "RID"})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("create: want 201, got %d (%s)", w.Code, w.Body.String())
@@ -490,28 +424,5 @@ func TestOneRequestIDTiesResponseAuditAndDecisions(t *testing.T) {
 	}
 	if row.Resource != "departments" || row.Method != http.MethodPost || row.Status != http.StatusCreated {
 		t.Fatalf("audit row for the request id: %+v", row)
-	}
-	var decisions []model.AuthzDecision
-	if err := db.Where("request_id = ?", rid).Find(&decisions).Error; err != nil {
-		t.Fatal(err)
-	}
-	if len(decisions) < 2 {
-		t.Fatalf("decisions sharing the request id = %d, want the console gate and the permission point: %+v", len(decisions), decisions)
-	}
-}
-
-func TestFailureLimiterWindow(t *testing.T) {
-	now := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
-	l := newFailureLimiter(time.Minute)
-	l.now = func() time.Time { return now }
-	if !l.allow("k") || l.allow("k") {
-		t.Fatal("first hit allowed, repeat within window throttled")
-	}
-	now = now.Add(61 * time.Second)
-	if !l.allow("k") {
-		t.Fatal("hit after the window must be allowed again")
-	}
-	if !l.allow("other") {
-		t.Fatal("different key is independent")
 	}
 }

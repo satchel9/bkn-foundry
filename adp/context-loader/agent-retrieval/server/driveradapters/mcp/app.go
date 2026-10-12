@@ -33,6 +33,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knskills"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/kntools"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permissionguide"
 	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
@@ -137,8 +138,10 @@ func (h *localizedMCPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		handler = h.handlers[defaultMCPLocale]
 	}
 
-	// The tool handlers read the effective locale from the request context.
-	r = r.WithContext(common.SetLanguageToCtx(r.Context(), common.Language(locale)))
+	// The tool handlers read the effective locale from the request context, and
+	// the origin the caller used so any Studio link they return points back to it.
+	ctx := common.SetLanguageToCtx(r.Context(), common.Language(locale))
+	r = r.WithContext(common.SetPublicOriginToCtx(ctx, common.PublicOriginFromRequest(r)))
 	handler.ServeHTTP(w, r)
 }
 
@@ -174,19 +177,23 @@ func newMCPServerForProfile(
 	localeBundle := loadMCPLocaleBundle(locale)
 	b := newToolBuilder(localeBundle)
 
+	bknBackend := drivenadapters.NewBknBackendAccess()
+	schemaAccess := drivenadapters.NewObjectSchemaAccess()
+	guide := permissionguide.New(config.NewConfigLoader().PermissionRequest, schemaAccess, bknBackend)
+
 	knSearchService := knsearch.NewKnSearchService()
 	b.add(toolKeySearchSchema, handleSearchSchema(knSearchService))
-	b.add(toolKeySearchInstance, handleSearchInstance(knSearchService))
+	b.add(toolKeySearchInstance, handleSearchInstance(knSearchService, guide))
 
 	ontologyQuery := drivenadapters.NewOntologyQueryAccess()
-	b.add(toolKeyQueryObjectInstance, handleQueryObjectInstance(ontologyQuery))
+	b.add(toolKeyQueryObjectInstance, handleQueryObjectInstance(ontologyQuery, guide))
 
 	knQuerySubgraphService := logicsKqs.NewKnQuerySubgraphService()
 	b.add(toolKeyQueryInstanceSubgraph, handleQueryInstanceSubgraph(knQuerySubgraphService))
 	b.add(toolKeyExploreSubgraph, handleExploreSubgraph(knQuerySubgraphService))
 
 	getLogicPropertiesValuesService := logicsKlp.NewKnLogicPropertyResolverService()
-	b.add(toolKeyGetLogicPropertiesValues, handleGetLogicPropertiesValues(getLogicPropertiesValuesService))
+	b.add(toolKeyGetLogicPropertiesValues, handleGetLogicPropertiesValues(getLogicPropertiesValuesService, guide))
 
 	getActionInfoService := logicsKar.NewKnActionRecallService()
 	b.add(toolKeyGetActionInfo, handleGetActionInfo(getActionInfoService))
@@ -197,9 +204,7 @@ func newMCPServerForProfile(
 	metricsService := knmetrics.NewKnMetricsService()
 	b.add(toolKeyQueryMetric, handleQueryMetric(metricsService))
 
-	bknBackend := drivenadapters.NewBknBackendAccess()
 	b.add(toolKeyListKnowledgeNetworks, handleListKnowledgeNetworks(bknBackend))
-	schemaAccess := drivenadapters.NewObjectSchemaAccess()
 	b.add(toolKeyGetKnDetail, handleGetKnDetail(bknBackend, metricsService, schemaAccess,
 		permission.NewKnowledgeNetworkAuthorizer(config.NewConfigLoader())))
 	b.add(toolKeyGetObjectTypes, handleGetObjectTypes(bknBackend, metricsService, schemaAccess))
@@ -209,7 +214,7 @@ func newMCPServerForProfile(
 	b.add(toolKeyRunSQL, handleRunSQL(runSQLService))
 
 	cypherService := kncypher.NewKnCypherService()
-	b.add(toolKeyRunCypher, handleRunCypher(cypherService))
+	b.add(toolKeyRunCypher, handleRunCypher(cypherService, guide))
 
 	resourcesService := knresources.NewKnResourcesService()
 	b.add(toolKeyListResources, handleListResources(resourcesService))
@@ -243,6 +248,11 @@ func newMCPServerForProfile(
 	b.claimGatewayNames()
 
 	b.addExtras()
+	// Through the builder, like every business tool: the compact profile does
+	// not publish these two, and only what the builder assembled is reachable
+	// through its gateway. Registering them straight onto the server kept them
+	// out of that catalogue, so the compact entry could not run code at all.
+	addInlinePTCTools(b, localeBundle, locale, sandboxPort)
 	b.verifyDecoratorsLanded()
 
 	var mcpServer *server.MCPServer
@@ -263,7 +273,7 @@ func newMCPServerForProfile(
 					return mcp.Tool{}, false
 				}
 				tools := b.filter(ctx, []mcp.Tool{registered.Tool})
-				if profile.published != nil {
+				if profile.rewritesListing() {
 					tools = profile.filter(ctx, tools)
 				}
 				if len(tools) == 0 {
@@ -291,7 +301,7 @@ func newMCPServerForProfile(
 		// notices.
 		server.WithToolFilter(b.filter),
 	)
-	if profile.published != nil {
+	if profile.rewritesListing() {
 		// Filters stack and run in order, on tools/list and tools/call alike,
 		// so the licence filter above still applies and a tool this profile
 		// does not publish is refused exactly like an unknown one.
@@ -300,9 +310,6 @@ func newMCPServerForProfile(
 	mcpServer = server.NewMCPServer(serverName, serverVersion, options...)
 	registerLifecycleTools(mcpServer, lifecycleClient, localeBundle)
 	b.attach(mcpServer)
-	if profile.inlinePTC {
-		registerInlinePTCTools(mcpServer, localeBundle, locale, sandboxPort)
-	}
 	if profile.gateway {
 		registerGatewayTools(mcpServer, b, lifecycleClient)
 	}
@@ -324,8 +331,8 @@ func newMCPServerForProfile(
 // Instructions at rest_public_handler.go.
 //
 // Only log when installation fails: When the embedded tool metadata cannot be read, the other twenty or so business tools should not be affected.
-func registerInlinePTCTools(
-	mcpServer *server.MCPServer, localeBundle *mcpLocaleBundle, locale string, sandboxPort int,
+func addInlinePTCTools(
+	b *toolBuilder, localeBundle *mcpLocaleBundle, locale string, sandboxPort int,
 ) {
 	toolkit, err := buildInlinePTCToolkit(sandboxPort, locale)
 	if err != nil {
@@ -341,10 +348,7 @@ func registerInlinePTCTools(
 		meta := localeBundle.ToolMeta(tool.Name)
 		meta.Description = tool.Description
 		input, output := tryLoadToolSchemas(localeBundle, tool.Name)
-		mcpServer.AddTool(
-			newToolWithSchemas(meta, input, output),
-			handlePTCExecuteForLocale(executor, toolkit, tool, localeBundle),
-		)
+		b.addWith(tool.Name, meta, input, output, handlePTCExecuteForLocale(executor, toolkit, tool, localeBundle))
 	}
 }
 

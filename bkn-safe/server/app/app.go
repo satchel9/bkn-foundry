@@ -29,7 +29,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"time"
 
 	"gorm.io/gorm"
 
@@ -44,6 +43,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/httpapi"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/license"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/oauthorigin"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/permissionrequest"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/seed"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/entitlement"
 )
@@ -58,14 +59,12 @@ type Options struct {
 
 // App is a booted, not-yet-serving bkn-safe.
 type App struct {
-	cfg      *config.Config
-	db       *gorm.DB
-	enforcer *authz.Enforcer
-	deps     httpapi.Deps
-	licSvc   *license.Service
-	// decisions is the authorization decision log; its retention purge runs
-	// alongside the listener.
-	decisions *decisionlog.Store
+	cfg          *config.Config
+	db           *gorm.DB
+	enforcer     *authz.Enforcer
+	deps         httpapi.Deps
+	licSvc       *license.Service
+	auditRuntime *audit.KafkaRuntime
 	// freshAuthorizationStore is captured before AutoMigrate creates the
 	// Casbin/marker schema. An old but empty store must still run the explicit
 	// offline migration and therefore is never inferred as fresh later.
@@ -103,6 +102,7 @@ func Boot(opts Options) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init authz: %w", err)
 	}
+	auditRuntime := audit.NewKafkaRuntimeFromEnv(os.Getenv)
 	// Run the normal_user withdrawal independently of seed_on_start. This is an
 	// upgrade migration for bkn-safe-owned data, whereas seed_on_start only
 	// controls whether the current catalog and role matrix are reconciled.
@@ -111,7 +111,7 @@ func Boot(opts Options) (*App, error) {
 	}
 
 	if cfg.SeedOnStart {
-		if err := seed.Apply(db, enforcer); err != nil {
+		if err := seed.ApplyWithAudit(db, enforcer, auditRuntime.Recorder); err != nil {
 			return nil, fmt.Errorf("seed: %w", err)
 		}
 		slog.Info("seed applied (roles + catalog + grants)")
@@ -119,6 +119,10 @@ func Boot(opts Options) (*App, error) {
 
 	userStore := auth.NewUserStore(db)
 	hydraAdmin := auth.NewHydraAdmin(cfg.Hydra.AdminURL)
+	oauthAccessOrigins, err := oauthorigin.New(db, hydraAdmin, cfg.OAuth.StudioBaselineRedirectURIs)
+	if err != nil {
+		return nil, fmt.Errorf("init OAuth access origins: %w", err)
+	}
 
 	// Authenticator: local bcrypt store, plus LDAP federation when configured
 	// (local first, then LDAP).
@@ -129,30 +133,32 @@ func Boot(opts Options) (*App, error) {
 	}
 	provider := auth.NewProvider(authenticator, hydraAdmin, userStore)
 	dir := directory.New(db)
-	auditStore := audit.New(db)
-	accessLogStore := accesslog.New(db)
-	decisionStore := decisionlog.New(db, decisionlog.Options{
-		Enabled:         cfg.Audit.DecisionLog.Enabled,
-		AllowSampleRate: cfg.Audit.DecisionLog.AllowSampleRate,
-		QueueSize:       cfg.Audit.DecisionLog.QueueSize,
-	})
-	authorizationResources, err := httpapi.NewAuthorizationResourceCatalog(cfg.Upstreams.BKNBackend, cfg.Upstreams.ExecutionFactory, cfg.Upstreams.VegaBackend)
+	accessLogRecorder := accesslog.NewKafkaRecorder(
+		auditRuntime.Publisher(),
+		os.Getenv("BKN_AUDIT_ENVIRONMENT"),
+		func(outcome string) { auditRuntime.Telemetry.ObserveForSource("bkn-safe-access", outcome) },
+	)
+	decisionRecorder := decisionlog.NewKafkaRecorder(
+		auditRuntime.Publisher(),
+		os.Getenv("BKN_AUDIT_ENVIRONMENT"),
+		func(outcome string) { auditRuntime.Telemetry.ObserveForSource("bkn-safe-security", outcome) },
+	)
+	authorizationResources, err := httpapi.NewAuthorizationResourceCatalog(cfg.Upstreams.BKNBackend, cfg.Upstreams.BKNAgent, cfg.Upstreams.ExecutionFactory, cfg.Upstreams.VegaBackend)
 	if err != nil {
 		return nil, fmt.Errorf("authorization resource catalog: %w", err)
+	}
+	permissionRequestResources, err := permissionrequest.NewHTTPResourceLivenessResolver(cfg.Upstreams.BKNBackend, cfg.Upstreams.ExecutionFactory, cfg.Upstreams.VegaBackend)
+	if err != nil {
+		return nil, fmt.Errorf("permission request resource resolver: %w", err)
 	}
 	rowFilterPublishedObjectTypes, err := httpapi.NewRowFilterPublishedObjectTypeResolver(cfg.Upstreams.OntologyQuery)
 	if err != nil {
 		return nil, fmt.Errorf("row-filter published object type resolver: %w", err)
 	}
-	if decisionStore.Enabled() {
-		slog.Info("authz decision log enabled",
-			"allow_sample_rate", cfg.Audit.DecisionLog.AllowSampleRate,
-			"retention_days", cfg.Audit.DecisionLog.RetentionDays)
-	}
 
 	// Cluster license hub: hold the one .lic, be the only egress to the
 	// license-server, distribute to modules.
-	licSvc, err := license.New(db, cfg.License, auditStore)
+	licSvc, err := license.New(db, cfg.License, auditRuntime.Recorder)
 	if err != nil {
 		slog.Error("license hub disabled", "err", err)
 		licSvc = nil
@@ -179,20 +185,24 @@ func Boot(opts Options) (*App, error) {
 		db:                      db,
 		enforcer:                enforcer,
 		licSvc:                  licSvc,
+		auditRuntime:            auditRuntime,
 		freshAuthorizationStore: freshAuthorizationStore,
-		decisions:               decisionStore,
 		deps: httpapi.Deps{
 			Enforcer:                      enforcer,
 			DB:                            db,
 			Provider:                      provider,
 			Hydra:                         hydraAdmin,
+			HydraBrowserPublicURL:         cfg.Hydra.BrowserPublicURL,
 			Directory:                     dir,
 			Users:                         userStore,
-			Audit:                         auditStore,
-			AccessLog:                     accessLogStore,
-			Decisions:                     decisionStore,
+			Audit:                         auditRuntime.Recorder,
+			AuditTelemetry:                auditRuntime.Telemetry,
+			AccessLog:                     accessLogRecorder,
+			Decisions:                     decisionRecorder,
+			OAuthAccessOrigins:            oauthAccessOrigins,
 			License:                       licSvc,
 			AuthorizationResources:        authorizationResources,
+			PermissionRequestResources:    permissionRequestResources,
 			RowFilterPublishedObjectTypes: rowFilterPublishedObjectTypes,
 		},
 	}, nil
@@ -220,21 +230,16 @@ func (a *App) Run() error {
 	entitlement.Freeze()
 	slog.Info("extensions assembled", "assembled", entitlement.Assembled())
 
-	// Background audit work lives for as long as the listener: committed audit
-	// events are chained asynchronously, the chain head is anchored externally,
-	// and decision logs are retained.
+	// Background work lives for as long as the listener.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go a.deps.Audit.RunPendingAppender(ctx, time.Second)
-	go a.deps.Audit.LogHead(ctx, a.cfg.Audit.ChainHeadLogInterval)
-	go a.decisions.RunRetention(ctx, a.cfg.Audit.DecisionLog.RetentionDays, 24*time.Hour)
+	defer a.auditRuntime.Close()
 	go a.enforcer.RunPolicyRefresh(ctx, a.cfg.Authz.PolicyRefreshInterval)
+	go a.deps.OAuthAccessOrigins.Run(ctx, a.cfg.OAuth.ReconcileInterval)
 
 	r := httpapi.New(a.deps)
 	slog.Info("bkn-safe listening", "addr", a.cfg.HTTPAddr)
 	err := r.Run(a.cfg.HTTPAddr)
-	// The listener is gone; drain the queued decisions before reporting why.
-	a.decisions.Close()
 	return err
 }
 

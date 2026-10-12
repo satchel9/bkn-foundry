@@ -20,11 +20,15 @@ const (
 	VegaBackend_Resource_LengthExceeded_Name                = "VegaBackend.Resource.LengthExceeded.Name"
 	VegaBackend_Resource_LengthExceeded_Description         = "VegaBackend.Resource.LengthExceeded.Description"
 	VegaBackend_Resource_CategoryNotCreatable               = "VegaBackend.Resource.CategoryNotCreatable"
+	VegaBackend_Resource_Duplicated_FieldFeatureType        = "VegaBackend.Resource.Duplicated.FieldFeatureType"
 	VegaBackend_InvalidParameter_Aggregation                = "VegaBackend.InvalidParameter.Aggregation"
 	VegaBackend_InvalidParameter_GroupBy                    = "VegaBackend.InvalidParameter.GroupBy"
 	VegaBackend_InvalidParameter_OrderBy                    = "VegaBackend.InvalidParameter.OrderBy"
 	VegaBackend_InvalidParameter_Having                     = "VegaBackend.InvalidParameter.Having"
 	VegaBackend_InvalidParameter_CalendarInterval           = "VegaBackend.InvalidParameter.CalendarInterval"
+
+	// 403 Forbidden (source database privilege)
+	VegaBackend_Resource_SourceReadForbidden = "VegaBackend.Resource.SourceReadForbidden"
 
 	// 404 Not Found
 	VegaBackend_Resource_NotFound        = "VegaBackend.Resource.NotFound"
@@ -40,6 +44,7 @@ const (
 	VegaBackend_Resource_MetadataUnavailable    = "VegaBackend.Resource.MetadataUnavailable"
 	VegaBackend_Resource_EnabledFieldNotAllowed = "VegaBackend.Resource.EnabledFieldNotAllowed"
 	VegaBackend_Resource_UpdateConflict         = "VegaBackend.Resource.UpdateConflict"
+	VegaBackend_Resource_DeleteConflict         = "VegaBackend.Resource.DeleteConflict"
 
 	// 500 Internal Server Error
 	VegaBackend_Resource_InternalError                       = "VegaBackend.Resource.InternalError"
@@ -64,11 +69,15 @@ var ResourceErrCodeList = []string{
 	VegaBackend_Resource_LengthExceeded_Name,
 	VegaBackend_Resource_LengthExceeded_Description,
 	VegaBackend_Resource_CategoryNotCreatable,
+	VegaBackend_Resource_Duplicated_FieldFeatureType,
 	VegaBackend_InvalidParameter_Aggregation,
 	VegaBackend_InvalidParameter_GroupBy,
 	VegaBackend_InvalidParameter_OrderBy,
 	VegaBackend_InvalidParameter_Having,
 	VegaBackend_InvalidParameter_CalendarInterval,
+
+	// 403 Forbidden (source database privilege)
+	VegaBackend_Resource_SourceReadForbidden,
 
 	// 404 Not Found
 	VegaBackend_Resource_NotFound,
@@ -84,6 +93,7 @@ var ResourceErrCodeList = []string{
 	VegaBackend_Resource_MetadataUnavailable,
 	VegaBackend_Resource_EnabledFieldNotAllowed,
 	VegaBackend_Resource_UpdateConflict,
+	VegaBackend_Resource_DeleteConflict,
 
 	// 500 Internal Server Error
 	VegaBackend_Resource_InternalError,

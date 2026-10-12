@@ -15,9 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
-	"github.com/go-sql-driver/mysql"
-	"github.com/lib/pq"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
@@ -29,7 +28,6 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/locale"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/factory"
-	opensearchconnector "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/index/opensearch"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/dataset"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/query/querypolicy"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/query/sqlglot"
@@ -62,7 +60,7 @@ func connectorInitializationError(ctx context.Context, err error) error {
 
 // NewRawQueryService creates SQL query services (singleton pattern)
 func NewRawQueryService(appSetting *common.AppSetting) interfaces.RawQueryService {
-	rawQueryCursorSessions.configure(appSetting.QuerySetting.CursorMaxSessions)
+	ConfigureCursorSessions(appSetting.QuerySetting.CursorMaxSessions, appSetting.QuerySetting.CursorMaxSessionsPerAccount)
 	rqServiceOnce.Do(func() {
 		rqService = &rawQueryService{
 			cf: factory.NewConnectorFactory(appSetting),
@@ -190,7 +188,7 @@ func (rqs *rawQueryService) executeInitialSQLCursor(ctx context.Context, req *in
 		req.QueryTimeoutSec,
 	)
 	if err != nil {
-		return nil, cursorSessionLimitError(ctx)
+		return nil, cursorSessionCreateError(ctx, err)
 	}
 	session.PageOffset = req.Paging.Offset
 	session.TotalCount = totalCount
@@ -275,33 +273,58 @@ func (rqs *rawQueryService) prepareSQLQuery(ctx context.Context, req *interfaces
 	if err != nil {
 		return nil, err
 	}
-	replacedSQL, err := rqs.replaceResourceIDWithSchemaTable(ctx, req.Query, resourceIDs, catalog, inputDialect)
-	if err != nil {
-		return nil, err
-	}
-	allowedReferences, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs, inputDialect)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateSQLPolicy(ctx, replacedSQL, inputDialect, allowedReferences, inputDialect == targetDialect); err != nil {
-		return nil, err
-	}
-	finalSQL := replacedSQL
-	if inputDialect != targetDialect {
-		result, err := sqlglot.TranspileSQL(ctx, replacedSQL, inputDialect, targetDialect)
+	// Compile temporary table references before binding source-dialect names.
+	needsUnicodeNormalization := targetDialect == "tsql" && strings.ContainsFunc(req.Query.(string), func(r rune) bool {
+		return r > unicode.MaxASCII
+	})
+	var finalSQL string
+	if inputDialect == targetDialect && !needsUnicodeNormalization {
+		finalSQL, err = rqs.replaceResourceIDWithSchemaTable(ctx, req.Query, resourceIDs, catalog, inputDialect)
+		if err != nil {
+			return nil, err
+		}
+		allowed, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateSQLPolicy(ctx, finalSQL, targetDialect, allowed, true); err != nil {
+			return nil, err
+		}
+	} else {
+		query := req.Query.(string)
+		markers := make([]string, len(resourceIDs))
+		for i, resourceID := range resourceIDs {
+			marker := fmt.Sprintf("__vega_resource_%d", i)
+			for strings.Contains(query, marker) {
+				marker += "_"
+			}
+			markers[i] = marker
+			query = replacePlaceholderInSQLCode(query, "{{"+resourceID+"}}", marker, inputDialect)
+			query = replacePlaceholderInSQLCode(query, "{{."+resourceID+"}}", marker, inputDialect)
+		}
+		if err := validateSQLPolicy(ctx, query, inputDialect, markers, inputDialect == targetDialect); err != nil {
+			return nil, err
+		}
+		compiled, err := sqlglot.TranspileSQL(ctx, query, inputDialect, targetDialect)
 		if err != nil {
 			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).
 				WithErrorDetails("failed to compile SQL query")
 		}
-		finalSQL = result.SQL
-		targetReferences, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs, targetDialect)
+		references, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs)
 		if err != nil {
 			return nil, err
 		}
-		// The connector executes finalSQL, not the input-dialect SQL validated
-		// above. Revalidate the target-dialect output so the read-only and
-		// table-reference boundaries apply to the executable statement.
-		if err := validateSQLPolicy(ctx, finalSQL, targetDialect, targetReferences, true); err != nil {
+		bindings := make(map[string]string, len(markers))
+		for i, marker := range markers {
+			bindings[marker] = references[i]
+		}
+		bound, err := sqlglot.BindTableReferences(ctx, compiled.SQL, targetDialect, bindings)
+		if err != nil {
+			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).
+				WithErrorDetails("failed to bind SQL resource references")
+		}
+		finalSQL = bound.SQL
+		if err := validateSQLPolicy(ctx, finalSQL, targetDialect, references, true); err != nil {
 			return nil, err
 		}
 	}
@@ -332,7 +355,7 @@ func validateSQLPolicy(ctx context.Context, sql, dialect string, allowedReferenc
 	return nil
 }
 
-func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resourceIDs []string, dialect string) ([]string, error) {
+func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resourceIDs []string) ([]string, error) {
 	identifiers := make([]string, 0, len(resourceIDs))
 	for _, resourceID := range resourceIDs {
 		resource, err := rqs.rs.InternalGetByID(ctx, nil, resourceID)
@@ -343,7 +366,7 @@ func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resou
 			return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Query_ResourceNotFound).
 				WithErrorDetails(fmt.Sprintf("resource %s has no queryable source", resourceID))
 		}
-		identifiers = append(identifiers, quotedResourceSourceIdentifier(resource, dialect))
+		identifiers = append(identifiers, resource.SourceIdentifier)
 	}
 	return identifiers, nil
 }
@@ -407,7 +430,7 @@ func (rqs *rawQueryService) executeInitialOpenSearchCursor(ctx context.Context, 
 		accountIDFromContext(ctx), catalog.ID, []string{queryResourceID(req.Query)}, "", req.Paging.Limit, req.Paging.KeepAliveSec, req.QueryTimeoutSec,
 	)
 	if err != nil {
-		return nil, cursorSessionLimitError(ctx)
+		return nil, cursorSessionCreateError(ctx, err)
 	}
 	session.QueryFormat = interfaces.QueryFormatDSL
 	bindCursorResource(session, req)
@@ -440,9 +463,16 @@ func queryResourceID(query any) string {
 	return resourceID
 }
 
-func cursorSessionLimitError(ctx context.Context) error {
-	return rest.NewHTTPError(ctx, http.StatusTooManyRequests, verrors.VegaBackend_Query_CursorSessionLimitExceeded).
-		WithErrorDetails("cursor session limit reached, please retry later")
+func cursorSessionCreateError(ctx context.Context, err error) error {
+	if errors.Is(err, errCursorAccountLimitReached) {
+		return rest.NewHTTPError(ctx, http.StatusTooManyRequests, verrors.VegaBackend_Query_CursorSessionLimitExceeded).
+			WithErrorDetails("per-account cursor session limit reached")
+	}
+	if errors.Is(err, errCursorSessionLimitReached) {
+		return rest.NewHTTPError(ctx, http.StatusTooManyRequests, verrors.VegaBackend_Query_CursorSessionLimitExceeded).
+			WithErrorDetails("global cursor session limit reached")
+	}
+	return err
 }
 
 func bindCursorResource(session *interfaces.CursorSession, req *interfaces.RawQueryRequest) {
@@ -690,7 +720,7 @@ func (rqs *rawQueryService) executeInitialDSLQuery(ctx context.Context, req *int
 
 	result, err := indexConnector.ExecuteRawQuery(queryCtx, resource.SourceIdentifier, queryMap)
 	if err != nil {
-		var validationErr *opensearchconnector.RawAggregationValidationError
+		var validationErr *interfaces.RawAggregationValidationError
 		if errors.As(err, &validationErr) {
 			return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 				WithErrorDetails(validationErr.Error())
@@ -738,6 +768,10 @@ func targetDialectForCatalog(ctx context.Context, catalog *interfaces.Catalog) (
 		return "postgres", nil
 	case interfaces.ConnectorTypeSQLServer:
 		return "tsql", nil
+	case interfaces.ConnectorTypeOracle:
+		return "oracle", nil
+	case interfaces.ConnectorTypeHANA:
+		return sqlglot.GenericDialect, nil
 	default:
 		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("unsupported connector type: %s", catalog.ConnectorType))
@@ -890,13 +924,10 @@ func (rqs *rawQueryService) replaceResourceIDWithSchemaTable(ctx context.Context
 				WithErrorDetails(fmt.Sprintf("resource %s not found", resourceID))
 		}
 
-		// Use the resource source identifier as the table reference.
-		// schemaTable := fmt.Sprintf(`%s.%s`, catalog.Name, resource.SourceIdentifier)
-
 		// Replace both supported placeholder forms with the quoted identifier.
 		placeholder1 := fmt.Sprintf("{{.%s}}", resourceID)
 		placeholder2 := fmt.Sprintf("{{%s}}", resourceID)
-		quotedIdentifier := quotedResourceSourceIdentifier(resource, inputDialect)
+		quotedIdentifier := resource.SourceIdentifier
 		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder1, quotedIdentifier, inputDialect)
 		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder2, quotedIdentifier, inputDialect)
 	}
@@ -910,39 +941,6 @@ func (rqs *rawQueryService) resourceForQuery(ctx context.Context, resourceID str
 		return nil, err
 	}
 	return rqs.rs.InternalGetByID(ctx, nil, resourceID)
-}
-
-func quotedResourceSourceIdentifier(resource *interfaces.Resource, dialect string) string {
-	sourceIdentifier := strings.TrimSpace(resource.SourceIdentifier)
-	schema := strings.TrimSpace(resource.Schema)
-	table := sourceIdentifier
-	if schema != "" {
-		prefixLength := len(schema) + 1
-		if len(sourceIdentifier) >= prefixLength &&
-			strings.EqualFold(sourceIdentifier[:prefixLength], schema+".") {
-			table = sourceIdentifier[prefixLength:]
-		} else if separator := strings.IndexByte(sourceIdentifier, '.'); separator >= 0 &&
-			strings.EqualFold(strings.TrimSpace(sourceIdentifier[:separator]), schema) {
-			table = sourceIdentifier[separator+1:]
-		}
-	} else if separator := strings.IndexByte(sourceIdentifier, '.'); separator >= 0 {
-		schema, table = sourceIdentifier[:separator], sourceIdentifier[separator+1:]
-	}
-	if schema == "" {
-		return quoteSQLIdentifier(strings.TrimSpace(table), dialect)
-	}
-	return quoteSQLIdentifier(schema, dialect) + "." + quoteSQLIdentifier(strings.TrimSpace(table), dialect)
-}
-
-func quoteSQLIdentifier(identifier, dialect string) string {
-	switch dialect {
-	case "mysql":
-		return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
-	case "tsql":
-		return "[" + strings.ReplaceAll(identifier, "]", "]]") + "]"
-	default:
-		return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
-	}
 }
 
 // replacePlaceholderInSQLCode preserves comments and quoted literals. They
@@ -1047,7 +1045,11 @@ func (rqs *rawQueryService) executeSQL(ctx context.Context, catalog *interfaces.
 	result, err := tableConnector.ExecuteRawSQL(ctx, sql)
 	if err != nil {
 		otellog.LogError(ctx, "Execute SQL failed", err)
-		if detail := rawQueryInvalidColumnError(err); detail != "" {
+		var sourceReadForbidden *interfaces.SourceReadForbiddenError
+		if errors.As(err, &sourceReadForbidden) {
+			return nil, rest.NewHTTPError(ctx, http.StatusForbidden, verrors.VegaBackend_Resource_SourceReadForbidden)
+		}
+		if detail, ok := interfaces.RequestSideQueryError(err); ok {
 			return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 				WithErrorDetails(detail)
 		}
@@ -1057,20 +1059,6 @@ func (rqs *rawQueryService) executeSQL(ctx context.Context, catalog *interfaces.
 
 	logger.Infof("SQL query executed successfully: paging_mode=%s, returned_rows=%d", pagingMode, len(result.Entries))
 	return result, nil
-}
-
-func rawQueryInvalidColumnError(err error) string {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1054 {
-		return mysqlErr.Message
-	}
-
-	var postgresErr *pq.Error
-	if errors.As(err, &postgresErr) && string(postgresErr.Code) == "42703" {
-		return postgresErr.Message
-	}
-
-	return ""
 }
 
 func rawQueryValidationError(ctx context.Context, err error) error {

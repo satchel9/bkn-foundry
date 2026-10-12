@@ -25,7 +25,6 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"github.com/tidwall/sjson"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/codes"
 
 	"ontology-query/common"
 	cond "ontology-query/common/condition"
@@ -47,7 +46,6 @@ type objectTypeService struct {
 	aoAccess       interfaces.AgentOperatorAccess
 	mfa            interfaces.ModelFactoryAccess
 	omAccess       interfaces.OntologyManagerAccess
-	osa            interfaces.OpenSearchAccess
 	vba            interfaces.VegaBackendAccess
 	mqs            interfaces.MetricQueryService
 	proxy          interfaces.ProxyContextResolver
@@ -63,7 +61,6 @@ func NewObjectTypeService(appSetting *common.AppSetting) interfaces.ObjectTypeSe
 			aoAccess:       logics.AOA,
 			mfa:            logics.MFA,
 			omAccess:       logics.OMA,
-			osa:            logics.OSA,
 			vba:            logics.VBA,
 			mqs:            metric.NewMetricQueryService(appSetting),
 			proxy:          logics.PCR,
@@ -286,6 +283,7 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 	}
 	query.EffectiveRowFilterDigest = decisions[0].EffectiveRowFilterDigest
 	query.RowFilterNoResults = noResults
+	resps.RowFilterApplied = rowCondition != nil || noResults
 	query.ActualCondition = andRowFilterCondition(query.ActualCondition, rowCondition)
 	for _, name := range rowFields {
 		plan.dependencyFields[name] = struct{}{}
@@ -312,11 +310,11 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 			return resps, invalidQueryCursorError(ctx)
 		}
 		if dataSourceType == interfaces.DATA_SOURCE_TYPE_RESOURCE {
-			resourceCursor, err := ots.cursor.decodeResource(ctx, query, proxyContext.PublishedModelVersion, query.Cursor)
+			resourceCursor, resourceOffset, err := ots.cursor.decodeResource(ctx, query, proxyContext.PublishedModelVersion, query.Cursor)
 			if err != nil {
 				return resps, invalidQueryCursorError(ctx)
 			}
-			query.ResourceCursor = resourceCursor
+			query.ResourceCursor, query.ResourceOffset = resourceCursor, resourceOffset
 		} else {
 			searchAfter, err := ots.cursor.decode(ctx, query, proxyContext.PublishedModelVersion, query.Cursor)
 			if err != nil {
@@ -347,6 +345,14 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		}
 		resps.Cursor, err = ots.cursor.encodeResource(ctx, query, proxyContext.PublishedModelVersion,
 			resps.ResourceCursor, resps.ResourceCursorExpiry)
+		if err != nil {
+			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, err)
+		}
+	} else if resps.ResourceNextOffset > 0 {
+		if ots.cursor == nil {
+			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, fmt.Errorf("query cursor codec is not configured"))
+		}
+		resps.Cursor, err = ots.cursor.encodeResourceOffset(ctx, query, proxyContext.PublishedModelVersion, resps.ResourceNextOffset)
 		if err != nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, err)
 		}
@@ -501,10 +507,12 @@ func downstreamErrorCode(statusCode int) string {
 		return rest.PublicError_NotFound
 	case http.StatusConflict:
 		return rest.PublicError_Conflict
+	case http.StatusTooManyRequests:
+		return oerrors.OntologyQuery_ObjectType_TooManyRequests
 	default:
-		// Other 4xx statuses (405/413/422/429, etc.) do not have semantically corresponding public error codes. Do not fall back here to
+		// Other 4xx statuses (405/413/422, etc.) do not have semantically corresponding public error codes. Do not fall back here to
 		// rest.PublicError_BadRequest: its en-US message is "Internal Server Error",
-		// English callers would read "Internal Server Error" for a 429, which is exactly the misleading behavior this change avoids.
+		// English callers would read "Internal Server Error" for a 413, which is exactly the misleading behavior this change avoids.
 		// Fall back to this service's parameter error code: messages in both languages are correct and behavior stays consistent with before. The real
 		// semantics are carried by the faithfully passed-through status code and the reason returned by downstream.
 		return oerrors.OntologyQuery_ObjectType_InvalidParameter
@@ -530,16 +538,12 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 		return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
 			WithErrorDetails(err.Error())
 	}
-	pagingMode := interfaces.ResourceDataPagingModeCursor
+	// A legacy object type may expose a schema-only primary key without a
+	// physical resource mapping. Its sort cannot be made total, so it keeps the
+	// historical single-page behavior and never returns a continuation.
+	stable := true
 	if query.ResourceCursor == "" {
-		var stable bool
 		resourceSort, stable = appendResourceSortTieBreakers(resourceSort, objectType)
-		if !stable {
-			// A legacy object type may expose a schema-only primary key without a
-			// physical resource mapping. Its sort cannot be made total for
-			// search_after, so retain the historical single-page query behavior.
-			pagingMode = interfaces.ResourceDataPagingModeSingle
-		}
 	}
 
 	viewQuery := interfaces.ViewQuery{
@@ -572,39 +576,19 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 	for k := range fieldPropMap {
 		outputFields = append(outputFields, k)
 	}
+	if plan.scoreVisible {
+		outputFields = append(outputFields, interfaces.SORT_FIELD_SCORE)
+	}
 	sort.Strings(outputFields)
 	params := &interfaces.ResourceDataQueryParams{
-		NeedTotal: query.NeedTotal,
-		Paging: interfaces.ResourceDataPagingRequest{
-			Mode:   pagingMode,
-			Limit:  query.Limit,
-			Offset: query.Offset,
-		},
-		Sort:            resourceSort,
-		SearchAfter:     query.SearchAfter,
-		FilterCondition: logics.CondCfgToFilterMap(viewQuery.Filters),
-		OutputFields:    outputFields,
+		IgnoreLocalIndex: &query.IgnoreLocalIndex,
+		NeedTotal:        query.NeedTotal,
+		Sort:             resourceSort,
+		SearchAfter:      query.SearchAfter,
+		FilterCondition:  logics.CondCfgToFilterMap(viewQuery.Filters),
+		OutputFields:     outputFields,
 	}
-	if query.ResourceCursor != "" {
-		params = &interfaces.ResourceDataQueryParams{
-			Paging: interfaces.ResourceDataPagingRequest{Cursor: query.ResourceCursor},
-		}
-	}
-	resp, err := ots.vba.QueryResourceData(ctx, objectType.DataSource.ID, params)
-	// Object-type bindings identify a Vega resource by ID but do not carry its
-	// category. Cursor paging is unavailable for some categories. Retry only an
-	// initial cursor request rejected as unsupported, retaining the historical
-	// single-page behavior for those resources. A continuation is never retried:
-	// it can only exist for a category that already accepted cursor paging.
-	if err != nil && query.ResourceCursor == "" && isCursorPagingUnsupported(err) {
-		singlePageParams := *params
-		singlePageParams.Paging = interfaces.ResourceDataPagingRequest{
-			Mode:   interfaces.ResourceDataPagingModeSingle,
-			Limit:  query.Limit,
-			Offset: query.Offset,
-		}
-		resp, err = ots.vba.QueryResourceData(ctx, objectType.DataSource.ID, &singlePageParams)
-	}
+	resp, nextOffset, err := ots.queryResourcePage(ctx, objectType.DataSource.ID, query, params, stable)
 	if err != nil {
 		// When downstream identifies a caller-side issue (4xx), pass through the original status code and carry its reason upward.
 		// Upgrading everything to 500 makes self-correctable problems such as unsupported operators or resources without built indexes look
@@ -627,7 +611,10 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 	for _, col := range resp.Entries {
 		rawObject := map[string]any{}
 		for k, v := range col {
-			if propName, exists := fieldPropMap[k]; exists {
+			if k == interfaces.SORT_FIELD_SCORE {
+				// Score is query metadata; projectRow applies its visibility policy.
+				rawObject[k] = v
+			} else if propName, exists := fieldPropMap[k]; exists {
 				rawObject[propName] = v
 			}
 		}
@@ -641,7 +628,9 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 			logger.Warnf("resource row could not produce a sanitized object for object type [%s/%s]", query.KNID, objectType.OTID)
 		}
 	}
+	resps.QuerySource = resp.QuerySource
 	resps.TotalCount = resp.TotalCount
+	resps.ResourceNextOffset = nextOffset
 	if resp.Paging != nil {
 		if resp.Paging.NextCursor != nil {
 			resps.ResourceCursor = *resp.Paging.NextCursor
@@ -652,6 +641,97 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 	}
 	resps.Datas = objects
 	return nil
+}
+
+// vegaIndexResultWindow is Vega's bound on offset+limit for index-backed reads.
+const vegaIndexResultWindow = 10000
+
+// queryResourcePage reads one page and returns the stateless next-row offset,
+// if any.
+//
+// A first page never opens a Vega cursor session. Sessions are held until the
+// final page or expiry and share one global limit, so one-shot callers (such as
+// MCP tool calls) that never continue would exhaust it and every later cursor
+// request would be rejected with 429. The session is opened only when a caller
+// actually asks for the next page, where search_after keeps deep index paging
+// beyond the offset window working.
+func (ots *objectTypeService) queryResourcePage(ctx context.Context, resourceID string,
+	query *interfaces.ObjectQueryBaseOnObjectType, params *interfaces.ResourceDataQueryParams,
+	stable bool) (*interfaces.DatasetQueryResponse, int, error) {
+	if query.ResourceCursor != "" {
+		resp, err := ots.vba.QueryResourceData(ctx, resourceID, &interfaces.ResourceDataQueryParams{
+			Paging: interfaces.ResourceDataPagingRequest{Cursor: query.ResourceCursor},
+		})
+		return resp, 0, err
+	}
+	if query.ResourceOffset <= 0 {
+		return ots.querySingleResourcePage(ctx, resourceID, query, params, query.Offset, stable)
+	}
+
+	// Past Vega's index window the page cannot be addressed by offset. Reopen
+	// the cursor at the first page's offset and continue past it, which yields
+	// the same rows the first page's session would have.
+	replay := query.ResourceOffset+query.Limit > vegaIndexResultWindow
+	start := query.ResourceOffset
+	if replay {
+		start = query.Offset
+	}
+	cursorParams := *params
+	cursorParams.Paging = interfaces.ResourceDataPagingRequest{
+		Mode:         interfaces.ResourceDataPagingModeCursor,
+		Limit:        query.Limit,
+		Offset:       start,
+		KeepAliveSec: int(queryCursorTTL / time.Second),
+	}
+	resp, err := ots.vba.QueryResourceData(ctx, resourceID, &cursorParams)
+	// Object-type bindings identify a Vega resource by ID but do not carry its
+	// category, and cursor paging is unavailable for some categories. Those
+	// keep paging by offset without any Vega state.
+	if err != nil && isCursorPagingUnsupported(err) {
+		return ots.querySingleResourcePage(ctx, resourceID, query, params, query.ResourceOffset, stable)
+	}
+	if err != nil || !replay || resp == nil {
+		return resp, 0, err
+	}
+	if resp.Paging == nil || resp.Paging.NextCursor == nil {
+		// The data shrank below the requested offset since the first page.
+		return &interfaces.DatasetQueryResponse{TotalCount: resp.TotalCount, QuerySource: resp.QuerySource,
+			Paging: &interfaces.ResourceDataPagingResponse{}}, 0, nil
+	}
+	resp, err = ots.vba.QueryResourceData(ctx, resourceID, &interfaces.ResourceDataQueryParams{
+		Paging: interfaces.ResourceDataPagingRequest{Cursor: *resp.Paging.NextCursor},
+	})
+	return resp, 0, err
+}
+
+func (ots *objectTypeService) querySingleResourcePage(ctx context.Context, resourceID string,
+	query *interfaces.ObjectQueryBaseOnObjectType, params *interfaces.ResourceDataQueryParams,
+	offset int, stable bool) (*interfaces.DatasetQueryResponse, int, error) {
+	singleParams := *params
+	singleParams.Paging = interfaces.ResourceDataPagingRequest{
+		Mode:   interfaces.ResourceDataPagingModeSingle,
+		Limit:  query.Limit,
+		Offset: offset,
+	}
+	resp, err := ots.vba.QueryResourceData(ctx, resourceID, &singleParams)
+	if err != nil || resp == nil || !stable {
+		return resp, 0, err
+	}
+	return resp, nextResourceOffset(offset, query.Limit, query.NeedTotal, resp), nil
+}
+
+// nextResourceOffset reports whether a single page may have a successor. A full
+// page is treated as having one unless the total proves otherwise, so the last
+// continuation can be empty; that costs one read and holds no state.
+func nextResourceOffset(offset, limit int, needTotal bool, resp *interfaces.DatasetQueryResponse) int {
+	if limit <= 0 || len(resp.Entries) < limit {
+		return 0
+	}
+	next := offset + len(resp.Entries)
+	if needTotal && int64(next) >= resp.TotalCount {
+		return 0
+	}
+	return next
 }
 
 func isCursorPagingUnsupported(err error) bool {
@@ -693,140 +773,6 @@ func appendResourceSortTieBreakers(sorts []*interfaces.SortParams, objectType in
 		present[mappedField] = struct{}{}
 	}
 	return result, true
-}
-
-// getObjectsFromObjectIndex retrieves object data from the object-type index.
-func (ots *objectTypeService) getObjectsFromObjectIndex(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
-	objectType interfaces.ObjectType, resps *interfaces.Objects, indexPropMap map[string]string,
-	plan *propertyAccessPlan) error {
-
-	objects := []map[string]any{}
-
-	// Build the DSL filter condition.
-	conditionDslStr := "{}"
-	if query.ActualCondition != nil {
-		condtion, err := cond.NewCondition(ctx, query.ActualCondition, 1, logics.TransferPropsToPropMap(objectType.DataProperties))
-		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest,
-				oerrors.OntologyQuery_InvalidParameter_Condition).
-				WithErrorDetails(locale.ValidationDetail(ctx, "QueryConditionInvalid", map[string]any{"error": err.Error()}))
-		}
-
-		// Convert the condition to DSL.
-		conditionDslStr, err = condtion.Convert(ctx, logics.MemoizeVectorizer(
-			func(ctx context.Context, property *cond.DataProperty, word string) ([]cond.VectorResp, error) {
-				return ots.handlerVector(ctx, property, word)
-			}))
-		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest,
-				oerrors.OntologyQuery_InvalidParameter_Condition).
-				WithErrorDetails(locale.ValidationDetail(ctx, "ConditionToDSLFailed", map[string]any{"error": err.Error()}))
-		}
-
-	}
-
-	dsl, err := logics.BuildDslQuery(ctx, conditionDslStr, query)
-	if err != nil {
-		return err
-	}
-	sourceFields := make([]string, 0, len(indexPropMap))
-	for field := range indexPropMap {
-		sourceFields = append(sourceFields, field)
-	}
-	sort.Strings(sourceFields)
-	dsl["_source"] = sourceFields
-	// Query OpenSearch.
-	osHits, err := ots.osa.SearchData(ctx, objectType.Status.Index, dsl)
-	if err != nil {
-		logger.Errorf("OpenSearch object query failed for index [%s]", objectType.Status.Index)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
-			oerrors.OntologyQuery_InternalError_SearchDataFromOpensearchFailed).
-			WithErrorDetails("OpenSearch object query failed")
-	}
-
-	// Decide whether to query the total based on NeedTotal.
-	if query.NeedTotal {
-		total, err := ots.GetTotal(ctx, objectType.Status.Index, dsl)
-		if err != nil {
-			return err
-		}
-		resps.TotalCount = total
-	}
-
-	// Append each data row to the result.
-	for _, hit := range osHits {
-		// One row is one object.
-		rawObject := map[string]any{}
-		for k, v := range hit.Source {
-			// k is the view field name, and v is this field's value.
-			if propName, exists := indexPropMap[k]; exists {
-				// Set the field only when it belongs to requested properties.
-				// If a mapping exists, assemble it into object properties.
-				rawObject[propName] = v
-			}
-		}
-		// Add the _score field.
-		rawObject[interfaces.SORT_FIELD_SCORE] = hit.Score
-		if err := ots.addLogicProperties(ctx, rawObject, objectType, plan); err != nil {
-			return err
-		}
-		object := plan.projectRow(rawObject, &objectType, query)
-
-		if len(object) > 0 {
-			objects = append(objects, object)
-		} else {
-			logger.Warnf("OpenSearch row could not produce a sanitized object for object type [%s/%s]", query.KNID, objectType.OTID)
-		}
-	}
-
-	var searchAfter []any
-	if len(osHits) > 0 {
-		searchAfter = osHits[len(osHits)-1].Sort
-	} else {
-		searchAfter = nil
-	}
-	resps.SearchAfter = searchAfter
-
-	resps.Datas = objects
-
-	return nil
-}
-
-func (ots *objectTypeService) GetTotal(ctx context.Context, index string, dsl map[string]any) (total int64, err error) {
-	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "logic layer: search object type total ")
-	defer span.End()
-
-	// delete(dsl, "pit")
-	delete(dsl, "from")
-	delete(dsl, "size")
-	delete(dsl, "sort")
-	delete(dsl, "track_scores")
-	totalBytes, err := ots.osa.Count(ctx, index, dsl)
-	if err != nil {
-		otellog.LogError(ctx, "Search total documents count failed", err)
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError).
-			WithErrorDetails(err.Error())
-		return total, httpErr
-	}
-
-	totalNode, err := sonic.Get(totalBytes, "count")
-	if err != nil {
-		otellog.LogError(ctx, "Get total documents count failed", err)
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError).
-			WithErrorDetails(err.Error())
-		return total, httpErr
-	}
-
-	total, err = totalNode.Int64()
-	if err != nil {
-		otellog.LogError(ctx, "Convert total documents count to type int64 failed", err)
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError).
-			WithErrorDetails(err.Error())
-		return total, httpErr
-	}
-
-	span.SetStatus(codes.Ok, "")
-	return total, nil
 }
 
 // Vectorize the query statement.
@@ -1009,15 +955,19 @@ func (ots *objectTypeService) handleMetricProperty(ctx context.Context,
 	dynamicParams map[string]map[string]any) (interfaces.MetricData, error) {
 
 	var (
-		start     int64
-		end       int64
+		// start and end stay nil unless the caller asks for a time range.
+		// They used to default to the last thirty minutes, which made every
+		// call look like a time-filtered one: a metric without a
+		// time_dimension was then refused for a filter nobody had asked for,
+		// and a metric with one silently answered for half an hour instead of
+		// its own default_range_policy.
+		start     *int64
+		end       *int64
 		isInstant bool
 		step      string
 	)
 
 	metricValue := propValue.(interfaces.MetricProperty)
-	start = time.Now().Add(-30 * time.Minute).UnixMilli()
-	end = time.Now().UnixMilli()
 	isInstant = true
 
 	var metricParams interfaces.MetricPropertyDynamicParams
@@ -1037,15 +987,7 @@ func (ots *objectTypeService) handleMetricProperty(ctx context.Context,
 			}))
 	}
 
-	if metricParams.Start != nil {
-		start = *metricParams.Start
-	}
-	if metricParams.End != nil {
-		end = *metricParams.End
-		if metricParams.Start == nil {
-			start = end - 30*time.Minute.Milliseconds()
-		}
-	}
+	start, end = logicMetricTimeWindow(metricParams, time.Now().UnixMilli())
 	if metricParams.Instant != nil {
 		isInstant = *metricParams.Instant
 	}

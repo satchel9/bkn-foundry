@@ -29,7 +29,7 @@
     "group": "query",
     "group_title": "实例查询",
     "order": 205,
-    "description": "用一句自然语言直接召回实例，不需要先知道对象类和字段名。先按 query 锁定相关对象类，再在这些对象类上做语义实例召回（向量 + 全文两路并发，按名次融合），返回实例行**以及读懂它们所需的对象类精简定义**（只含真正出了实例的那几个），因此单次调用就够用，不必再回头查 Schema。适合「这句话说的是哪几条数据」这类取数起点；只想了解网络里有哪些结构、不取数时用 search_schema，已经知道对象类和过滤条件时用 query_object_instance。只有 condition_operations 含 match / knn 的属性参与召回，因此没建索引的对象类不会出实例。默认按名次融合排序；传 rerank=true 可让 cross-encoder 逐条判断相关性并重排，能分辨「欠款」与「还款」这类融合分不出的语义差异，代价是多一次模型调用。"
+    "description": "用一句自然语言直接召回实例，不需要先知道对象类和字段名。先按 query 锁定相关对象类，再在这些对象类上做语义实例召回（向量 + 全文两路并发，按名次融合），返回实例行**以及读懂它们所需的对象类精简定义**（只含真正出了实例的那几个），因此单次调用就够用，不必再回头查 Schema。适合「这句话说的是哪几条数据」这类取数起点；只想了解网络里有哪些结构、不取数时用 search_schema，已经知道对象类和过滤条件时用 query_object_instance。只有建了索引的属性参与召回（属性 indexed=true 且对象类的 index_operations 含 match / knn，或属性自带的 condition_operations 含它们），因此没建索引的对象类不会出实例。默认按名次融合排序；传 rerank=true 可让 cross-encoder 逐条判断相关性并重排，能分辨「欠款」与「还款」这类融合分不出的语义差异，代价是多一次模型调用。"
   },
   "query_object_instance": {
     "name": "query_object_instance",
@@ -37,7 +37,7 @@
     "group": "query",
     "group_title": "实例查询",
     "order": 210,
-    "description": "单对象类实例过滤查询。已知对象类与过滤条件时，查询实例列表。支持 cursor 顺序翻页（用上一页返回的不透明 cursor 取下一页，不支持跳页）。 文本检索按字段能力选算子：condition_operations 含 match 的字段可做全文模糊匹配，含 knn 的字段可做向量语义检索（自然语言、跨语言、换个说法都能召回，需配 limit_key=k + limit_value）；两者都要就用 or 把子条件并起来。"
+    "description": "单对象类实例过滤查询。已知对象类与过滤条件时，查询实例列表。支持 cursor 顺序翻页（用上一页返回的不透明 cursor 取下一页，不支持跳页）。 文本检索按字段能力选算子（能力看属性的 condition_operations，或 indexed=true 时看对象类的 index_operations）：含 match 的字段可做全文模糊匹配，含 knn 的字段可做向量语义检索（自然语言、跨语言、换个说法都能召回，需配 limit_key=k + limit_value）；两者都要就用 or 把子条件并起来。\n\n权限申请链接：结果或报错里有 permission_guidance 时，即使同时返回了业务数据，最终回答也必须展示 message 和其中每个可用的 request_permission_url，不能只展示业务数据；链接原样使用，不要改写。没有时自行拼接：字段档位四档——none 不可见、schema 只见字段名、masked 为脱敏值、full 为原值；被 403 拒绝用 requestPermission=1&operations=query_data；effective_permissions 里有 schema 或 masked 字段用 requestPermission=3&properties=<这些字段名，英文逗号分隔>；需要扩大行访问范围用 requestPermission=2。链接格式：/studio/knowledge-network/workspace/<kn_id>/object-types/<ot_id>/detail?requestPermission=<1|2|3>[&operations=…|&properties=…]&reason=<URL 编码的申请原因>&source=agent。只带与该类别对应的参数，不要编造域名；空结果或空值本身不代表权限不足。"
   },
   "query_instance_subgraph": {
     "name": "query_instance_subgraph",
@@ -183,7 +183,7 @@
     "group": "query",
     "group_title": "实例查询",
     "order": 250,
-    "description": "按已建模指标的口径取数（OT-first 路径第 3 步）。先 search_schema / get_kn_detail 锁定对象类，再 get_object_types 从 related_metrics 里选定 metric_id，最后调本工具计算——口径写在 MetricDefinition 里，别用 run_sql 自己重写。分流：实例级且已绑逻辑属性的走 get_logic_properties_values；类级、或未绑逻辑属性的走本工具。可选 condition 过滤、analysis_dimensions 拆维、time 取单点或序列。时间窗规则：省略 instant 等同于序列查询，必须给 step；start 与 end 要么都给要么都不给。"
+    "description": "按已建模指标的口径取数（OT-first 路径第 3 步）。先 search_schema / get_kn_detail 锁定对象类，再 get_object_types 从 related_metrics 里选定 metric_id，最后调本工具计算——口径写在 MetricDefinition 里，别自己重写。分流：实例级且已绑逻辑属性的走 get_logic_properties_values；类级、或未绑逻辑属性的走本工具。可选 condition 过滤、analysis_dimensions 拆维、time 取单点或序列。时间窗规则：省略 instant 等同于序列查询，必须给 step；start 与 end 要么都给要么都不给。"
   },
   "get_action_info": {
     "name": "get_action_info",
@@ -256,7 +256,7 @@
     "group": "action",
     "group_title": "行动",
     "order": 330,
-    "description": "查询单次行动执行的状态与结果。用 execute_action 返回的 execution_id 查询整体 status 与逐对象 results。",
+    "description": "查询单次行动执行的状态与结果。用 execute_action 返回的 execution_id 查询整体 status 与逐条 results；通过 results_total、results_offset 与本页条数判断是否还需翻页。传分页参数后每页默认 100 条、最多 1000 条；最多可翻到第 10000 条。",
     "gateway": {
       "summary": "按执行 ID 查看一次行动执行的状态和逐对象结果。",
       "use_when": "已经有执行 ID，想知道它成功了没有、每个对象的结果是什么。",
@@ -325,7 +325,7 @@
     "group": "discovery",
     "group_title": "网络与 Schema",
     "order": 120,
-    "description": "获取知识网络 schema（概念组、对象类型含 data_source.id、关系类型、行动类型）。**概念组带 name/tags/comment，是收敛检索范围的入口：先据此选出 1-3 个相关分组，再传给 search_schema 的 search_scope.concept_groups。**默认 detail_level=summary：返回骨架 + 每个属性仅 name+type（不含 display_name/comment/字段映射/查询算子/映射规则）——足够理解结构与规划查询，体积小。需要某对象的完整字段映射（含 comment）时调 get_object_types，需要关系的 mapping_rules 时调 get_relation_types。detail_level=full 一次拿全量（体积大，慎用）。对象类条目附带 related_metric_count（该对象类下已建模指标数），用来判断是否值得下钻取指标。**顶层附带 mounted_capabilities**：该网络已挂载的能力按类型计数（skill / function / mcp_tool，function 含 API 工具）。它只回答「有没有、有多少」——要具体能力用 search_capabilities，那里带名称、说明与调用所需的 input_schema。该字段缺席表示这次没读到绑定或无权读该网络，不等于没挂。**它数的是挂载,不是你能调用的数量**:某个工具箱你看不到时，search_capabilities 会少返回几条，两个数字对不上是正常的。"
+    "description": "获取知识网络 schema（概念组、对象类型含 data_source.id、关系类型、行动类型）。**概念组带 name/tags/comment，是收敛检索范围的入口：先据此选出 1-3 个相关分组，再传给 search_schema 的 search_scope.concept_groups。**默认 detail_level=summary：返回骨架 + 每个属性仅 name+type（不含 display_name/comment/字段映射/查询算子/映射规则）——足够理解结构与规划查询，体积小。需要某对象的完整字段映射（含 comment）时调 get_object_types，需要关系的 mapping_rules 时调 get_relation_types。detail_level=full 一次拿全量（体积大，慎用）。对象类条目附带 related_metric_count（该对象类下已建模指标数），用来判断是否值得下钻取指标。**顶层附带 mounted_capabilities**：该网络已挂载的能力按类型计数（skill / function / mcp_tool，function 含 API 工具）。它只回答「有没有、有多少」——要具体能力用 search_capabilities，那里带名称、说明与调用所需的 input_schema。该字段缺席表示这次没读到绑定或无权读该网络，不等于没挂。**它数的是挂载,不是你能调用的数量**:某个工具箱你看不到时，search_capabilities 会少返回几条，两个数字对不上是正常的。**超过 200 个对象类、或超过 600 个关系类的知识网络只返回导航壳**：概念组清单 + object_type_count / relation_type_count / action_type_count 三个数量 + notice，三个概念数组回 null。这类网络的全量 schema 有一兆多，读不进上下文，也不该读——按 concept_groups 选簇再 search_schema 才是路径。detail_level=full 在这个规模下同样不返回数组。**该网络没划概念组时**，notice 改为让你直接调 search_schema 按语义召回。"
   },
   "get_object_types": {
     "name": "get_object_types",
@@ -333,11 +333,11 @@
     "group": "discovery",
     "group_title": "网络与 Schema",
     "order": 140,
-    "description": "按 id 批量取对象类的完整定义（data_properties 含 mapped_field/condition_operations，logic_properties 含 data_source/parameters），并返回该对象类下可用的指标 related_metrics（scope_type=object_type 且 scope_ref=对象类 id，含未绑逻辑属性的指标）。渐进式下钻用：先 get_kn_detail（summary）拿对象 id，再用本工具展开需要的对象。选定指标后：实例级且已绑逻辑属性走 get_logic_properties_values，类级或未绑的走 query_metric。ids 支持多个，一次取回；未匹配的 id 会在 missing 返回。",
+    "description": "按 id 批量取对象类的完整定义（data_properties 含 mapped_field/condition_operations，logic_properties 含 data_source/parameters），并返回该对象类下可用的指标 related_metrics（scope_type=object_type 且 scope_ref=对象类 id，含未绑逻辑属性的指标）。渐进式下钻用：先 get_kn_detail（summary）拿对象 id，再用本工具展开需要的对象。选定指标后：实例级且已绑逻辑属性走 get_logic_properties_values，类级或未绑的走 query_metric。ids 支持多个，一次取回；未匹配的 id 会在 missing 返回。**不传 ids 即按 offset/limit 列举该网络的对象类索引**（只有 id/name/comment/tags/data_source，不含字段与指标；默认 50 条，上限 200，响应带 total_count 与 next_offset）——get_kn_detail 对超限网络只回导航壳，那条路拿不到 id，这里是唯一的枚举入口；挑好再把 id 传回来取完整定义。",
     "gateway": {
       "summary": "按 ID 取对象类的完整定义：字段、可用的查询算子、逻辑属性和相关指标。",
-      "use_when": "要知道某个对象类有哪些字段、字段能怎么过滤，或它有哪些指标和逻辑属性。",
-      "not_for": "不知道对象类 ID 时先用 search_schema 或 get_kn_detail。",
+      "use_when": "要知道某个对象类有哪些字段、能怎么过滤，或想按页列举全网络的对象类。",
+      "not_for": "找「哪个对象类相关」用 search_schema；这里只按 ID 取或按页列举。",
       "next_step": "查实例用 query_object_instance；相关指标用 query_metric。",
       "keywords": [
         "对象类",
@@ -433,7 +433,7 @@
     "group": "query",
     "group_title": "实例查询",
     "order": 245,
-    "description": "按知识网络的**模型**提问：用对象类名与关系类名写 Cypher，服务端编译成一条只读 SQL 执行。与 run_sql 的分工——本工具走模型（标签=对象类、关系=已建模的关联、属性=逻辑属性名），不需要知道物理表名与物理列名；run_sql 留给模型表达不了的口径。\n支持的写法：MATCH 一个或多个路径（可用逗号分隔，也可写多个 MATCH；同名变量指同一个节点，不共享变量则是笛卡尔积）；关系写 -[:R]->、<-[:R]- 或无向 -[:R]-，必须指名一个关系类；节点必须指名一个对象类，首次出现要带标签，可带内联属性 {prop: value}；WHERE 支持 =、<>、<、>、<=、>=、IN [...]（或 IN $list：整个列表作为一个参数传入，须为非空、同类标量数组，最多 500 个元素）、IS NULL / IS NOT NULL、STARTS WITH / ENDS WITH / CONTAINS（右侧为字符串字面量或字符串参数，按字面子串匹配，% 和 _ 不是通配符；只能用于字符串属性，大小写是否敏感取决于数据源的排序规则），用 AND / OR / NOT 组合，括号分组；值可写字面量或参数 $name（参数在 parameters 里传，只能是值，不能当表名列名）；RETURN 支持属性、别名 AS、DISTINCT，以及聚合 count/sum/avg/min/max（含 count(*) 与 DISTINCT 形式）——Cypher 没有 GROUP BY，聚合时按 RETURN 里其余列自动分组；ORDER BY 可用属性、返回列名或聚合；SKIP / LIMIT 分页。\n不支持（会以 400 明确报出用了哪个构造）：OPTIONAL MATCH、WITH、UNION、变长路径 [:R*1..3]、XOR、返回整个节点 RETURN n、函数调用与算术表达式、关系变量 -[r:R]->。一条查询最多 8 条关系、9 个节点；不写 LIMIT 默认 1000 行，LIMIT 上限 10000。被聚合或 DISTINCT 折叠过的结果只能按返回的值排序。",
+    "description": "按知识网络的**模型**提问：用对象类名与关系类名写 Cypher，服务端编译成一条只读 SQL 执行。本工具走模型（标签=对象类、关系=已建模的关联、属性=逻辑属性名），不需要知道物理表名与物理列名。\n支持的写法：MATCH 一个或多个路径（可用逗号分隔，也可写多个 MATCH；同名变量指同一个节点，不共享变量则是笛卡尔积）；关系写 -[:R]->、<-[:R]- 或无向 -[:R]-，必须指名一个关系类；节点必须指名一个对象类，首次出现要带标签，可带内联属性 {prop: value}；WHERE 支持 =、<>、<、>、<=、>=、IN [...]（或 IN $list：整个列表作为一个参数传入，须为非空、同类标量数组，最多 500 个元素）、IS NULL / IS NOT NULL、STARTS WITH / ENDS WITH / CONTAINS（右侧为字符串字面量或字符串参数，按字面子串匹配，% 和 _ 不是通配符；只能用于字符串属性，大小写是否敏感取决于数据源的排序规则），用 AND / OR / NOT 组合，括号分组；值可写字面量或参数 $name（参数在 parameters 里传，只能是值，不能当表名列名）；RETURN 支持属性、别名 AS、DISTINCT，以及聚合 count/sum/avg/min/max（含 count(*) 与 DISTINCT 形式）——Cypher 没有 GROUP BY，聚合时按 RETURN 里其余列自动分组；RETURN 可做 + - * / % 算术，如 count(*) * 2、sum(o.price * o.qty)、count(o.x) * 1.0 / count(*)：操作数是数值属性、聚合、数字或数值参数；两个整数相除会被拒（Cypher 丢余数，各 SQL 库不一致），要小数结果把一边乘 1.0；% 只用于整数；WHERE 比较的两侧（如 o.amount * o.rate > $floor）和 ORDER BY（如 count(g.id) * 0.5 + p.rank * 0.3 DESC）也能写算术，聚合后排序键里聚合外读的属性须同时在 RETURN 返回，DISTINCT 结果要按算出来的值排序请用别名；ORDER BY 可用属性、返回列名或聚合；SKIP / LIMIT 分页。\nOPTIONAL MATCH 写一条关系，把一个新节点挂到前面子句已经找到的节点上：匹配不到时该行保留、新节点的列为 NULL，所以 count(可选侧的属性) 得 0 而不是整行消失（count(*) 仍然算 1 行）。它自带的 WHERE 与内联属性决定这条关系匹配到什么，不决定哪些行留下。首个子句必须是 MATCH；一条 OPTIONAL MATCH 只能写一条关系、只能引入一个新节点；它引入的节点不能被后面的 MATCH 或查询的 WHERE 再要求（那会把留下来的行又删掉）。\n不支持（会以 400 明确报出用了哪个构造）：WITH、UNION、变长路径 [:R*1..3]、XOR、返回整个节点 RETURN n、函数调用、乘方 ^、关系变量 -[r:R]->。一条查询最多 8 条关系、9 个节点；不写 LIMIT 默认 1000 行，LIMIT 上限 10000。被聚合或 DISTINCT 折叠过的结果只能按返回的值排序。",
     "gateway": {
       "summary": "用对象类和关系类的名字写只读 Cypher，服务端编译成一条 SQL；适合跨对象的多跳查询与聚合统计。",
       "use_when": "统计、排名、跨关系汇总（count/sum/avg/min/max），或路径上带过滤的多跳查询。",
@@ -628,14 +628,56 @@
     "title": "运行代码",
     "group": "execution",
     "group_title": "代码执行",
-    "order": 610
+    "order": 610,
+    "gateway": {
+      "summary": "在沙箱里跑一段 Python，代码里可以直接调用本服务的工具；适合把多次查询的结果在本地汇总、转换或批量处理。",
+      "use_when": "一次问题要串起多次查询再算，或需要循环、分页遍历、临时脚本这类本地计算。",
+      "not_for": "单次取数用对应的查询工具；可售、齐套、产能这类业务口径用已发布函数（search_capabilities）。",
+      "next_step": "代码里按工具名调用本服务的工具；run_code 与 run_shell 共用一个按会话隔离的工作目录。",
+      "keywords": [
+        "跑代码",
+        "运行代码",
+        "Python",
+        "脚本",
+        "批量",
+        "本地计算",
+        "循环",
+        "run code",
+        "python",
+        "script",
+        "sandbox"
+      ],
+      "example_arguments": {
+        "code": "print(1 + 1)"
+      }
+    }
   },
   "run_shell": {
     "name": "run_shell",
     "title": "运行命令",
     "group": "execution",
     "group_title": "代码执行",
-    "order": 620
+    "order": 620,
+    "gateway": {
+      "summary": "在沙箱里执行一条 shell 命令，返回 stdout 与 stderr；用来看环境和 run_code 落盘的文件。",
+      "use_when": "查看沙箱里的文件、目录或环境，通常是核对 run_code 写出来的结果。",
+      "not_for": "取知识网络的数据不要用它，对象类、实例、SQL 都有各自的工具。",
+      "next_step": "命令交给 sh -c 执行，工作目录与 run_code 相同。",
+      "keywords": [
+        "shell",
+        "命令",
+        "执行命令",
+        "查看文件",
+        "目录",
+        "沙箱",
+        "run shell",
+        "command",
+        "ls"
+      ],
+      "example_arguments": {
+        "command": "ls -la"
+      }
+    }
   },
   "search_capabilities": {
     "name": "search_capabilities",
@@ -713,7 +755,7 @@
     "group": "gateway",
     "group_title": "按需查询",
     "order": 710,
-    "description": "在本入口按需提供的工具中，按要做的事查找合适的工具，返回最多 5 个候选：名称、用途、适用与不适用的场景、下一步和参数签名。范围覆盖本入口没有直接公布的全部能力，包括统计查询、行动、技能和查找挂载函数的工具。候选不能按名称直接调用：先用 describe_native_tool 取参数 schema，再经执行器执行；已知名称和参数时可以直接执行。本入口直接公布的工具不在搜索范围内。"
+    "description": "在本入口按需提供的工具中，按要做的事查找合适的工具，返回最多 5 个候选：名称、用途、适用与不适用的场景、下一步和参数签名。范围覆盖本入口没有直接公布的全部能力，包括统计查询、行动、技能和查找挂载函数的工具。候选不能按名称直接调用，要经执行器执行。结果里带 ready 时，它就是最佳候选的可执行参数 schema 与调用模板，直接照它调 execute_native_tool，不必再调 describe_native_tool；没有 ready（多个候选打平，或该工具 schema 太大）才去 describe_native_tool 取。本入口直接公布的工具不在搜索范围内。"
   },
   "describe_native_tool": {
     "name": "describe_native_tool",

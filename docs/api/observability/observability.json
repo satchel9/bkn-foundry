@@ -73,6 +73,15 @@
             }
           },
           {
+            "name": "source_id",
+            "in": "query",
+            "description": "Filters records by their registered source identifier across all selected sources.",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
             "name": "categories",
             "in": "query",
             "schema": {
@@ -186,12 +195,11 @@
           {
             "name": "page",
             "in": "query",
-            "description": "One-based page number. The server uses a controlled cursor to keep each page's query range stable.",
+            "description": "One-based page number. A single audit-ledger source supports direct page jumps. Cursor-only or mixed sources retain pages 1–100 within one shared source timeout; deeper jumps return pagination_not_supported. A supplied cursor takes precedence over page.",
             "schema": {
               "type": "integer",
               "default": 1,
-              "minimum": 1,
-              "maximum": 100
+              "minimum": 1
             }
           },
           {
@@ -200,7 +208,18 @@
             "schema": {
               "type": "integer",
               "default": 50,
-              "minimum": 1,
+              "minimum": 20,
+              "maximum": 200
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Alias for page_size. If both are present, page_size takes precedence; both supplied values must be valid.",
+            "schema": {
+              "type": "integer",
+              "default": 50,
+              "minimum": 20,
               "maximum": 200
             }
           }
@@ -620,7 +639,6 @@
           "access.user",
           "audit.admin",
           "audit.security",
-          "runtime.system",
           "runtime.business",
           "runtime.model"
         ]
@@ -636,7 +654,6 @@
       "RuntimeLogCategory": {
         "type": "string",
         "enum": [
-          "runtime.system",
           "runtime.business",
           "runtime.model"
         ]
@@ -689,9 +706,7 @@
           "outcome",
           "safe_summary",
           "service_name",
-          "deployment_environment",
-          "ingress_principal",
-          "trust_level"
+          "deployment_environment"
         ],
         "properties": {
           "schema_version": {
@@ -749,14 +764,6 @@
           },
           "application_id": {
             "type": "string"
-          },
-          "ingress_principal": {
-            "type": "string"
-          },
-          "trust_level": {
-            "type": "string",
-            "description": "This OpenAPI describes only the ordinary authorized query projection; quarantined records have no query endpoint.",
-            "const": "trusted"
           },
           "request_id": {
             "type": "string"
@@ -1185,40 +1192,6 @@
           },
           {
             "if": {
-              "properties": {
-                "log_category": {
-                  "const": "runtime.system"
-                }
-              },
-              "required": [
-                "log_category"
-              ]
-            },
-            "then": {
-              "properties": {
-                "attributes": {
-                  "propertyNames": {
-                    "enum": [
-                      "error_code",
-                      "dependency_name",
-                      "url",
-                      "exception_type",
-                      "exception_message",
-                      "dropped_count",
-                      "drop_reason",
-                      "task_id",
-                      "causation_request_id",
-                      "linked_trace_id",
-                      "linked_span_id",
-                      "sandbox_action"
-                    ]
-                  }
-                }
-              }
-            }
-          },
-          {
-            "if": {
               "required": [
                 "span_id"
               ]
@@ -1457,6 +1430,10 @@
           "reason": {
             "type": "string"
           },
+          "required_action": {
+            "type": "string",
+            "description": "Deployment action required to configure this source. A disabled audit-ledger reports status=not_integrated and reason=audit_consumer_not_configured."
+          },
           "reliability": {
             "$ref": "#/components/schemas/Reliability"
           },
@@ -1486,6 +1463,7 @@
               "direct_otlp",
               "container_stdout",
               "source_adapter",
+              "kafka_audit",
               "not_integrated"
             ]
           },
@@ -1501,6 +1479,14 @@
               "null"
             ],
             "minimum": 0
+          },
+          "dropped_records_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Start of the observed dropped-record counter window."
           },
           "sampling_rate": {
             "type": [
@@ -1527,6 +1513,58 @@
             ]
           }
         },
+        "dependentRequired": {
+          "dropped_records": [
+            "dropped_records_since"
+          ],
+          "dropped_records_since": [
+            "dropped_records"
+          ]
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "collection_method": {
+                  "const": "kafka_audit"
+                }
+              },
+              "required": [
+                "collection_method"
+              ]
+            },
+            "then": {
+              "required": [
+                "dropped_records",
+                "dropped_records_since"
+              ],
+              "oneOf": [
+                {
+                  "properties": {
+                    "dropped_records": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "dropped_records_since": {
+                      "type": "string",
+                      "format": "date-time"
+                    }
+                  }
+                },
+                {
+                  "properties": {
+                    "dropped_records": {
+                      "type": "null"
+                    },
+                    "dropped_records_since": {
+                      "type": "null"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ],
         "additionalProperties": false
       },
       "Count": {
@@ -1587,7 +1625,7 @@
             "required": ["page", "page_size"],
             "properties": {
               "page": { "type": "integer", "minimum": 1 },
-              "page_size": { "type": "integer", "minimum": 1, "maximum": 200 }
+              "page_size": { "type": "integer", "minimum": 20, "maximum": 200 }
             },
             "additionalProperties": false
           },
@@ -1838,7 +1876,7 @@
     },
     "responses": {
       "BadRequest": {
-        "description": "invalid_log_filter or cursor_invalid.",
+        "description": "invalid_log_filter, cursor_invalid, or pagination_not_supported (numbered jumps beyond page 100 for cursor-only or mixed sources).",
         "content": {
           "application/json": {
             "schema": {
@@ -1878,7 +1916,7 @@
         }
       },
       "SourcesUnavailable": {
-        "description": "All authorized sources failed; code=sources_unavailable.",
+        "description": "All authorized sources failed: code=sources_unavailable, retryable=true. If the only authorized source is an unconfigured audit-ledger: code=audit_consumer_not_configured, retryable=false, with required_action describing Helm configuration. Mixed queries retain available records, report the audit configuration gap in source_status, and mark results partial.",
         "content": {
           "application/json": {
             "schema": {

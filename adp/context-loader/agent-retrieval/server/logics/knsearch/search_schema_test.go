@@ -25,6 +25,11 @@ type stubSearchSchemaBknBackend struct {
 	searchMetricCalls     int
 }
 
+// Present so the stub still satisfies the interface; search_schema never lists.
+func (s *stubSearchSchemaBknBackend) ListObjectTypes(context.Context, string, int, int) (*interfaces.ObjectTypePage, error) {
+	return &interfaces.ObjectTypePage{}, nil
+}
+
 func (s *stubSearchSchemaBknBackend) GetKnowledgeNetworkDetail(_ context.Context, _ string) (*interfaces.KnowledgeNetworkDetail, error) {
 	return nil, nil
 }
@@ -719,4 +724,18 @@ func TestSearchSchema_AllScopeDisabled_ReturnsBadRequest(t *testing.T) {
 			t.Fatal("expected error when all concept types are disabled")
 		}
 	})
+}
+
+// See TestNormalizeSearchInstanceReqPrefersTheArgumentOverTheHeader: both
+// search paths read the header first, and nothing else on the service did.
+func TestNormalizeSearchSchemaReqPrefersTheArgumentOverTheHeader(t *testing.T) {
+	knReq, _, err := NormalizeSearchSchemaReq(&interfaces.SearchSchemaReq{
+		Query: "q", KnID: "kn-argument", XKnID: "kn-header",
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if knReq.KnID != "kn-argument" {
+		t.Errorf("kn id = %q, want the argument", knReq.KnID)
+	}
 }

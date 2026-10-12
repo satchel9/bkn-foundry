@@ -36,6 +36,9 @@ data:
   {{- $bknBackend := $upstreams.bknBackend | default dict }}
   SAFE_BKN_BACKEND_BASE_URL: {{ $bknBackend.baseURL | default "http://bkn-backend-svc:13014" | quote }}
   SAFE_BKN_BACKEND_TIMEOUT: {{ $bknBackend.timeout | default "3s" | quote }}
+  {{- $bknAgent := $upstreams.bknAgent | default dict }}
+  SAFE_BKN_AGENT_BASE_URL: {{ $bknAgent.baseURL | default "http://bkn-agent:30800" | quote }}
+  SAFE_BKN_AGENT_TIMEOUT: {{ $bknAgent.timeout | default "3s" | quote }}
   {{- $executionFactory := $upstreams.executionFactory | default dict }}
   SAFE_EXECUTION_FACTORY_BASE_URL: {{ $executionFactory.baseURL | default "http://agent-operator-integration:9000" | quote }}
   SAFE_EXECUTION_FACTORY_TIMEOUT: {{ $executionFactory.timeout | default "3s" | quote }}
@@ -47,6 +50,8 @@ data:
   SAFE_ONTOLOGY_QUERY_TIMEOUT: {{ $ontologyQuery.timeout | default "3s" | quote }}
   SAFE_HYDRA_ADMIN_URL: {{ .Values.config.hydra.adminURL | quote }}
   SAFE_HYDRA_PUBLIC_URL: {{ .Values.config.hydra.publicURL | quote }}
+  SAFE_HYDRA_BROWSER_PUBLIC_URL: {{ include "bkn-safe.hydraBrowserPublicURL" . | quote }}
+  SAFE_OAUTH_STUDIO_BASELINE_REDIRECT_URIS: {{ include "bkn-safe.studioRedirectURIs" . | quote }}
   SAFE_LDAP_URL: {{ .Values.config.ldap.url | quote }}
   SAFE_LDAP_BIND_DN: {{ .Values.config.ldap.bindDN | quote }}
   {{- /* SAFE_LDAP_BIND_PASSWORD and BKN_SAFE_INITIAL_PASSWORD are NOT here —
@@ -56,18 +61,6 @@ data:
   SAFE_LICENSE_SERVER_URL: {{ .Values.config.license.serverURL | quote }}
   SAFE_LICENSE_CA_FILE: {{ .Values.config.license.caFile | quote }}
   SAFE_LICENSE_INSECURE_SKIP_VERIFY: {{ .Values.config.license.insecureSkipVerify | quote }}
-  {{- with .Values.config.audit }}
-  {{- /* No `default` here: it treats false and 0 as unset, and 0 is a documented
-         value for every one of these knobs (disable / keep all / record no
-         allows). Only a missing key falls back. */}}
-  SAFE_AUDIT_CHAIN_HEAD_LOG_INTERVAL: {{ if kindIs "invalid" .chainHeadLogInterval }}"15m"{{ else }}{{ .chainHeadLogInterval | toString | quote }}{{ end }}
-  {{- with .decisionLog }}
-  SAFE_AUTHZ_DECISION_LOG_ENABLED: {{ if kindIs "bool" .enabled }}{{ .enabled | toString | quote }}{{ else }}"true"{{ end }}
-  SAFE_AUTHZ_DECISION_LOG_ALLOW_SAMPLE_RATE: {{ if kindIs "invalid" .allowSampleRate }}"1"{{ else }}{{ .allowSampleRate | toString | quote }}{{ end }}
-  SAFE_AUTHZ_DECISION_LOG_QUEUE_SIZE: {{ if kindIs "invalid" .queueSize }}"4096"{{ else }}{{ .queueSize | toString | quote }}{{ end }}
-  SAFE_AUTHZ_DECISION_LOG_RETENTION_DAYS: {{ if kindIs "invalid" .retentionDays }}"90"{{ else }}{{ .retentionDays | toString | quote }}{{ end }}
-  {{- end }}
-  {{- end }}
   {{- /* OPENBKN_INSTANCE_ID is NOT here — the instance identity lives in its
          own ConfigMap (templates/instance-id.yaml) so that it survives
          `helm uninstall`. Both are pulled in via envFrom. */}}

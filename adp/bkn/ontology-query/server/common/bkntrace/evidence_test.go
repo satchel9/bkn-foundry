@@ -9,19 +9,19 @@ package bkntrace
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 	"go.opentelemetry.io/otel/trace"
 )
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+type captureEvidenceSender struct{ records []evidencepublisher.Record }
 
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+func (s *captureEvidenceSender) Send(_ context.Context, record evidencepublisher.Record) error {
+	s.records = append(s.records, record)
+	return nil
+}
 
 func testTraceContext() context.Context {
 	sc := trace.NewSpanContext(trace.SpanContextConfig{
@@ -34,8 +34,65 @@ func testTraceContext() context.Context {
 func testRequestContext() RequestContext {
 	return RequestContext{
 		RequestID: "req_ontology_data_0001", AccountID: "acct_demo", AccountType: "user",
+		ApplicationPrincipalID: "openbkn-sdk", EffectiveSubjectType: "user", EffectiveSubjectID: "acct_demo",
+		ConversationID: "conv_data_query_001", SessionScopePresent: true,
 		InteractionID: "int_data_query_001", OperationID: "op_data_query_001", CausationEventID: "evt_tool_called_001", Attempt: 1,
 		ObservedAt: "2026-07-25T08:00:00Z",
+	}
+}
+
+func TestDataQueryEvidenceCarriesOwnerAndOnlyTrustedCoreOperation(t *testing.T) {
+	req := testRequestContext()
+	event := BuildDataQueryEvents(testTraceContext(), req, DataQuerySubject{EntityKind: EntityKindObjectInstance, KNID: "kn_demo"}, nil)[0]
+	owner, ok := event["owner"].(map[string]any)
+	if !ok || owner["application_principal_id"] != "openbkn-sdk" || owner["effective_subject_id"] != "acct_demo" {
+		t.Fatalf("owner = %#v, want verified caller identity", event["owner"])
+	}
+	ec, _ := contextFromRequest(testTraceContext(), req)
+	core, err := toCoreEvent(event, ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if core.OperationID != "" {
+		t.Fatalf("core operation ID = %q, want omitted local ID", core.OperationID)
+	}
+	req.OperationScopePresent = true
+	req.CoreOperationID = "op_core_registered_001"
+	ec, _ = contextFromRequest(testTraceContext(), req)
+	core, err = toCoreEvent(event, ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if core.OperationID != req.CoreOperationID {
+		t.Fatalf("core operation ID = %q, want registered parent %q", core.OperationID, req.CoreOperationID)
+	}
+}
+
+func TestEmitDataQueryEventsDoesNotAdvertiseDroppedEvidence(t *testing.T) {
+	publisher, err := evidencepublisher.New(evidencepublisher.Config{ProducerID: "ontology-query", BaseStreamID: "ontology-query", WorkloadIdentity: "ontology-query", ProcessBootID: "boot-1", CapturePolicyRevision: "41"}, &captureEvidenceSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetEvidencePublisher(publisher)
+	t.Cleanup(func() { SetEvidencePublisher(nil); _ = publisher.Close(context.Background()) })
+	reqCtx := testRequestContext()
+	reqCtx.SessionScopePresent = false
+	if eventID := EmitDataQueryEvents(testTraceContext(), reqCtx, DataQuerySubject{EntityKind: EntityKindObjectInstance, KNID: "kn_demo"}, nil); eventID != "" {
+		t.Fatalf("event ID = %q, want empty without trusted session scope", eventID)
+	}
+}
+
+func TestEmitDataQueryEventsDoesNotAdvertiseMissingOwner(t *testing.T) {
+	publisher, err := evidencepublisher.New(evidencepublisher.Config{ProducerID: "ontology-query", BaseStreamID: "ontology-query", WorkloadIdentity: "ontology-query", ProcessBootID: "boot-owner", CapturePolicyRevision: "1"}, &captureEvidenceSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetEvidencePublisher(publisher)
+	t.Cleanup(func() { SetEvidencePublisher(nil); _ = publisher.Close(context.Background()) })
+	req := testRequestContext()
+	req.ApplicationPrincipalID = ""
+	if got := EmitDataQueryEvents(testTraceContext(), req, DataQuerySubject{EntityKind: EntityKindObjectInstance, KNID: "kn_demo"}, nil); got != "" {
+		t.Fatalf("event ID = %q, want empty without verified owner", got)
 	}
 }
 
@@ -47,37 +104,82 @@ func TestBuildDataQueryEventsRejectsMissingReplayEnvelope(t *testing.T) {
 	}
 }
 
-func TestPostBatchWithRetryRetriesNon2xx(t *testing.T) {
-	previous := evidenceHTTPClient
-	t.Cleanup(func() { evidenceHTTPClient = previous })
-	var calls atomic.Int32
-	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		status := http.StatusServiceUnavailable
-		if calls.Add(1) == 3 {
-			status = http.StatusNoContent
-		}
-		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
-	if err := postBatchWithRetry("http://trace.local", time.Second, batch{}); err != nil {
+func TestSubmitEventsMatchesCanonicalEvidenceFixture(t *testing.T) {
+	sender := &captureEvidenceSender{}
+	publisher, err := evidencepublisher.New(evidencepublisher.Config{
+		ProducerID: "ontology-query", BaseStreamID: "ontology-query", WorkloadIdentity: "ontology-query",
+		ProcessBootID: "boot-1", CapturePolicyRevision: "41",
+	}, sender)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 3 {
-		t.Fatalf("calls=%d, want 3", calls.Load())
+	SetEvidencePublisher(publisher)
+	t.Cleanup(func() {
+		SetEvidencePublisher(nil)
+		_ = publisher.Close(context.Background())
+	})
+
+	events := BuildDataQueryEvents(testTraceContext(), testRequestContext(), DataQuerySubject{
+		EntityKind: EntityKindObjectInstance, Operation: "bkn.object.query", KNID: "kn_demo",
+	}, nil)
+	SubmitEvents(testTraceContext(), testRequestContext(), events)
+	queued := publisher.SnapshotQueue()
+	if len(queued) != 1 {
+		t.Fatalf("queued records = %d, want 1", len(queued))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(queued[0].Value, &payload); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"event_id": events[0]["event_id"], "event_type": "data.query.observed", "conversation_id": "conv_data_query_001",
+		"producer_id": "ontology-query", "producer_stream_id": "ontology-query:boot-1",
+	} {
+		if payload[key] != want {
+			t.Fatalf("payload[%q] = %#v, want %#v; payload=%s", key, payload[key], want, queued[0].Value)
+		}
+	}
+	wantHeaders := []evidencepublisher.Header{
+		{Key: "content-type", Value: "application/json"},
+		{Key: "bkn-trace-schema-version", Value: "3.0.0"},
+		{Key: "capture_policy_revision", Value: "41"},
+		{Key: "producer_instance_id", Value: "ontology-query#boot-1"},
+		{Key: "bkn-evidence-record-class", Value: "live"},
+	}
+	if len(queued[0].Headers) != len(wantHeaders) {
+		t.Fatalf("headers = %+v", queued[0].Headers)
+	}
+	for i := range wantHeaders {
+		if queued[0].Headers[i] != wantHeaders[i] {
+			t.Fatalf("header[%d] = %+v, want %+v", i, queued[0].Headers[i], wantHeaders[i])
+		}
 	}
 }
 
-func TestPostBatchSendsDedicatedIngestToken(t *testing.T) {
-	t.Setenv("BKN_TRACE_EVIDENCE_INGEST_TOKEN", "producer-token")
-	previous := evidenceHTTPClient
-	t.Cleanup(func() { evidenceHTTPClient = previous })
-	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if got := req.Header.Get("X-BKN-Trace-Ingest-Token"); got != "producer-token" {
-			t.Fatalf("ingest token header=%q", got)
-		}
-		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
-	if err := postBatch("http://trace.local", time.Second, batch{}); err != nil {
-		t.Fatal(err)
+func TestSubmitEventsDropsWithoutTrustedSessionScope(t *testing.T) {
+	for _, field := range []string{"conversation_id", "interaction_id", "source_flag"} {
+		t.Run(field, func(t *testing.T) {
+			publisher, err := evidencepublisher.New(evidencepublisher.Config{ProducerID: "ontology-query", BaseStreamID: "ontology-query", WorkloadIdentity: "ontology-query", ProcessBootID: "boot-1", CapturePolicyRevision: "41"}, &captureEvidenceSender{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			SetEvidencePublisher(publisher)
+			t.Cleanup(func() { SetEvidencePublisher(nil); _ = publisher.Close(context.Background()) })
+			reqCtx := testRequestContext()
+			switch field {
+			case "conversation_id":
+				reqCtx.ConversationID = ""
+			case "interaction_id":
+				reqCtx.InteractionID = ""
+			case "source_flag":
+				reqCtx.SessionScopePresent = false
+			}
+			events := BuildDataQueryEvents(testTraceContext(), reqCtx, DataQuerySubject{EntityKind: EntityKindObjectInstance, KNID: "kn_demo"}, nil)
+			SubmitEvents(testTraceContext(), reqCtx, events)
+			if got := len(publisher.SnapshotQueue()); got != 0 {
+				t.Fatalf("queued records = %d, want 0 without %s", got, field)
+			}
+		})
 	}
 }
 

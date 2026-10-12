@@ -62,6 +62,9 @@ func (r *restHandler) postResourceData(c *gin.Context, visitor hydra.Visitor, s2
 	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 	if s2sInternal {
 		ctx = interfaces.WithS2SInternalAccess(ctx)
+		if callerID := strings.TrimSpace(c.GetHeader(interfaces.HTTPHeaderBKNCallerID)); callerID != "" {
+			ctx = interfaces.WithCursorQuotaOwner(ctx, callerID)
+		}
 	}
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
@@ -187,7 +190,6 @@ func (r *restHandler) executeResourceDataQuery(c *gin.Context, ctx context.Conte
 
 	logger.Debug("Handler queryResourceData Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
-	emitResourceDataEvidence(c, ctx, resource, params, result)
 	rest.ReplyOkWithHeaders(c, http.StatusOK, resultData, map[string]string{
 		interfaces.X_REQUEST_TOOK: time.Since(start).String(),
 	})

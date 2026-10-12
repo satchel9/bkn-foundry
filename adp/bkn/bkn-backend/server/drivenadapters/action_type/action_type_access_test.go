@@ -188,6 +188,27 @@ func Test_ActionTypeAccess_CheckActionTypeExistByName(t *testing.T) {
 	})
 }
 
+func Test_ActionTypeAccess_GetActionTypeIdentitiesByIDsOrNames(t *testing.T) {
+	Convey("batch query action type identities", t, func() {
+		ata, smock := MockNewActionTypeAccess(&common.AppSetting{})
+		sqlStr := "SELECT f_id, f_name FROM t_action_type WHERE f_kn_id = ? AND f_branch = ? " +
+			"AND (f_id IN (?,?) OR f_name IN (?,?))"
+		rows := sqlmock.NewRows([]string{"f_id", "f_name"}).AddRow("at1", "Action Type 1").AddRow("at2", "Action Type 2")
+		smock.ExpectQuery(sqlStr).
+			WithArgs("kn1", interfaces.MAIN_BRANCH, "at1", "at2", "Action Type 1", "Action Type 2").
+			WillReturnRows(rows)
+
+		result, err := ata.GetActionTypeIdentitiesByIDsOrNames(testCtx, "kn1", interfaces.MAIN_BRANCH,
+			[]string{"at1", "at2"}, []string{"Action Type 1", "Action Type 2"})
+
+		So(err, ShouldBeNil)
+		So(result, ShouldHaveLength, 2)
+		So(result[0].ATID, ShouldEqual, "at1")
+		So(result[1].ATName, ShouldEqual, "Action Type 2")
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
+	})
+}
+
 func Test_ActionTypeAccess_CreateActionType(t *testing.T) {
 	Convey("test CreateActionType\n", t, func() {
 		appSetting := &common.AppSetting{}
@@ -224,6 +245,29 @@ func Test_ActionTypeAccess_CreateActionType(t *testing.T) {
 				t.Errorf("there were unfulfilled expectations: %s", err)
 			}
 		})
+	})
+}
+
+func Test_ActionTypeAccess_CreateActionTypes(t *testing.T) {
+	Convey("batch create action types", t, func() {
+		ata, smock := MockNewActionTypeAccess(&common.AppSetting{})
+		second := *testActionType
+		second.ATID = "at2"
+		second.ATName = "Action Type 2"
+		sqlStr := fmt.Sprintf("INSERT INTO %s (f_id,f_name,f_tags,f_comment,f_icon,f_color,f_bkn_raw_content,"+
+			"f_kn_id,f_branch,f_action_type,f_action_intent,f_impact_contracts,f_object_type_id,f_condition,"+
+			"f_affect,f_action_source,f_parameters,f_schedule,f_creator,f_creator_type,f_create_time,f_updater,"+
+			"f_updater_type,f_update_time) VALUES "+
+			"(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?),(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", AT_TABLE_NAME)
+		smock.ExpectBegin()
+		smock.ExpectExec(sqlStr).WillReturnResult(sqlmock.NewResult(1, 2))
+		tx, err := ata.db.Begin()
+		So(err, ShouldBeNil)
+
+		err = ata.CreateActionTypes(testCtx, tx, []*interfaces.ActionType{testActionType, &second})
+
+		So(err, ShouldBeNil)
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 
@@ -544,6 +588,58 @@ func Test_ActionTypeAccess_ListActionTypes(t *testing.T) {
 			}
 		})
 
+	})
+}
+
+func Test_ActionTypeAccess_ListActionTypeSummariesPreservesPublicSchema(t *testing.T) {
+	Convey("test ListActionTypeSummaries preserves public fields\n", t, func() {
+		ata, smock := MockNewActionTypeAccess(&common.AppSetting{})
+		conditionBytes, _ := sonic.Marshal(&interfaces.ActionCondCfg{})
+		affectBytes, _ := sonic.Marshal(&interfaces.ActionAffect{})
+		actionSourceBytes, _ := sonic.Marshal(interfaces.ActionSource{
+			Type: interfaces.ACTION_SOURCE_TYPE_TOOL, BoxID: "box1", ToolID: "tool1",
+		})
+		parametersBytes, _ := sonic.Marshal([]interfaces.Parameter{})
+		scheduleBytes, _ := sonic.Marshal(interfaces.Schedule{Type: "cron", Expression: "0 0 * * *"})
+		impactContractsBytes, _ := sonic.Marshal([]interfaces.ImpactContractItem{})
+
+		query := interfaces.ActionTypesQueryParams{
+			KNID: "kn1", Branch: interfaces.MAIN_BRANCH,
+			PaginationQueryParameters: interfaces.PaginationQueryParameters{
+				Sort: "f_name", Direction: interfaces.ASC_DIRECTION, Limit: 10,
+			},
+		}
+		sqlStr, _, err := processQueryCondition(query, sq.Select(
+			"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_kn_id", "f_branch",
+			"f_action_type", "f_action_intent", "f_impact_contracts", "f_object_type_id", "f_condition",
+			"f_affect", "f_action_source", "f_parameters", "f_schedule", "f_creator", "f_creator_type",
+			"f_create_time", "f_updater", "f_updater_type", "f_update_time",
+		).From(AT_TABLE_NAME)).OrderBy("f_name ASC", "f_id ASC").Limit(10).ToSql()
+		So(err, ShouldBeNil)
+
+		rows := sqlmock.NewRows([]string{
+			"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_kn_id", "f_branch",
+			"f_action_type", "f_action_intent", "f_impact_contracts", "f_object_type_id", "f_condition",
+			"f_affect", "f_action_source", "f_parameters", "f_schedule", "f_creator", "f_creator_type",
+			"f_create_time", "f_updater", "f_updater_type", "f_update_time",
+		}).AddRow(
+			"at1", "Action Type 1", `"tag1"`, "comment", "icon", "color", "kn1", "main",
+			interfaces.ACTION_SOURCE_TYPE_TOOL, "", impactContractsBytes, "ot1", conditionBytes,
+			affectBytes, actionSourceBytes, parametersBytes, scheduleBytes, "admin", "admin",
+			testUpdateTime, "admin", "admin", testUpdateTime,
+		)
+		smock.ExpectQuery(sqlStr).WithArgs().WillReturnRows(rows)
+
+		items, err := ata.ListActionTypeSummaries(testCtx, query)
+		So(err, ShouldBeNil)
+		So(len(items), ShouldEqual, 1)
+		So(items[0].Condition, ShouldNotBeNil)
+		So(items[0].Affect, ShouldNotBeNil)
+		So(items[0].ActionSource.ToolID, ShouldEqual, "tool1")
+		So(items[0].Parameters, ShouldNotBeNil)
+		So(items[0].Schedule.Expression, ShouldEqual, "0 0 * * *")
+		So(items[0].ImpactContracts, ShouldNotBeNil)
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 
@@ -925,6 +1021,35 @@ func Test_ActionTypeAccess_UpdateActionType(t *testing.T) {
 				t.Errorf("there were unfulfilled expectations: %s", err)
 			}
 		})
+	})
+}
+
+func Test_ActionTypeAccess_UpdateActionTypes(t *testing.T) {
+	Convey("batch update action types in bounded chunks", t, func() {
+		db, smock, err := sqlmock.New()
+		So(err, ShouldBeNil)
+		ata := &actionTypeAccess{appSetting: &common.AppSetting{}, db: db}
+		actionTypes := make([]*interfaces.ActionType, 0, actionTypeUpdateBatchSize+1)
+		for index := 0; index < actionTypeUpdateBatchSize+1; index++ {
+			actionTypes = append(actionTypes, &interfaces.ActionType{
+				ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
+					ATID:       fmt.Sprintf("at%d", index),
+					ATName:     fmt.Sprintf("Action Type %d", index),
+					Parameters: []interfaces.Parameter{},
+				},
+				KNID: "kn1", Branch: interfaces.MAIN_BRANCH,
+			})
+		}
+		smock.ExpectBegin()
+		smock.ExpectExec("^UPDATE t_action_type SET ").WillReturnResult(sqlmock.NewResult(0, actionTypeUpdateBatchSize))
+		smock.ExpectExec("^UPDATE t_action_type SET ").WillReturnResult(sqlmock.NewResult(0, 1))
+		tx, err := db.Begin()
+		So(err, ShouldBeNil)
+
+		err = ata.UpdateActionTypes(testCtx, tx, actionTypes)
+
+		So(err, ShouldBeNil)
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 

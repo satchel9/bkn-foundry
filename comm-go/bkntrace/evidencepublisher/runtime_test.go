@@ -1,0 +1,655 @@
+package evidencepublisher
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestPublisherRuntimeLogsRefreshFailureOnceAndRecovery(t *testing.T) {
+	var output bytes.Buffer
+	previousOutput := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previousOutput) })
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	reads := make(chan struct{}, 4)
+	policyReads := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			policyReads++
+			reads <- struct{}{}
+			if policyReads <= 2 {
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
+			}
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case traceEvidenceControlPath + "/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+		default:
+			t.Errorf("unexpected request: %s", request.URL)
+			return noContentResponse(), nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := make(chan time.Time)
+	done := make(chan error, 1)
+	go func() { done <- runtime.run(ctx, ticks) }()
+	for i := 0; i < 3; i++ {
+		select {
+		case <-reads:
+		case <-time.After(time.Second):
+			t.Fatal("publisher did not refresh")
+		}
+		// An unbuffered tick waits until the preceding refresh, including its log, completes.
+		select {
+		case ticks <- now:
+		case <-time.After(time.Second):
+			t.Fatal("publisher did not complete refresh")
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("publisher did not stop")
+	}
+	if got := output.String(); strings.Count(got, "refresh failed:") != 1 || strings.Count(got, "refresh recovered") != 1 || !strings.Contains(got, "read trace evidence policy: unexpected status 503") {
+		t.Fatalf("expected one actionable failure and one recovery log, got %q", got)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("publisher did not recover admission: %+v", result)
+	}
+}
+
+func TestPublisherRuntimeUsesValidatedSnapshotAndAcknowledgesDisabledBoundary(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	enabled := policySnapshotForTest(now)
+	disabled := policySnapshotForTest(now)
+	disabled.Revision = 43
+	disabled.TraceAdmission = "disabled"
+	disabled.EvidenceAdmission = "disabled"
+	reenabled := policySnapshotForTest(now)
+	reenabled.Revision = 44
+	policyReads := 0
+	heartbeats := []string{}
+	acks := []string{}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			policyReads++
+			if policyReads == 1 {
+				return policyResponse(unsignedPolicySnapshot(t, enabled)), nil
+			}
+			if policyReads == 2 {
+				return policyResponse(unsignedPolicySnapshot(t, disabled)), nil
+			}
+			return policyResponse(unsignedPolicySnapshot(t, reenabled)), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			body, _ := io.ReadAll(request.Body)
+			heartbeats = append(heartbeats, string(body))
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			// desired/effective are not admission inputs: the policy snapshot is.
+			return configurationResponse(`{"kind":"configuration_get","desired_state":"enabled","effective_state":"enabled","policy_revision":43,"active_operation_id":"op-43"}`), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/operations/op-43:publisher-ack":
+			body, _ := io.ReadAll(request.Body)
+			acks = append(acks, string(body))
+			return noContentResponse(), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	policy, err := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &fakeSender{}
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: sender, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("NewPublisherRuntime() error = %v", err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh() error = %v", err)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+	if got := runtime.publisher.SnapshotQueue()[0].Header("capture_policy_revision"); got != "42" {
+		t.Fatalf("capture_policy_revision = %q; want 42", got)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherClosing {
+		t.Fatalf("disabled TryPublish() = %+v", result)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("rollback Refresh() error = %v", err)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("reenabled TryPublish() = %+v", result)
+	}
+	if got := runtime.publisher.SnapshotQueue()[0].Header("capture_policy_revision"); got != "44" {
+		t.Fatalf("reenabled capture_policy_revision = %q; want 44", got)
+	}
+	if len(sender.records) != 1 || len(heartbeats) != 3 || len(acks) != 1 {
+		t.Fatalf("records=%d heartbeats=%d acks=%d", len(sender.records), len(heartbeats), len(acks))
+	}
+	var ack struct {
+		CapturePolicyRevision uint64 `json:"capture_policy_revision"`
+		LastAcceptedSequence  uint64 `json:"last_accepted_sequence"`
+		Published             uint64 `json:"published"`
+		Dropped               uint64 `json:"dropped"`
+		QueueEmpty            bool   `json:"queue_empty"`
+	}
+	if err := json.Unmarshal([]byte(acks[0]), &ack); err != nil {
+		t.Fatal(err)
+	}
+	if ack.CapturePolicyRevision != 43 || ack.LastAcceptedSequence != 1 || ack.Published != 1 || ack.Dropped != 0 || !ack.QueueEmpty {
+		t.Fatalf("ack = %+v", ack)
+	}
+}
+
+func TestPublisherRuntimeAcknowledgesEnabledOperationBeforeAdmission(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	enabled := policySnapshotForTest(now)
+	acknowledgements := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, enabled)), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42,"active_operation_id":"op-enable"}`), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/operations/op-enable:publisher-ack":
+			acknowledgements++
+			var ack struct {
+				CapturePolicyRevision uint64 `json:"capture_policy_revision"`
+				LastAcceptedSequence  uint64 `json:"last_accepted_sequence"`
+				Published             uint64 `json:"published"`
+				Dropped               uint64 `json:"dropped"`
+				QueueEmpty            bool   `json:"queue_empty"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&ack); err != nil {
+				t.Fatal(err)
+			}
+			if ack.CapturePolicyRevision != 42 || ack.LastAcceptedSequence != 0 || ack.Published != 0 || ack.Dropped != 0 || !ack.QueueEmpty {
+				t.Fatalf("enabled ACK = %+v", ack)
+			}
+			return noContentResponse(), nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if acknowledgements != 1 {
+		t.Fatalf("enabled acknowledgements = %d, want 1", acknowledgements)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("admission after enabled ACK = %+v", result)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("same-revision Refresh() error = %v", err)
+	}
+	if acknowledgements != 1 {
+		t.Fatalf("enabled ACK replayed after admission: %d attempts", acknowledgements)
+	}
+}
+
+func TestPublisherRuntimeAdmitsUnfrozenNewInstanceAfterEnabledAckConflict(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	ackAttempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42,"active_operation_id":"op-enable"}`), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/operations/op-enable:publisher-ack":
+			ackAttempts++
+			return &http.Response{StatusCode: http.StatusConflict, Body: io.NopCloser(strings.NewReader(`{"code":"EVIDENCE_PUBLISHER_ACK_NOT_EXPECTED"}`))}, nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err == nil {
+		t.Fatal("rejected enabled ACK was reported as accepted")
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("policy admission after nonmember ACK conflict = %+v", result)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("same-revision refresh retried an unacknowledgeable instance: %v", err)
+	}
+	if ackAttempts != 1 {
+		t.Fatalf("ACK attempts = %d, want 1 for the frozen operation", ackAttempts)
+	}
+}
+
+func TestPublisherRuntimeKeepsEvidenceClosedWhenEnabledAckCandidateUnavailable(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err == nil {
+		t.Fatal("missing ACK candidate read error")
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherUnavailable {
+		t.Fatalf("evidence admission before enabled ACK = %+v", result)
+	}
+}
+
+func TestPublisherRuntimeKeepsSameRevisionAdmissionDuringConfigurationOutage(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	configurationReads := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			configurationReads++
+			if configurationReads == 1 {
+				return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+			}
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("initial enabled admission was closed")
+	}
+	if err := runtime.Refresh(context.Background()); err == nil {
+		t.Fatal("missing configuration error on repeated refresh")
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("same-revision validated admission after configuration outage = %+v", result)
+	}
+}
+
+func TestPublisherRuntimeAcknowledgesDisabledEmptyDrainWithCumulativeDisposition(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	enabled := policySnapshotForTest(now)
+	disabled := policySnapshotForTest(now)
+	disabled.Revision = 43
+	disabled.TraceAdmission, disabled.EvidenceAdmission = "disabled", "disabled"
+	policyReads, acknowledgements := 0, 0
+	var received struct {
+		LastAcceptedSequence uint64 `json:"last_accepted_sequence"`
+		Published            uint64 `json:"published"`
+		Dropped              uint64 `json:"dropped"`
+		QueueEmpty           bool   `json:"queue_empty"`
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			policyReads++
+			snapshot := enabled
+			if policyReads > 1 {
+				snapshot = disabled
+			}
+			return policyResponse(unsignedPolicySnapshot(t, snapshot)), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":43,"active_operation_id":"op-43"}`), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/operations/op-43:publisher-ack":
+			acknowledgements++
+			if err := json.NewDecoder(request.Body).Decode(&received); err != nil {
+				t.Fatal(err)
+			}
+			return noContentResponse(), nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("enabled Refresh() error = %v", err)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+	if drain := runtime.Flush(context.Background()); drain.Published != 1 || drain.Dropped != 0 || drain.LastAcceptedSequence != 1 {
+		t.Fatalf("Flush() = %+v", drain)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("disabled Refresh() error = %v", err)
+	}
+	if acknowledgements != 1 || received.Published != 1 || received.Dropped != 0 || received.LastAcceptedSequence != 1 || !received.QueueEmpty {
+		t.Fatalf("acknowledgements=%d received=%+v", acknowledgements, received)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("repeat disabled Refresh() error = %v", err)
+	}
+	if acknowledgements != 1 {
+		t.Fatalf("duplicate disabled acknowledgement count = %d", acknowledgements)
+	}
+}
+
+func TestPublisherRuntimeDoesNotRequireStaticPolicyRevision(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	config := publisherTestConfig()
+	config.CapturePolicyRevision = ""
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: config, Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("NewPublisherRuntime() error = %v", err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh() error = %v", err)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Accepted {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+	if got := runtime.publisher.SnapshotQueue()[0].Header("capture_policy_revision"); got != "42" {
+		t.Fatalf("capture_policy_revision = %q; want 42", got)
+	}
+}
+
+func TestPublisherRuntimeStartsClosedAndRecoversAfterInitialPolicyFailure(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	var policyReads atomic.Int32
+	policyRead := make(chan struct{}, 2)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			policyRead <- struct{}{}
+			if policyReads.Add(1) == 1 {
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("temporarily unavailable"))}, nil
+			}
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL)
+			return nil, nil
+		}
+	})}
+	policy, err := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("initial policy failure must not prevent runtime construction: %v", err)
+	}
+	if got := policyReads.Load(); got != 0 {
+		t.Fatalf("constructor made %d policy reads; want none", got)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherUnavailable {
+		t.Fatalf("pre-policy TryPublish() = %+v; want fail-closed", result)
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(runCtx) }()
+	select {
+	case <-policyRead:
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not attempt the initial policy read")
+	}
+	if got := runtime.TryPublish(publisherTestEvent()); got.Disposition != Dropped || got.Reason != ReasonPublisherUnavailable {
+		t.Fatalf("TryPublish() after failed policy read = %+v; want fail-closed", got)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("retry Refresh() error = %v", err)
+	}
+	if got := runtime.TryPublish(publisherTestEvent()); got.Disposition != Accepted {
+		t.Fatalf("TryPublish() after recovered policy = %+v; want accepted", got)
+	}
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("Run() did not stop after cancellation")
+	}
+}
+
+func TestPublisherRuntimeFlushUsesValidatedRevisionWithoutControlIO(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	sender := &fakeSender{}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, policySnapshotForTest(now))), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+		default:
+			t.Fatalf("Flush() made unexpected control request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: sender, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh() error = %v", err)
+	}
+	if runtime.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("TryPublish() rejected event")
+	}
+	if drain := runtime.Flush(context.Background()); drain.CapturePolicyRevision != "42" || drain.Published != 1 || !drain.QueueEmpty {
+		t.Fatalf("Flush() = %+v", drain)
+	}
+}
+
+func TestPublisherRuntimeStartsStableDisabledWithoutOperationOrAck(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	snapshot := policySnapshotForTest(now)
+	snapshot.TraceAdmission, snapshot.EvidenceAdmission = "disabled", "disabled"
+	configurationReads, acknowledgements := 0, 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			return policyResponse(unsignedPolicySnapshot(t, snapshot)), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			configurationReads++
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42,"active_operation_id":null}`), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/operations/":
+			acknowledgements++
+			t.Fatal("stable disabled runtime must not ACK without an active operation")
+			return nil, nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, _ := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	configuration, _ := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	control, _ := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("NewPublisherRuntime() error = %v", err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh() error = %v", err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("stable disabled Refresh() error = %v", err)
+	}
+	if configurationReads != 2 || acknowledgements != 0 {
+		t.Fatalf("configuration reads=%d acknowledgements=%d", configurationReads, acknowledgements)
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherClosing {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+}
+
+func TestPublisherRuntimeFailsClosedWhenCachedSnapshotExpires(t *testing.T) {
+	now := time.Date(2026, time.September, 25, 8, 0, 0, 0, time.UTC)
+	snapshot := policySnapshotForTest(now)
+	snapshot.ExpiresAt = now.Add(time.Second)
+	policyReads := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case traceEvidencePolicyPath:
+			policyReads++
+			if policyReads > 1 {
+				return &http.Response{StatusCode: http.StatusServiceUnavailable, Body: io.NopCloser(strings.NewReader("unavailable"))}, nil
+			}
+			return policyResponse(unsignedPolicySnapshot(t, snapshot)), nil
+		case "/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat":
+			return noContentResponse(), nil
+		case traceEvidenceConfigurationPath:
+			return configurationResponse(`{"kind":"configuration_get","policy_revision":42}`), nil
+		default:
+			t.Fatalf("unexpected request: %s", request.URL)
+			return nil, nil
+		}
+	})}
+	policy, err := NewPolicyClient(PolicyClientConfig{BaseURL: "https://trace.internal", HTTPClient: client, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := NewControlClient(ControlClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := NewConfigurationClient(ConfigurationClientConfig{BaseURL: "https://trace.internal", HTTPClient: client})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewPublisherRuntime(context.Background(), PublisherRuntimeConfig{Publisher: publisherTestConfig(), Sender: &fakeSender{}, Policy: policy, Configuration: configuration, Control: control, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial Refresh() error = %v", err)
+	}
+	now = now.Add(2 * time.Second)
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherUnavailable {
+		t.Fatalf("expired TryPublish() = %+v", result)
+	}
+	now = now.Add(-1500 * time.Millisecond)
+	if err := runtime.Refresh(context.Background()); err == nil {
+		t.Fatal("Refresh() error = nil; want policy read failure")
+	}
+	if runtime.LastRefreshError() == nil {
+		t.Fatal("LastRefreshError() = nil after failed refresh")
+	}
+	if result := runtime.TryPublish(publisherTestEvent()); result.Disposition != Dropped || result.Reason != ReasonPublisherUnavailable {
+		t.Fatalf("failed-refresh TryPublish() = %+v", result)
+	}
+}
+
+func noContentResponse() *http.Response {
+	return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}
+}

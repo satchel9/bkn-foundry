@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/creasty/defaults"
@@ -26,6 +27,7 @@ func (s *knSearchService) SearchInstance(
 ) (*interfaces.SearchInstanceResp, error) {
 	knReq, err := NormalizeSearchInstanceReq(req)
 	if err != nil {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
 		return nil, aerrors.DefaultHTTPError(ctx, http.StatusBadRequest, err.Error())
 	}
 
@@ -51,10 +53,7 @@ func NormalizeSearchInstanceReq(req *interfaces.SearchInstanceReq) (*interfaces.
 		return nil, errors.New("failed to apply defaults: " + err.Error())
 	}
 
-	knID := strings.TrimSpace(req.XKnID)
-	if knID == "" {
-		knID = strings.TrimSpace(req.KnID)
-	}
+	knID := req.ResolvedKnID()
 	if knID == "" {
 		return nil, errors.New("kn_id is required (configure X-Kn-ID header or pass kn_id in body)")
 	}
@@ -81,7 +80,7 @@ func NormalizeSearchInstanceReq(req *interfaces.SearchInstanceReq) (*interfaces.
 		// (retrievalConfigStructToLocal) will unconditionally wrap each bool into boolPtr,
 		// So "not filled in" and "filled in false" become the same thing, and unset switches will be explicitly false.
 		// Override the default true——enable_global_final_score_ratio_filter,
-		// The three knobs enable_coarse_recall and enable_property_brief that are turned on by default will be turned off silently.
+		// and enable_property_brief, which are on by default, would be turned off silently.
 		// If the local structure is used, the unset fields will remain nil, and MergeRetrievalConfig will retain the default value as it is.
 		RetrievalConfig: &interfaces.KnSearchRetrievalConfig{
 			ConceptRetrieval: &interfaces.KnSearchConceptRetrievalConfig{
@@ -110,8 +109,10 @@ func FilterSearchInstanceResp(resp *interfaces.KnSearchResp, includeObjectTypes 
 		return out
 	}
 	out.Nodes = toAnySlice(resp.Nodes)
+	hitObjectTypes := objectTypesOfNodes(toAnySlice(resp.ObjectTypes), out.Nodes)
+	out.PermissionImpacts = permissionImpactsOfObjectTypes(hitObjectTypes)
 	if includeObjectTypes {
-		out.ObjectTypes = objectTypesOfNodes(toAnySlice(resp.ObjectTypes), out.Nodes)
+		out.ObjectTypes = hitObjectTypes
 	}
 	// Pass the message through whenever retrieval wrote one, empty result or not.
 	//
@@ -124,6 +125,36 @@ func FilterSearchInstanceResp(resp *interfaces.KnSearchResp, includeObjectTypes 
 		out.Message = strings.TrimSpace(*resp.Message)
 	}
 	return out
+}
+
+func permissionImpactsOfObjectTypes(objectTypes []any) []interfaces.ObjectPermissionImpact {
+	var impacts []interfaces.ObjectPermissionImpact
+	for _, objectType := range objectTypes {
+		entry, ok := objectType.(map[string]any)
+		if !ok {
+			continue
+		}
+		objectTypeID, _ := entry["concept_id"].(string)
+		effective, _ := entry["effective_permissions"].(map[string]any)
+		if strings.TrimSpace(objectTypeID) == "" || len(effective) == 0 {
+			continue
+		}
+		properties := make([]string, 0, len(effective))
+		for property, rawLevel := range effective {
+			level, _ := rawLevel.(string)
+			if level != string(interfaces.PropertyAccessFull) && level != string(interfaces.PropertyAccessNone) {
+				properties = append(properties, property)
+			}
+		}
+		if len(properties) == 0 {
+			continue
+		}
+		sort.Strings(properties)
+		impacts = append(impacts, interfaces.ObjectPermissionImpact{
+			ObjectTypeID: objectTypeID, Properties: properties,
+		})
+	}
+	return impacts
 }
 
 // objectTypesOfNodes only retains those object types that actually have instances.

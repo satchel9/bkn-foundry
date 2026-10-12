@@ -22,6 +22,10 @@ info:
 
     **错误码复用 Resource 系列**：本规范不引入 `Dataset.*` 专属错误码；单条文档不存在
     与 resource 不存在共用 `VegaBackend.Resource.NotFound`，靠 `error_details` 区分。
+
+    cursor 可通过 `DELETE /resources/cursors/{cursor}` 提前关闭，详见
+    [raw-query.yaml](raw-query.yaml)。默认空闲租约为 1800 秒；单账号 cursor session
+    默认上限 100，全局默认上限 1000。
   version: 0.1.0
 servers:
   - url: /api/vega-backend/v1
@@ -52,6 +56,11 @@ paths:
 
         **`Override: GET` 响应**：200 + `{ entries, total_count, paging }`。cursor 模式通过
         `paging.next_cursor` 续页；`total_count` 仅在 `need_total=true` 时返回。
+        逻辑视图查询要求 EE 专业版及以上授权；未安装 EE 扩展返回 501，
+        授权版本不足返回 403 `Public.Forbidden`。
+        HANA 源表无 SELECT 权限时返回 403
+        `VegaBackend.Resource.SourceReadForbidden`，不暴露驱动原始错误。
+        已保存的复合逻辑视图在首次查询和 cursor 续页时也暂时返回 501。
 
         **`Override: POST` 响应**：201 + `{ id }`。后端生成文档 ID；携带 `_id` 的 body 返回 400。
 
@@ -97,14 +106,26 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "406":
           $ref: "#/components/responses/NotAcceptable"
         "409":
           $ref: "#/components/responses/Conflict"
+        "429":
+          description: |
+            `VegaBackend.Query.CursorSessionLimitExceeded`。`error_details` 区分
+            `per-account cursor session limit reached` 与 `global cursor session limit reached`。
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
   /resources/{id}/data/{docid}:
     parameters:
       - name: id
@@ -235,6 +256,12 @@ components:
         application/json:
           schema:
             $ref: "../_shared/errors.yaml#/components/schemas/Error"
+    Forbidden:
+      description: 当前 EE 授权版本不包含逻辑视图功能（`Public.Forbidden`）
+      content:
+        application/json:
+          schema:
+            $ref: "../_shared/errors.yaml#/components/schemas/Error"
     NotFound:
       description: |
         Resource 或文档不存在。errcode `VegaBackend.Resource.NotFound`；
@@ -267,6 +294,12 @@ components:
             $ref: "../_shared/errors.yaml#/components/schemas/Error"
     InternalServerError:
       description: 服务内部错误（如底层 OpenSearch / 索引故障）
+      content:
+        application/json:
+          schema:
+            $ref: "../_shared/errors.yaml#/components/schemas/Error"
+    NotImplemented:
+      description: 未安装 EE 逻辑视图扩展，或复合视图查询暂时不支持
       content:
         application/json:
           schema:
@@ -306,12 +339,16 @@ components:
         paging:
           $ref: "#/components/schemas/PagingRequest"
         sort:
-          description: 排序字段
+          description: |
+            排序字段。派生逻辑视图的非聚合查询支持保留元字段 `_score`，无需在视图 Schema
+            中发布；索引通道按真实相关性分数排序，source 表查询忽略该项并保留其余排序项。
           type: array
           items:
             $ref: "#/components/schemas/SortField"
         output_fields:
-          description: 指定输出字段列表
+          description: |
+            指定输出字段列表。派生逻辑视图的非聚合查询可指定 `_score`；索引通道返回真实
+            相关性分数，source 表查询不返回该元字段，不补零或伪造分数。
           type: array
           items:
             type: string

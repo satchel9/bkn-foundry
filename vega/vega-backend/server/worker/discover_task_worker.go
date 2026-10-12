@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
@@ -27,6 +28,7 @@ import (
 const (
 	discoverTaskPollInterval   = 30 * time.Second
 	defaultDiscoverWorkerCount = 1
+	resourceCountTimeout       = 5 * time.Minute
 )
 
 type discoverTaskQueueItem struct {
@@ -331,7 +333,9 @@ func (dtw *DiscoverTaskWorker) Run(ctx context.Context, taskID string) error {
 	//Then obtain the resource information of the catalog based on its metadata: metadata
 	progress := &discoverTaskReconcileProgress{}
 	var result *interfaces.DiscoverResult
-	if taskInfo.ResourceID != "" {
+	if countOnlyActions(taskInfo.DiscoverActions) {
+		result, err = dtw.countResources(ctx, catalog, taskInfo)
+	} else if taskInfo.ResourceID != "" {
 		result, err = dtw.discoverResource(ctx, catalog, taskInfo, progress)
 	} else {
 		result, err = dtw.discoverCatalog(ctx, catalog, taskInfo, progress)
@@ -363,6 +367,7 @@ func (dtw *DiscoverTaskWorker) Run(ctx context.Context, taskID string) error {
 // discoverResource refreshes one already-discovered Resource without listing or reconciling its Catalog.
 func (dtw *DiscoverTaskWorker) discoverResource(ctx context.Context, catalog *interfaces.Catalog,
 	task *interfaces.DiscoverTask, progress *discoverTaskReconcileProgress) (*interfaces.DiscoverResult, error) {
+
 	resource, err := dtw.rs.InternalGetByID(ctx, nil, task.ResourceID)
 	if err != nil {
 		return nil, fmt.Errorf("get resource for discovery: %w", err)
@@ -384,12 +389,13 @@ func (dtw *DiscoverTaskWorker) discoverResource(ctx context.Context, catalog *in
 		if !ok {
 			return nil, fmt.Errorf("connector does not support single-resource table metadata refresh")
 		}
-		table, err := tableConnector.GetTableMetaByIdentifier(ctx, resource.SourceIdentifier)
+		meta, err := tableConnector.DecodeTableMeta(resource.SourceMetadata)
 		if err != nil {
-			return nil, fmt.Errorf("get table metadata: %w", err)
+			return nil, err
 		}
+
 		if err := dtw.enrichTableMetadata(ctx, task, tableConnector, []tableDiscoverItem{{
-			resource: resource, tableMeta: table, markAfterEnrich: true,
+			resource: resource, tableMeta: meta, markAfterEnrich: true,
 		}}, result, progress); err != nil {
 			return nil, err
 		}
@@ -398,12 +404,37 @@ func (dtw *DiscoverTaskWorker) discoverResource(ctx context.Context, catalog *in
 		if !ok {
 			return nil, fmt.Errorf("connector does not support single-resource index metadata refresh")
 		}
-		index, err := indexConnector.GetIndexMetaByIdentifier(ctx, resource.SourceIdentifier)
+		data, err := sonic.Marshal(resource.SourceMetadata)
 		if err != nil {
-			return nil, fmt.Errorf("get index metadata: %w", err)
+			return nil, fmt.Errorf("serialize index metadata: %w", err)
 		}
+		meta := &interfaces.IndexMeta{}
+		if err := common.UnmarshalPreciseJSON(data, meta); err != nil {
+			return nil, fmt.Errorf("decode index metadata: %w", err)
+		}
+		if meta.Name == "" {
+			meta.Name = resource.SourceIdentifier
+		}
+		// 用连接器已解析的发现范围确认存在性，兼容源端别名和多目标模式。
+		indices, err := indexConnector.ListIndexes(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list indexes for resource refresh: %w", err)
+		}
+		found := false
+		for _, index := range indices {
+			if index != nil && index.Name == meta.Name {
+				meta.CreationTime = index.CreationTime
+				meta.Properties = index.Properties
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("index %q not found within the connector discovery scope", meta.Name)
+		}
+		meta.Description = sourceOriginalDescription(resource.SourceMetadata)
 		if err := dtw.enrichIndexMetadata(ctx, task, indexConnector, []indexDiscoverItem{{
-			resource: resource, indexMeta: index, markAfterEnrich: true,
+			resource: resource, indexMeta: meta, markAfterEnrich: true,
 		}}, result, progress); err != nil {
 			return nil, err
 		}
@@ -460,6 +491,7 @@ func (dtw *DiscoverTaskWorker) discoverCatalog(ctx context.Context, catalog *int
 	} else {
 		logger.Warnf("Failed to get metadata: %v", err)
 	}
+
 	// 2. Distribute to different discovery functions based on the connector category: For example, mysql will collect metadata under mysql.go, where there will be specific implementations
 	category := connector.GetCategory()
 	switch category {
@@ -475,6 +507,104 @@ func (dtw *DiscoverTaskWorker) discoverCatalog(ctx context.Context, catalog *int
 	default:
 		return nil, fmt.Errorf("unsupported connector category for discover: %s", category)
 	}
+}
+
+// countResources 独立执行纯计数任务，支持单资源和目录范围。
+func (dtw *DiscoverTaskWorker) countResources(ctx context.Context, catalog *interfaces.Catalog, task *interfaces.DiscoverTask) (*interfaces.DiscoverResult, error) {
+	if dtw.stopped.Load() {
+		return nil, ErrWorkerManagerStopping
+	}
+	singleResource := task.ResourceID != ""
+	var resources []*interfaces.Resource
+	if singleResource {
+		resource, err := dtw.rs.InternalGetByID(ctx, nil, task.ResourceID)
+		if err != nil {
+			return nil, fmt.Errorf("get resource for count: %w", err)
+		}
+		if resource == nil || resource.CatalogID != catalog.ID {
+			return nil, fmt.Errorf("resource %s not found in catalog %s", task.ResourceID, catalog.ID)
+		}
+		// 历史任务也必须先判断能力，避免为不支持的资源创建连接器。
+		if !interfaces.SupportsResourceCount(resource.Category) {
+			return nil, fmt.Errorf("resource category %q does not support count_only", resource.Category)
+		}
+		resources = []*interfaces.Resource{resource}
+	}
+	if !singleResource {
+		var err error
+		resources, err = dtw.rs.InternalGetByCatalogID(ctx, catalog.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 逻辑目录及单个视图由视图服务解析源资源，无须创建所属目录连接器。
+	var connector interfaces.Connector
+	var category string
+	needsConnector := false
+	for _, resource := range resources {
+		if resource.Category == interfaces.ResourceCategoryTable || resource.Category == interfaces.ResourceCategoryIndex {
+			needsConnector = singleResource || catalog.Type == interfaces.CatalogTypePhysical
+			if needsConnector {
+				break
+			}
+		}
+	}
+	if needsConnector {
+		var err error
+		connector, err = dtw.createAndConnectConnector(ctx, catalog)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to data source: %w", err)
+		}
+		defer func() { _ = connector.Close(ctx) }()
+		if !singleResource {
+			category = connector.GetCategory()
+		}
+	}
+	var err error
+	result := &interfaces.DiscoverResult{CatalogID: catalog.ID}
+	for i, resource := range resources {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if dtw.stopped.Load() {
+			return nil, ErrWorkerManagerStopping
+		}
+		switch {
+		case resource.Category == interfaces.ResourceCategoryLogicalView:
+			err = dtw.enrichResourceLogicalViewRowCount(ctx, resource, result)
+		case resource.Category == interfaces.ResourceCategoryTable && (singleResource || category == interfaces.ConnectorCategoryTable):
+			if tableConnector, ok := connector.(interfaces.TableConnector); ok {
+				err = dtw.enrichResourceTableRowCount(ctx, task, resource, tableConnector, result)
+			} else if singleResource {
+				result.FailedCount++
+			} else {
+				return nil, fmt.Errorf("connector does not support table count")
+			}
+		case resource.Category == interfaces.ResourceCategoryIndex && (singleResource || category == interfaces.ConnectorCategoryIndex):
+			if indexConnector, ok := connector.(interfaces.IndexConnector); ok {
+				err = dtw.enrichResourceIndexRowCount(ctx, task, resource, indexConnector, &interfaces.IndexMeta{Name: resource.SourceIdentifier}, result)
+			} else if singleResource {
+				result.FailedCount++
+			} else {
+				return nil, fmt.Errorf("connector does not support index count")
+			}
+		default:
+			if singleResource {
+				result.FailedCount++
+			} else {
+				result.SkippedCount++
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !singleResource {
+			if err := dtw.updateProgress(ctx, task.ID, 5+90*(i+1)/len(resources), fmt.Sprintf("Exact count processed: %d/%d", i+1, len(resources))); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return finishCountResult(result), nil
 }
 
 // createAndConnectConnector creates and connects a connector for the catalog.
@@ -493,4 +623,43 @@ func (dtw *DiscoverTaskWorker) createAndConnectConnector(ctx context.Context, ca
 	}
 
 	return connector, nil
+}
+
+func finishCountResult(result *interfaces.DiscoverResult) *interfaces.DiscoverResult {
+	result.Failed = result.UpdatedCount == 0 && result.FailedCount+result.SkippedCount > 0
+	result.Message = fmt.Sprintf("Exact count finished: %d counted, %d failed, %d skipped", result.UpdatedCount, result.FailedCount, result.SkippedCount)
+	return result
+}
+
+// enrichResourceLogicalViewRowCount 复用视图查询解析，按完整视图定义获取精确总数。
+func (dtw *DiscoverTaskWorker) enrichResourceLogicalViewRowCount(ctx context.Context, view *interfaces.Resource, result *interfaces.DiscoverResult) error {
+	queryCtx, cancel := context.WithTimeout(ctx, resourceCountTimeout)
+	ignoreLocalIndex := true
+	counted, err := resource.QueryLogicalViewWithPaging(queryCtx, view, &interfaces.ResourceDataQueryParams{
+		Paging: interfaces.PagingRequest{
+			Mode:  interfaces.PagingModeSingle,
+			Limit: 1,
+		},
+		NeedTotal:        true,
+		IgnoreLocalIndex: &ignoreLocalIndex,
+		Timeout:          resourceCountTimeout,
+	})
+	cancel()
+
+	if parentErr := ctx.Err(); parentErr != nil {
+		return parentErr
+	}
+	if err == nil && (counted == nil || !counted.NeedTotal || counted.TotalCount < 0) {
+		err = fmt.Errorf("logical view did not return an exact total count")
+	}
+	if err == nil {
+		err = dtw.rs.InternalUpdateRowCount(ctx, nil, view, counted.TotalCount, time.Now().UnixMilli())
+	}
+	if err != nil {
+		result.FailedCount++
+		logger.Warnf("Resource exact count failed: resource_id=%s error=%v", view.ID, err)
+	} else {
+		result.UpdatedCount++
+	}
+	return nil
 }

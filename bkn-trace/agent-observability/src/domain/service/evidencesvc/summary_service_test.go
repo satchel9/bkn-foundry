@@ -7,7 +7,10 @@ package evidencesvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +35,85 @@ type capturingProjectionSource struct {
 }
 
 type fixedTraceStatsSource map[string]int
+
+type countingConversationTraceReads struct {
+	isessionstore.Store
+	statsCalls, traceIdentityReads int
+}
+
+type countingConversationTransaction struct {
+	isessionstore.Transaction
+	reads *countingConversationTraceReads
+}
+
+func (s *countingConversationTraceReads) WithinTransaction(ctx context.Context, fn func(isessionstore.Transaction) error) error {
+	return s.Store.WithinTransaction(ctx, func(tx isessionstore.Transaction) error {
+		return fn(countingConversationTransaction{Transaction: tx, reads: s})
+	})
+}
+
+func (s *countingConversationTraceReads) CountSpansByTraceIDs(context.Context, []string) (map[string]int, error) {
+	s.statsCalls++
+	return map[string]int{}, nil
+}
+
+func (tx countingConversationTransaction) ListFirstOperationSourceModulesByTraceIDs(ids []string) map[string]string {
+	tx.reads.traceIdentityReads++
+	return tx.Transaction.ListFirstOperationSourceModulesByTraceIDs(ids)
+}
+
+func TestConversationKeywordReadSkipsUnusedTraceEnrichmentAndRetainsRequestIdentity(t *testing.T) {
+	base := evidencestore.New()
+	seedBusinessProvenanceRequest(t, base, "req-identity", "trace-identity", "conv-identity", "int-identity",
+		"2026-08-10T08:00:00Z", "查询库存", "库存 230", "acct_demo")
+	sessions := sessionstore.New()
+	if err := sessions.WithinTransaction(context.Background(), func(tx isessionstore.Transaction) error {
+		tx.SaveConversation(sessionvo.Conversation{
+			ID: "conv-identity", AgentName: "canonical-agent", Status: sessionvo.ConversationActive,
+			Owner: sessionvo.Owner{EffectiveSubjectID: "acct_demo", EffectiveSubjectType: sessionvo.SubjectUser},
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reads := &countingConversationTraceReads{Store: sessions}
+	service := New(base, WithProjectionSource(base), WithSessionStore(reads), WithTraceStatsSource(reads))
+	page, err := service.ListConversations(context.Background(), evidencevo.SummaryQueryOptions{
+		Scope: summaryScope("acct_demo"), Keyword: "库存", AgentOrApp: "canonical-agent", Limit: 20,
+	})
+	if err != nil || len(page.Entries) != 1 || page.Entries[0].AgentName != "canonical-agent" {
+		t.Fatalf("canonical request identity must remain usable by agent filter: page=%+v err=%v", page, err)
+	}
+	if reads.statsCalls != 0 || reads.traceIdentityReads != 0 {
+		t.Fatalf("conversation list discards trace enrichment: stats=%d canonicalTrace=%d", reads.statsCalls, reads.traceIdentityReads)
+	}
+}
+
+func TestConversationKeywordSummaryReadKeepsCrossConversationMatches(t *testing.T) {
+	base := evidencestore.New()
+	const target = "conv_5932399dcec2f8f1d0d30884b883f763"
+	seedBusinessProvenanceRequestWithAgent(t, base, "req-target", "trace-target", target, "int-target",
+		"2026-08-10T08:00:00Z", "原会话问题", "原会话结论", "acct_demo", "business_agent", "agent_id")
+	seedBusinessProvenanceRequestWithAgent(t, base, "req-reference", "trace-reference", "conv-reference", "int-reference",
+		"2026-08-10T08:01:00Z", "复盘 "+target, "引用另一会话", "acct_demo", "business_agent", "agent_id")
+	result, err := base.LoadExecutionProjection(context.Background(), iprojectionsource.Query{Scope: summaryScope("acct_demo")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection := &capturingProjectionSource{result: result}
+	page, err := New(base, WithProjectionSource(projection)).ListConversations(context.Background(), evidencevo.SummaryQueryOptions{
+		Scope: summaryScope("acct_demo"), Keyword: target, Limit: 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Entries) != 2 || page.Entries[0].ConversationID != "conv-reference" || page.Entries[1].ConversationID != target {
+		t.Fatalf("keyword must keep both identity and text matches: %+v", page)
+	}
+	if len(projection.queries) != 1 || !projection.queries[0].SummaryOnly || len(projection.queries[0].ConversationIDs) != 0 {
+		t.Fatalf("must use summary projection without changing keyword scope: %+v", projection.queries)
+	}
+}
 
 func pageSummaryTrace(traceID, requestID, at, account, domain string) evidencevo.NormalizedTrace {
 	return evidencevo.NormalizedTrace{
@@ -1913,6 +1995,19 @@ func TestSummaryCandidateLimitUsesPageBudgetOnlyWithoutContentFilters(t *testing
 	}
 }
 
+func TestSummaryPaginationDoesNotOverflow(t *testing.T) {
+	options := evidencevo.SummaryQueryOptions{Page: math.MaxInt, Limit: 20}
+	if got := summaryCandidateLimit(options); got != MaxSummaryScanEntries {
+		t.Errorf("large page candidate limit=%d, want %d", got, MaxSummaryScanEntries)
+	}
+	if got := summaryQueryOffset(options); got != math.MaxInt {
+		t.Errorf("large page offset=%d, want saturated maximum", got)
+	}
+	if got := summaryQueryOffset(evidencevo.SummaryQueryOptions{Page: 181, Limit: 20}); got != 3600 {
+		t.Errorf("ordinary page offset=%d, want 3600", got)
+	}
+}
+
 func TestStatusFilteredAggregateListsPreserveCompatibilityWindow(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -2540,4 +2635,126 @@ func containsSummaryReason(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func TestCanonicalTraceIdentityPrefersUsefulMessageBeforeFiltering(t *testing.T) {
+	sessions := sessionstore.New()
+	payload, err := sessionvo.InlineJSONPayload([]byte(`{"code":"OBJECT_NOT_FOUND","safe_error_summary":"Operation failed","message":"对象不存在：物料 U00-000160","result":{"debug":"extra diagnostics"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessions.WithinTransaction(context.Background(), func(tx isessionstore.Transaction) error {
+		tx.SaveOperationCallFact(sessionvo.OperationCallFact{OperationID: "op-failed", Attempt: 1, ConversationID: "conv", InteractionID: "int", TraceID: "trace", Status: sessionvo.AttemptFailed, Error: &payload})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{sessionStore: sessions}
+	traces := []evidencevo.TraceSummary{{TraceID: "trace", ConversationID: "conv", InteractionID: "int", Status: "error"}}
+	if err := service.applyCanonicalTraceIdentity(context.Background(), traces); err != nil {
+		t.Fatal(err)
+	}
+	if traces[0].ErrorSummary != "对象不存在：物料 U00-000160" {
+		t.Fatalf("summary=%q", traces[0].ErrorSummary)
+	}
+	if !matchesTraceFilters(traces[0], evidencevo.SummaryQueryOptions{ErrorKeyword: "不存在"}) {
+		t.Fatal("recorded failure must match error_keyword")
+	}
+}
+
+func TestCanonicalTraceFailureSummaryUsesUsefulMessageAndExactAttempt(t *testing.T) {
+	sessions := sessionstore.New()
+	payload, _ := sessionvo.InlineJSONPayload([]byte(`{"code":"TOOL_FAILED","message":"字段不存在：available_qty","result":{"debug":"extra diagnostics"}}`))
+	unsafeCode, _ := sessionvo.InlineJSONPayload([]byte(`{"code":"TOOL_FAILED"}`))
+	if err := sessions.WithinTransaction(context.Background(), func(tx isessionstore.Transaction) error {
+		tx.SaveOperationCallFact(sessionvo.OperationCallFact{OperationID: "op", Attempt: 1, TraceID: "trace", ConversationID: "conv", InteractionID: "int", Status: sessionvo.AttemptFailed, Error: &payload})
+		tx.SaveOperationCallFact(sessionvo.OperationCallFact{OperationID: "op", Attempt: 2, TraceID: "other", ConversationID: "conv", InteractionID: "int", Status: sessionvo.AttemptFailed, Error: &unsafeCode})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{sessionStore: sessions}
+	traces := []evidencevo.TraceSummary{
+		{TraceID: "trace", ConversationID: "conv", InteractionID: "int", Status: "error"},
+		{TraceID: "other", ConversationID: "conv", InteractionID: "int", Status: "error"},
+		{TraceID: "none", ConversationID: "conv", InteractionID: "int", Status: "error"},
+		{TraceID: "trace", ConversationID: "conv", InteractionID: "int", Status: "completed"},
+		{TraceID: "trace", ConversationID: "conv", InteractionID: "int", Status: "error", ErrorSummary: "existing safe summary"},
+	}
+	if err := service.applyCanonicalTraceIdentity(context.Background(), traces); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"字段不存在：available_qty", "TOOL_FAILED", "", "", "existing safe summary"}
+	for i := range traces {
+		if traces[i].ErrorSummary != want[i] {
+			t.Fatalf("trace %d summary=%q want %q", i, traces[i].ErrorSummary, want[i])
+		}
+	}
+}
+
+func TestListTraceExecutionsFiltersAndPaginatesRecordedFailureMessage(t *testing.T) {
+	sessions := sessionstore.New()
+	payload, _ := sessionvo.InlineJSONPayload([]byte(`{"code":"NOT_FOUND","message":"对象不存在"}`))
+	var traces []evidencevo.NormalizedTrace
+	for _, id := range []string{"first", "second"} {
+		trace := pageSummaryTrace(id, "req-"+id, "2026-08-19T09:00:00Z", "acct_demo", "")
+		trace.ConversationID = "conv"
+		trace.Events = append(trace.Events, evidencevo.EvidenceEvent{EventID: "receipt:" + id, EventType: "retrieval.completed", TraceID: id, RequestID: "req-" + id, OperationID: "op-" + id, InteractionID: "int", ObservedAt: "2026-08-19T09:00:01Z", EmittedAt: "2026-08-19T09:00:01Z", Payload: map[string]any{"status": "failed", "evidence_durability": "durable"}})
+		traces = append(traces, trace)
+		if err := sessions.WithinTransaction(context.Background(), func(tx isessionstore.Transaction) error {
+			tx.SaveOperationCallFact(sessionvo.OperationCallFact{OperationID: "op-" + id, Attempt: 1, ConversationID: "conv", InteractionID: "int", TraceID: id, Status: sessionvo.AttemptFailed, Error: &payload})
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	projection := &capturingProjectionSource{result: iprojectionsource.Result{Traces: traces}}
+	service := New(evidencestore.New(), WithProjectionSource(projection), WithSessionStore(sessions))
+	options := evidencevo.SummaryQueryOptions{Scope: summaryScope("acct_demo"), Status: "error", ErrorKeyword: "不存在", Limit: 1, Page: 1}
+	page, err := service.ListTraceExecutions(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Entries) != 1 || page.Entries[0].ErrorSummary != "对象不存在" {
+		t.Fatalf("page=%+v", page)
+	}
+	options.Page = 2
+	next, err := service.ListTraceExecutions(context.Background(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Total != 2 || len(next.Entries) != 1 || next.Entries[0].TraceID == page.Entries[0].TraceID {
+		t.Fatalf("next=%+v", next)
+	}
+	_, detailed, _, err := service.loadTraceExecutionSummaries(context.Background(), page.Entries[0].TraceID, options.Scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detailed) == 0 || detailed[0].ErrorSummary != "对象不存在" {
+		t.Fatalf("detail=%+v", detailed)
+	}
+}
+
+func TestOperationFailureSummaryKeepsUsefulTextAndBoundsListSize(t *testing.T) {
+	payload, _ := sessionvo.InlineJSONPayload([]byte(`"对象不存在"`))
+	if got := operationFailureSummary(sessionvo.OperationCallFact{Error: &payload}); got != "对象不存在" {
+		t.Fatal(got)
+	}
+	stderr := "Traceback (most recent call last):\n" + strings.Repeat("  at execution frame\n", 40) + "RuntimeError: intentional acceptance failure\n"
+	envelope, _ := json.Marshal(map[string]any{"stdout": "", "stderr": stderr, "exit_code": 1})
+	errorJSON, _ := json.Marshal(map[string]any{"message": string(envelope)})
+	payload, _ = sessionvo.InlineJSONPayload(errorJSON)
+	if got := operationFailureSummary(sessionvo.OperationCallFact{Error: &payload}); !strings.HasSuffix(got, "RuntimeError: intentional acceptance failure") || strings.Contains(got, "exit_code") {
+		t.Fatalf("execution error must retain the actual exception: %q", got)
+	}
+	message := strings.Repeat("错", 600)
+	raw := []byte(`{"message":"` + message + `"}`)
+	payload, _ = sessionvo.InlineJSONPayload(raw)
+	got := operationFailureSummary(sessionvo.OperationCallFact{Error: &payload})
+	if len([]rune(got)) != 513 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("summary length=%d", len([]rune(got)))
+	}
+	if !strings.Contains(string(payload.Inline), message) {
+		t.Fatal("original details must remain intact")
+	}
 }

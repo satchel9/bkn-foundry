@@ -3,9 +3,14 @@ Description = "无效的数据资源参数"
 Solution = "请检查参数"
 ErrorLink = ""
 
+[VegaBackend.Resource.Duplicated.FieldFeatureType]
+Description = "字段 {{.FieldName}} 已存在 {{.FieldFeatureType}} 类型的特征"
+Solution = "请只保留一个该类型的字段特征"
+ErrorLink = ""
+
 [VegaBackend.Resource.CategoryNotCreatable]
 Description = "该类型资源不允许通过 API 创建"
-Solution = "通过该 API 仅可创建 'dataset' 与 'logicview' 类型资源，其他类型请通过发现任务（discover）创建。"
+Solution = "通过该 API 仅可创建 'dataset' 与 'logical_view' 类型资源，其他类型请通过发现任务（discover）创建。"
 ErrorLink = ""
 
 [VegaBackend.Resource.InvalidParameter.Type]
@@ -51,6 +56,11 @@ ErrorLink = ""
 [VegaBackend.Resource.NotFound]
 Description = "数据资源不存在"
 Solution = "请检查数据资源ID"
+ErrorLink = ""
+
+[VegaBackend.Resource.SourceReadForbidden]
+Description = "数据源账号无权读取该资源"
+Solution = "请检查连接的 Schema 范围，或为源表授予 SELECT 权限"
 ErrorLink = ""
 
 [VegaBackend.Resource.NameExists]
@@ -141,4 +151,9 @@ ErrorLink = ""
 [VegaBackend.Resource.UpdateConflict]
 Description = "资源在读取后已被更新"
 Solution = "请重新加载资源后再提交修改"
+ErrorLink = ""
+
+[VegaBackend.Resource.DeleteConflict]
+Description = "资源已不再处于失效且探查缺失状态"
+Solution = "请重新加载资源后再删除"
 ErrorLink = ""

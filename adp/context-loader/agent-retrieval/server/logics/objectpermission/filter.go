@@ -10,21 +10,94 @@ package objectpermission
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
+	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 )
 
+// schemaFanOut bounds how many object-type schema reads run at once.
+//
+// The property plan is per object type and ontology-query publishes no batch
+// route, so a network's worth of them is a fan-out either way; the only question
+// was whether it ran serially. It did, at roughly 28ms a read, which a
+// 1000-object network paid one read at a time -- 28 seconds, past every caller's
+// timeout (#1877). Eight at a time keeps the wall clock proportional to the
+// network without turning one get_kn_detail into a thousand simultaneous
+// requests against the service that has to answer them.
+const schemaFanOut = 8
+
 // FilterObjectTypes clones and filters object types using the authorization-safe
 // schema result from ontology-query. A missing or unknown decision is denied.
+//
+// The reads run concurrently but the answer does not depend on how they
+// interleave: each object type is written back to its own slot, so the result
+// keeps the caller's order, and the failure reported is the first one in that
+// same order rather than the first to arrive.
 func FilterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
 	objectTypes []*interfaces.ObjectType) ([]*interfaces.ObjectType, error) {
+	filtered, _, err := filterObjectTypes(ctx, access, knID, objectTypes, 0)
+	return filtered, err
+}
+
+// FilterObjectTypesDegrading is FilterObjectTypes with a time limit on each
+// schema read. A read that times out or meets a dependency fault (5xx or no
+// HTTP answer at all) keeps its object type with no properties -- the way an
+// unbound one is kept -- instead of failing every other object type with it,
+// and its id is returned in degraded, in caller order. An explicit answer (4xx)
+// still fails the call, as does the caller's own context ending.
+//
+// One schema read that never answered used to hold search_schema until the
+// caller's own deadline cancelled it, discarding the reads that had finished
+// (#1906). Properties stay fail-closed: a degraded object type exposes none.
+func FilterObjectTypesDegrading(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
+	objectTypes []*interfaces.ObjectType, readTimeout time.Duration,
+) (filtered []*interfaces.ObjectType, degraded []string, err error) {
+	return filterObjectTypes(ctx, access, knID, objectTypes, readTimeout)
+}
+
+// filterObjectTypes degrades transient read failures only when readTimeout is
+// positive; zero keeps every failure fatal.
+func filterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
+	objectTypes []*interfaces.ObjectType, readTimeout time.Duration,
+) ([]*interfaces.ObjectType, []string, error) {
 	if access == nil {
-		return objectTypes, nil
+		return objectTypes, nil, nil
 	}
-	result := make([]*interfaces.ObjectType, 0, len(objectTypes))
-	for _, objectType := range objectTypes {
+
+	// Cancelled as soon as one read fails: the answer is already lost, so the
+	// reads still in flight are load on a dependency for a result nobody reads.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	filtered := make([]*interfaces.ObjectType, len(objectTypes))
+	degraded := make([]bool, len(objectTypes))
+	var mu sync.Mutex
+	failure := struct {
+		index int
+		err   error
+	}{index: -1}
+	record := func(i int, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		// Once one read has failed the rest are cancelled, and that cancellation is
+		// our own doing -- recording it would bury the failure that caused it.
+		if failure.err != nil && errors.Is(err, context.Canceled) {
+			return
+		}
+		if failure.err == nil || i < failure.index {
+			failure.index, failure.err = i, err
+		}
+	}
+
+	var wg sync.WaitGroup
+	tokens := make(chan struct{}, schemaFanOut)
+queue:
+	for i, objectType := range objectTypes {
 		if objectType == nil {
 			continue
 		}
@@ -32,19 +105,84 @@ func FilterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess
 		// binding. Keep an unbound object discoverable, but expose no properties.
 		if objectType.DataSource == nil || strings.TrimSpace(objectType.DataSource.ID) == "" ||
 			(strings.TrimSpace(objectType.DataSource.Type) != "" && objectType.DataSource.Type != "resource") {
-			result = append(result, filterObjectType(objectType, nil))
+			filtered[i] = filterObjectType(objectType, nil)
 			continue
 		}
-		schema, err := access.GetObjectTypeSchema(ctx, knID, objectType.ID)
-		if err != nil {
-			return nil, err
+		select {
+		case tokens <- struct{}{}:
+		case <-ctx.Done():
+			// A read has already failed, or the caller left. Either way this answer
+			// is lost, so stop queueing reads someone would still have to serve.
+			break queue
 		}
-		if schema == nil {
-			return nil, fmt.Errorf("ontology-query returned an empty schema for object type %q", objectType.ID)
-		}
-		result = append(result, filterObjectType(objectType, schema.EffectivePermissions))
+		wg.Add(1)
+		go func(i int, objectType *interfaces.ObjectType) {
+			defer wg.Done()
+			defer func() { <-tokens }()
+			readCtx, cancelRead := ctx, context.CancelFunc(func() {})
+			if readTimeout > 0 {
+				readCtx, cancelRead = context.WithTimeout(ctx, readTimeout)
+			}
+			schema, err := access.GetObjectTypeSchema(readCtx, knID, objectType.ID)
+			cancelRead()
+			switch {
+			case err != nil && readTimeout > 0 && ctx.Err() == nil && transientReadFailure(err):
+				filtered[i] = filterObjectType(objectType, nil)
+				degraded[i] = true
+				return
+			case err != nil:
+				record(i, err)
+			case schema == nil:
+				record(i, fmt.Errorf("ontology-query returned an empty schema for object type %q", objectType.ID))
+			default:
+				filtered[i] = filterObjectType(objectType, schema.EffectivePermissions)
+				return
+			}
+			cancel()
+		}(i, objectType)
 	}
-	return result, nil
+	wg.Wait()
+
+	if failure.err != nil {
+		return nil, nil, failure.err
+	}
+	// No read failed, so an object type still missing means the caller's context
+	// ended mid-fan-out. Saying so beats handing back a network whose model is
+	// silently short a few concepts.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+
+	result := make([]*interfaces.ObjectType, 0, len(objectTypes))
+	var degradedIDs []string
+	for i, objectType := range filtered {
+		if objectType != nil {
+			result = append(result, objectType)
+			if degraded[i] {
+				degradedIDs = append(degradedIDs, objectType.ID)
+			}
+		}
+	}
+	return result, degradedIDs, nil
+}
+
+// transientReadFailure reports a schema read that gave no answer: it timed out,
+// never reached ontology-query, or ontology-query answered 5xx. A 4xx is
+// ontology-query's verdict on the request and is never treated as transient.
+//
+// Only a 5xx ontology-query actually sent counts: the HTTP client attaches the
+// response body to those. A 500 raised here because an answer could not be
+// decoded carries none, and a response contract that stopped matching is a
+// fault to surface, not one to hide behind "retry later" on every call.
+func transientReadFailure(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var httpErr *infraErr.HTTPError
+	if !errors.As(err, &httpErr) {
+		return true
+	}
+	return httpErr.HTTPCode >= 500 && httpErr.DownstreamBody != nil
 }
 
 func filterObjectType(source *interfaces.ObjectType,
@@ -112,6 +250,41 @@ func clonePermissions(source map[string]interfaces.PropertyAccessLevel) map[stri
 		}
 	}
 	return result
+}
+
+// OmitUnrestrictedPermissions drops an object type's effective_permissions when
+// every property in it is full.
+//
+// The map names every property of every object type a second time, so on a
+// network the caller may read in full it repeats "full" for each one and says
+// nothing: a fifth of a summary on the supply sample, and 64% of one 1000-object
+// network -- 103,464 entries, every one of them full (#1891). A map holding any
+// schema, masked or absent entry is the one that tells the caller something, and
+// it is kept whole.
+//
+// Absence therefore means "nothing here is restricted for you", which is also
+// what an unbound object type's absent map means. The two are told apart by the
+// properties beside it: an unbound object type publishes none.
+//
+// REST and MCP both call this helper, for the same reason they both call
+// TrimObjectTypesToIndexBackedOps: one service answering one question about one
+// network should not answer it two ways.
+func OmitUnrestrictedPermissions(objectTypes []*interfaces.ObjectType) {
+	for _, objectType := range objectTypes {
+		if objectType == nil || len(objectType.EffectivePermissions) == 0 {
+			continue
+		}
+		restricted := false
+		for _, level := range objectType.EffectivePermissions {
+			if level != interfaces.PropertyAccessFull {
+				restricted = true
+				break
+			}
+		}
+		if !restricted {
+			objectType.EffectivePermissions = nil
+		}
+	}
 }
 
 // TrimObjectTypesToIndexBackedOps keeps only operators whose availability

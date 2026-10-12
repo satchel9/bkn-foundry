@@ -1,0 +1,817 @@
+package permissionrequest
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/glebarez/sqlite"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/finegrained"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/permissionproposal"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/database"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/entitlement"
+	"github.com/openbkn-ai/licverify"
+	"gorm.io/gorm"
+)
+
+type emptyOperationProposalHandler struct{}
+
+func (emptyOperationProposalHandler) Validate(context.Context, permissionproposal.Request) error {
+	return nil
+}
+func (emptyOperationProposalHandler) Apply(context.Context, *gorm.DB, permissionproposal.Request) error {
+	return nil
+}
+func (emptyOperationProposalHandler) Preview(context.Context, string, string, string) (any, error) {
+	return nil, nil
+}
+func (emptyOperationProposalHandler) ApprovalMode() permissionproposal.ApprovalMode {
+	return permissionproposal.ApprovalModeApply
+}
+
+func TestPermissionRequestTextUnicodeBoundaries(t *testing.T) {
+	tests := []struct {
+		name  string
+		text  string
+		valid bool
+	}{
+		{name: "512 ASCII", text: strings.Repeat("a", 512), valid: true},
+		{name: "513 ASCII", text: strings.Repeat("a", 513)},
+		{name: "512 Chinese", text: strings.Repeat("测", 512), valid: true},
+		{name: "513 Chinese", text: strings.Repeat("测", 513)},
+		{name: "512 emoji", text: strings.Repeat("😀", 512), valid: true},
+		{name: "513 emoji", text: strings.Repeat("😀", 513)},
+		{name: "512 combining code points", text: strings.Repeat("e\u0301", 256), valid: true},
+		{name: "514 combining code points", text: strings.Repeat("e\u0301", 257)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			create := CreateInput{
+				RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1",
+				Operation: authz.ActFullBusinessAccess, Reason: tt.text,
+			}
+			if got := validCreate(&create); got != tt.valid {
+				t.Fatalf("validCreate() = %v, want %v", got, tt.valid)
+			}
+			decision := DecisionInput{ReviewerID: "reviewer", Decision: "reject", Comment: tt.text}
+			if got := validDecisionInput(&decision); got != tt.valid {
+				t.Fatalf("review comment validation = %v, want %v", got, tt.valid)
+			}
+		})
+	}
+	for _, forbidden := range []string{"\x00", "\r", "\n"} {
+		create := CreateInput{
+			RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1",
+			Operation: authz.ActFullBusinessAccess, Reason: "valid" + forbidden + "reason",
+		}
+		if forbidden == "\n" || forbidden == "\r" {
+			if !validCreate(&create) {
+				t.Fatalf("validCreate() rejected a multiline reason containing %q", forbidden)
+			}
+			continue
+		}
+		if validCreate(&create) {
+			t.Fatalf("validCreate() accepted a reason containing %q", forbidden)
+		}
+	}
+}
+
+func TestRequestPageOrderDoesNotUseClientSortText(t *testing.T) {
+	page := normalizePage(PageOptions{
+		Sort:      "created_at DESC; DROP TABLE permission_request",
+		Direction: "DESC; DROP TABLE permission_request",
+	})
+	order := requestPageOrder("permission_request", page)
+	if order.Column.Table != "permission_request" || order.Column.Name != "created_at" || !order.Desc {
+		t.Fatalf("unexpected structural order: %#v", order)
+	}
+}
+
+func TestValidCreateRejectsControlCharactersBeforeNormalization(t *testing.T) {
+	for _, field := range []string{"resource type", "resource ID", "resource name"} {
+		for _, control := range []string{"\x00", "\r", "\n"} {
+			for _, position := range []string{"leading", "middle", "trailing"} {
+				t.Run(field+"/"+control+"/"+position, func(t *testing.T) {
+					value := "valid"
+					switch position {
+					case "leading":
+						value = control + value
+					case "middle":
+						value = "va" + control + "lid"
+					case "trailing":
+						value += control
+					}
+					in := CreateInput{
+						RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", ResourceName: "resource",
+						Operation: authz.ActFullBusinessAccess, Reason: "need access",
+					}
+					switch field {
+					case "resource type":
+						in.ResourceType = value
+					case "resource ID":
+						in.ResourceID = value
+					case "resource name":
+						in.ResourceName = value
+					case "reason":
+						in.Reason = value
+					}
+					if validCreate(&in) {
+						t.Fatal("validCreate() accepted a control character in raw input")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestValidDecisionInputAllowsMultilineComment(t *testing.T) {
+	in := DecisionInput{ReviewerID: "reviewer", Decision: "reject", Comment: "Please revise\nthe access scope."}
+	if !validDecisionInput(&in) {
+		t.Fatal("validDecisionInput() rejected a multiline comment")
+	}
+}
+
+func TestCreatePolicyProposalDoesNotInsertEmptyOperationRows(t *testing.T) {
+	permissionproposal.Register("test_empty_operation_rows", emptyOperationProposalHandler{})
+	db, err := gorm.Open(sqlite.Open("file:permission-request-policy-create?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "requester", Account: "requester", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	created, first, err := New(db, enforcer).Create(t.Context(), CreateInput{
+		RequesterID: "requester", ResourceType: "object_type", ResourceID: "kn-1/object-1",
+		ProposalKind: "test_empty_operation_rows", ProposalPayload: json.RawMessage(`{"current_policy":null}`), Reason: "need more data",
+	})
+	if err != nil || !first {
+		t.Fatalf("Create() = %#v, %v, want policy request without an empty-slice error", created, err)
+	}
+	var count int64
+	if err := db.Model(&model.PermissionRequestOperation{}).Where("request_id = ?", created.ID).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("operation rows = %d, want 0", count)
+	}
+}
+
+func TestOnlyRowFilterProposalRequiresReason(t *testing.T) {
+	rowFilterRequest := CreateInput{
+		RequesterID: "requester", ResourceType: "object_type", ResourceID: "kn-1/object-1",
+		ProposalKind: "row_filter", ProposalPayload: json.RawMessage(`{"current_policy":null}`),
+	}
+	if validCreate(&rowFilterRequest) {
+		t.Fatal("validCreate() accepted a row-filter request without a reason")
+	}
+	propertyRequest := CreateInput{
+		RequesterID: "requester", ResourceType: "object_type", ResourceID: "kn-1/object-1",
+		ProposalKind: "property_grants", ProposalPayload: json.RawMessage(`{"changes":[{"property_name":"name","level":"full"}]}`),
+	}
+	if !validCreate(&propertyRequest) {
+		t.Fatal("validCreate() rejected a property request without a reason")
+	}
+}
+
+func TestGetMigratesLegacyRowFilterPendingConfigurationToGranted(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-legacy-row-filter?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "requester", Account: "requester", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacy := model.PermissionRequest{
+		ID: "legacy-row-filter", RequestKey: "legacy-row-filter", RequesterID: "requester",
+		// proposal_kind was added after this intermediate status existed, so a
+		// stored legacy row has no proposal kind.
+		ResourceType: "object_type", ResourceID: "kn-1/object-1",
+		Status: "pending_configuration",
+	}
+	if err := db.Create(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	request, err := New(db, enforcer).Get(t.Context(), legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Status != StatusGranted {
+		t.Fatalf("legacy request status = %q, want %q", request.Status, StatusGranted)
+	}
+}
+
+func TestLegacyConfigurationStatusMigrationRetriesAfterCancelledRequest(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-legacy-migration-retry?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "requester", Account: "requester", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	legacy := model.PermissionRequest{
+		ID: "legacy-row-filter-retry", RequestKey: "legacy-row-filter-retry", RequesterID: "requester",
+		ResourceType: "object_type", ResourceID: "kn-1/object-1", Status: "pending_configuration",
+	}
+	if err := db.Create(&legacy).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, enforcer)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := service.normalizeLegacyConfigurationStatuses(cancelled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled migration error = %v, want context.Canceled", err)
+	}
+	request, err := service.Get(t.Context(), legacy.ID)
+	if err != nil {
+		t.Fatalf("Get() after a cancelled migration = %v, want retry to succeed", err)
+	}
+	if request.Status != StatusGranted {
+		t.Fatalf("retried legacy request status = %q, want %q", request.Status, StatusGranted)
+	}
+}
+
+func TestApprovalCreatesOneIndependentGrant(t *testing.T) {
+	entitlement.SetGateForTest(entitlement.GateFunc(func() entitlement.Snapshot {
+		return entitlement.Snapshot{Edition: licverify.EditionProfessional}
+	}))
+	t.Cleanup(entitlement.ResetForTest)
+	db, err := gorm.Open(sqlite.Open("file:permission-request-approval?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"requester", "reviewer"} {
+		if err := db.Create(&model.User{ID: id, Account: id, Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&model.ResourceType{ID: "knowledge_network", Name: "Knowledge Network"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := enforcer.GrantCommunityBundle("reviewer", "knowledge_network", "r-1", authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, enforcer)
+	created, first, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "missing access"})
+	if err != nil || !first {
+		t.Fatalf("Create() = %v, %v", first, err)
+	}
+	replay, second, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "missing access"})
+	if err != nil || second || replay.ID != created.ID {
+		t.Fatalf("Create replay = %#v, %v, %v", replay, second, err)
+	}
+	approved, err := service.Decide(t.Context(), created.ID, DecisionInput{ReviewerID: "reviewer", Decision: "approve"})
+	if err != nil || approved.Status != StatusGranted {
+		t.Fatalf("Decide() = %#v, %v", approved, err)
+	}
+	var grant model.AuthorizationGrant
+	if err := db.First(&grant, "grant_id = ?", created.GrantID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if grant.AccessorID != "requester" || grant.CreatedBy != "reviewer" {
+		t.Fatalf("unexpected grant: %#v", grant)
+	}
+	replayedApproval, err := service.Decide(t.Context(), created.ID, DecisionInput{ReviewerID: "reviewer", Decision: "approve"})
+	if err != nil || replayedApproval.Status != StatusGranted {
+		t.Fatalf("second approval = %#v, %v; want the completed request", replayedApproval, err)
+	}
+	decisions, err := service.ListDecisions(t.Context(), created.ID)
+	if err != nil || len(decisions) != 1 || decisions[0].Decision != "approve" {
+		t.Fatalf("approval replay decisions = %#v, %v; want one approve decision", decisions, err)
+	}
+	for _, input := range []DecisionInput{
+		{ReviewerID: "reviewer", Decision: "reject"},
+		{ReviewerID: "other-reviewer", Decision: "approve"},
+	} {
+		if _, err := service.Decide(t.Context(), created.ID, input); !errors.Is(err, ErrClosed) {
+			t.Fatalf("closed request decision %#v = %v, want ErrClosed", input, err)
+		}
+	}
+	if _, _, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "access needed again"}); err != ErrPermissionAlreadyGranted {
+		t.Fatalf("Create after granted = %v, want ErrPermissionAlreadyGranted", err)
+	}
+}
+
+func TestApprovalAddsPermissionRequestSourceWhenPermissionWasGrantedElsewhere(t *testing.T) {
+	entitlement.ResetForTest()
+	finegrained.ResetForTest()
+	t.Cleanup(func() {
+		finegrained.ResetForTest()
+		entitlement.ResetForTest()
+	})
+	entitlement.SetGateForTest(entitlement.GateFunc(func() entitlement.Snapshot {
+		return entitlement.Snapshot{Edition: licverify.EditionProfessional}
+	}))
+	finegrained.Register(licverify.EditionProfessional)
+
+	db, err := gorm.Open(sqlite.Open("file:permission-request-source-on-approval?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"requester", "reviewer", "administrator"} {
+		if err := db.Create(&model.User{ID: id, Account: id, Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&model.ResourceType{ID: "catalog", Name: "Catalog"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	grantable := true
+	if err := db.Create(&[]model.Operation{
+		{ResourceTypeID: "catalog", ID: "view_detail", Name: "View detail", Grantable: &grantable},
+		{ResourceTypeID: "catalog", ID: "resource_manage", Name: "Manage resource", RequiredOperationIDs: "view_detail", Grantable: &grantable},
+		{ResourceTypeID: "catalog", ID: "authorize", Name: "Authorize", Grantable: &grantable},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"view_detail", "resource_manage", "authorize"} {
+		if err := enforcer.GrantObjectPermission("reviewer", "catalog", "catalog-1", operation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enforcer.GrantObjectPermission("requester", "catalog", "catalog-1", "view_detail"); err != nil {
+		t.Fatal(err)
+	}
+
+	service := New(db, enforcer)
+	request, _, err := service.Create(t.Context(), CreateInput{
+		RequesterID: "requester", ResourceType: "catalog", ResourceID: "catalog-1",
+		Operations: []string{"resource_manage"}, Reason: "need to manage this catalog",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := enforcer.GrantPolicy(t.Context(), authz.PolicyGrant{
+		GrantID: "admin-authz-resource-manage", AccessorID: "requester", Object: "catalog:catalog-1", Operation: "resource_manage",
+		Effect: authz.EffectAllow, PolicySource: authz.PolicySourceProfessionalRule,
+		AuthoritySource: authz.AuthoritySourceAdminAuthz, CreatedBy: "administrator",
+	})
+	if err != nil || !created {
+		t.Fatalf("admin grant = %v, %v; want created", created, err)
+	}
+
+	approved, err := service.Decide(t.Context(), request.ID, DecisionInput{ReviewerID: "reviewer", Decision: "approve"})
+	if err != nil || approved.Status != StatusGranted {
+		t.Fatalf("Decide() = %#v, %v; want granted", approved, err)
+	}
+	decisions, err := service.ListDecisions(t.Context(), request.ID)
+	if err != nil || len(decisions) != 1 || decisions[0].Decision != "approve" {
+		t.Fatalf("decisions = %#v, %v; want one approve decision", decisions, err)
+	}
+	records, err := enforcer.PolicyRecords(authz.PolicyFilter{
+		AccessorID: "requester", Object: "catalog:catalog-1", Operation: "resource_manage",
+	})
+	if err != nil || len(records) != 2 {
+		t.Fatalf("resource_manage sources = %#v, %v; want admin and request sources", records, err)
+	}
+	if _, err := enforcer.RevokePolicy("admin-authz-resource-manage"); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := enforcer.CheckContext(t.Context(), "requester", "catalog", "catalog-1", "resource_manage"); err != nil || !allowed {
+		t.Fatalf("request grant did not survive admin revoke: allowed=%v err=%v", allowed, err)
+	}
+	if _, err := enforcer.RevokePolicy(request.GrantID); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := enforcer.CheckContext(t.Context(), "requester", "catalog", "catalog-1", "resource_manage"); err != nil || allowed {
+		t.Fatalf("permission remained after all sources were revoked: allowed=%v err=%v", allowed, err)
+	}
+	if _, err := service.Decide(t.Context(), request.ID, DecisionInput{ReviewerID: "reviewer", Decision: "approve"}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("approval after request source revocation = %v, want ErrClosed", err)
+	}
+}
+
+func TestRequesterCannotApproveOwnRequest(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-self-review?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "requester", Account: "requester", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, enforcer)
+	req, _, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "missing access"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Decide(t.Context(), req.ID, DecisionInput{ReviewerID: "requester", Decision: "approve"}); err != ErrForbidden {
+		t.Fatalf("self approval = %v, want ErrForbidden", err)
+	}
+}
+
+func TestNonPersonAccountsCannotReviewPermissionRequests(t *testing.T) {
+	entitlement.ResetForTest()
+	finegrained.ResetForTest()
+	t.Cleanup(func() {
+		finegrained.ResetForTest()
+		entitlement.ResetForTest()
+	})
+	entitlement.SetGateForTest(entitlement.GateFunc(func() entitlement.Snapshot {
+		return entitlement.Snapshot{Edition: licverify.EditionProfessional}
+	}))
+	finegrained.Register(licverify.EditionProfessional)
+
+	for _, accountType := range []model.AccountType{model.AccountTypeApp, model.AccountTypeContactor} {
+		t.Run(string(accountType), func(t *testing.T) {
+			db, err := gorm.Open(sqlite.Open("file:permission-request-non-person-"+string(accountType)+"?mode=memory&cache=shared"), &gorm.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Migrate(db); err != nil {
+				t.Fatal(err)
+			}
+			enforcer, err := authz.New(db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, user := range []model.User{
+				{ID: "requester", Account: "requester", Enabled: true},
+				{ID: "person-reviewer", Account: "person-reviewer", Enabled: true},
+				{ID: "non-person-reviewer", Account: "non-person-reviewer", Enabled: true, AccountType: accountType},
+			} {
+				if err := db.Create(&user).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Create(&model.ResourceType{ID: "catalog", Name: "Catalog"}).Error; err != nil {
+				t.Fatal(err)
+			}
+			grantable := true
+			if err := db.Create(&[]model.Operation{
+				{ResourceTypeID: "catalog", ID: "view_detail", Name: "View detail", Grantable: &grantable},
+				{ResourceTypeID: "catalog", ID: "authorize", Name: "Authorize", Grantable: &grantable},
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			for _, reviewerID := range []string{"person-reviewer", "non-person-reviewer"} {
+				for _, operation := range []string{"view_detail", "authorize"} {
+					if err := enforcer.GrantObjectPermission(reviewerID, "catalog", "catalog-1", operation); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+
+			service := New(db, enforcer)
+			request, _, err := service.Create(t.Context(), CreateInput{
+				RequesterID: "requester", ResourceType: "catalog", ResourceID: "catalog-1", Operations: []string{"view_detail"}, Reason: "need access",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			todo, err := service.ListTodo(t.Context(), "non-person-reviewer")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(todo) != 0 {
+				t.Fatalf("non-person todo = %#v, want empty", todo)
+			}
+			summary, err := service.GetTodoSummary(t.Context(), "non-person-reviewer")
+			if err != nil || summary.PendingCount != 0 {
+				t.Fatalf("non-person todo summary = %#v, %v; want zero", summary, err)
+			}
+			if _, err := service.Decide(t.Context(), request.ID, DecisionInput{ReviewerID: "non-person-reviewer", Decision: "approve"}); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("non-person approval = %v, want ErrForbidden", err)
+			}
+			var candidateCount, decisionCount, grantCount int64
+			if err := db.Model(&model.PermissionRequestReviewer{}).Where("request_id = ? AND reviewer_id = ?", request.ID, "non-person-reviewer").Count(&candidateCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&model.PermissionRequestDecision{}).Where("request_id = ?", request.ID).Count(&decisionCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Model(&model.AuthorizationGrant{}).Where("grant_id = ?", request.GrantID).Count(&grantCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if candidateCount != 0 || decisionCount != 0 || grantCount != 0 {
+				t.Fatalf("non-person reviewer wrote candidate=%d decision=%d grant=%d; want all zero", candidateCount, decisionCount, grantCount)
+			}
+		})
+	}
+}
+
+func TestApprovalInvalidatesRequestWhenPrerequisiteWasRevoked(t *testing.T) {
+	entitlement.ResetForTest()
+	finegrained.ResetForTest()
+	t.Cleanup(func() {
+		finegrained.ResetForTest()
+		entitlement.ResetForTest()
+	})
+	entitlement.SetGateForTest(entitlement.GateFunc(func() entitlement.Snapshot {
+		return entitlement.Snapshot{Edition: licverify.EditionProfessional}
+	}))
+	finegrained.Register(licverify.EditionProfessional)
+	db, err := gorm.Open(sqlite.Open("file:permission-request-invalidated?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"requester", "reviewer"} {
+		if err := db.Create(&model.User{ID: id, Account: id, Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&model.ResourceType{ID: "knowledge_network", Name: "Knowledge Network"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	grantable := true
+	if err := db.Create(&[]model.Operation{
+		{ResourceTypeID: "knowledge_network", ID: "view_detail", Name: "View detail", Grantable: &grantable},
+		{ResourceTypeID: "knowledge_network", ID: "delete", Name: "Delete", RequiredOperationIDs: "view_detail", Grantable: &grantable},
+		{ResourceTypeID: "knowledge_network", ID: "authorize", Name: "Authorize", Grantable: &grantable},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"view_detail", "delete", "authorize"} {
+		if err := enforcer.GrantObjectPermission("reviewer", "knowledge_network", "r-1", operation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(db, enforcer)
+	if _, _, err := service.Create(t.Context(), CreateInput{
+		RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operations: []string{"delete"}, Reason: "delete access",
+	}); !errors.Is(err, ErrPrerequisiteMissing) {
+		t.Fatalf("Create without view_detail = %v, want ErrPrerequisiteMissing", err)
+	}
+	if err := enforcer.GrantObjectPermission("requester", "knowledge_network", "r-1", "view_detail"); err != nil {
+		t.Fatal(err)
+	}
+	request, _, err := service.Create(t.Context(), CreateInput{
+		RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operations: []string{"delete"}, Reason: "delete access",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enforcer.RevokeObjectPermission("requester", "knowledge_network", "r-1", "view_detail"); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := service.Decide(t.Context(), request.ID, DecisionInput{ReviewerID: "reviewer", Decision: "approve"})
+	if err != nil || result.Status != StatusInvalidated {
+		t.Fatalf("Decide() = %#v, %v; want invalidated request", result, err)
+	}
+	allowed, err := enforcer.CheckContext(t.Context(), "requester", "knowledge_network", "r-1", "delete")
+	if err != nil || allowed {
+		t.Fatalf("delete grant = %v, %v; want no grant", allowed, err)
+	}
+	decisions, err := service.ListDecisions(t.Context(), request.ID)
+	if err != nil || len(decisions) != 1 || decisions[0].Decision != DecisionInvalidated {
+		t.Fatalf("decisions = %#v, %v; want one invalidated decision", decisions, err)
+	}
+	if _, created, err := service.Create(t.Context(), CreateInput{
+		RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operations: []string{"view_detail", "delete"}, Reason: "reapply",
+	}); err != nil || !created {
+		t.Fatalf("reapply = %v, %v; want new request", created, err)
+	}
+}
+
+func TestCommunityCreateRequiresBundleRootAndForbidsAuthorize(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-community-shape?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, enforcer)
+	for _, input := range []CreateInput{
+		{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: "view_detail"},
+		{RequesterID: "requester", ResourceType: "resource", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess},
+		{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: "authorize"},
+	} {
+		if _, _, err := service.Create(t.Context(), input); err != ErrInvalidRequest {
+			t.Fatalf("Create(%+v) = %v, want ErrInvalidRequest", input, err)
+		}
+	}
+}
+
+func TestRejectionRemovesOnlyReviewersTodo(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-reject?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"requester", "reviewer"} {
+		if err := db.Create(&model.User{ID: id, Account: id, Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enforcer.GrantCommunityBundle("reviewer", "knowledge_network", "r-1", authz.AuthoritySourceAdminAuthz); err != nil {
+		t.Fatal(err)
+	}
+	service := New(db, enforcer)
+	req, _, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "missing access"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Decide(t.Context(), req.ID, DecisionInput{ReviewerID: "reviewer", Decision: "reject"}); err != nil {
+		t.Fatal(err)
+	}
+	todo, err := service.ListTodo(t.Context(), "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(todo) != 0 {
+		t.Fatalf("todo after rejection = %#v, want empty", todo)
+	}
+}
+
+func TestPendingRequestListsOnlyUnreviewedEligibleReviewers(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-pending-reviewers?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	enforcer, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"requester", "reviewer-one", "reviewer-two"} {
+		if err := db.Create(&model.User{ID: id, Account: id, Enabled: true}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&model.ResourceType{ID: "knowledge_network", Name: "Knowledge Network"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, reviewer := range []string{"reviewer-one", "reviewer-two"} {
+		if err := enforcer.GrantCommunityBundle(reviewer, "knowledge_network", "r-1", authz.AuthoritySourceAdminAuthz); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(db, enforcer)
+	req, _, err := service.Create(t.Context(), CreateInput{RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: authz.ActFullBusinessAccess, Reason: "missing access"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Decide(t.Context(), req.ID, DecisionInput{ReviewerID: "reviewer-one", Decision: "reject"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.Get(t.Context(), req.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusPending || got.ReviewerID != "reviewer-two" || got.ReviewerName != "reviewer-two" {
+		t.Fatalf("pending reviewers = %#v, want reviewer-two only", got)
+	}
+}
+
+func TestRequestedPageFiltersByExactResourceID(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-resource-id-filter?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "requester", Account: "requester", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []model.PermissionRequest{
+		{
+			ID:           "request-one",
+			RequestKey:   "requester|knowledge_network|network-one|view_detail",
+			GrantID:      "grant-request-one",
+			RequesterID:  "requester",
+			ResourceType: "knowledge_network",
+			ResourceID:   "network-one",
+			ResourceName: "Network one",
+			Operation:    "view_detail",
+			Status:       StatusPending,
+		},
+		{
+			ID:           "request-two",
+			RequestKey:   "requester|knowledge_network|network-two|view_detail",
+			GrantID:      "grant-request-two",
+			RequesterID:  "requester",
+			ResourceType: "knowledge_network",
+			ResourceID:   "network-two",
+			ResourceName: "Network two",
+			Operation:    "view_detail",
+			Status:       StatusPending,
+		},
+	} {
+		if err := db.Create(&request).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	page, err := New(db, nil).ListRequestedPage(t.Context(), "requester", PageOptions{
+		Limit:        20,
+		ResourceType: "knowledge_network",
+		ResourceID:   "network-two",
+		Status:       StatusPending,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.TotalCount != 1 || len(page.Entries) != 1 || page.Entries[0].ID != "request-two" {
+		t.Fatalf("resource ID filtered page = %#v, want request-two only", page)
+	}
+}
+
+func TestTodoSummaryCountsOnlyActiveUnreviewedPendingRequests(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:permission-request-todo-summary?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "reviewer", Account: "reviewer", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range []model.PermissionRequest{
+		{ID: "pending", RequestKey: "pending", GrantID: "grant-pending", RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-1", Operation: "view_detail", Status: StatusPending},
+		{ID: "reviewed", RequestKey: "reviewed", GrantID: "grant-reviewed", RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-2", Operation: "view_detail", Status: StatusPending},
+		{ID: "revoked", RequestKey: "revoked", GrantID: "grant-revoked", RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-3", Operation: "view_detail", Status: StatusPending},
+		{ID: "closed", RequestKey: "closed", GrantID: "grant-closed", RequesterID: "requester", ResourceType: "knowledge_network", ResourceID: "r-4", Operation: "view_detail", Status: StatusGranted},
+	} {
+		if err := db.Create(&request).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, reviewer := range []model.PermissionRequestReviewer{
+		{ID: "candidate-pending", RequestID: "pending", ReviewerID: "reviewer", EligibilityStatus: ReviewerActive},
+		{ID: "candidate-reviewed", RequestID: "reviewed", ReviewerID: "reviewer", EligibilityStatus: ReviewerActive},
+		{ID: "candidate-revoked", RequestID: "revoked", ReviewerID: "reviewer", EligibilityStatus: ReviewerRevoked},
+		{ID: "candidate-closed", RequestID: "closed", ReviewerID: "reviewer", EligibilityStatus: ReviewerActive},
+	} {
+		if err := db.Create(&reviewer).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Create(&model.PermissionRequestDecision{ID: "decision", RequestID: "reviewed", ReviewerID: "reviewer", Decision: "reject"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := New(db, nil).GetTodoSummary(t.Context(), "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.PendingCount != 1 {
+		t.Fatalf("todo summary = %#v, want one active unreviewed pending request", summary)
+	}
+}

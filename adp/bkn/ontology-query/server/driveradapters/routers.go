@@ -18,6 +18,10 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/middleware"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"ontology-query/common"
 	oerrors "ontology-query/errors"
@@ -68,8 +72,8 @@ func NewRestHandler(appSetting *common.AppSetting) RestHandler {
 }
 
 func (r *restHandler) RegisterPublic(c *gin.Engine) {
-	c.Use(r.AccessLog())
 	c.Use(middleware.TracingMiddleware())
+	c.Use(r.AccessLog())
 	c.Use(r.TraceContextMiddleware())
 	c.Use(r.LanguageMiddleware())
 
@@ -78,11 +82,6 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 	apiV1 := c.Group("/api/ontology-query/v1")
 	apiV1.Use(rest.PrivateNoCacheMiddleware())
 	{
-		apiV1.GET("/trace/outbox", r.ListTraceOutbox)
-		apiV1.GET("/trace/outbox/:outbox_id", r.GetTraceOutbox)
-		apiV1.POST("/trace/outbox/:outbox_id/retry", r.verifyJsonContentType(), r.RetryTraceOutbox)
-		apiV1.POST("/trace/outbox/:outbox_id/abandon", r.verifyJsonContentType(), r.AbandonTraceOutbox)
-
 		// Query object data for the specified object type.
 		apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_id/schema", r.GetObjectTypeSchemaByEx)
 		apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_id/sample-data", r.GetObjectTypeSampleDataByEx)
@@ -186,17 +185,48 @@ func (r *restHandler) TraceContextMiddleware() gin.HandlerFunc {
 func (r *restHandler) AccessLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		beginTime := time.Now()
-		c.Next()
-		endTime := time.Now()
-		durTime := endTime.Sub(beginTime).Seconds()
-
-		logger.Debugf("access log: url: %s, method: %s, begin_time: %s, end_time: %s, subTime: %f",
-			c.Request.URL.Path,
-			c.Request.Method,
-			beginTime.Format(libCommon.RFC3339Milli),
-			endTime.Format(libCommon.RFC3339Milli),
-			durTime,
+		ctx, span := otel.Tracer("ontology-query/http").Start(
+			c.Request.Context(), "HTTP request", trace.WithSpanKind(trace.SpanKindServer),
 		)
+		c.Request = c.Request.WithContext(ctx)
+		defer func() {
+			panicValue := recover()
+			if panicValue != nil && !c.Writer.Written() {
+				c.Status(http.StatusInternalServerError)
+			}
+			endTime := time.Now()
+			durTime := endTime.Sub(beginTime).Seconds()
+
+			logger.Debugf("access log: url: %s, method: %s, begin_time: %s, end_time: %s, subTime: %f",
+				c.Request.URL.Path,
+				c.Request.Method,
+				beginTime.Format(libCommon.RFC3339Milli),
+				endTime.Format(libCommon.RFC3339Milli),
+				durTime,
+			)
+			route := c.FullPath()
+			if route == "" {
+				route = "unmatched"
+			}
+			span.SetName(c.Request.Method + " " + route)
+			span.SetAttributes(operationSpanAttributes(c.Request.Method, route, c.Writer.Status())...)
+			if c.Writer.Status() >= http.StatusInternalServerError {
+				span.SetStatus(codes.Error, http.StatusText(c.Writer.Status()))
+			}
+			span.End()
+			if panicValue != nil {
+				panic(panicValue)
+			}
+		}()
+		c.Next()
+	}
+}
+
+func operationSpanAttributes(method, route string, status int) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String("http.request.method", method),
+		attribute.String("http.route", route),
+		attribute.Int("http.response.status_code", status),
 	}
 }
 

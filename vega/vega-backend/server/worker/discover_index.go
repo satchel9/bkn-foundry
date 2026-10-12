@@ -7,11 +7,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
@@ -20,6 +23,7 @@ type indexDiscoverItem struct {
 	resource        *interfaces.Resource
 	indexMeta       *interfaces.IndexMeta
 	markAfterEnrich bool
+	countOnly       bool
 }
 
 func (dtw *DiscoverTaskWorker) discoverIndexResources(ctx context.Context,
@@ -107,9 +111,9 @@ func (dtw *DiscoverTaskWorker) reconcileIndexResources(ctx context.Context,
 		sourceIdentifier := idx.Name
 
 		if resource, ok := existingMap[sourceIdentifier]; ok {
-			if actions != nil && actions.Refresh {
-				markAfterEnrich := true
-				if resource.Status == interfaces.ResourceStatusStale {
+			if actions != nil && (actions.Refresh || actions.Count) {
+				markAfterEnrich := actions.Refresh
+				if actions.Refresh && resource.Status == interfaces.ResourceStatusStale {
 					if err := dtw.rs.UpdateStatus(ctx, resource.ID, interfaces.ResourceStatusActive, ""); err != nil {
 						logger.Errorf("Failed to reactivate resource %s: %v", resource.ID, err)
 					} else {
@@ -124,6 +128,7 @@ func (dtw *DiscoverTaskWorker) reconcileIndexResources(ctx context.Context,
 					resource:        resource,
 					indexMeta:       idx,
 					markAfterEnrich: markAfterEnrich,
+					countOnly:       !actions.Refresh,
 				})
 			}
 		} else {
@@ -177,10 +182,6 @@ func (dtw *DiscoverTaskWorker) createIndexResource(ctx context.Context,
 		Enabled:          true,
 		Status:           interfaces.ResourceStatusActive,
 		SourceIdentifier: index.Name,
-		SourceMetadata: map[string]any{
-			"original_name":        index.Name,
-			"original_description": index.Description,
-		},
 	}
 	resource, err := dtw.rs.Create(ctx, req)
 	if err != nil {
@@ -197,12 +198,23 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 
 	progress.SetMetadataTotal(len(items))
 
-	for _, item := range items {
+	for itemIndex, item := range items {
 		if dtw.stopped.Load() {
 			return ErrWorkerManagerStopping
 		}
 		idx := item.indexMeta
 		resource := item.resource
+
+		if item.countOnly {
+			if err := dtw.enrichResourceIndexRowCount(ctx, task, resource, indexConnector, idx, result); err != nil {
+				return err
+			}
+			if err := dtw.updateProgress(ctx, task.ID, 5+90*(itemIndex+1)/len(items), fmt.Sprintf("Exact count processed: %d/%d", itemIndex+1, len(items))); err != nil {
+				return err
+			}
+			continue
+		}
+
 		beforeHash := sourceSnapshotHash(resource)
 
 		if err := indexConnector.GetIndexMeta(ctx, idx); err != nil {
@@ -226,6 +238,30 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 			continue
 		}
 
+		var exactCount *int64
+		if task.DiscoverActions != nil && task.DiscoverActions.Count {
+			queryCtx, cancel := context.WithTimeout(ctx, resourceCountTimeout)
+			count, err := indexConnector.CountRows(queryCtx, idx)
+			cancel()
+			if parentErr := ctx.Err(); parentErr != nil {
+				return parentErr
+			}
+			if err == nil && count < 0 {
+				err = fmt.Errorf("invalid negative row count")
+			}
+			if err != nil {
+				result.FailedCount++
+				logger.Warnf("Failed to count index %s during discovery: %v", idx.Name, err)
+				if current, changed := progress.AdvanceMetadata(); changed {
+					if err := dtw.updateProgress(ctx, task.ID, current, fmt.Sprintf("resource metadata enriched: %d/%d", progress.metadataProcessed, progress.metadataTotal)); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			exactCount = &count
+		}
+
 		existingProperties := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
 		for _, property := range resource.SchemaDefinition {
 			if property != nil {
@@ -236,11 +272,15 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 		var props []*interfaces.Property
 		for _, field := range idx.Mapping {
 			delete(field.Attributes, "type")
+			nativeType := field.Type
+			if field.ResolvedType != "" {
+				nativeType = field.ResolvedType
+			}
 
 			property := &interfaces.Property{
 				Name:        field.Name,
 				DisplayName: field.Name,
-				Type:        indexConnector.MapType(field.Type),
+				Type:        indexConnector.MapType(nativeType),
 				Description: field.Description,
 
 				OriginalName:        field.Name,
@@ -260,16 +300,22 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 
 		resource.Description = resolveSourceDescription(resource.Description, sourceOriginalDescription(resource.SourceMetadata), idx.Description)
 
-		sourceMetadata := make(map[string]any)
-		if resource.SourceMetadata != nil {
-			sourceMetadata = resource.SourceMetadata
+		// SourceMetadata stores the complete source IndexMeta without additional fields.
+		data, err := sonic.Marshal(idx)
+		if err != nil {
+			return fmt.Errorf("serialize index metadata: %w", err)
 		}
-		sourceMetadata["original_name"] = idx.Name
-		sourceMetadata["original_description"] = idx.Description
-		sourceMetadata["properties"] = idx.Properties
-		sourceMetadata["mapping"] = idx.Mapping
-		sourceMetadata["mapping_meta"] = idx.MappingMeta
+		sourceMetadata := make(map[string]any)
+		if err := common.UnmarshalPreciseJSON(data, &sourceMetadata); err != nil {
+			return fmt.Errorf("decode index metadata: %w", err)
+		}
 		resource.SourceMetadata = sourceMetadata
+
+		observedAt := time.Now().UnixMilli()
+		if exactCount != nil {
+			resource.RowCount = exactCount
+			resource.RowCountTime = &observedAt
+		}
 
 		discoverStatus := resource.LastDiscoverStatus
 		if item.markAfterEnrich {
@@ -278,11 +324,12 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 		}
 
 		resource.LastDiscoverStatus = discoverStatus
+		resource.LastDiscoverTime = observedAt
 		resource.StatusMessage = ""
 		expectedUpdateTime := resource.UpdateTime
 		resource.Updater = task.Creator
-		resource.UpdateTime = time.Now().UnixMilli()
-		if err := dtw.rs.InternalUpdateDiscoveryMetadata(ctx, nil, resource, expectedUpdateTime); err != nil {
+		resource.UpdateTime = observedAt
+		if err := dtw.saveDiscoveredResource(ctx, resource, expectedUpdateTime, exactCount, observedAt); err != nil {
 			logger.Errorf("Failed to update metadata for index %s: %v", idx.Name, err)
 			return err
 		}
@@ -316,11 +363,11 @@ func mergeIndexFeatures(existing, native []interfaces.PropertyFeature) []interfa
 // osSubFieldTypeToFeatureType maps supported OpenSearch multi-field types to VEGA feature types.
 func osSubFieldTypeToFeatureType(osType string) string {
 	switch osType {
-	case "keyword":
+	case "keyword", "constant_keyword":
 		return interfaces.PropertyFeatureType_Keyword
-	case "text":
+	case "text", "match_only_text":
 		return interfaces.PropertyFeatureType_Fulltext
-	case "dense_vector", "knn_vector":
+	case "knn_vector":
 		return interfaces.PropertyFeatureType_Vector
 	default:
 		return ""
@@ -351,4 +398,32 @@ func buildSubFieldFeatures(parentName string, subFields []interfaces.IndexSubFie
 		return nil
 	}
 	return features
+}
+
+// enrichResourceIndexRowCount 采集并保存单个索引的数量。
+func (dtw *DiscoverTaskWorker) enrichResourceIndexRowCount(ctx context.Context,
+	task *interfaces.DiscoverTask, resource *interfaces.Resource, connector interfaces.IndexConnector,
+	meta *interfaces.IndexMeta, result *interfaces.DiscoverResult) error {
+
+	queryCtx, cancel := context.WithTimeout(ctx, resourceCountTimeout)
+	count, err := connector.CountRows(queryCtx, meta)
+	cancel()
+
+	if err == nil && count < 0 {
+		err = fmt.Errorf("invalid negative row count")
+	}
+	if err == nil {
+		err = dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli())
+	}
+	if err != nil {
+		if errors.Is(err, interfaces.ErrRowCountUnavailable) && task.ResourceID == "" {
+			result.SkippedCount++
+		} else {
+			result.FailedCount++
+		}
+		logger.Warnf("Resource exact count failed: resource_id=%s error=%v", resource.ID, err)
+	} else {
+		result.UpdatedCount++
+	}
+	return nil
 }

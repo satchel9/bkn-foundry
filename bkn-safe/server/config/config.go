@@ -16,23 +16,21 @@ type Config struct {
 	HTTPAddr string `yaml:"http_addr"` // listen address (login/consent/device + APIs)
 	DB       DBConfig
 	Hydra    HydraConfig
+	OAuth    OAuthConfig
 	LDAP     LDAPConfig
 	License  LicenseConfig `yaml:"license"`
 	// SeedOnStart controls whether roles/resource-types/operations/grants are
 	// seeded into the DB at startup (idempotent). Default true.
-	SeedOnStart bool `yaml:"seed_on_start"`
-	// Audit tunes the audit chain anchor export and the authorization
-	// decision log (#334).
-	Audit AuditConfig `yaml:"audit"`
-
-	Authz     AuthzConfig     `yaml:"authz"`
-	Upstreams UpstreamsConfig `yaml:"upstreams"`
+	SeedOnStart bool            `yaml:"seed_on_start"`
+	Authz       AuthzConfig     `yaml:"authz"`
+	Upstreams   UpstreamsConfig `yaml:"upstreams"`
 }
 
 // UpstreamsConfig contains environment-specific base URLs. Provider paths and
 // response mappings remain compiled into bkn-safe.
 type UpstreamsConfig struct {
 	BKNBackend       UpstreamConfig `yaml:"bkn_backend"`
+	BKNAgent         UpstreamConfig `yaml:"bkn_agent"`
 	ExecutionFactory UpstreamConfig `yaml:"execution_factory"`
 	VegaBackend      UpstreamConfig `yaml:"vega_backend"`
 	OntologyQuery    UpstreamConfig `yaml:"ontology_query"`
@@ -48,30 +46,6 @@ type AuthzConfig struct {
 	// PolicyRefreshInterval reloads the in-memory policy from the store on a
 	// timer, picking up rows changed outside bkn-safe. 0 disables it.
 	PolicyRefreshInterval time.Duration `yaml:"policy_refresh_interval"`
-}
-
-// AuditConfig tunes what the audit subsystem does beyond recording rows.
-type AuditConfig struct {
-	// ChainHeadLogInterval is how often the audit chain head (seq + hash) is
-	// written to the service log, so an external append-only log store holds
-	// anchors a verifier can compare the database against. 0 disables. In a
-	// YAML file write it as a duration string ("15m", "0s"): yaml.v3 decodes
-	// those into time.Duration but rejects a bare number.
-	ChainHeadLogInterval time.Duration `yaml:"chain_head_log_interval"`
-	// DecisionLog configures the authorization decision log.
-	DecisionLog DecisionLogConfig `yaml:"decision_log"`
-}
-
-// DecisionLogConfig tunes the authorization decision log. Denies are always
-// recorded; only the allow side is sampled.
-type DecisionLogConfig struct {
-	Enabled bool `yaml:"enabled"`
-	// AllowSampleRate in [0,1] is the fraction of allow decisions kept.
-	AllowSampleRate float64 `yaml:"allow_sample_rate"`
-	// QueueSize bounds the rows waiting to be written; beyond it rows drop.
-	QueueSize int `yaml:"queue_size"`
-	// RetentionDays purges older rows daily. 0 keeps everything.
-	RetentionDays int `yaml:"retention_days"`
 }
 
 // LicenseConfig points bkn-safe at the license-server (activation + renewal).
@@ -129,8 +103,17 @@ func (d DBConfig) DSN() string {
 // HydraConfig is how bkn-safe reaches hydra's admin API (login/consent/device
 // accept + client mgmt). Admin is internal-only.
 type HydraConfig struct {
-	AdminURL  string `yaml:"admin_url"`  // e.g. http://hydra-admin:4445
-	PublicURL string `yaml:"public_url"` // e.g. http://hydra-public:4444
+	AdminURL         string `yaml:"admin_url"`          // e.g. http://hydra-admin:4445
+	PublicURL        string `yaml:"public_url"`         // internal SDK endpoint, e.g. http://hydra-public:4444
+	BrowserPublicURL string `yaml:"browser_public_url"` // canonical browser-facing issuer origin
+}
+
+// OAuthConfig contains the deployment-owned OAuth client baseline. Runtime
+// access origins are stored in the database; these redirect URIs are supplied
+// by Helm and cannot be removed through the admin API.
+type OAuthConfig struct {
+	StudioBaselineRedirectURIs []string      `yaml:"studio_baseline_redirect_uris"`
+	ReconcileInterval          time.Duration `yaml:"reconcile_interval"`
 }
 
 // LDAPConfig enables the light external-directory federation (Phase 5). When

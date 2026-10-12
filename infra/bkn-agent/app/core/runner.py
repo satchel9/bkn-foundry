@@ -102,6 +102,7 @@ async def run_agent_once(
         "bkn.agent.task",
         conversation_id=cl_session.conversation_id if cl_session else None,
         interaction_id=cl_session.interaction_id if cl_session else None,
+        owner=cl_session.owner if cl_session else None,
     )
     answer: str | None = None
     failure: str | None = None
@@ -323,7 +324,6 @@ async def _emit_task_evidence(
                 claim_id_value=cid,
                 evidence_refs=evidence_refs,
                 operation_name="bkn.agent.task",
-                operation_id=operation_ids[-1] if operation_ids else None,
                 causation_event_id=claim_event["event_id"] if claim_event else None,
             )
         )
@@ -332,7 +332,6 @@ async def _emit_task_evidence(
             claim_id_value=cid,
             business_refs=business_refs,
             operation_name="bkn.agent.task",
-            operation_id=operation_ids[-1],
             causation_event_id=claim_event["event_id"],
         )
     )

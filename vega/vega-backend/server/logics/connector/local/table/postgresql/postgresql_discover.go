@@ -13,14 +13,16 @@ import (
 	"strings"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/bytedance/sonic"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
-var pgSq = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
+var stmtBuilder = sq.StatementBuilder.PlaceholderFormat(sq.Dollar)
 
-// PostgreSQL 及兼容数据库不支持的 relkind 不会出现在 pg_class 中，固定过滤不会产生版本语法错误。
-var postgresqlTableRelKinds = []string{"r", "v", "f", "m", "p"}
+// Unsupported relkinds do not occur in pg_class, so this fixed filter works on compatible databases.
+var tableRelKinds = []string{"r", "v", "f", "m", "p"}
 
 type postgresqlDomainMetadata struct {
 	BaseType        string
@@ -31,6 +33,7 @@ type postgresqlDomainMetadata struct {
 	CheckConstraint string
 }
 
+// fetchDomainMetadata resolves domain chains to their base types, constraints, and defaults.
 func (c *PostgresqlConnector) fetchDomainMetadata(ctx context.Context,
 	domainOIDs []int64) (map[int64]postgresqlDomainMetadata, error) {
 	metadata := make(map[int64]postgresqlDomainMetadata, len(domainOIDs))
@@ -47,58 +50,68 @@ func (c *PostgresqlConnector) fetchDomainMetadata(ctx context.Context,
 
 	//nolint:gosec // PostgreSQL placeholders are generated locally; OID values are driver-bound.
 	query := fmt.Sprintf(`
-WITH RECURSIVE domain_chain AS (
-    SELECT root.oid AS domain_oid,
-           root.oid AS current_domain_oid,
-           0 AS domain_depth,
-           root.typbasetype AS base_type_oid,
-           root.typtypmod AS base_typmod,
-           root.typnotnull AS domain_not_null
-    FROM pg_catalog.pg_type root
-    WHERE root.typtype = 'd'
-      AND root.oid IN (%s)
-    UNION ALL
-    SELECT d.domain_oid,
-           parent.oid,
-           d.domain_depth + 1,
-           parent.typbasetype,
-           CASE WHEN d.base_typmod >= 0 THEN d.base_typmod ELSE parent.typtypmod END,
-           d.domain_not_null OR parent.typnotnull
-    FROM domain_chain d
-    JOIN pg_catalog.pg_type parent ON parent.oid = d.base_type_oid
-    WHERE parent.typtype = 'd'
-),
-resolved_domain AS (
-    SELECT d.domain_oid,
-           d.base_type_oid,
-           d.base_typmod,
-           d.domain_not_null
-    FROM domain_chain d
-    JOIN pg_catalog.pg_type base_type ON base_type.oid = d.base_type_oid
-    WHERE base_type.typtype <> 'd'
-),
-domain_checks AS (
-    SELECT d.domain_oid,
-           string_agg(pg_catalog.pg_get_constraintdef(con.oid, false), '; '
-                      ORDER BY d.domain_depth DESC, con.conname) AS check_constraint
-    FROM domain_chain d
-    JOIN pg_catalog.pg_constraint con
-      ON con.contypid = d.current_domain_oid
-     AND con.contype = 'c'
-    GROUP BY d.domain_oid
-)
-SELECT root.oid AS domain_oid,
-       base_type.typname AS base_type,
-       base_type.typtype::text AS base_type_kind,
-       resolved.base_typmod,
-       resolved.domain_not_null,
-       COALESCE(pg_catalog.pg_get_expr(root.typdefaultbin, 0), root.typdefault) AS domain_default,
-       COALESCE(checks.check_constraint, '') AS check_constraint
-FROM pg_catalog.pg_type root
-JOIN resolved_domain resolved ON resolved.domain_oid = root.oid
-JOIN pg_catalog.pg_type base_type ON base_type.oid = resolved.base_type_oid
-LEFT JOIN domain_checks checks ON checks.domain_oid = root.oid
-ORDER BY root.oid`, strings.Join(placeholders, ", "))
+		WITH RECURSIVE domain_chain AS (
+			SELECT
+				root.oid AS domain_oid,
+				root.oid AS current_domain_oid,
+				0 AS domain_depth,
+				root.typbasetype AS base_type_oid,
+				root.typtypmod AS base_typmod,
+				root.typnotnull AS domain_not_null
+			FROM pg_catalog.pg_type root
+				WHERE root.typtype = 'd' AND root.oid IN (%s)
+			UNION ALL
+			SELECT
+				d.domain_oid,
+				parent.oid,
+				d.domain_depth + 1,
+				parent.typbasetype,
+				CASE WHEN d.base_typmod >= 0 THEN d.base_typmod ELSE parent.typtypmod END,
+				d.domain_not_null OR parent.typnotnull
+			FROM domain_chain d
+			JOIN pg_catalog.pg_type parent
+				ON parent.oid = d.base_type_oid
+			WHERE parent.typtype = 'd'
+		),
+		resolved_domain AS (
+			SELECT
+				d.domain_oid,
+				d.base_type_oid,
+				d.base_typmod,
+				d.domain_not_null
+			FROM domain_chain d
+			JOIN pg_catalog.pg_type base_type
+				ON base_type.oid = d.base_type_oid
+			WHERE base_type.typtype <> 'd'
+		),
+		domain_checks AS (
+			SELECT
+				d.domain_oid,
+				string_agg(pg_catalog.pg_get_constraintdef(con.oid, false), '; '
+					ORDER BY d.domain_depth DESC, con.conname) AS check_constraint
+			FROM domain_chain d
+			JOIN pg_catalog.pg_constraint con
+				ON con.contypid = d.current_domain_oid AND con.contype = 'c'
+			GROUP BY d.domain_oid
+		)
+
+		SELECT
+			root.oid AS domain_oid,
+			base_type.typname AS base_type,
+			base_type.typtype::text AS base_type_kind,
+			resolved.base_typmod,
+			resolved.domain_not_null,
+			COALESCE(pg_catalog.pg_get_expr(root.typdefaultbin, 0), root.typdefault) AS domain_default,
+			COALESCE(checks.check_constraint, '') AS check_constraint
+		FROM pg_catalog.pg_type root
+		JOIN resolved_domain resolved
+			ON resolved.domain_oid = root.oid
+		JOIN pg_catalog.pg_type base_type
+			ON base_type.oid = resolved.base_type_oid
+		LEFT JOIN domain_checks checks
+			ON checks.domain_oid = root.oid
+		ORDER BY root.oid
+	`, strings.Join(placeholders, ", "))
 
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -145,31 +158,38 @@ func (c *PostgresqlConnector) ListTables(ctx context.Context) ([]*interfaces.Tab
 	return c.listTables(ctx, "", "")
 }
 
-func (c *PostgresqlConnector) listTables(ctx context.Context, schema, tableName string) ([]*interfaces.TableMeta, error) {
-	if err := c.Connect(ctx); err != nil {
-		return nil, err
-	}
-
-	builder := pgSq.Select(
-		"n.nspname AS table_schema",
-		"c.relname AS table_name",
-		"c.relkind::text AS relkind",
-		"COALESCE(obj_description(c.oid, 'pg_class'), '') AS description",
-	).From("pg_catalog.pg_class c").
+func discoverableRelationsBuilder() sq.SelectBuilder {
+	return stmtBuilder.Select().
+		From("pg_catalog.pg_class c").
 		Join("pg_catalog.pg_namespace n ON n.oid = c.relnamespace").
 		// relkind: r=ordinary table, p=partitioned table, v=view, m=materialized view, f=foreign table.
-		Where(sq.Eq{"c.relkind": postgresqlTableRelKinds}).
+		Where(sq.Eq{"c.relkind": tableRelKinds}).
 		// relpersistence: p=permanent, u=unlogged, t=temporary.
 		Where(sq.NotEq{"c.relpersistence": "t"}).
 		Where(sq.Expr("has_table_privilege(c.oid, ?)", "SELECT")).
 		Where(sq.NotEq{"n.nspname": SYSTEM_SCHEMAS}).
 		Where(sq.Expr("NOT pg_is_other_temp_schema(n.oid)")).
 		Where(sq.Expr("NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhrelid = c.oid)"))
+}
+
+// listTables filters readable tables and views by optional schema and table name.
+func (c *PostgresqlConnector) listTables(ctx context.Context, schema, tableName string) ([]*interfaces.TableMeta, error) {
+	if err := c.Connect(ctx); err != nil {
+		return nil, err
+	}
+
+	if schema != "" && !c.schemaAllowed(schema) {
+		return nil, fmt.Errorf("schema %q is outside the connector scope", schema)
+	}
+
+	builder := discoverableRelationsBuilder().Columns(
+		"n.nspname AS table_schema",
+		"c.relname AS table_name",
+		"c.relkind::text AS relkind",
+		"COALESCE(obj_description(c.oid, 'pg_class'), '') AS description",
+	)
 
 	if schema != "" {
-		if len(c.config.Schemas) > 0 && !containsPostgresqlSchema(c.config.Schemas, schema) {
-			return nil, fmt.Errorf("schema %q is outside the connector scope", schema)
-		}
 		builder = builder.Where(sq.Eq{"n.nspname": schema})
 	} else if len(c.config.Schemas) > 0 {
 		builder = builder.Where(sq.Eq{"n.nspname": c.config.Schemas})
@@ -177,8 +197,9 @@ func (c *PostgresqlConnector) listTables(ctx context.Context, schema, tableName 
 	if tableName != "" {
 		builder = builder.Where(sq.Eq{"c.relname": tableName})
 	}
+	builder = builder.OrderBy("n.nspname", "c.relname")
 
-	query, args, err := builder.OrderBy("n.nspname", "c.relname").ToSql()
+	query, args, err := builder.ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("failed to build list tables query: %w", err)
 	}
@@ -189,23 +210,39 @@ func (c *PostgresqlConnector) listTables(ctx context.Context, schema, tableName 
 	}
 	defer func() { _ = rows.Close() }()
 
-	var tables []*interfaces.TableMeta
+	tables := make([]*interfaces.TableMeta, 0)
 	for rows.Next() {
 		var schema, name, relKind, description sql.NullString
-		if err := rows.Scan(&schema, &name, &relKind, &description); err != nil {
+
+		if err := rows.Scan(
+			&schema,
+			&name,
+			&relKind,
+			&description,
+		); err != nil {
 			return nil, fmt.Errorf("failed to scan table info: %w", err)
 		}
 		if !schema.Valid || !name.Valid || !relKind.Valid {
 			return nil, fmt.Errorf("required table metadata contains NULL")
 		}
-		tables = append(tables, &interfaces.TableMeta{
+
+		// SQL 条件用于缩小范围；配置范围统一按源端原始名称精确匹配。
+		// 此处过滤可避免数据库比较规则与配置语义不一致，
+		// 并保留普通 SQL 条件，避免 BINARY/COLLATE 影响索引使用或条件下推。
+		if !c.schemaAllowed(schema.String) {
+			continue
+		}
+
+		meta := &interfaces.TableMeta{
 			Name:        name.String,
-			TableType:   c.tableTypeFromRelKind(relKind.String),
+			TableType:   c.mapTableType(relKind.String),
+			Description: description.String,
 			Database:    c.config.Database,
 			Schema:      schema.String,
-			Description: description.String,
-			Properties:  map[string]any{},
-		})
+			Properties:  make(map[string]any),
+		}
+
+		tables = append(tables, meta)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate table info: %w", err)
@@ -213,8 +250,12 @@ func (c *PostgresqlConnector) listTables(ctx context.Context, schema, tableName 
 	return tables, nil
 }
 
-func containsPostgresqlSchema(schemas []string, schema string) bool {
-	for _, configuredSchema := range schemas {
+// schemaAllowed 判断 schema 是否在配置的发现范围内。
+func (c *PostgresqlConnector) schemaAllowed(schema string) bool {
+	if len(c.config.Schemas) == 0 {
+		return true
+	}
+	for _, configuredSchema := range c.config.Schemas {
 		if configuredSchema == schema {
 			return true
 		}
@@ -222,7 +263,8 @@ func containsPostgresqlSchema(schemas []string, schema string) bool {
 	return false
 }
 
-func (c *PostgresqlConnector) tableTypeFromRelKind(relKind string) string {
+// mapTableType maps a PostgreSQL relkind to a table metadata type.
+func (c *PostgresqlConnector) mapTableType(relKind string) string {
 	switch relKind {
 	case "v":
 		return "view"
@@ -238,76 +280,57 @@ func (c *PostgresqlConnector) GetTableMeta(ctx context.Context, table *interface
 	if err := c.Connect(ctx); err != nil {
 		return err
 	}
+	if !c.schemaAllowed(table.Schema) {
+		return fmt.Errorf("schema %q is outside the connector scope", table.Schema)
+	}
+
 	if err := c.fetchTableStatus(ctx, table); err != nil {
 		return fmt.Errorf("failed to fetch table status: %w", err)
 	}
+
 	if err := c.fetchColumns(ctx, table); err != nil {
 		return fmt.Errorf("failed to fetch columns: %w", err)
 	}
+
 	if err := c.fetchIndexes(ctx, table); err != nil {
 		return fmt.Errorf("failed to fetch indexes: %w", err)
 	}
+
 	if err := c.fetchForeignKeys(ctx, table); err != nil {
 		return fmt.Errorf("failed to fetch foreign keys: %w", err)
 	}
 	return nil
 }
 
-func (c *PostgresqlConnector) GetTableMetaByIdentifier(ctx context.Context, sourceIdentifier string) (*interfaces.TableMeta, error) {
-	schema, tableName, err := splitPostgresqlTableIdentifier(sourceIdentifier)
-	if err != nil {
-		return nil, err
-	}
-	table, err := c.findTableByIdentifier(ctx, schema, tableName)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.GetTableMeta(ctx, table); err != nil {
-		return nil, err
-	}
-	return table, nil
-}
-
-func splitPostgresqlTableIdentifier(sourceIdentifier string) (schema, tableName string, err error) {
-	separator := strings.LastIndex(sourceIdentifier, ".")
-	if separator <= 0 || separator == len(sourceIdentifier)-1 {
-		return "", "", fmt.Errorf("invalid PostgreSQL table source identifier %q", sourceIdentifier)
-	}
-	return sourceIdentifier[:separator], sourceIdentifier[separator+1:], nil
-}
-
-func (c *PostgresqlConnector) findTableByIdentifier(ctx context.Context, schema, tableName string) (*interfaces.TableMeta, error) {
-	tables, err := c.listTables(ctx, schema, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("list tables: %w", err)
-	}
-	for _, table := range tables {
-		if table.Name == tableName && table.Schema == schema {
-			return table, nil
-		}
-	}
-	return nil, fmt.Errorf("table %q in schema %q not found", tableName, schema)
-}
-
+// fetchTableStatus retrieves the table type, description, estimated row count, and storage sizes.
 func (c *PostgresqlConnector) fetchTableStatus(ctx context.Context, table *interfaces.TableMeta) error {
-	relKinds := "'" + strings.Join(postgresqlTableRelKinds, "', '") + "'"
+	relKinds := "'" + strings.Join(tableRelKinds, "', '") + "'"
 	//nolint:gosec // Relation kinds are static constants, not user input.
 	query := fmt.Sprintf(`
-SELECT c.relkind::text,
-       obj_description(c.oid, 'pg_class') AS description,
-       COALESCE(s.n_live_tup, 0) AS est_rows,
-       pg_total_relation_size(c.oid) AS total_bytes,
-       pg_indexes_size(c.oid) AS index_bytes
-FROM pg_class c
-JOIN pg_namespace n ON n.oid = c.relnamespace
-LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN (%s)`, relKinds)
+		SELECT c.relkind::text,
+			obj_description(c.oid, 'pg_class') AS description,
+			COALESCE(s.n_live_tup, 0) AS est_rows,
+			pg_total_relation_size(c.oid) AS total_bytes,
+			pg_indexes_size(c.oid) AS index_bytes
+		FROM pg_class c
+		JOIN pg_namespace n
+			ON n.oid = c.relnamespace
+		LEFT JOIN pg_stat_user_tables s
+			ON s.relid = c.oid
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN (%s)
+	`, relKinds)
 
-	var relKind, desc sql.NullString
-	var estRows, totalBytes, indexBytes sql.NullInt64
-	err := c.db.QueryRowContext(ctx, query, table.Schema, table.Name).Scan(
-		&relKind, &desc, &estRows, &totalBytes, &indexBytes)
-	if err != nil {
+	var relKind, description sql.NullString
+	var estimatedRowCount, totalBytes, indexBytes sql.NullInt64
+
+	row := c.db.QueryRowContext(ctx, query, table.Schema, table.Name)
+	if err := row.Scan(
+		&relKind,
+		&description,
+		&estimatedRowCount,
+		&totalBytes,
+		&indexBytes,
+	); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Errorf("table metadata not found or inaccessible: %s.%s", table.Schema, table.Name)
 		}
@@ -317,54 +340,51 @@ WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN (%s)`, relKinds)
 		return fmt.Errorf("required table metadata contains NULL")
 	}
 
-	switch relKind.String {
-	case "r", "p", "f":
-		table.TableType = "table"
-	case "v":
-		table.TableType = "view"
-	case "m":
-		table.TableType = "materialized_view"
-	default:
-		table.TableType = "table"
-	}
+	table.TableType = c.mapTableType(relKind.String)
+	table.Description = description.String
 
-	if table.Properties == nil {
-		table.Properties = make(map[string]any)
+	table.Properties = map[string]any{
+		"estimated_row_count": estimatedRowCount.Int64,
+		"data_length":         totalBytes.Int64,
+		"index_length":        indexBytes.Int64,
 	}
-	if desc.Valid {
-		table.Description = desc.String
-	}
-	table.Properties["row_count"] = estRows.Int64
-	table.Properties["data_length"] = totalBytes.Int64
-	table.Properties["index_length"] = indexBytes.Int64
 	return nil
 }
 
+// fetchColumns retrieves column metadata and resolves domain types and primary-key columns.
 func (c *PostgresqlConnector) fetchColumns(ctx context.Context, table *interfaces.TableMeta) error {
-	relKinds := "'" + strings.Join(postgresqlTableRelKinds, "', '") + "'"
+	relKinds := "'" + strings.Join(tableRelKinds, "', '") + "'"
 	//nolint:gosec // Relation kinds are static constants, not user input.
 	query := fmt.Sprintf(`
-SELECT a.attname AS column_name,
-       a.atttypid AS type_oid,
-       t.typtype::text AS type_kind,
-       t.typname AS type_name,
-       a.atttypmod AS type_modifier,
-       a.attnotnull AS column_not_null,
-       pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-       COALESCE(coll.collname, '') AS collation_name,
-       a.attnum AS ordinal_position,
-       COALESCE(pg_catalog.col_description(a.attrelid, a.attnum), '') AS description
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
-LEFT JOIN pg_catalog.pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
-LEFT JOIN pg_catalog.pg_collation coll ON coll.oid = a.attcollation
-WHERE n.nspname = $1 AND c.relname = $2
-  AND c.relkind IN (%s)
-  AND a.attnum > 0
-  AND NOT a.attisdropped
-ORDER BY a.attnum`, relKinds)
+		SELECT
+			a.attname AS column_name,
+			a.atttypid AS type_oid,
+			t.typtype::text AS type_kind,
+			t.typname AS type_name,
+			a.atttypmod AS type_modifier,
+			a.attnotnull AS column_not_null,
+			pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+			COALESCE(coll.collname, '') AS collation_name,
+			a.attnum AS ordinal_position,
+			COALESCE(pg_catalog.col_description(a.attrelid, a.attnum), '') AS description
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n
+			ON n.oid = c.relnamespace
+		JOIN pg_catalog.pg_attribute a
+			ON a.attrelid = c.oid
+		JOIN pg_catalog.pg_type t
+			ON t.oid = a.atttypid
+		LEFT JOIN pg_catalog.pg_attrdef ad
+			ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+		LEFT JOIN pg_catalog.pg_collation coll
+			ON coll.oid = a.attcollation
+		WHERE n.nspname = $1
+			AND c.relname = $2
+			AND c.relkind IN (%s)
+			AND a.attnum > 0
+			AND NOT a.attisdropped
+		ORDER BY a.attnum
+	`, relKinds)
 
 	rows, err := c.db.QueryContext(ctx, query, table.Schema, table.Name)
 	if err != nil {
@@ -379,15 +399,22 @@ ORDER BY a.attnum`, relKinds)
 		defaultValue                                     sql.NullString
 	}
 
-	var rawColumns []columnMetadata
+	rawColumns := make([]columnMetadata, 0)
 	domainOIDs := make([]int64, 0)
 	seenDomainOIDs := make(map[int64]bool)
 	for rows.Next() {
 		var column columnMetadata
 		if err := rows.Scan(
-			&column.name, &column.typeOID, &column.typeKind, &column.typeName,
-			&column.typeModifier, &column.notNull, &column.defaultValue,
-			&column.collation, &column.ordinalPosition, &column.description,
+			&column.name,
+			&column.typeOID,
+			&column.typeKind,
+			&column.typeName,
+			&column.typeModifier,
+			&column.notNull,
+			&column.defaultValue,
+			&column.collation,
+			&column.ordinalPosition,
+			&column.description,
 		); err != nil {
 			return fmt.Errorf("failed to scan PostgreSQL column metadata: %w", err)
 		}
@@ -482,19 +509,24 @@ ORDER BY a.attnum`, relKinds)
 	return nil
 }
 
+// fetchPrimaryKeyColumns retrieves the primary-key column names for a table.
 func (c *PostgresqlConnector) fetchPrimaryKeyColumns(ctx context.Context, schema, tableName string) (map[string]bool, error) {
-	q := `
-SELECT kcu.column_name
-FROM information_schema.table_constraints tc
-JOIN information_schema.key_column_usage kcu
-  ON tc.constraint_catalog = kcu.constraint_catalog
- AND tc.constraint_schema = kcu.constraint_schema
- AND tc.constraint_name = kcu.constraint_name
-WHERE tc.table_catalog = $1 AND tc.table_schema = $2 AND tc.table_name = $3
-  AND tc.constraint_type = 'PRIMARY KEY'
-ORDER BY kcu.ordinal_position`
+	query := `
+		SELECT
+			kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+			ON tc.constraint_catalog = kcu.constraint_catalog
+				AND tc.constraint_schema = kcu.constraint_schema
+				AND tc.constraint_name = kcu.constraint_name
+		WHERE tc.table_catalog = $1
+			AND tc.table_schema = $2
+			AND tc.table_name = $3
+			AND tc.constraint_type = 'PRIMARY KEY'
+		ORDER BY kcu.ordinal_position
+	`
 
-	rows, err := c.db.QueryContext(ctx, q, c.config.Database, schema, tableName)
+	rows, err := c.db.QueryContext(ctx, query, c.config.Database, schema, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -517,10 +549,11 @@ ORDER BY kcu.ordinal_position`
 	return out, nil
 }
 
+// fetchIndexes retrieves index metadata for a table.
 func (c *PostgresqlConnector) fetchIndexes(ctx context.Context, table *interfaces.TableMeta) error {
-	q := c.indexMetadataQuery()
+	query := c.indexMetadataQuery()
 
-	rows, err := c.db.QueryContext(ctx, q, table.Schema, table.Name)
+	rows, err := c.db.QueryContext(ctx, query, table.Schema, table.Name)
 	if err != nil {
 		return err
 	}
@@ -529,22 +562,29 @@ func (c *PostgresqlConnector) fetchIndexes(ctx context.Context, table *interface
 	indexMap := make(map[string]*interfaces.TableIndexMeta)
 	for rows.Next() {
 		var indexName, columnName sql.NullString
-		var unique, primary sql.NullBool
+		var isUnique, isPrimary sql.NullBool
 		var ord sql.NullInt64
-		if err := rows.Scan(&indexName, &columnName, &unique, &primary, &ord); err != nil {
+		if err := rows.Scan(
+			&indexName,
+			&columnName,
+			&isUnique,
+			&isPrimary,
+			&ord,
+		); err != nil {
 			return err
 		}
-		if !indexName.Valid || !columnName.Valid || !unique.Valid || !primary.Valid || !ord.Valid {
+		if !indexName.Valid || !columnName.Valid || !isUnique.Valid || !isPrimary.Valid || !ord.Valid {
 			return fmt.Errorf("required index metadata contains NULL")
 		}
+
 		if idx, ok := indexMap[indexName.String]; ok {
 			idx.Columns = append(idx.Columns, columnName.String)
 		} else {
 			indexMap[indexName.String] = &interfaces.TableIndexMeta{
 				Name:    indexName.String,
 				Columns: []string{columnName.String},
-				Unique:  unique.Bool,
-				Primary: primary.Bool,
+				Unique:  isUnique.Bool,
+				Primary: isPrimary.Bool,
 			}
 		}
 	}
@@ -552,7 +592,7 @@ func (c *PostgresqlConnector) fetchIndexes(ctx context.Context, table *interface
 		return err
 	}
 
-	var indices []interfaces.TableIndexMeta
+	indices := make([]interfaces.TableIndexMeta, 0)
 	for _, idx := range indexMap {
 		indices = append(indices, *idx)
 	}
@@ -560,53 +600,73 @@ func (c *PostgresqlConnector) fetchIndexes(ctx context.Context, table *interface
 	return nil
 }
 
+// indexMetadataQuery selects an index metadata query based on database compatibility.
 func (c *PostgresqlConnector) indexMetadataQuery() string {
 	if !c.compatibility.supportsLateral() {
 		return `
-SELECT q.index_name,
-       a.attname AS column_name,
-       q.indisunique,
-       q.indisprimary,
-       q.ord
-FROM (
-    SELECT i.relname AS index_name,
-           t.oid AS table_oid,
-           ix.indkey::int[] AS indkey,
-           ix.indisunique,
-           ix.indisprimary,
-           generate_subscripts(ix.indkey::int[], 1) AS ord
-    FROM pg_index ix
-    JOIN pg_class t ON t.oid = ix.indrelid
-    JOIN pg_namespace n ON n.oid = t.relnamespace
-    JOIN pg_class i ON i.oid = ix.indexrelid
-    WHERE n.nspname = $1 AND t.relname = $2
-) q
-JOIN pg_attribute a ON a.attrelid = q.table_oid AND a.attnum = q.indkey[q.ord]
-    AND q.indkey[q.ord] > 0 AND NOT a.attisdropped
-ORDER BY q.index_name, q.ord`
+			SELECT
+				q.index_name,
+				a.attname AS column_name,
+				q.indisunique,
+				q.indisprimary,
+				q.ord
+			FROM (
+				SELECT
+					i.relname AS index_name,
+					t.oid AS table_oid,
+					ix.indkey::int[] AS indkey,
+					ix.indisunique,
+					ix.indisprimary,
+					generate_subscripts(ix.indkey::int[], 1) AS ord
+				FROM pg_index ix
+				JOIN pg_class t
+					ON t.oid = ix.indrelid
+				JOIN pg_namespace n
+					ON n.oid = t.relnamespace
+				JOIN pg_class i
+					ON i.oid = ix.indexrelid
+				WHERE n.nspname = $1 AND t.relname = $2
+			) q
+			JOIN pg_attribute a
+				ON a.attrelid = q.table_oid
+					AND a.attnum = q.indkey[q.ord]
+					AND q.indkey[q.ord] > 0
+					AND NOT a.attisdropped
+			ORDER BY q.index_name, q.ord
+		`
 	}
 
 	return `
-SELECT i.relname AS index_name,
-       a.attname AS column_name,
-       ix.indisunique,
-       ix.indisprimary,
-       k.n AS ord
-FROM pg_index ix
-JOIN pg_class t ON t.oid = ix.indrelid
-JOIN pg_namespace n ON n.oid = t.relnamespace
-JOIN pg_class i ON i.oid = ix.indexrelid
-JOIN LATERAL generate_subscripts(ix.indkey::int[], 1) AS k(n) ON true
-JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = (ix.indkey::int[])[k.n]
-    AND (ix.indkey::int[])[k.n] > 0 AND NOT a.attisdropped
-WHERE n.nspname = $1 AND t.relname = $2
-ORDER BY i.relname, k.n`
+		SELECT
+			i.relname AS index_name,
+			a.attname AS column_name,
+			ix.indisunique,
+			ix.indisprimary,
+			k.n AS ord
+		FROM pg_index ix
+		JOIN pg_class t
+			ON t.oid = ix.indrelid
+		JOIN pg_namespace n
+			ON n.oid = t.relnamespace
+		JOIN pg_class i
+			ON i.oid = ix.indexrelid
+		JOIN LATERAL generate_subscripts(ix.indkey::int[], 1) AS k(n)
+			ON true
+		JOIN pg_attribute a
+			ON a.attrelid = t.oid
+				AND a.attnum = (ix.indkey::int[])[k.n]
+				AND (ix.indkey::int[])[k.n] > 0
+				AND NOT a.attisdropped
+		WHERE n.nspname = $1 AND t.relname = $2
+		ORDER BY i.relname, k.n
+	`
 }
 
+// fetchForeignKeys retrieves foreign keys and their referenced columns.
 func (c *PostgresqlConnector) fetchForeignKeys(ctx context.Context, table *interfaces.TableMeta) error {
-	q := c.foreignKeyMetadataQuery()
+	query := c.foreignKeyMetadataQuery()
 
-	rows, err := c.db.QueryContext(ctx, q, table.Schema, table.Name)
+	rows, err := c.db.QueryContext(ctx, query, table.Schema, table.Name)
 	if err != nil {
 		return err
 	}
@@ -614,23 +674,30 @@ func (c *PostgresqlConnector) fetchForeignKeys(ctx context.Context, table *inter
 
 	fkMap := make(map[string]*interfaces.TableForeignKeyMeta)
 	for rows.Next() {
-		var cname, col, refCol, refSchema, refTable sql.NullString
-		if err := rows.Scan(&cname, &col, &refCol, &refSchema, &refTable); err != nil {
+		var constraintName, columnName, refColumnName, refSchemaName, refTableName sql.NullString
+		if err := rows.Scan(
+			&constraintName,
+			&columnName,
+			&refColumnName,
+			&refSchemaName,
+			&refTableName,
+		); err != nil {
 			return err
 		}
-		if !cname.Valid || !col.Valid || !refCol.Valid || !refSchema.Valid || !refTable.Valid {
+		if !constraintName.Valid || !columnName.Valid || !refColumnName.Valid || !refSchemaName.Valid || !refTableName.Valid {
 			return fmt.Errorf("required foreign key metadata contains NULL")
 		}
-		refFull := refSchema.String + "." + refTable.String
-		if fk, ok := fkMap[cname.String]; ok {
-			fk.Columns = append(fk.Columns, col.String)
-			fk.RefColumns = append(fk.RefColumns, refCol.String)
+
+		refFull := refSchemaName.String + "." + refTableName.String
+		if fk, ok := fkMap[constraintName.String]; ok {
+			fk.Columns = append(fk.Columns, columnName.String)
+			fk.RefColumns = append(fk.RefColumns, refColumnName.String)
 		} else {
-			fkMap[cname.String] = &interfaces.TableForeignKeyMeta{
-				Name:       cname.String,
-				Columns:    []string{col.String},
+			fkMap[constraintName.String] = &interfaces.TableForeignKeyMeta{
+				Name:       constraintName.String,
+				Columns:    []string{columnName.String},
 				RefTable:   refFull,
-				RefColumns: []string{refCol.String},
+				RefColumns: []string{refColumnName.String},
 			}
 		}
 	}
@@ -646,50 +713,76 @@ func (c *PostgresqlConnector) fetchForeignKeys(ctx context.Context, table *inter
 	return nil
 }
 
+// foreignKeyMetadataQuery selects a foreign-key metadata query based on database compatibility.
 func (c *PostgresqlConnector) foreignKeyMetadataQuery() string {
 	if !c.compatibility.supportsWithOrdinality() {
 		return `
-SELECT q.conname,
-       a.attname AS col,
-       af.attname AS ref_col,
-       nf.nspname AS ref_schema,
-       cf.relname AS ref_table
-FROM (
-    SELECT c.conname,
-           c.conrelid,
-           c.confrelid,
-           c.conkey::int[] AS conkey,
-           c.confkey::int[] AS confkey,
-           generate_subscripts(c.conkey::int[], 1) AS ord
-    FROM pg_constraint c
-    JOIN pg_namespace n ON n.oid = c.connamespace
-    JOIN pg_class cl ON cl.oid = c.conrelid AND cl.relnamespace = n.oid
-    WHERE c.contype = 'f' AND n.nspname = $1 AND cl.relname = $2
-) q
-JOIN pg_attribute a ON a.attrelid = q.conrelid AND NOT a.attisdropped AND a.attnum = q.conkey[q.ord]
-JOIN pg_class cf ON cf.oid = q.confrelid
-JOIN pg_namespace nf ON nf.oid = cf.relnamespace
-JOIN pg_attribute af ON af.attrelid = cf.oid AND NOT af.attisdropped AND af.attnum = q.confkey[q.ord]
-ORDER BY q.conname, q.ord`
+			SELECT
+				q.conname,
+				a.attname AS col,
+				af.attname AS ref_col,
+				nf.nspname AS ref_schema,
+				cf.relname AS ref_table
+			FROM (
+				SELECT
+					c.conname,
+					c.conrelid,
+					c.confrelid,
+					c.conkey::int[] AS conkey,
+					c.confkey::int[] AS confkey,
+					generate_subscripts(c.conkey::int[], 1) AS ord
+				FROM pg_constraint c
+				JOIN pg_namespace n
+					ON n.oid = c.connamespace
+				JOIN pg_class cl
+					ON cl.oid = c.conrelid AND cl.relnamespace = n.oid
+				WHERE c.contype = 'f'
+					AND n.nspname = $1
+					AND cl.relname = $2
+			) q
+			JOIN pg_attribute a
+				ON a.attrelid = q.conrelid
+					AND NOT a.attisdropped
+					AND a.attnum = q.conkey[q.ord]
+			JOIN pg_class cf
+				ON cf.oid = q.confrelid
+			JOIN pg_namespace nf
+				ON nf.oid = cf.relnamespace
+			JOIN pg_attribute af
+				ON af.attrelid = cf.oid
+					AND NOT af.attisdropped
+					AND af.attnum = q.confkey[q.ord]
+			ORDER BY q.conname, q.ord
+		`
 	}
 
 	return `
-SELECT c.conname,
-       a.attname AS col,
-       af.attname AS ref_col,
-       nf.nspname AS ref_schema,
-       cf.relname AS ref_table
-FROM pg_constraint c
-JOIN pg_namespace n ON n.oid = c.connamespace
-JOIN pg_class cl ON cl.oid = c.conrelid AND cl.relnamespace = n.oid
-JOIN LATERAL unnest(c.conkey::int[]) WITH ORDINALITY AS u1(attnum, ord1) ON true
-JOIN LATERAL unnest(c.confkey::int[]) WITH ORDINALITY AS u2(attnum2, ord2) ON u1.ord1 = u2.ord2
-JOIN pg_attribute a ON a.attrelid = cl.oid AND NOT a.attisdropped AND a.attnum = u1.attnum
-JOIN pg_class cf ON cf.oid = c.confrelid
-JOIN pg_namespace nf ON nf.oid = cf.relnamespace
-JOIN pg_attribute af ON af.attrelid = cf.oid AND NOT af.attisdropped AND af.attnum = u2.attnum2
-WHERE c.contype = 'f' AND n.nspname = $1 AND cl.relname = $2
-ORDER BY c.conname, u1.ord1`
+		SELECT
+			c.conname,
+			a.attname AS col,
+			af.attname AS ref_col,
+			nf.nspname AS ref_schema,
+			cf.relname AS ref_table
+		FROM pg_constraint c
+		JOIN pg_namespace n
+			ON n.oid = c.connamespace
+		JOIN pg_class cl
+			ON cl.oid = c.conrelid AND cl.relnamespace = n.oid
+		JOIN LATERAL unnest(c.conkey::int[]) WITH ORDINALITY AS u1(attnum, ord1)
+			ON true
+		JOIN LATERAL unnest(c.confkey::int[]) WITH ORDINALITY AS u2(attnum2, ord2)
+			ON u1.ord1 = u2.ord2
+		JOIN pg_attribute a
+			ON a.attrelid = cl.oid AND NOT a.attisdropped AND a.attnum = u1.attnum
+		JOIN pg_class cf
+			ON cf.oid = c.confrelid
+		JOIN pg_namespace nf
+			ON nf.oid = cf.relnamespace
+		JOIN pg_attribute af
+			ON af.attrelid = cf.oid AND NOT af.attisdropped AND af.attnum = u2.attnum2
+		WHERE c.contype = 'f' AND n.nspname = $1 AND cl.relname = $2
+		ORDER BY c.conname, u1.ord1
+	`
 }
 
 // GetMetadata returns instance/session-level metadata.
@@ -698,24 +791,36 @@ func (c *PostgresqlConnector) GetMetadata(ctx context.Context) (map[string]any, 
 		return nil, err
 	}
 
-	meta := make(map[string]any)
+	metadata := make(map[string]any)
 
 	var version sql.NullString
-	if err := c.db.QueryRowContext(ctx, `SELECT version()`).Scan(&version); err != nil {
+	versionRow := c.db.QueryRowContext(ctx, `SELECT version()`)
+	if err := versionRow.Scan(&version); err != nil {
 		return nil, err
 	}
 	if !version.Valid {
 		return nil, fmt.Errorf("required database metadata contains NULL")
 	}
-	meta["version"] = version.String
+	metadata["version"] = version.String
 
-	rows, err := c.db.QueryContext(ctx, `
-SELECT name, setting FROM pg_settings
-WHERE name IN ('server_version','server_version_num','TimeZone','max_connections','data_directory','default_text_search_config')`)
+	query := `
+		SELECT name, setting
+		FROM pg_settings
+		WHERE name IN (
+			'server_version',
+			'server_version_num',
+			'TimeZone',
+			'max_connections',
+			'data_directory',
+			'default_text_search_config'
+		)
+	`
+	rows, err := c.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+
 	for rows.Next() {
 		var k, v sql.NullString
 		if err := rows.Scan(&k, &v); err != nil {
@@ -724,7 +829,7 @@ WHERE name IN ('server_version','server_version_num','TimeZone','max_connections
 		if !k.Valid {
 			return nil, fmt.Errorf("required database setting metadata contains NULL")
 		}
-		meta[k.String] = v.String
+		metadata[k.String] = v.String
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -734,42 +839,132 @@ WHERE name IN ('server_version','server_version_num','TimeZone','max_connections
 	if err != nil {
 		return nil, err
 	}
-	meta["schemas"] = schemas
+	metadata["schemas"] = schemas
 
-	meta["cluster_mode"] = "standalone"
-	return meta, nil
+	metadata["cluster_mode"] = "standalone"
+	return metadata, nil
 }
 
+// listSchemas lists configured schemas or schemas with discoverable tables.
 func (c *PostgresqlConnector) listSchemas(ctx context.Context) ([]string, error) {
-	schemaBuilder := pgSq.Select("n.nspname").From("pg_catalog.pg_namespace n").
-		Where(sq.NotEq{"n.nspname": SYSTEM_SCHEMAS}).
-		Where(sq.Expr("NOT pg_is_other_temp_schema(n.oid)"))
+	var builder sq.SelectBuilder
 	if len(c.config.Schemas) > 0 {
-		schemaBuilder = schemaBuilder.Where(sq.Eq{"n.nspname": c.config.Schemas})
+		builder = stmtBuilder.Select("n.nspname").
+			From("pg_catalog.pg_namespace n").
+			Where(sq.NotEq{"n.nspname": SYSTEM_SCHEMAS}).
+			Where(sq.Expr("NOT pg_is_other_temp_schema(n.oid)"))
+		builder = builder.Where(sq.Eq{"n.nspname": c.config.Schemas})
+	} else {
+		builder = discoverableRelationsBuilder().Columns("DISTINCT n.nspname")
 	}
-	schemaQuery, schemaArgs, err := schemaBuilder.OrderBy("n.nspname").ToSql()
+	builder = builder.OrderBy("n.nspname")
+
+	sqlStr, args, err := builder.ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build list schemas query: %w", err)
 	}
-	schemaRows, err := c.db.QueryContext(ctx, schemaQuery, schemaArgs...)
+	rows, err := c.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list schemas: %w", err)
 	}
-	defer func() { _ = schemaRows.Close() }()
+	defer func() { _ = rows.Close() }()
 
 	schemas := make([]string, 0)
-	for schemaRows.Next() {
+	for rows.Next() {
 		var schema sql.NullString
-		if err := schemaRows.Scan(&schema); err != nil {
+		if err := rows.Scan(&schema); err != nil {
 			return nil, fmt.Errorf("scan schema: %w", err)
 		}
 		if !schema.Valid {
 			return nil, fmt.Errorf("required schema metadata contains NULL")
 		}
+
+		// SQL 条件用于缩小范围；配置范围统一按源端原始名称精确匹配。
+		// 此处过滤可避免数据库比较规则与配置语义不一致，
+		// 并保留普通 SQL 条件，避免 BINARY/COLLATE 影响索引使用或条件下推。
+		if !c.schemaAllowed(schema.String) {
+			continue
+		}
+
 		schemas = append(schemas, schema.String)
 	}
-	if err := schemaRows.Err(); err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate schemas: %w", err)
 	}
 	return schemas, nil
+}
+
+// CountRows 使用源 SQL 表引用获取表或视图的精确数量。
+func (c *PostgresqlConnector) CountRows(ctx context.Context, sourceIdentifier string) (int64, error) {
+	if sourceIdentifier == "" {
+		return 0, fmt.Errorf("empty source identifier")
+	}
+	if err := c.Connect(ctx); err != nil {
+		return 0, err
+	}
+
+	query, args, err := sq.Select("COUNT(*)").
+		From(sourceIdentifier).
+		ToSql()
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	if err := c.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	if count < 0 {
+		return 0, fmt.Errorf("invalid negative row count")
+	}
+	return count, nil
+}
+
+// BuildSourceIdentifier 生成源 SQL 表引用，不连接源数据库。
+func (c *PostgresqlConnector) BuildSourceIdentifier(meta *interfaces.TableMeta) string {
+	return pgQuoteIdent(meta.Schema) + "." + pgQuoteIdent(meta.Name)
+}
+
+// BuildOriginalName 生成不含 SQL 引用符的源端名称，不连接源数据库。
+func (c *PostgresqlConnector) BuildOriginalName(meta *interfaces.TableMeta) string {
+	return meta.Schema + "." + meta.Name
+}
+
+// DecodeTableMeta decodes source metadata and restores missing legacy name components.
+// Historical components are assumed not to contain dots or SQL quoting characters.
+func (c *PostgresqlConnector) DecodeTableMeta(metadata map[string]any) (*interfaces.TableMeta, error) {
+	data, err := sonic.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("serialize table metadata: %w", err)
+	}
+	table := &interfaces.TableMeta{}
+	if err := common.UnmarshalPreciseJSON(data, table); err != nil {
+		return nil, fmt.Errorf("decode table metadata: %w", err)
+	}
+	if _, ok := metadata["description"]; !ok {
+		table.Description, _ = metadata["original_description"].(string)
+	}
+	originalName, _ := metadata["original_name"].(string)
+	if table.Name == "" || table.Schema == "" {
+		namespace, name, qualified := strings.Cut(originalName, ".")
+		if qualified {
+			if namespace == "" || name == "" || strings.Contains(name, ".") {
+				return nil, fmt.Errorf("invalid legacy table name")
+			}
+			if table.Schema == "" {
+				table.Schema = namespace
+			}
+		} else {
+			name = originalName
+		}
+		if table.Name == "" {
+			table.Name = name
+		}
+	}
+	if table.Database == "" && c.config != nil {
+		table.Database = c.config.Database
+	}
+	if table.Name == "" || table.Schema == "" {
+		return nil, fmt.Errorf("incomplete table metadata")
+	}
+	return table, nil
 }

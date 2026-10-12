@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
@@ -129,7 +128,6 @@ func (r *restHandler) listResources(c *gin.Context, visitor hydra.Visitor) {
 
 	logger.Debug("Handler ListResources Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
-	emitResourceSummaryReadEvidence(c, ctx, "data.catalog.get", entries, total, safeResourceListQueryShape(params))
 	rest.ReplyOK(c, http.StatusOK, result)
 }
 
@@ -166,7 +164,7 @@ func (r *restHandler) createResource(c *gin.Context, visitor hydra.Visitor) {
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
 	var req interfaces.ResourceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.BindPreciseJSON(c.Request.Body, &req); err != nil {
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest,
 			verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails(err.Error())
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
@@ -196,11 +194,8 @@ func (r *restHandler) createResource(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	// Record the successful creation in the audit log.
-	audit.NewInfoLog(audit.OPERATION, audit.CREATE, audit.TransforOperator(visitor),
-		interfaces.GenerateResourceAuditObject(resource.ID, req.Name), "")
-
 	result := map[string]any{"id": resource.ID}
+	c.Set(operationAuditTargetIDKey, resource.ID)
 
 	logger.Debug("Handler CreateResource Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
@@ -286,7 +281,6 @@ func (r *restHandler) getResources(c *gin.Context, visitor hydra.Visitor) {
 
 	logger.Debug("Handler GetResource Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
-	emitResourceReadEvidence(c, ctx, "data.catalog.get", resources, int64(len(resources)), safeResourceIDsQueryShape(ids, ignoreMissing))
 	rest.ReplyOK(c, http.StatusOK, result)
 }
 
@@ -325,7 +319,7 @@ func (r *restHandler) updateResource(c *gin.Context, visitor hydra.Visitor) {
 	id := c.Param("id")
 
 	var req interfaces.ResourceRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := common.BindPreciseJSON(c.Request.Body, &req); err != nil {
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest,
 			verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails(err.Error())
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
@@ -361,9 +355,6 @@ func (r *restHandler) updateResource(c *gin.Context, visitor hydra.Visitor) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
-
-	audit.NewInfoLog(audit.OPERATION, audit.UPDATE, audit.TransforOperator(visitor),
-		interfaces.GenerateResourceAuditObject(id, req.Name), "")
 
 	logger.Debug("Handler UpdateResource Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
@@ -408,7 +399,7 @@ func (r *restHandler) setResourceEnabled(c *gin.Context, visitor hydra.Visitor, 
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
 	id := c.Param("id")
-	resource, err := r.rs.SetEnabled(ctx, id, enabled)
+	_, err := r.rs.SetEnabled(ctx, id, enabled)
 	if err != nil {
 		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Resource_InternalError)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
@@ -416,8 +407,6 @@ func (r *restHandler) setResourceEnabled(c *gin.Context, visitor hydra.Visitor, 
 		return
 	}
 
-	audit.NewInfoLog(audit.OPERATION, audit.UPDATE, audit.TransforOperator(visitor),
-		interfaces.GenerateResourceAuditObject(id, resource.Name), "")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
 	rest.ReplyOK(c, http.StatusNoContent, nil)
 }
@@ -464,17 +453,20 @@ func (r *restHandler) deleteResources(c *gin.Context, visitor hydra.Visitor) {
 	}
 
 	ignoreMissing := strings.EqualFold(c.Query("ignore_missing"), "true")
-
-	if err := r.rs.DeleteByIDs(ctx, ids, ignoreMissing); err != nil {
-		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Resource_InternalError)
+	onlyIfStale := strings.EqualFold(c.Query("only_if_stale"), "true")
+	if onlyIfStale && ignoreMissing {
+		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+			WithErrorDetails("only_if_stale cannot be combined with ignore_missing")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
 
-	for _, id := range ids {
-		audit.NewWarnLog(audit.OPERATION, audit.DELETE, audit.TransforOperator(visitor),
-			interfaces.GenerateResourceAuditObject(id, ""), audit.SUCCESS, "")
+	if err := r.rs.DeleteByIDs(ctx, ids, ignoreMissing, onlyIfStale); err != nil {
+		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Resource_InternalError)
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
 	}
 
 	logger.Debug("Handler DeleteResource Success")
@@ -516,7 +508,13 @@ func (r *restHandler) discoverResource(c *gin.Context, visitor hydra.Visitor) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
+	strategy, err := readResourceDiscoverStrategy(c)
+	if err != nil {
+		rest.ReplyError(c, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails(err.Error()))
+		return
+	}
 	taskID, err := r.dts.Create(ctx, &interfaces.CreateDiscoverTaskRequest{
+		Strategy:    strategy,
 		CatalogID:   resource.CatalogID,
 		ResourceID:  resource.ID,
 		TriggerType: interfaces.DiscoverTaskTriggerManual,
@@ -529,4 +527,22 @@ func (r *restHandler) discoverResource(c *gin.Context, visitor hydra.Visitor) {
 	}
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	rest.ReplyOK(c, http.StatusOK, map[string]any{"id": taskID})
+}
+
+func readResourceDiscoverStrategy(c *gin.Context) (string, error) {
+	request := struct {
+		Strategy string `json:"strategy"`
+	}{Strategy: interfaces.DiscoverStrategyFullSync}
+	if c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&request); err != nil {
+			return "", err
+		}
+	}
+	if request.Strategy == "" {
+		request.Strategy = interfaces.DiscoverStrategyFullSync
+	}
+	if request.Strategy != interfaces.DiscoverStrategyFullSync && request.Strategy != interfaces.DiscoverStrategyCountOnly {
+		return "", fmt.Errorf("unsupported single-resource discover strategy %q", request.Strategy)
+	}
+	return request.Strategy, nil
 }

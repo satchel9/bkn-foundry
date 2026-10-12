@@ -17,36 +17,6 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
-func TestQuoteColumnName(t *testing.T) {
-	t.Run("quote column name simple", func(t *testing.T) {
-		if got := quoteColumnName("name"); got != "`name`" {
-			t.Errorf("expected `name`, got %s", got)
-		}
-	})
-	t.Run("quote column name with alias", func(t *testing.T) {
-		got := quoteColumnName("t1.name")
-		if got != "`t1`.`name`" {
-			t.Errorf("expected `t1`.`name`, got %s", got)
-		}
-	})
-	t.Run("quote column name empty", func(t *testing.T) {
-		if got := quoteColumnName(""); got != "``" {
-			t.Errorf("expected ``, got %s", got)
-		}
-	})
-	t.Run("quote column name with backtick", func(t *testing.T) {
-		got := quoteColumnName("col`name")
-		if got != "`col``name`" {
-			t.Errorf("expected `col``name`, got %s", got)
-		}
-	})
-	t.Run("quote column name alias with spaces", func(t *testing.T) {
-		got := quoteColumnName(" t1 . name ")
-		if got != "`t1`.`name`" {
-			t.Errorf("expected `t1`.`name`, got %s", got)
-		}
-	})
-}
 func TestMariaDBConnectorConvertFilterConditionEqual(t *testing.T) {
 	t.Run("convert equal const", func(t *testing.T) {
 		c := &MariaDBConnector{}
@@ -84,7 +54,7 @@ func TestMariaDBConnectorConvertFilterConditionEqual(t *testing.T) {
 	t.Run("reject date literal before mysql numeric coercion", func(t *testing.T) {
 		c := &MariaDBConnector{}
 		cond := mustNewCond(t, "created_at", "==", "2026-01-01 00:00:00")
-		expr, err := c.ConvertFilterCondition(context.Background(), cond, testFieldsMap())
+		expr, err := c.ConvertFilterCondition(cond)
 		if err == nil {
 			t.Fatal("expected non-epoch date value error")
 		}
@@ -275,7 +245,7 @@ func TestMariaDBDateExpressionsKeepTimeValuesRaw(t *testing.T) {
 	t.Run("rejects numeric time values", func(t *testing.T) {
 		c := &MariaDBConnector{}
 		cond := mustNewCond(t, "event_time", ">=", float64(1785295334428))
-		expr, err := c.ConvertFilterCondition(context.Background(), cond, testFieldsMap())
+		expr, err := c.ConvertFilterCondition(cond)
 		if err == nil {
 			t.Fatal("expected numeric time value error")
 		}
@@ -452,6 +422,48 @@ func TestMariaDBConnectorConvertFilterConditionTrue(t *testing.T) {
 			t.Errorf("unexpected args: %v", args)
 		}
 	})
+	t.Run("tinyint flag treats nonzero as true", func(t *testing.T) {
+		field := &interfaces.Property{Name: "flag", OriginalName: "flag", OriginalType: "tinyint(1)", Type: interfaces.DataType_Integer}
+		fields := map[string]*interfaces.Property{"flag": field}
+		connector := &MariaDBConnector{}
+		for _, test := range []struct {
+			operation string
+			sql       string
+		}{
+			{operation: "true", sql: "`flag` <> ?"},
+			{operation: "false", sql: "`flag` = ?"},
+		} {
+			condition, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Name: "flag", Operation: test.operation}, fields)
+			if err != nil {
+				t.Fatalf("build %s condition: %v", test.operation, err)
+			}
+			expression, err := connector.ConvertFilterCondition(condition)
+			if err != nil {
+				t.Fatalf("convert %s condition: %v", test.operation, err)
+			}
+			statement, args, err := expression.ToSql()
+			if err != nil {
+				t.Fatalf("render %s condition: %v", test.operation, err)
+			}
+			if statement != test.sql || len(args) != 1 || args[0] != 0 {
+				t.Fatalf("%s condition: sql=%q args=%v", test.operation, statement, args)
+			}
+		}
+	})
+	t.Run("rejects ordinary integer", func(t *testing.T) {
+		field := &interfaces.Property{Name: "count", OriginalName: "count", OriginalType: "int(11)", Type: interfaces.DataType_Integer}
+		fields := map[string]*interfaces.Property{"count": field}
+		for _, operation := range []string{"true", "false"} {
+			condition, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Name: "count", Operation: operation}, fields)
+			if err != nil {
+				t.Fatalf("build %s condition: %v", operation, err)
+			}
+			_, err = (&MariaDBConnector{}).ConvertFilterCondition(condition)
+			if err == nil {
+				t.Fatalf("expected MariaDB to reject %s for INT", operation)
+			}
+		}
+	})
 }
 func TestMariaDBConnectorConvertFilterConditionPrefix(t *testing.T) {
 	t.Run("convert prefix", func(t *testing.T) {
@@ -463,6 +475,17 @@ func TestMariaDBConnectorConvertFilterConditionPrefix(t *testing.T) {
 		}
 		if len(args) != 1 || args[0] != "ali%" {
 			t.Errorf("unexpected args: %v", args)
+		}
+	})
+	t.Run("reject field source", func(t *testing.T) {
+		field := testFieldsMap()["name"]
+		cond := &filter_condition.PrefixCond{
+			Cfg:    &interfaces.FilterCondCfg{ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Field}},
+			Lfield: field, Value: "ali",
+		}
+		expr, err := (&MariaDBConnector{}).ConvertFilterConditionPrefix(cond)
+		if expr != nil || err == nil || !strings.Contains(err.Error(), "only supports ValueFrom_Const") {
+			t.Fatalf("expected constant-source error and nil expression, got expr=%v err=%v", expr, err)
 		}
 	})
 }
@@ -550,7 +573,7 @@ func testFieldsMap() map[string]*interfaces.Property {
 
 func toSQL(t *testing.T, connector *MariaDBConnector, cond interfaces.FilterCondition) (string, []interface{}) {
 	t.Helper()
-	sqlizer, err := connector.ConvertFilterCondition(context.Background(), cond, testFieldsMap())
+	sqlizer, err := connector.ConvertFilterCondition(cond)
 	if err != nil {
 		t.Fatalf("ConvertFilterCondition failed: %v", err)
 	}

@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -101,9 +102,13 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 		return page, err
 	}
 	candidateLimit := summaryCandidateLimit(options)
+	if options.ConversationID != "" {
+		// The selector bounds this read to one conversation, independently of page size.
+		candidateLimit = MaxSummaryScanEntries
+	}
 	loadOptions := options
 	loadOptions.Status = ""
-	requests, _, metadata, err := s.loadExecutionSummariesWithCandidateLimit(ctx, loadOptions, candidateLimit)
+	requests, metadata, err := s.loadConversationExecutionSummaries(ctx, loadOptions, candidateLimit)
 	if err != nil {
 		return evidencevo.ConversationSummaryPage{}, err
 	}
@@ -112,6 +117,8 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 	childOptions := options
 	childOptions.Status = ""
 	childOptions.EvidenceCompleteness = ""
+	// Terminal previews and canonical identity must be available before keyword matching.
+	childOptions.Keyword = ""
 	for _, request := range requests {
 		if request.ConversationID != "" && matchesAnyExcludedAgent(request, options) {
 			excludedConversations[request.ConversationID] = struct{}{}
@@ -127,8 +134,38 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 	for conversationID, group := range grouped {
 		entries = append(entries, buildConversationSummary(conversationID, group))
 	}
+	entries, err = s.appendRegisteredConversationCandidates(ctx, entries, grouped, options, &metadata)
+	if err != nil {
+		return evidencevo.ConversationSummaryPage{}, err
+	}
 	if err := s.applyCanonicalConversationState(ctx, entries, grouped); err != nil {
 		return evidencevo.ConversationSummaryPage{}, err
+	}
+	if err := s.applyConversationTerminalPreviews(ctx, entries, options.Scope, &metadata); err != nil {
+		return evidencevo.ConversationSummaryPage{}, err
+	}
+	if keyword := strings.TrimSpace(options.Keyword); keyword != "" {
+		matched := entries[:0]
+		for _, entry := range entries {
+			if matchesConversationKeyword(entry, grouped[entry.ConversationID], keyword) {
+				matched = append(matched, entry)
+			}
+		}
+		entries = matched
+	}
+	if options.RecordIntegrity != "" {
+		if err := s.applyConversationRecordIntegrity(ctx, entries, options.Scope); err != nil {
+			return evidencevo.ConversationSummaryPage{}, err
+		}
+	}
+	if options.RecordIntegrity != "" {
+		for _, entry := range entries {
+			if entry.RecordIntegrityCheckFailed {
+				metadata.Truncated = true
+				metadata.PartialReasons = appendUniqueSummaryReason(metadata.PartialReasons, "record_integrity_check_failed")
+				break
+			}
+		}
 	}
 	entries = filterConversationSummaries(entries, options)
 	sort.Slice(entries, func(i, j int) bool {
@@ -153,12 +190,108 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 		Total:   len(entries), Page: normalizeSummaryPage(options.Page), PageSize: normalizeSummaryLimit(options.Limit), Truncated: metadata.Truncated, Partial: metadata.Truncated,
 		PartialReasons: append([]string{}, metadata.PartialReasons...),
 	}
+	if options.RecordIntegrity == "" {
+		if err := s.applyConversationRecordIntegrity(ctx, page.Entries, options.Scope); err != nil {
+			return evidencevo.ConversationSummaryPage{}, err
+		}
+	}
 	if end < len(entries) && len(page.Entries) > 0 {
 		last := page.Entries[len(page.Entries)-1]
 		next := encodeSummaryCursor(summaryCursor{StartedAt: last.StartedAt, ID: last.ConversationID})
 		page.NextCursor = &next
 	}
 	return page, nil
+}
+
+// Preserve execution facts used by legacy business-reference and network filters.
+// First-turn previews are loaded independently so operation artifacts cannot hide them.
+func (s *Service) loadConversationExecutionSummaries(ctx context.Context, options evidencevo.SummaryQueryOptions, limit int) ([]evidencevo.RequestSummary, summaryLoadMetadata, error) {
+	if !trustedQueryScope(options.Scope) {
+		return []evidencevo.RequestSummary{}, summaryLoadMetadata{}, nil
+	}
+	if s.projectionSource == nil {
+		return nil, summaryLoadMetadata{}, errors.New("execution summary projection source is not configured")
+	}
+	query := iprojectionsource.Query{
+		Scope: options.Scope, From: options.From, To: options.To,
+		TraceID: options.TraceID, InteractionID: options.InteractionID,
+		Limit: limit, SummaryOnly: true,
+	}
+	if options.ConversationID != "" {
+		query.ConversationIDs = []string{options.ConversationID}
+	}
+	result, err := s.projectionSource.LoadExecutionProjection(ctx, query)
+	if err != nil {
+		return nil, summaryLoadMetadata{}, err
+	}
+	metadata := summaryLoadMetadata{}
+	if result.Truncated {
+		metadata.addReason("projection_scan_cap_reached")
+	}
+	requests, _ := evidencevo.BuildExecutionSummaries(result.Traces, result.Artifacts)
+	if err := s.applyCanonicalRequestIdentity(ctx, requests); err != nil {
+		return nil, summaryLoadMetadata{}, err
+	}
+	// Conversation filters consume request facts only; trace identity and span
+	// statistics belong to the trace list and must not add discarded reads here.
+	return requests, metadata, nil
+}
+
+// Reuse the same authorized, first-turn artifact read as the ordinary list.
+// This is one bounded batch per candidate set, never a read per operation.
+func (s *Service) applyConversationTerminalPreviews(ctx context.Context, entries []evidencevo.ConversationSummary, scope evidencevo.QueryScope, metadata *summaryLoadMetadata) error {
+	source, ok := s.projectionSource.(iprojectionsource.ArtifactProjectionSourcePort)
+	if !ok || s.sessionStore == nil || len(entries) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.ConversationID)
+	}
+	_, byConversation, err := s.listCanonicalInteractionIDs(ctx, ids)
+	if err != nil {
+		return err
+	}
+	firstIDs := firstCanonicalInteractionIDs(byConversation)
+	if len(firstIDs) == 0 {
+		return nil
+	}
+	result, err := source.LoadArtifactProjection(ctx, iprojectionsource.Query{
+		Scope: scope, InteractionIDs: firstIDs,
+		ArtifactTypes: []evidencevo.ArtifactType{evidencevo.ArtifactTypeQuestion, evidencevo.ArtifactTypeResult},
+		Limit:         selectedSummaryCandidateLimit(len(firstIDs)),
+	})
+	if err != nil {
+		return err
+	}
+	if result.Truncated {
+		metadata.addReason("artifact_projection_scan_cap_reached")
+	}
+	previews := evidencevo.BuildInteractionTerminalPreviews(result.Artifacts)
+	for index := range entries {
+		if first, found := firstCanonicalInteraction(byConversation[entries[index].ConversationID]); found {
+			preview := previews[first.ID]
+			entries[index].QuestionPreview = preview.QuestionPreview
+			entries[index].ResultPreview = preview.ResultPreview
+		}
+	}
+	return nil
+}
+
+func matchesConversationKeyword(entry evidencevo.ConversationSummary, requests []evidencevo.RequestSummary, keyword string) bool {
+	keyword = strings.ToLower(keyword)
+	haystack := strings.ToLower(strings.Join([]string{entry.ConversationID, entry.QuestionPreview, entry.ResultPreview, entry.AgentOrApp, entry.AgentName, entry.ApplicationPrincipalID, entry.EffectiveSubjectID}, "\n"))
+	if strings.Contains(haystack, keyword) {
+		return true
+	}
+	// Preserve existing request/interaction ID, business reference and error
+	// keyword matches without discarding other rounds before aggregation.
+	for _, request := range requests {
+		if matchesRequestFilters(request, evidencevo.SummaryQueryOptions{Keyword: keyword}) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) ListInteractions(ctx context.Context, options evidencevo.SummaryQueryOptions) (evidencevo.InteractionSummaryPage, error) {
@@ -199,6 +332,20 @@ func (s *Service) ListInteractions(ctx context.Context, options evidencevo.Summa
 	if err := s.applyCanonicalInteractionState(ctx, entries); err != nil {
 		return evidencevo.InteractionSummaryPage{}, err
 	}
+	if options.RecordIntegrity != "" {
+		if err := s.applyInteractionRecordIntegrity(ctx, entries, options.Scope); err != nil {
+			return evidencevo.InteractionSummaryPage{}, err
+		}
+	}
+	if options.RecordIntegrity != "" {
+		for _, entry := range entries {
+			if entry.RecordIntegrityCheckFailed {
+				metadata.Truncated = true
+				metadata.PartialReasons = appendUniqueSummaryReason(metadata.PartialReasons, "record_integrity_check_failed")
+				break
+			}
+		}
+	}
 	assignInteractionRoundNumbers(entries)
 	entries = filterInteractionSummaries(entries, options)
 	sort.Slice(entries, func(i, j int) bool {
@@ -222,6 +369,11 @@ func (s *Service) ListInteractions(ctx context.Context, options evidencevo.Summa
 		Entries: append([]evidencevo.InteractionListSummary{}, entries[start:end]...),
 		Total:   len(entries), Page: normalizeSummaryPage(options.Page), PageSize: normalizeSummaryLimit(options.Limit), Truncated: metadata.Truncated, Partial: metadata.Truncated,
 		PartialReasons: append([]string{}, metadata.PartialReasons...),
+	}
+	if options.RecordIntegrity == "" {
+		if err := s.applyInteractionRecordIntegrity(ctx, page.Entries, options.Scope); err != nil {
+			return evidencevo.InteractionSummaryPage{}, err
+		}
 	}
 	if end < len(entries) && len(page.Entries) > 0 {
 		last := page.Entries[len(page.Entries)-1]
@@ -295,6 +447,9 @@ func (s *Service) listCanonicalConversationInteractions(
 	if err := s.applyCanonicalInteractionState(ctx, entries); err != nil {
 		return evidencevo.InteractionSummaryPage{}, false, err
 	}
+	if err := s.applyInteractionRecordIntegrity(ctx, entries, options.Scope); err != nil {
+		return evidencevo.InteractionSummaryPage{}, true, err
+	}
 	page := evidencevo.InteractionSummaryPage{
 		Entries: append([]evidencevo.InteractionListSummary{}, entries...),
 		Total:   selection.Total, Page: normalizeSummaryPage(options.Page), PageSize: limit,
@@ -318,7 +473,7 @@ func (s *Service) canPageCanonicalConversation(options evidencevo.SummaryQueryOp
 	return options.InteractionID == "" && options.TraceID == "" && options.Status == "" &&
 		options.AgentOrApp == "" && options.ExcludeAgentOrApp == "" && len(options.ExcludeAgentOrApps) == 0 && options.Service == "" &&
 		options.Tool == "" && options.ErrorKeyword == "" && options.KnowledgeNetwork == "" &&
-		options.EvidenceCompleteness == "" && options.Keyword == "" && options.From.IsZero() && options.To.IsZero()
+		options.RecordIntegrity == "" && options.EvidenceCompleteness == "" && options.Keyword == "" && options.From.IsZero() && options.To.IsZero()
 }
 
 func canonicalInteractionListSummary(
@@ -481,6 +636,9 @@ func filterConversationSummaries(
 ) []evidencevo.ConversationSummary {
 	filtered := make([]evidencevo.ConversationSummary, 0, len(entries))
 	for _, entry := range entries {
+		if options.RecordIntegrity != "" && (entry.CurrentRecordIntegrity == nil || entry.CurrentRecordIntegrity.Status != options.RecordIntegrity) {
+			continue
+		}
 		if options.Status != "" && entry.Status != options.Status {
 			continue
 		}
@@ -510,6 +668,9 @@ func matchesInteractionSummaryFilters(
 	entry evidencevo.InteractionListSummary,
 	options evidencevo.SummaryQueryOptions,
 ) bool {
+	if options.RecordIntegrity != "" && (entry.CurrentRecordIntegrity == nil || entry.CurrentRecordIntegrity.Status != options.RecordIntegrity) {
+		return false
+	}
 	if options.ConversationID != "" && entry.ConversationID != options.ConversationID {
 		return false
 	}
@@ -1053,6 +1214,10 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 		}
 		byConversation := tx.ListConversationsByIDs(conversationIDs)
 		sourceModulesByTraceID := tx.ListFirstOperationSourceModulesByTraceIDs(traceIDs)
+		type traceFailure struct {
+			traceID, conversationID, summary string
+		}
+		failuresByInteraction := map[string][]traceFailure{}
 		for index := range traces {
 			conversationID := traces[index].ConversationID
 			if conversationID != "" {
@@ -1063,12 +1228,77 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 					traces[index].EffectiveSubjectID = conversation.Owner.EffectiveSubjectID
 				}
 			}
+			if traces[index].Status == "error" && traces[index].ErrorSummary == "" && traces[index].InteractionID != "" {
+				summary := &traces[index]
+				failures, loaded := failuresByInteraction[summary.InteractionID]
+				if !loaded {
+					for _, fact := range tx.ListOperationCallFacts(summary.InteractionID) {
+						if _, requested := seenTraceIDs[fact.TraceID]; requested && fact.Status == sessionvo.AttemptFailed && fact.InteractionID == summary.InteractionID {
+							failures = append(failures, traceFailure{fact.TraceID, fact.ConversationID, operationFailureSummary(fact)})
+						}
+					}
+					// Retain bounded summaries, not full input/output/error payloads.
+					failuresByInteraction[summary.InteractionID] = failures
+				}
+				for _, failure := range failures {
+					if failure.traceID == summary.TraceID && failure.conversationID == summary.ConversationID {
+						summary.ErrorSummary = failure.summary
+						break
+					}
+				}
+			}
+
 			if sourceModule := sourceModulesByTraceID[traces[index].TraceID]; sourceModule != "" {
 				traces[index].RootService = sourceModule
 			}
 		}
 		return nil
 	})
+}
+
+// Summaries reuse the recorded failure, not unrelated result/debug payloads.
+func operationFailureSummary(fact sessionvo.OperationCallFact) string {
+	if fact.Error != nil && fact.Error.Mode == sessionvo.PayloadInline {
+		var text string
+		if json.Unmarshal(fact.Error.Inline, &text) == nil && strings.TrimSpace(text) != "" {
+			return readableFailureSummary(text)
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(fact.Error.Inline, &fields) == nil {
+			for _, key := range []string{"message", "safe_error_summary", "code"} {
+				var value string
+				if json.Unmarshal(fields[key], &value) == nil && strings.TrimSpace(value) != "" {
+					return readableFailureSummary(value)
+				}
+			}
+		}
+	}
+	return "OpenBKN operation failed"
+}
+
+// Tool execution messages may wrap stderr in a JSON string. Keep the
+// exception at the end of long tracebacks; the recorded payload stays intact.
+func readableFailureSummary(value string) string {
+	var execution struct {
+		Stderr   string `json:"stderr"`
+		ExitCode *int   `json:"exit_code"`
+	}
+	if json.Unmarshal([]byte(value), &execution) == nil && execution.ExitCode != nil && strings.TrimSpace(execution.Stderr) != "" {
+		runes := []rune(strings.TrimSpace(execution.Stderr))
+		if len(runes) > 512 {
+			return "…" + string(runes[len(runes)-512:])
+		}
+		return string(runes)
+	}
+	return boundedFailureSummary(value)
+}
+
+func boundedFailureSummary(value string) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) > 512 {
+		return string(runes[:512]) + "…"
+	}
+	return string(runes)
 }
 
 func evidenceCompletenessRank(value string) int {
@@ -1199,11 +1429,17 @@ func summaryStringSet(groups ...[]string) map[string]struct{} {
 	return result
 }
 
-func (s *Service) GetInteractionSummary(
-	ctx context.Context,
-	interactionID string,
-	scope evidencevo.QueryScope,
-) (evidencevo.InteractionSummary, bool, error) {
+func (s *Service) GetInteractionSummary(ctx context.Context, interactionID string, scope evidencevo.QueryScope) (evidencevo.InteractionSummary, bool, error) {
+	return s.getInteractionSummary(ctx, interactionID, scope, true)
+}
+
+// GetInteractionSummaryWithoutRecordIntegrity retains identical authorization
+// and summary semantics for probes that do not display current call content.
+func (s *Service) GetInteractionSummaryWithoutRecordIntegrity(ctx context.Context, interactionID string, scope evidencevo.QueryScope) (evidencevo.InteractionSummary, bool, error) {
+	return s.getInteractionSummary(ctx, interactionID, scope, false)
+}
+
+func (s *Service) getInteractionSummary(ctx context.Context, interactionID string, scope evidencevo.QueryScope, checkIntegrity bool) (evidencevo.InteractionSummary, bool, error) {
 	interactionID = strings.TrimSpace(interactionID)
 	if interactionID == "" || !trustedQueryScope(scope) {
 		return evidencevo.InteractionSummary{}, false, nil
@@ -1333,6 +1569,13 @@ func (s *Service) GetInteractionSummary(
 					reason,
 				)
 			}
+		}
+	}
+	if checkIntegrity {
+		var applicable bool
+		summary.CurrentRecordIntegrity, applicable, err = s.inspectRecordIntegrityWithScope(ctx, interactionID, scope)
+		if err != nil || (applicable && summary.CurrentRecordIntegrity == nil) {
+			summary.RecordIntegrityCheckFailed = true
 		}
 	}
 	return summary, true, nil
@@ -1546,6 +1789,7 @@ func (s *Service) listConversationIdentityPage(ctx context.Context, options evid
 		query.Offset = 0
 		query.AfterStartedAt, query.AfterID = cursor.StartedAt, cursor.ID
 	}
+	query.IncludeRegisteredCalls = s.currentRecordIntegrity
 	identityPage, err := pageStore.ListConversationSummaryIdentities(ctx, query)
 	if err != nil {
 		return evidencevo.ConversationSummaryPage{}, true, err
@@ -1598,6 +1842,9 @@ func (s *Service) listConversationIdentityPage(ctx context.Context, options evid
 				entriesForCanonical[index].ResultPreview = preview.ResultPreview
 			}
 		}
+	}
+	if err := s.applyConversationRecordIntegrity(ctx, entriesForCanonical, options.Scope); err != nil {
+		return evidencevo.ConversationSummaryPage{}, true, err
 	}
 	for _, entry := range entriesForCanonical {
 		byID[entry.ConversationID] = entry
@@ -1742,7 +1989,7 @@ func summaryScopeMatchesProfile(scope evidencevo.QueryScope) bool {
 func hasSummaryContentFilters(options evidencevo.SummaryQueryOptions) bool {
 	return options.Status != "" || options.AgentOrApp != "" ||
 		options.Service != "" || options.Tool != "" || options.ErrorKeyword != "" ||
-		options.KnowledgeNetwork != "" || options.EvidenceCompleteness != "" || options.Keyword != ""
+		options.RecordIntegrity != "" || options.KnowledgeNetwork != "" || options.EvidenceCompleteness != "" || options.Keyword != ""
 }
 
 func matchesAnyExcludedAgent(request evidencevo.RequestSummary, options evidencevo.SummaryQueryOptions) bool {
@@ -1900,6 +2147,10 @@ func summaryCandidateLimit(options evidencevo.SummaryQueryOptions) int {
 		// The compatibility path does not push cursors into Projection. Keep its
 		// historical scan window so a cursor never makes previously reachable
 		// entries disappear merely because the ordinary list fast path exists.
+		return MaxSummaryScanEntries
+	}
+	// Check the scan cap before multiplying so deep page numbers cannot overflow.
+	if page > (MaxSummaryScanEntries-1)/(limit*maxReceiptsPerSummary) {
 		return MaxSummaryScanEntries
 	}
 	candidates := page*limit*maxReceiptsPerSummary + 1
@@ -2199,5 +2450,10 @@ func summaryOffset(options evidencevo.SummaryQueryOptions, length int) int {
 }
 
 func summaryQueryOffset(options evidencevo.SummaryQueryOptions) int {
-	return (normalizeSummaryPage(options.Page) - 1) * normalizeSummaryLimit(options.Limit)
+	pageIndex := normalizeSummaryPage(options.Page) - 1
+	limit := normalizeSummaryLimit(options.Limit)
+	if pageIndex > math.MaxInt/limit {
+		return math.MaxInt
+	}
+	return pageIndex * limit
 }

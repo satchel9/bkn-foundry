@@ -22,9 +22,26 @@ import (
 func TestOpenSearchSubFieldFeatures(t *testing.T) {
 	t.Run("maps opensearch sub field types to features", func(t *testing.T) {
 		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, osSubFieldTypeToFeatureType("keyword"))
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, osSubFieldTypeToFeatureType("constant_keyword"))
+		assert.Empty(t, osSubFieldTypeToFeatureType("wildcard"))
+		assert.Empty(t, osSubFieldTypeToFeatureType("icu_collation_keyword"))
+		assert.Equal(t, interfaces.PropertyFeatureType_Fulltext, osSubFieldTypeToFeatureType("match_only_text"))
+		assert.Empty(t, osSubFieldTypeToFeatureType("dense_vector"))
 		assert.Equal(t, interfaces.PropertyFeatureType_Fulltext, osSubFieldTypeToFeatureType("text"))
 		assert.Equal(t, interfaces.PropertyFeatureType_Vector, osSubFieldTypeToFeatureType("knn_vector"))
 		assert.Empty(t, osSubFieldTypeToFeatureType("object"))
+	})
+
+	t.Run("keeps raw keyword when specialized subfields precede it", func(t *testing.T) {
+		features := buildSubFieldFeatures("title", []interfaces.IndexSubFieldMeta{
+			{Name: "de", Type: "icu_collation_keyword"},
+			{Name: "grep", Type: "wildcard"},
+			{Name: "raw", Type: "keyword", Attributes: map[string]any{"ignore_above": 256}},
+		})
+		require.Len(t, features, 1)
+		assert.Equal(t, "raw", features[0].FeatureName)
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, features[0].FeatureType)
+		assert.Equal(t, map[string]any{"ignore_above": 256}, features[0].Config)
 	})
 
 	t.Run("builds supported sub field features", func(t *testing.T) {
@@ -253,7 +270,9 @@ func TestEnrichIndexMetadataSynchronizesFieldDescriptions(t *testing.T) {
 		ID:          "r1",
 		Description: "人工索引说明",
 		SourceMetadata: map[string]any{
-			"original_description": "",
+			"description":          "",
+			"original_description": "legacy comment",
+			"original_name":        "legacy-name",
 		},
 		SchemaDefinition: []*interfaces.Property{
 			{Name: "empty", Description: ""},
@@ -277,7 +296,9 @@ func TestEnrichIndexMetadataSynchronizesFieldDescriptions(t *testing.T) {
 	rs.EXPECT().InternalUpdateDiscoveryMetadata(gomock.Any(), nil, gomock.AssignableToTypeOf(&interfaces.Resource{}), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ *sql.Tx, updated *interfaces.Resource, _ int64) error {
 			assert.Equal(t, "人工索引说明", updated.Description)
-			assert.Equal(t, "", updated.SourceMetadata["original_description"])
+			assert.Equal(t, "", updated.SourceMetadata["description"])
+			assert.NotContains(t, updated.SourceMetadata, "original_description")
+			assert.NotContains(t, updated.SourceMetadata, "original_name")
 			assert.Equal(t, map[string]any{"description": "新 mapping 说明", "owner": "search-team"}, updated.SourceMetadata["mapping_meta"])
 			fields := make(map[string]*interfaces.Property, len(updated.SchemaDefinition))
 			for _, field := range updated.SchemaDefinition {
@@ -296,5 +317,36 @@ func TestEnrichIndexMetadataSynchronizesFieldDescriptions(t *testing.T) {
 		indexMeta: &interfaces.IndexMeta{Name: "products"},
 	}}, &interfaces.DiscoverResult{}, &discoverTaskReconcileProgress{lastProgress: 95})
 
+	require.NoError(t, err)
+}
+
+func TestEnrichIndexMetadataResolvesAliasWithoutLosingSourceType(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	rs := vmock.NewMockResourceService(ctrl)
+	connector := vmock.NewMockIndexConnector(ctrl)
+	resource := &interfaces.Resource{ID: "r1"}
+	connector.EXPECT().GetIndexMeta(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, index *interfaces.IndexMeta) error {
+			index.Mapping = map[string]interfaces.IndexFieldMeta{
+				"age_alias": {Name: "age_alias", Type: "alias", ResolvedType: "long",
+					Attributes: map[string]any{"type": "alias", "path": "profile.age"}},
+			}
+			return nil
+		})
+	connector.EXPECT().MapType("long").Return(interfaces.DataType_Integer)
+	rs.EXPECT().InternalUpdateDiscoveryMetadata(gomock.Any(), nil, gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ *sql.Tx, updated *interfaces.Resource, _ int64) error {
+			require.Len(t, updated.SchemaDefinition, 1)
+			field := updated.SchemaDefinition[0]
+			assert.Equal(t, interfaces.DataType_Integer, field.Type)
+			assert.Equal(t, "alias", field.OriginalType)
+			assert.Equal(t, "age_alias", field.OriginalName)
+			assert.Equal(t, map[string]any{"path": "profile.age"}, field.Attributes)
+			return nil
+		})
+	worker := &DiscoverTaskWorker{rs: rs}
+	err := worker.enrichIndexMetadata(t.Context(), &interfaces.DiscoverTask{}, connector,
+		[]indexDiscoverItem{{resource: resource, indexMeta: &interfaces.IndexMeta{Name: "products"}}},
+		&interfaces.DiscoverResult{}, &discoverTaskReconcileProgress{lastProgress: 95})
 	require.NoError(t, err)
 }

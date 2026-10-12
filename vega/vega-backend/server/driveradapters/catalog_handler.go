@@ -10,14 +10,14 @@ package driveradapters
 import (
 	"context"
 	"fmt"
-	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
-	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common/visitor"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common/visitor"
+
 	"github.com/gin-gonic/gin"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
@@ -254,11 +254,8 @@ func (r *restHandler) createCatalog(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	// Record the successful creation in the audit log.
-	audit.NewInfoLog(audit.OPERATION, audit.CREATE, audit.TransforOperator(visitor),
-		interfaces.GenerateCatalogAuditObject(id, req.Name), "")
-
 	result := map[string]any{"id": id}
+	c.Set(operationAuditTargetIDKey, id)
 
 	logger.Debug("Handler CreateCatalog Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
@@ -420,9 +417,6 @@ func (r *restHandler) updateCatalog(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	audit.NewInfoLog(audit.OPERATION, audit.UPDATE, audit.TransforOperator(visitor),
-		interfaces.GenerateCatalogAuditObject(id, req.Name), "")
-
 	logger.Debug("Handler UpdateCatalog Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
 	rest.ReplyOK(c, http.StatusNoContent, nil)
@@ -472,16 +466,13 @@ func (r *restHandler) setCatalogEnabled(c *gin.Context, visitor hydra.Visitor, e
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
 	id := c.Param("id")
-	catalog, err := r.cs.SetEnabled(ctx, id, enabled)
+	_, err := r.cs.SetEnabled(ctx, id, enabled)
 	if err != nil {
 		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Catalog_InternalError)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
-
-	audit.NewInfoLog(audit.OPERATION, audit.UPDATE, audit.TransforOperator(visitor),
-		interfaces.GenerateCatalogAuditObject(id, catalog.Name), "")
 
 	logger.Debug("Handler SetCatalogEnabled Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
@@ -557,9 +548,6 @@ func (r *restHandler) deleteCatalog(c *gin.Context, visitor hydra.Visitor) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
-
-	audit.NewWarnLog(audit.OPERATION, audit.DELETE, audit.TransforOperator(visitor),
-		interfaces.GenerateCatalogAuditObject(id, ""), audit.SUCCESS, "")
 
 	logger.Debug("Handler DeleteCatalog Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
@@ -772,11 +760,12 @@ func (r *restHandler) discoverCatalogResources(c *gin.Context, visitor hydra.Vis
 	}
 	if !interfaces.IsValidDiscoverStrategy(strategy) {
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_DiscoverSchedule_InvalidStrategies).
-			WithErrorDetails(fmt.Sprintf("invalid strategy: %s, must be one of: %s, %s, %s",
+			WithErrorDetails(fmt.Sprintf("invalid strategy: %s, must be one of: %s, %s, %s, %s",
 				strategy,
 				interfaces.DiscoverStrategyFullSync,
 				interfaces.DiscoverStrategyCreateOnly,
-				interfaces.DiscoverStrategyCleanupOnly))
+				interfaces.DiscoverStrategyCleanupOnly,
+				interfaces.DiscoverStrategyCountOnly))
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
@@ -803,7 +792,7 @@ func (r *restHandler) discoverCatalogResources(c *gin.Context, visitor hydra.Vis
 		rest.ReplyError(c, httpErr)
 		return
 	}
-	if catalog.Type != interfaces.CatalogTypePhysical {
+	if catalog.Type != interfaces.CatalogTypePhysical && strategy != interfaces.DiscoverStrategyCountOnly {
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Catalog_InvalidParameter_Type).
 			WithErrorDetails("discover only supports physical catalogs")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)

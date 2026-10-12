@@ -25,6 +25,53 @@ import (
 	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
 )
 
+func registerMockLogicalViewService(t *testing.T, service interfaces.LogicalViewService) {
+	t.Helper()
+	previous := resourcelogic.GetLogicalViewService()
+	resourcelogic.SetLogicalViewService(service)
+	t.Cleanup(func() { resourcelogic.SetLogicalViewService(previous) })
+}
+
+func TestQuerySourcePageVectorConditionErrorProvenance(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		stored     bool
+		statusCode int
+	}{
+		{name: "stored condition", stored: true, statusCode: http.StatusInternalServerError},
+		{name: "request condition", statusCode: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+			mockMFS := mock_interfaces.NewMockModelFactoryService(ctrl)
+			mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+				Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+			mockMFS.EXPECT().GetModelByID(gomock.Any(), "removed-model").Return(nil, nil)
+			rds := &resourceDataService{cs: mockCS, mfs: mockMFS}
+			resource := &interfaces.Resource{
+				ID: "source", CatalogID: "catalog-1", Category: interfaces.ResourceCategoryTable,
+				LocalIndexName: "source-index", LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+				IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "removed-model"},
+				SchemaDefinition: []*interfaces.Property{{Name: "embedding", Type: interfaces.DataType_Vector,
+					Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector}}}},
+			}
+			condition := &interfaces.FilterCondCfg{Name: "embedding", Operation: filter_condition.OperationKnnVector,
+				ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: "query text"}}
+			params := &interfaces.ResourceDataQueryParams{FilterCondCfg: condition}
+			if tc.stored {
+				params.FixedFilterCondCfg = condition
+			}
+			rows, total, err := rds.QuerySourcePage(context.Background(), resource, params)
+			assert.Nil(t, rows)
+			assert.Zero(t, total)
+			var httpErr *rest.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, tc.statusCode, httpErr.HTTPCode)
+		})
+	}
+}
+
 func TestResourceDataServicePrepareOutputFieldsParams(t *testing.T) {
 	t.Run("prepare output fields params filters undefined fields", func(t *testing.T) {
 		rds := &resourceDataService{}
@@ -198,7 +245,56 @@ func TestResourceDataServiceQueryWithPagingRequiresQueryDataPermission(t *testin
 	require.ErrorIs(t, err, denied)
 }
 
+func TestResourceDataServiceQueryWithPagingPreservesLogicalViewQuerySource(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	rs := mock_interfaces.NewMockResourceService(ctrl)
+	lvs := mock_interfaces.NewMockLogicalViewService(ctrl)
+	registerMockLogicalViewService(t, lvs)
+	rds := &resourceDataService{rs: rs}
+	view := &interfaces.Resource{ID: "view-1", Category: interfaces.ResourceCategoryLogicalView,
+		Enabled: true, SchemaDefinition: []*interfaces.Property{{Name: "name"}}}
+	params := &interfaces.ResourceDataQueryParams{}
+	rs.EXPECT().CheckResourcePermission(gomock.Any(), view.ID, interfaces.OPERATION_TYPE_QUERY_DATA).Return(nil)
+	lvs.EXPECT().QueryWithPaging(gomock.Any(), view, params).Return(&interfaces.ResourceDataQueryResult{
+		Entries: []map[string]any{{"name": "alice"}}, QuerySource: interfaces.ResourceQuerySourceLocalIndex,
+	}, nil)
+
+	result, err := rds.QueryWithPaging(context.Background(), view, params)
+	require.NoError(t, err)
+	assert.Equal(t, interfaces.ResourceQuerySourceLocalIndex, result.QuerySource)
+}
+
 func TestResourceDataServiceQuery(t *testing.T) {
+	t.Run("public table query preserves local index score and cursor position", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		catalogs := mock_interfaces.NewMockCatalogService(ctrl)
+		resources := mock_interfaces.NewMockResourceService(ctrl)
+		index := mock_interfaces.NewMockLocalIndexManager(ctrl)
+		resource := &interfaces.Resource{ID: "table-1", CatalogID: "catalog-1", Category: interfaces.ResourceCategoryTable,
+			Enabled: true, Status: interfaces.ResourceStatusActive,
+			LocalIndexName: "table-index", LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_Integer}}}
+		params := &interfaces.ResourceDataQueryParams{NeedTotal: true,
+			Paging:       interfaces.PagingRequest{Mode: interfaces.PagingModeSingle, Limit: 2},
+			Sort:         []*interfaces.SortField{{Field: "_score", Direction: "desc"}, {Field: "id", Direction: "asc"}},
+			OutputFields: []string{"id", "_score"}, SearchAfter: []any{0.875, 1}}
+		resources.EXPECT().CheckResourcePermission(gomock.Any(), "table-1", interfaces.OPERATION_TYPE_QUERY_DATA).Return(nil)
+		catalogs.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{Enabled: true}, nil)
+		index.EXPECT().ListDocuments(gomock.Any(), "table-index", resource, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ string, _ *interfaces.Resource, actual *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+				assert.Equal(t, []*interfaces.SortField{{Field: "_score", Direction: "desc"}, {Field: "id", Direction: "asc"}}, actual.Sort)
+				assert.Equal(t, []string{"id", "_score"}, actual.OutputFields)
+				assert.Equal(t, []any{0.875, 1}, actual.SearchAfter)
+				actual.SearchAfter = []any{0.875, 2}
+				return []map[string]any{{"id": 2, "_score": 0.875}}, 3, nil
+			})
+		result, err := (&resourceDataService{rs: resources, cs: catalogs, lim: index}).QueryWithPaging(context.Background(), resource, params)
+		require.NoError(t, err)
+		assert.Equal(t, interfaces.ResourceQuerySourceLocalIndex, result.QuerySource)
+		assert.Equal(t, []map[string]any{{"id": 2, "_score": 0.875}}, result.Entries)
+		assert.Equal(t, int64(3), result.TotalCount)
+		assert.Equal(t, []any{0.875, 2}, params.SearchAfter)
+	})
 	t.Run("query rejects disabled catalog", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
@@ -242,7 +338,7 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		mockLIM.EXPECT().ListDocuments(gomock.Any(), resource.LocalIndexName, resource, params).
 			Return(wantRows, int64(1), nil)
 
-		rows, total, err := rds.query(context.Background(), resource, params)
+		rows, total, err := rds.QuerySourcePage(context.Background(), resource, params)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), total)
 		assert.Equal(t, "openbkn", rows[0]["name"])
@@ -263,7 +359,7 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		}
 		params := &interfaces.ResourceDataQueryParams{}
 		cause := fmt.Errorf("failed to build filter query: %w",
-			filter_condition.NewConditionBuildError("text field title has no keyword feature; re-save the resource configuration and rebuild the local index, or use match"))
+			interfaces.NewConditionBuildError("text field title has no keyword feature; re-save the resource configuration and rebuild the local index, or use match"))
 
 		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
 			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
@@ -276,6 +372,29 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
 		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
 		assert.Contains(t, httpErr.BaseError.ErrorDetails, "re-save the resource configuration")
+	})
+
+	t.Run("query table with local index answers 500 for a stored condition the index cannot build", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockLIM := mock_interfaces.NewMockLocalIndexManager(ctrl)
+		rds := &resourceDataService{cs: mockCS, lim: mockLIM}
+		resource := &interfaces.Resource{ID: "resource-1", CatalogID: "catalog-1",
+			Category: interfaces.ResourceCategoryTable, LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+			LocalIndexName: "source-index", SchemaDefinition: []*interfaces.Property{{Name: "title", Type: interfaces.DataType_Text}}}
+		fixed := &interfaces.FilterCondCfg{Name: "title", Operation: filter_condition.OperationEqual,
+			ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: "example"}}
+		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: fixed, FixedFilterCondCfg: fixed}
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), resource.CatalogID, true).
+			Return(&interfaces.Catalog{Enabled: true}, nil)
+		mockLIM.EXPECT().ListDocuments(gomock.Any(), resource.LocalIndexName, resource, params).Return(nil, int64(0),
+			interfaces.NewStoredConditionBuildError(interfaces.NewConditionBuildError("text field has no keyword feature")))
+		rows, total, err := rds.QuerySourcePage(context.Background(), resource, params)
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
 	})
 
 	t.Run("force source bypasses local index and returns binary metadata", func(t *testing.T) {
@@ -305,11 +424,39 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, params).
 			Return(&interfaces.QueryResult{Entries: []map[string]any{{"blob": int64(12)}}, Total: 1}, nil)
 
-		rows, total, err := rds.query(context.Background(), resource, params)
+		rows, total, err := rds.QuerySourcePage(context.Background(), resource, params)
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), total)
 		length := int64(12)
 		assert.Equal(t, interfaces.ResourceValue{Mode: interfaces.ResourceValueModeMetadata, ByteLength: &length}, rows[0]["blob"])
+	})
+
+	t.Run("source page returns binary content envelope", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockTableConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := &interfaces.Resource{ID: "resource-1", CatalogID: "catalog-1",
+			Category:         interfaces.ResourceCategoryTable,
+			SchemaDefinition: []*interfaces.Property{{Name: "blob", Type: interfaces.DataType_Binary}}}
+		binaryMode := interfaces.BinaryModeContent
+		params := &interfaces.ResourceDataQueryParams{BinaryMode: &binaryMode, OutputFields: []string{"blob"}}
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), resource.CatalogID, true).
+			Return(&interfaces.Catalog{Enabled: true}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, params).
+			Return(&interfaces.QueryResult{Entries: []map[string]any{{"blob": []byte{1, 2, 3}}}, Total: 1}, nil)
+
+		rows, total, err := rds.QuerySourcePage(context.Background(), resource, params)
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), total)
+		length := int64(3)
+		data := "AQID"
+		assert.Equal(t, interfaces.ResourceValue{Mode: interfaces.ResourceValueModeContent,
+			ByteLength: &length, Data: &data}, rows[0]["blob"])
 	})
 
 	t.Run("query dataset passes the dataset service HTTP error through", func(t *testing.T) {
@@ -385,16 +532,17 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		assert.Equal(t, int64(1), total)
 	})
 
-	t.Run("query logic view filters sort and output fields before delegating", func(t *testing.T) {
+	t.Run("query logical view filters sort and output fields before delegating", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-		mockLVS := mock_interfaces.NewMockLogicViewService(ctrl)
-		rds := &resourceDataService{cs: mockCS, lvs: mockLVS}
+		mockLVS := mock_interfaces.NewMockLogicalViewService(ctrl)
+		registerMockLogicalViewService(t, mockLVS)
+		rds := &resourceDataService{cs: mockCS}
 		resource := &interfaces.Resource{
 			ID:        "logic-view-1",
 			Enabled:   true,
 			CatalogID: "catalog-1",
-			Category:  interfaces.ResourceCategoryLogicView,
+			Category:  interfaces.ResourceCategoryLogicalView,
 			SchemaDefinition: []*interfaces.Property{
 				{Name: "name"},
 			},
@@ -425,14 +573,15 @@ func TestResourceDataServiceQuery(t *testing.T) {
 		assert.Equal(t, int64(1), total)
 	})
 
-	t.Run("query logic view passes the logic view service HTTP error through", func(t *testing.T) {
+	t.Run("query logical view passes the logical view service HTTP error through", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-		mockLVS := mock_interfaces.NewMockLogicViewService(ctrl)
-		rds := &resourceDataService{cs: mockCS, lvs: mockLVS}
+		mockLVS := mock_interfaces.NewMockLogicalViewService(ctrl)
+		registerMockLogicalViewService(t, mockLVS)
+		rds := &resourceDataService{cs: mockCS}
 		resource := &interfaces.Resource{
 			ID: "logic-view-1", Enabled: true, CatalogID: "catalog-1",
-			Category:         interfaces.ResourceCategoryLogicView,
+			Category:         interfaces.ResourceCategoryLogicalView,
 			SchemaDefinition: []*interfaces.Property{{Name: "body", Type: interfaces.DataType_Text}},
 		}
 		params := &interfaces.ResourceDataQueryParams{}
@@ -685,6 +834,11 @@ func assertCatalogDisabledError(t *testing.T, err error) {
 // 分支根本没做判断——两处加起来，anyshare / mariadb 那几个连接器返回
 // UnsupportedOperationError 的改动一点行为变化都没有，调用方拿到的仍是
 // 「数据资源内部错误」，ontology-query 继续判成依赖故障。
+type codedQueryError struct{ code int }
+
+func (e codedQueryError) Error() string { return "source database error" }
+func (e codedQueryError) Code() int     { return e.code }
+
 func TestQueryClassifiesUnsupportedOperations(t *testing.T) {
 	newResource := func(category string) *interfaces.Resource {
 		return &interfaces.Resource{
@@ -692,7 +846,153 @@ func TestQueryClassifiesUnsupportedOperations(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "name", Type: interfaces.DataType_String}},
 		}
 	}
-	unsupported := filter_condition.NewUnsupportedOperationError("regex", filter_condition.QueryChannelSQL)
+	unsupported := interfaces.NewUnsupportedOperationError("regex", filter_condition.QueryChannelSQL)
+
+	t.Run("table connector unknown column becomes HTTP 400 without driver details", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockTableConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryTable)
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeMariaDB}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeMariaDB, gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).
+			Return(nil, fmt.Errorf("execute source query: %w", interfaces.NewSourceQueryInvalidParameterError(
+				interfaces.SourceQueryInvalidParameterUnknownColumn, errors.New("private driver column details"))))
+
+		rows, total, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Query_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.NotContains(t, httpErr.Error(), "private driver column details")
+	})
+
+	t.Run("connector source permission error becomes HTTP 403", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockTableConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryTable)
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeMariaDB}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeMariaDB, gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).
+			Return(nil, fmt.Errorf("execute source query: %w", interfaces.NewSourceReadForbiddenError(errors.New("source database error"))))
+
+		rows, total, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusForbidden, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_SourceReadForbidden, httpErr.BaseError.ErrorCode)
+		assert.NotContains(t, httpErr.Error(), "source database error")
+	})
+
+	t.Run("index connector source permission error becomes HTTP 403", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockIndexConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryIndex)
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource.SourceIdentifier, resource, gomock.Any()).
+			Return(nil, interfaces.NewSourceReadForbiddenError(errors.New("source database error")))
+
+		_, _, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusForbidden, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_SourceReadForbidden, httpErr.BaseError.ErrorCode)
+	})
+
+	t.Run("index condition build error becomes HTTP 400", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockIndexConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryIndex)
+		cause := fmt.Errorf("failed to build filter query: %w", interfaces.NewConditionBuildError("text field body has no keyword feature"))
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource.SourceIdentifier, resource, gomock.Any()).Return(nil, cause)
+
+		rows, total, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Query_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Contains(t, httpErr.Error(), "text field body has no keyword feature")
+	})
+
+	t.Run("fileset connector source permission error becomes HTTP 403", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockFilesetConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryFileset)
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), gomock.Any(), gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).
+			Return(nil, interfaces.NewSourceReadForbiddenError(errors.New("source database error")))
+
+		_, _, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusForbidden, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_SourceReadForbidden, httpErr.BaseError.ErrorCode)
+	})
+
+	t.Run("raw driver code is not classified by the service", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockCF := mock_interfaces.NewMockConnectorFactory(ctrl)
+		mockConn := mock_interfaces.NewMockTableConnector(ctrl)
+		rds := &resourceDataService{cs: mockCS, cf: mockCF}
+		resource := newResource(interfaces.ResourceCategoryTable)
+
+		mockCS.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
+			Return(&interfaces.Catalog{ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeHANA}, nil)
+		mockCF.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeHANA, gomock.Any()).Return(mockConn, nil)
+		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
+		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
+		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Return(nil, codedQueryError{258})
+
+		_, _, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
+	})
 
 	t.Run("表分支的 400 不再被上层压成 500", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -727,7 +1027,7 @@ func TestQueryClassifiesUnsupportedOperations(t *testing.T) {
 		mockConn.EXPECT().Connect(gomock.Any()).Return(nil)
 		mockConn.EXPECT().Close(gomock.Any()).Return(nil)
 		mockConn.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).
-			Return(nil, filter_condition.NewUnsupportedOperationError("regex", filter_condition.QueryChannelFileset))
+			Return(nil, interfaces.NewUnsupportedOperationError("regex", filter_condition.QueryChannelFileset))
 
 		_, _, err := rds.query(context.Background(), resource, &interfaces.ResourceDataQueryParams{})
 		assertUnsupportedOperationHTTPError(t, err)
@@ -763,4 +1063,37 @@ func assertUnsupportedOperationHTTPError(t *testing.T, err error) {
 	assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode,
 		"算子不支持是请求侧问题：包成 500 会让 ontology-query 判成依赖故障")
 	assert.Equal(t, verrors.VegaBackend_Query_InvalidParameter, httpErr.BaseError.ErrorCode)
+}
+
+func TestResourceDataServiceQueryRejectsUnavailableIndexFields(t *testing.T) {
+	for _, fieldType := range []string{interfaces.DataType_Json, interfaces.DataType_Binary, interfaces.DataType_Other} {
+		for _, stored := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stored=%v", fieldType, stored), func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				cs := mock_interfaces.NewMockCatalogService(ctrl)
+				lim := mock_interfaces.NewMockLocalIndexManager(ctrl)
+				cs.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{Enabled: true}, nil)
+				service := &resourceDataService{cs: cs, lim: lim}
+				resource := tableResource("index")
+				resource.CatalogID = "catalog-1"
+				resource.SchemaDefinition = []*interfaces.Property{{Name: "payload", Type: fieldType}}
+				cfg := &interfaces.FilterCondCfg{Name: "payload", Operation: "exist"}
+				params := &interfaces.ResourceDataQueryParams{FilterCondCfg: cfg}
+				expected := http.StatusBadRequest
+				if stored {
+					params.FixedFilterCondCfg = cfg
+					expected = http.StatusInternalServerError
+				}
+				rows, total, err := service.QuerySourcePage(context.Background(), resource, params)
+				require.Nil(t, rows)
+				assert.Zero(t, total)
+				var httpErr *rest.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, expected, httpErr.HTTPCode)
+				if !stored {
+					assert.Contains(t, httpErr.BaseError.ErrorDetails, "not found")
+				}
+			})
+		}
+	}
 }

@@ -139,12 +139,12 @@ func TestExploreSubgraphSchema_ShapeAndRequiredFields(t *testing.T) {
 			_, ok := in.Properties[key]
 			convey.So(ok, convey.ShouldBeTrue)
 		}
-		for _, key := range []string{"exclude_system_properties", "ignoring_store_cache", "need_total",
+		for _, key := range []string{"exclude_system_properties", "ignore_local_index", "need_total",
 			"relation_type_paths"} {
 			_, ok := in.Properties[key]
 			convey.So(ok, convey.ShouldBeFalse)
 		}
-		// bkn_context is added by offerBKNContext to the business tools during assembly and is not in the baseline file.
+		// bkn_context is required by offerBKNContext during assembly.
 		convey.So(in.Required, convey.ShouldResemble,
 			[]string{"kn_id", "source_object_type_id", "direction", "path_length", "bkn_context"})
 

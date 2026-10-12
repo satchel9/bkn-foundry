@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,7 +20,6 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
-	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
@@ -49,15 +50,22 @@ var sensitiveBodyKeys = []string{"password", "new_password", "old_password"}
 // context (logged) but never fail the request: auditing must not break the
 // operation it audits. Read requests are skipped, so the audit-log read endpoint
 // itself produces no entries (no feedback loop).
-func auditMiddleware(store *audit.Store, dir *directory.Service, db *gorm.DB) gin.HandlerFunc {
+type auditBatchRecorder interface {
+	RecordBatch(context.Context, []audit.Entry) error
+}
+
+func auditMiddleware(store auditBatchRecorder, dir *directory.Service, db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		requestID := strings.TrimSpace(c.GetHeader("x-request-id"))
-		if !validAuditRequestID(requestID) {
-			requestID = audit.NewID()
+		// Every normal audit fact has an authenticated actor. A caller that
+		// reaches this middleware without one is not allowed into the business
+		// audit stream; it may still complete its request normally.
+		if c.GetString(ctxAccessorID) == "" {
+			c.Next()
+			return
 		}
-		c.Header("x-request-id", requestID)
+		requestID := ensureRequestID(c)
 		var raw []byte
-		if isMutating(c.Request.Method) && c.Request.Body != nil {
+		if isAuditedManagementOperation(c.Request.Method, c.FullPath()) && c.Request.Body != nil {
 			// Buffer a bounded prefix for the Detail snapshot, then hand the
 			// handler that prefix followed by whatever is still unread. The
 			// snapshot is capped; the request is not — a resource-parents batch
@@ -82,54 +90,68 @@ func auditMiddleware(store *audit.Store, dir *directory.Service, db *gorm.DB) gi
 		}
 		beforeName := auditTargetName(c.Request.Context(), dir, db, resource, targetID, detail)
 		actorID := c.GetString(ctxAccessorID)
+		actorName := auditActorName(c.Request.Context(), dir, db, actorID)
 		actorType, authMethod, sourceChannel := "user", "oauth", "api"
-		if actorID == "" {
-			actorType, authMethod, sourceChannel = "service", "network", "internal"
-			detail = withAuditCallerService(detail, c)
-		}
-		requestOperation := audit.NewRequestOperation(audit.Entry{
-			ActorID: actorID, ActorNameSnapshot: auditActorName(c.Request.Context(), dir, actorID),
+		operationEntry := audit.Entry{
+			ActorID: actorID, ActorNameSnapshot: actorName,
 			ActorType: actorType, AuthMethod: authMethod, RequestID: requestID, SourceChannel: sourceChannel,
 			Method: c.Request.Method, Resource: resource, Action: action, TargetID: targetID, TargetName: beforeName,
 			Detail: detail, ClientIP: c.ClientIP(),
-		})
+		}
+		requestOperation := audit.NewRequestOperation(operationEntry)
+		if kafkaRecorder, ok := store.(*audit.KafkaRecorder); ok {
+			requestOperation = audit.NewKafkaRequestOperation(operationEntry, kafkaRecorder.Record)
+		}
 		c.Request = c.Request.WithContext(audit.WithRequestOperation(c.Request.Context(), requestOperation))
 		c.Next()
-		if !isMutating(c.Request.Method) {
+		if !isAuditedManagementOperation(c.Request.Method, c.FullPath()) {
+			return
+		}
+		// A rejected or failed request did not commit a business operation. Its
+		// HTTP outcome belongs to the caller, not to the business audit stream.
+		if status := c.Writer.Status(); status < http.StatusOK || status >= http.StatusMultipleChoices {
 			return
 		}
 		if requestOperation.Handled() {
 			return
 		}
 		explicitTargetName := ""
+		var snapshotErr error
+		explicitOperation := false
 		if rawOperation, ok := c.Get(ctxAuditOperation); ok {
 			if operation, valid := rawOperation.(auditOperation); valid {
+				if operation.Suppress {
+					return
+				}
+				explicitOperation = true
 				if operation.Action != "" {
 					action = operation.Action
 				}
-				if operation.TargetID != "" {
-					targetID = operation.TargetID
-				}
+				targetID = operation.TargetID
 				explicitTargetName = operation.TargetName
+				snapshotErr = operation.SnapshotErr
 			}
 		}
 		targetName := beforeName
-		if explicitTargetName != "" {
+		if explicitOperation && explicitTargetName != "" {
 			targetName = explicitTargetName
-		} else if c.Writer.Status() < http.StatusBadRequest {
+		} else if snapshotErr == nil && c.Writer.Status() < http.StatusBadRequest {
 			if name := auditTargetName(c.Request.Context(), dir, db, resource, targetID, detail); name != "" {
 				targetName = name
 			}
 		}
 		actorID = c.GetString(ctxAccessorID)
 		actorType, authMethod, sourceChannel = "user", "oauth", "api"
-		if actorID == "" {
-			// Tokenless service face (/authz policy and hierarchy writes): the
-			// platform network boundary is the credential, so there is no
-			// subject to name — only the peer address, plus the caller's
-			// self-declared service name in Detail when it sends one.
-			actorType, authMethod, sourceChannel = "service", "network", "internal"
-			detail = withAuditCallerService(detail, c)
+		if strings.TrimSpace(actorName) == "" {
+			logAuditCoverageGap(requestID, resource, action, targetID, "snapshot", "actor_snapshot_unavailable", errors.New("actor display name could not be resolved"))
+			return
+		}
+		if strings.TrimSpace(targetName) == "" {
+			if snapshotErr == nil {
+				snapshotErr = errors.New("target display name could not be resolved")
+			}
+			logAuditCoverageGap(requestID, resource, action, targetID, "snapshot", "target_snapshot_unavailable", snapshotErr)
+			return
 		}
 		// The write may have committed after the caller hung up (its deadline
 		// passed mid-commit); its audit row must not be dropped with the
@@ -139,7 +161,7 @@ func auditMiddleware(store *audit.Store, dir *directory.Service, db *gorm.DB) gi
 		defer cancelRecord()
 		baseEntry := audit.Entry{
 			ActorID:           actorID,
-			ActorNameSnapshot: auditActorName(recordCtx, dir, actorID),
+			ActorNameSnapshot: actorName,
 			ActorType:         actorType,
 			AuthMethod:        authMethod,
 			RequestID:         requestID,
@@ -152,30 +174,13 @@ func auditMiddleware(store *audit.Store, dir *directory.Service, db *gorm.DB) gi
 			Status:            c.Writer.Status(),
 			ClientIP:          c.ClientIP(),
 		}
-		entries := []audit.Entry{baseEntry}
-		if records := auditOutcomeRecords(c); len(records) > 0 {
-			entries = make([]audit.Entry, 0, len(records))
-			for _, record := range records {
-				entry := baseEntry
-				entry.TargetID = record.targetID
-				entry.TargetName = ""
-				entry.Detail = withAuditGate(record.detail, c)
-				entries = append(entries, entry)
+		baseEntry.Detail = withAuditGate(withAuditOutcome(detail, c), c)
+		if err := store.RecordBatch(recordCtx, []audit.Entry{baseEntry}); err != nil {
+			if !audit.CoverageGapWasLogged(err) {
+				logAuditCoverageGap(requestID, resource, action, targetID, "record", "record_failed", err)
 			}
-		} else {
-			entries[0].Detail = withAuditGate(withAuditOutcome(detail, c), c)
-		}
-		if err := store.RecordBatch(recordCtx, entries); err != nil {
-			slog.Error("failed to persist operation audit record",
-				"request_id", requestID,
-				"resource", resource,
-				"action", action,
-				"records", len(entries),
-				"error", err,
-			)
 			_ = c.Error(err)
 		}
-		c.Set(ctxAuditRecorded, true)
 	}
 }
 
@@ -188,15 +193,27 @@ func validAuditRequestID(value string) bool {
 	})
 }
 
-func auditActorName(ctx context.Context, dir *directory.Service, actorID string) string {
-	if dir == nil || actorID == "" {
+func auditActorName(ctx context.Context, dir *directory.Service, db *gorm.DB, actorID string) string {
+	if actorID == "" {
 		return ""
 	}
-	names, err := dir.ResolveUserNames(ctx, []string{actorID})
-	if err != nil || len(names) == 0 {
+	if dir != nil {
+		names, err := dir.ResolveUserNames(ctx, []string{actorID})
+		if err == nil && len(names) > 0 && strings.TrimSpace(names[0].Name) != "" {
+			return names[0].Name
+		}
+	}
+	if db == nil {
 		return ""
 	}
-	return names[0].Name
+	var user model.User
+	if err := db.WithContext(ctx).Select("name", "account").Where("id = ?", actorID).First(&user).Error; err != nil {
+		return ""
+	}
+	if name := strings.TrimSpace(user.Name); name != "" {
+		return name
+	}
+	return strings.TrimSpace(user.Account)
 }
 
 // isMutating reports whether the method is a write the audit trail records.
@@ -206,6 +223,22 @@ func isMutating(method string) bool {
 		return false
 	}
 	return true
+}
+
+// A few management APIs use POST to evaluate a proposed change without
+// committing one. They are queries, not administration mutations.
+func isAuditedManagementOperation(method, fullPath string) bool {
+	if !isMutating(method) {
+		return false
+	}
+	switch fullPath {
+	case "/api/safe/v1/authz/explain",
+		"/api/safe/v1/admin/object-grants/preview",
+		"/api/safe/v1/admin/row-filter-policies/explain":
+		return false
+	default:
+		return true
+	}
 }
 
 // auditDetail turns a JSON request body into a redacted, truncated snapshot for
@@ -287,26 +320,43 @@ func auditDetailFromPrefix(raw []byte) string {
 // does not say, e.g. how many grants a revoke actually removed.
 const ctxAuditOutcome = "audit_outcome"
 
-const ctxAuditOutcomeRecords = "audit_outcome_records"
-
 const ctxAuditOperation = "audit_operation"
 
 type auditOperation struct {
-	Action     string
-	TargetID   string
-	TargetName string
-}
-
-// auditOutcomeRecord is one independently queryable audit row produced by a
-// batch mutation. detail is pre-encoded and size-checked before the mutation is
-// committed, so the middleware cannot silently discard its provenance.
-type auditOutcomeRecord struct {
-	targetID string
-	detail   string
+	Action      string
+	TargetID    string
+	TargetName  string
+	SnapshotErr error
+	Suppress    bool
 }
 
 func setAuditOperation(c *gin.Context, action, targetID, targetName string) {
 	c.Set(ctxAuditOperation, auditOperation{Action: action, TargetID: targetID, TargetName: targetName})
+}
+
+func setAuditSnapshotFailure(c *gin.Context, action, targetID string, err error) {
+	c.Set(ctxAuditOperation, auditOperation{Action: action, TargetID: targetID, SnapshotErr: err})
+}
+
+func suppressAuditOperation(c *gin.Context) {
+	c.Set(ctxAuditOperation, auditOperation{Suppress: true})
+}
+
+func logAuditCoverageGap(requestID, resource, action, targetID, stage, reason string, err error) {
+	attributes := []any{
+		"request_id", requestID,
+		"resource", resource,
+		"action", action,
+		"stage", stage,
+		"reason", reason,
+	}
+	if targetID != "" {
+		attributes = append(attributes, "target_id", targetID)
+	}
+	if err != nil {
+		attributes = append(attributes, "error", err)
+	}
+	slog.Error("safe audit coverage gap", attributes...)
 }
 
 // setAuditOutcome records outcome facts for the audit Detail of the current
@@ -314,36 +364,6 @@ func setAuditOperation(c *gin.Context, action, targetID, targetName string) {
 // read): the value is then simply never consumed.
 func setAuditOutcome(c *gin.Context, outcome map[string]any) {
 	c.Set(ctxAuditOutcome, outcome)
-}
-
-func newAuditOutcomeRecord(targetID string, outcome map[string]any) (auditOutcomeRecord, bool) {
-	targetID = strings.TrimSpace(targetID)
-	if targetID == "" || len(outcome) == 0 {
-		return auditOutcomeRecord{}, false
-	}
-	detail, err := json.Marshal(map[string]any{
-		"grant_id": targetID,
-		"_outcome": outcome,
-	})
-	if err != nil || len(detail) > maxAuditDetail {
-		return auditOutcomeRecord{}, false
-	}
-	return auditOutcomeRecord{targetID: targetID, detail: string(detail)}, true
-}
-
-func setAuditOutcomeRecords(c *gin.Context, records []auditOutcomeRecord) {
-	if len(records) > 0 {
-		c.Set(ctxAuditOutcomeRecords, records)
-	}
-}
-
-func auditOutcomeRecords(c *gin.Context) []auditOutcomeRecord {
-	raw, ok := c.Get(ctxAuditOutcomeRecords)
-	if !ok {
-		return nil
-	}
-	records, _ := raw.([]auditOutcomeRecord)
-	return records
 }
 
 // withAuditGate notes in Detail which gate refused a mutating request that a
@@ -355,22 +375,6 @@ func withAuditGate(detail string, c *gin.Context) string {
 		return detail
 	}
 	return withAuditFact(detail, "_gate", gate)
-}
-
-// maxCallerServiceLen bounds the self-declared x-caller-service header value.
-const maxCallerServiceLen = 64
-
-// withAuditCallerService records the caller's self-declared service name for
-// a tokenless write. It is metadata for correlation only — nothing trusts it —
-// which is why it lives in Detail and never in the actor columns.
-func withAuditCallerService(detail string, c *gin.Context) string {
-	name := strings.TrimSpace(c.GetHeader("x-caller-service"))
-	if name == "" || len(name) > maxCallerServiceLen || strings.ContainsFunc(name, func(r rune) bool {
-		return r < 0x21 || r > 0x7e
-	}) {
-		return detail
-	}
-	return withAuditFact(detail, "_caller_service", name)
 }
 
 // withAuditFact merges one key into the Detail JSON object, keeping the
@@ -415,6 +419,14 @@ func withAuditOutcome(detail string, c *gin.Context) string {
 	}
 	m["_outcome"] = outcome
 	b, err := json.Marshal(m)
+	if (err != nil || len(b) > maxAuditDetail) && m["grant_ids"] != nil {
+		// Batch revoke requests can contain hundreds of opaque IDs. The
+		// handler supplies a bounded ID sample plus the complete count in the
+		// outcome; drop the duplicated request list so that outcome remains
+		// readable and persisted within the audit column limit.
+		delete(m, "grant_ids")
+		b, err = json.Marshal(m)
+	}
 	if err != nil || len(b) > maxAuditDetail {
 		return detail
 	}
@@ -429,6 +441,9 @@ func auditTargetName(
 	targetID string,
 	detail string,
 ) string {
+	if resource == "role-bindings" || resource == "object-grants" || resource == "enterprise-object-grants" {
+		return auditDetailName(ctx, dir, db, resource, detail)
+	}
 	if targetID == "" {
 		return auditDetailName(ctx, dir, db, resource, detail)
 	}
@@ -486,6 +501,9 @@ func auditDetailName(
 	if name, ok := body["name"].(string); ok && name != "" {
 		return name
 	}
+	// Object-grant names must come from the owning resource catalog. Request
+	// IDs and type names are not display snapshots and are never synthesized
+	// here.
 	if resource == "role-bindings" {
 		roleID, _ := body["role_id"].(string)
 		accessorID, _ := body["accessor_id"].(string)
@@ -500,6 +518,62 @@ func auditDetailName(
 		return accessorName
 	}
 	return ""
+}
+
+func auditObjectGrantName(ctx context.Context, db *gorm.DB, dir *directory.Service, accessorID, resourceName string) string {
+	accessorName := accessorNameByID(ctx, dir, accessorID)
+	if accessorName == "" && db != nil && accessorID != "" {
+		var user model.User
+		if err := db.WithContext(ctx).Select("name", "account").First(&user, "id = ?", accessorID).Error; err == nil {
+			accessorName = strings.TrimSpace(user.Name)
+			if accessorName == "" {
+				accessorName = strings.TrimSpace(user.Account)
+			}
+		}
+		for _, target := range []any{&model.Department{}, &model.Group{}, &model.Role{}} {
+			if accessorName != "" {
+				break
+			}
+			var row struct{ Name string }
+			if err := db.WithContext(ctx).Model(target).Select("name").Where("id = ?", accessorID).Scan(&row).Error; err == nil && row.Name != "" {
+				accessorName = row.Name
+				break
+			}
+		}
+	}
+	resourceName = strings.TrimSpace(resourceName)
+	if accessorName == "" || resourceName == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s · authorization for %s", accessorName, resourceName)
+}
+
+func auditBindingTargetName(ctx context.Context, db *gorm.DB, accessorID, roleID string) string {
+	accessorName := ""
+	if db != nil {
+		var user model.User
+		if err := db.WithContext(ctx).Select("name", "account").First(&user, "id = ?", accessorID).Error; err == nil {
+			accessorName = strings.TrimSpace(user.Name)
+			if accessorName == "" {
+				accessorName = strings.TrimSpace(user.Account)
+			}
+		}
+		for _, target := range []any{&model.Department{}, &model.Group{}} {
+			if accessorName != "" {
+				break
+			}
+			var row struct{ Name string }
+			if err := db.WithContext(ctx).Model(target).Select("name").Where("id = ?", accessorID).Scan(&row).Error; err == nil && row.Name != "" {
+				accessorName = row.Name
+				break
+			}
+		}
+	}
+	roleName := roleNameByID(ctx, db, roleID)
+	if accessorName == "" || roleName == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s · %s role binding", accessorName, roleName)
 }
 
 func auditDetailTargetID(resource, detail string) string {
@@ -662,6 +736,16 @@ func auditAction(method, fullPath string) string {
 			return "remove_redirect_uri"
 		}
 		return "add_redirect_uri"
+	case "/api/safe/v1/admin/oauth/access-origins":
+		return "add_access_origin"
+	case "/api/safe/v1/admin/oauth/access-origins/reconcile":
+		return "reconcile_access_origins"
+	case "/api/safe/v1/admin/oauth/access-origins/:id":
+		return "remove_access_origin"
+	case "/api/safe/v1/me/permission-requests/:id/cancel":
+		return "cancel"
+	case "/api/safe/v1/me/permission-requests/:id/decision":
+		return "decide"
 	case "/api/safe/v1/me":
 		return "update_profile"
 	}
@@ -675,59 +759,4 @@ func auditAction(method, fullPath string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(method))
 	}
-}
-
-// registerAuditReads mounts the audit-log read endpoint under the admin group.
-// It is a GET, so auditMiddleware does not record calls to it.
-func registerAuditReads(g *gin.RouterGroup, store *audit.Store, e *authz.Enforcer) {
-	// GET /audit-logs — list audit entries newest-first, filterable. Query:
-	// ?actor_id=&request_id=&resource=&action=&target_id=&from=&to=&offset=&limit=
-	// from/to are RFC3339 timestamps. -> { logs:[...], total }
-	g.GET("/audit-logs", RequirePermission(e, "admin-audit", "view"), func(c *gin.Context) {
-		f := audit.Filter{
-			ActorID:    c.Query("actor_id"),
-			RequestID:  c.Query("request_id"),
-			Resource:   c.Query("resource"),
-			Action:     c.Query("action"),
-			TargetID:   c.Query("target_id"),
-			Offset:     atoiDefault(c.Query("offset"), 0),
-			Limit:      atoiDefault(c.Query("limit"), 0),
-			FailedOnly: strings.EqualFold(c.Query("failed_only"), "true"),
-			BeforeID:   c.Query("before_id"),
-		}
-		if v := c.Query("from"); v != "" {
-			t, err := time.Parse(time.RFC3339Nano, v)
-			if err != nil {
-				replyPublicError(c, http.StatusBadRequest)
-				return
-			}
-			f.From = t
-		}
-		if v := c.Query("to"); v != "" {
-			t, err := time.Parse(time.RFC3339Nano, v)
-			if err != nil {
-				replyPublicError(c, http.StatusBadRequest)
-				return
-			}
-			f.To = t
-		}
-		logs, total, err := store.List(c.Request.Context(), f)
-		if err != nil {
-			serverError(c, err)
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"logs": logs, "total": total})
-	})
-	g.GET("/audit-logs/:id", RequirePermission(e, "admin-audit", "view"), func(c *gin.Context) {
-		entry, found, err := store.Get(c.Request.Context(), c.Param("id"))
-		if err != nil {
-			serverError(c, err)
-			return
-		}
-		if !found {
-			replyPublicError(c, http.StatusNotFound)
-			return
-		}
-		c.JSON(http.StatusOK, entry)
-	})
 }

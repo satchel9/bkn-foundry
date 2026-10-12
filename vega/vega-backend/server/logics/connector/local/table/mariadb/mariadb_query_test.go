@@ -1,19 +1,90 @@
 package mariadb
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
+func TestMariaDBConnectorExecuteRawSQLInvalidParameter(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	connector := &MariaDBConnector{db: db, connected: true}
+	driverErr := &mysql.MySQLError{Number: 1054, Message: "Unknown column 'missing' in 'field list'"}
+	mock.ExpectQuery("SELECT missing FROM orders").WillReturnError(driverErr)
+	result, err := connector.ExecuteRawSQL(context.Background(), "SELECT missing FROM orders")
+	assert.Nil(t, result)
+	var invalid *interfaces.SourceQueryInvalidParameterError
+	require.ErrorAs(t, err, &invalid)
+	assert.Equal(t, interfaces.SourceQueryInvalidParameterUnknownColumn, invalid.Reason)
+	assert.True(t, errors.Is(err, driverErr))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestMariaDBConnectorExecuteQueryInvalidParameter(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		needTotal bool
+		rowError  bool
+	}{
+		{name: "select references removed column"},
+		{name: "row iteration returns unknown column", rowError: true},
+		{name: "count query returns unknown column", needTotal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			connector := &MariaDBConnector{db: db, connected: true}
+			resource := &interfaces.Resource{SourceIdentifier: "`shop`.`orders`", SchemaDefinition: []*interfaces.Property{{Name: "missing"}}}
+			params := &interfaces.ResourceDataQueryParams{Paging: interfaces.PagingRequest{Limit: 10}, NeedTotal: tc.needTotal}
+			driverErr := &mysql.MySQLError{Number: 1054, Message: "private source column details"}
+			if tc.needTotal {
+				mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"missing"}).AddRow("value"))
+				mock.ExpectQuery("SELECT COUNT").WillReturnError(driverErr)
+			} else if tc.rowError {
+				mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"missing"}).AddRow("value").RowError(0, driverErr))
+			} else {
+				mock.ExpectQuery("SELECT").WillReturnError(driverErr)
+			}
+
+			result, err := connector.ExecuteQuery(context.Background(), resource, params)
+
+			assert.Nil(t, result)
+			var invalid *interfaces.SourceQueryInvalidParameterError
+			require.ErrorAs(t, err, &invalid)
+			assert.Equal(t, interfaces.SourceQueryInvalidParameterUnknownColumn, invalid.Reason)
+			assert.ErrorIs(t, err, driverErr)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 func TestMariaDBConnectorBuildPagedSQL(t *testing.T) {
 	connector := &MariaDBConnector{}
 	assert.Equal(t,
-		"SELECT * FROM (SELECT id FROM orders) AS _raw_query_page LIMIT 10 OFFSET 20",
+		"SELECT * FROM (SELECT id FROM orders\n) AS _raw_query_page LIMIT 10 OFFSET 20",
 		connector.BuildPagedSQL("SELECT id FROM orders", 20, 10),
+	)
+	assert.Equal(t,
+		"SELECT * FROM (SELECT id FROM orders -- trailing comment\n) AS _raw_query_page LIMIT 10 OFFSET 20",
+		connector.BuildPagedSQL("SELECT id FROM orders -- trailing comment\n", 20, 10),
+	)
+}
+
+func TestMariaDBConnectorBuildCountSQL(t *testing.T) {
+	connector := &MariaDBConnector{}
+	assert.Equal(t,
+		"SELECT COUNT(*) AS _raw_query_total_count FROM (SELECT id FROM orders -- trailing comment\n) AS _raw_query_total",
+		connector.BuildCountSQL("SELECT id FROM orders -- trailing comment"),
 	)
 }
 
@@ -132,7 +203,7 @@ func TestBuildSelectBuilderQuotesIdentifiers(t *testing.T) {
 	connector := &MariaDBConnector{}
 	// fact 表带一个名为 key 的列——MySQL 保留字，裸拼进 SELECT 会在执行期报 1064
 	resource := &interfaces.Resource{
-		SourceIdentifier: "yanfeng_kb.fact",
+		SourceIdentifier: "`yanfeng_kb`.`fact`",
 		SchemaDefinition: []*interfaces.Property{
 			{Name: "id", OriginalName: "id", Type: interfaces.DataType_String},
 			{Name: "key", OriginalName: "key", Type: interfaces.DataType_String},
@@ -188,7 +259,7 @@ func TestBuildSelectBuilderQuotesIdentifiers(t *testing.T) {
 	// 否则会拼出空标识符 `` 让整条 SQL 报错
 	t.Run("a property without original_name falls back to the property name", func(t *testing.T) {
 		schemaless := &interfaces.Resource{
-			SourceIdentifier: "yanfeng_kb.fact",
+			SourceIdentifier: "`yanfeng_kb`.`fact`",
 			SchemaDefinition: []*interfaces.Property{
 				{Name: "id", OriginalName: "id", Type: interfaces.DataType_String},
 				{Name: "content_vector", Type: interfaces.DataType_Vector},
@@ -216,7 +287,7 @@ func TestBuildSelectBuilderQuotesIdentifiers(t *testing.T) {
 	// 默认查全字段这条路也要走兜底，否则 original_name 为空的属性会拼出空标识符
 	t.Run("select all falls back for a property without original_name", func(t *testing.T) {
 		schemaless := &interfaces.Resource{
-			SourceIdentifier: "yanfeng_kb.fact",
+			SourceIdentifier: "`yanfeng_kb`.`fact`",
 			SchemaDefinition: []*interfaces.Property{
 				{Name: "id", OriginalName: "id", Type: interfaces.DataType_String},
 				{Name: "content_vector", Type: interfaces.DataType_Vector},

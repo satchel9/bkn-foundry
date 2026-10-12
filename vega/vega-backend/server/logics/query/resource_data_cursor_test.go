@@ -20,7 +20,7 @@ import (
 func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 	t.Run("pages and closes", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "table-1", CatalogID: "catalog-1"}
@@ -51,7 +51,7 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 
 	t.Run("preserves need total", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "table-1", CatalogID: "catalog-1"}
@@ -81,7 +81,7 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 
 	t.Run("rejects wrong resource", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "table-1", CatalogID: "catalog-1"}
@@ -102,7 +102,7 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 
 	t.Run("preserves opensearch search after", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "index-1", CatalogID: "catalog-1"}
@@ -127,7 +127,7 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 
 	t.Run("uses last returned hit for search after", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "index-1", CatalogID: "catalog-1", Category: interfaces.ResourceCategoryIndex}
@@ -165,7 +165,7 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 
 	t.Run("rejects updated resource", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
 		resource := &interfaces.Resource{ID: "view-1", CatalogID: "catalog-1", UpdateTime: 100}
@@ -199,10 +199,10 @@ func TestExecuteResourceDataCursorContinuation(t *testing.T) {
 func TestExecuteInitialResourceDataCursorWithCategory(t *testing.T) {
 	t.Run("uses physical pagination category", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		rawQueryCursorSessions = newCursorSessionManager(10)
+		rawQueryCursorSessions = newCursorSessionManager(10, 9)
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
-		resource := &interfaces.Resource{ID: "view-1", Category: interfaces.ResourceCategoryLogicView, CatalogID: "catalog-1"}
+		resource := &interfaces.Resource{ID: "view-1", Category: interfaces.ResourceCategoryLogicalView, CatalogID: "catalog-1"}
 		result, err := ExecuteInitialResourceDataCursorWithCategory(context.Background(), "account-1", resource,
 			interfaces.ResourceCategoryIndex,
 			&interfaces.ResourceDataQueryParams{NeedTotal: true, Paging: interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Limit: 1}},
@@ -217,10 +217,76 @@ func TestExecuteInitialResourceDataCursorWithCategory(t *testing.T) {
 	})
 }
 
+func TestExecuteResourceDataCursorContinuationWithRunnerRejectsChangedSource(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*interfaces.Resource)
+	}{
+		{name: "source revision", change: func(source *interfaces.Resource) { source.UpdateTime++ }},
+		{name: "local index availability", change: func(source *interfaces.Resource) {
+			source.LocalIndexStatus = interfaces.ResourceLocalIndexStatusUnavailable
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previousManager := rawQueryCursorSessions
+			rawQueryCursorSessions = newCursorSessionManager(10, 9)
+			t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+
+			view := &interfaces.Resource{ID: "view-1", Category: interfaces.ResourceCategoryLogicalView, UpdateTime: 10}
+			source := &interfaces.Resource{ID: "source-1", Category: interfaces.ResourceCategoryTable,
+				UpdateTime: 20, LocalIndexName: "source-index", LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable}
+			calls := 0
+			executor := ResourceDataPageExecutor(func(_ context.Context, params *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+				calls++
+				params.SearchAfter = []any{"next"}
+				return []map[string]any{{"id": calls}}, 2, nil
+			})
+			first, err := ExecuteInitialResourceDataCursorWithCategoryRunner(context.Background(), "account-1", view,
+				source, interfaces.ResourceCategoryIndex,
+				&interfaces.ResourceDataQueryParams{Paging: interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Limit: 1}}, executor)
+			require.NoError(t, err)
+			require.NotNil(t, first.Paging.NextCursor)
+			second, err := ExecuteResourceDataCursorContinuationWithRunner(context.Background(), "account-1", view,
+				source, *first.Paging.NextCursor, executor)
+			require.NoError(t, err)
+			require.NotNil(t, second.Paging.NextCursor)
+
+			changed := *source
+			tc.change(&changed)
+			_, err = ExecuteResourceDataCursorContinuationWithRunner(context.Background(), "account-1", view,
+				&changed, *second.Paging.NextCursor, executor)
+			assertHTTPError(t, err, http.StatusNotFound)
+			assert.Equal(t, 2, calls)
+		})
+	}
+}
+
 func TestExecuteInitialResourceDataCursor(t *testing.T) {
+	t.Run("accounts quota to trusted caller and binds cursor to access account", func(t *testing.T) {
+		previousManager := rawQueryCursorSessions
+		manager := newCursorSessionManager(4, 1)
+		rawQueryCursorSessions = manager
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+		resource := &interfaces.Resource{ID: "table-1", CatalogID: "catalog-1"}
+		params := &interfaces.ResourceDataQueryParams{Paging: interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Limit: 1}}
+		execute := func(_ context.Context, _ *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+			return []map[string]any{{"id": 1}, {"id": 2}}, 2, nil
+		}
+		first, err := ExecuteInitialResourceDataCursor(interfaces.WithCursorQuotaOwner(context.Background(), "caller-a"), "admin", resource, params, execute)
+		require.NoError(t, err)
+		require.NotNil(t, first.Paging.NextCursor)
+		_, err = ExecuteInitialResourceDataCursor(interfaces.WithCursorQuotaOwner(context.Background(), "caller-a"), "admin", resource, params, execute)
+		assertHTTPError(t, err, http.StatusTooManyRequests)
+		second, err := ExecuteInitialResourceDataCursor(interfaces.WithCursorQuotaOwner(context.Background(), "caller-b"), "admin", resource, params, execute)
+		require.NoError(t, err)
+		require.NotNil(t, second.Paging.NextCursor)
+		_, err = ExecuteResourceDataCursorContinuation(context.Background(), "caller-a", resource, *first.Paging.NextCursor, execute)
+		assertHTTPError(t, err, http.StatusForbidden)
+	})
+
 	t.Run("active initial page is not reclaimed", func(t *testing.T) {
 		previousManager := rawQueryCursorSessions
-		manager := newCursorSessionManager(10)
+		manager := newCursorSessionManager(10, 9)
 		rawQueryCursorSessions = manager
 		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 

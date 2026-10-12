@@ -89,6 +89,11 @@ service:
     periodicFullScanInterval: 168h # 7 days.
     enableTaskCleanup: false
     taskRetention: 720h # 30 days.
+  # PyPI indexes that dependency version lookups may query (trusted-mirror allowlist).
+  # A request's pypi_repo_url must match one entry; the first entry is used when none is given.
+  pypi:
+    trustedIndexURLs:
+      - "https://pypi.org/simple"
 
 depServices:
   class-443:
@@ -217,9 +222,30 @@ observability:
     enabled: false
     sampling_rate: 1.0
   evidence:
-    ingest_url: ""
-    ingest_token_secret_name: ""
-    ingest_token_secret_key: "ingest-token"
+    publisher:
+      brokers: ""
+      credentials_secret_name: ""
+      username_secret_key: "username"
+      password_secret_key: "password"
+      producer_id: agent-operator-integration
+      producer_stream_id: agent-operator-integration
+      workload_identity: agent-operator-integration
+      trace_admission:
+        policy_url: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/policy"
+        configuration_url: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/configuration"
+        heartbeat_url: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat"
+        ack_url_base: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/operations"
+      queue_max_records: 4096
+      queue_max_bytes: 67108864
+      max_record_bytes: 1048576
+      max_attempts: 3
+      retry_backoff_ms: 100
+  audit:
+    publisher:
+      brokers: ""
+      credentials_secret_name: ""
+      username_secret_key: "username"
+      password_secret_key: "password"
   log:
     enabled: false
     level: info

@@ -9,6 +9,7 @@ package object_type
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -583,6 +584,51 @@ func Test_objectTypeService_GetObjectTypeByID(t *testing.T) {
 			result, err := service.GetObjectTypeByID(ctx, nil, knID, branch, otID)
 			So(err, ShouldNotBeNil)
 			So(result, ShouldBeNil)
+			httpErr, ok := err.(*rest.HTTPError)
+			So(ok, ShouldBeTrue)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusInternalServerError)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed)
+		})
+
+		Convey("Keeps not found when access layer returns a structured 404\n", func() {
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ObjectType_ObjectTypeNotFound))
+			smock.ExpectRollback()
+
+			result, err := service.GetObjectTypeByID(ctx, nil, "kn1", interfaces.MAIN_BRANCH, "missing")
+			So(result, ShouldBeNil)
+			httpErr, ok := err.(*rest.HTTPError)
+			So(ok, ShouldBeTrue)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusNotFound)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_ObjectTypeNotFound)
+		})
+
+		Convey("Returns not found when access layer returns no object type\n", func() {
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil)
+			smock.ExpectCommit()
+
+			result, err := service.GetObjectTypeByID(ctx, nil, "kn1", interfaces.MAIN_BRANCH, "missing")
+			So(result, ShouldBeNil)
+			httpErr, ok := err.(*rest.HTTPError)
+			So(ok, ShouldBeTrue)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusNotFound)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_ObjectTypeNotFound)
+		})
+
+		Convey("Wraps a plain database error as internal error\n", func() {
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, errors.New("connection reset"))
+			smock.ExpectRollback()
+
+			result, err := service.GetObjectTypeByID(ctx, nil, "kn1", interfaces.MAIN_BRANCH, "ot1")
+			So(result, ShouldBeNil)
+			httpErr, ok := err.(*rest.HTTPError)
+			So(ok, ShouldBeTrue)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusInternalServerError)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed)
 		})
 	})
 }
@@ -649,6 +695,55 @@ func Test_objectTypeService_CreateObjectTypes(t *testing.T) {
 			So(result[0], ShouldEqual, "ot1")
 		})
 
+		Convey("Success creating multiple object types through batch access\n", func() {
+			objectTypes := []*interfaces.ObjectType{
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "object_type1"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "object_type2"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+			}
+
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeIdentitiesByIDsOrNames(gomock.Any(), "kn1", interfaces.MAIN_BRANCH,
+				[]string{"ot1", "ot2"}, []string{"object_type1", "object_type2"}).Return(nil, nil)
+			ota.EXPECT().CreateObjectTypes(gomock.Any(), gomock.Any(), objectTypes).Return(nil)
+			ota.EXPECT().CreateObjectTypeStatuses(gomock.Any(), gomock.Any(), objectTypes).Return(nil)
+			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			smock.ExpectCommit()
+
+			result, err := service.CreateObjectTypes(ctx, nil, objectTypes, interfaces.ImportMode_Normal, false, true)
+
+			So(err, ShouldBeNil)
+			So(result, ShouldResemble, []string{"ot1", "ot2"})
+		})
+
+		Convey("Batch name conflict does not blame the first object type\n", func() {
+			objectTypes := []*interfaces.ObjectType{
+				{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "object_type1"},
+					KNID: "kn1", Branch: interfaces.MAIN_BRANCH},
+				{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "object_type2"},
+					KNID: "kn1", Branch: interfaces.MAIN_BRANCH},
+			}
+
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeIdentitiesByIDsOrNames(gomock.Any(), "kn1", interfaces.MAIN_BRANCH,
+				[]string{"ot1", "ot2"}, []string{"object_type1", "object_type2"}).Return(nil, nil)
+			ota.EXPECT().CreateObjectTypes(gomock.Any(), gomock.Any(), objectTypes).
+				Return(errors.New("Error 1062: Duplicate entry 'object_type2' for key 'uk_object_type_name'"))
+			smock.ExpectRollback()
+
+			result, err := service.CreateObjectTypes(ctx, nil, objectTypes, interfaces.ImportMode_Normal, false, true)
+			So(result, ShouldBeEmpty)
+			So(err, ShouldNotBeNil)
+			httpErr := err.(*rest.HTTPError)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_ObjectTypeNameExisted)
+			assert.NotContains(t, err.Error(), "object_type1")
+		})
+
 		Convey("Failed when object type ID already exists in normal mode\n", func() {
 			objectTypes := []*interfaces.ObjectType{
 				{
@@ -695,7 +790,7 @@ func Test_objectTypeService_CreateObjectTypes(t *testing.T) {
 			So(len(result), ShouldEqual, 0)
 		})
 
-		Convey("Success with Overwrite mode when ID exists\n", func() {
+		Convey("Success with Overwrite mode when ID exists and relation sync is deferred\n", func() {
 			ot := &interfaces.ObjectType{
 				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
 					OTID:   "ot1",
@@ -707,7 +802,6 @@ func Test_objectTypeService_CreateObjectTypes(t *testing.T) {
 			objectTypes := []*interfaces.ObjectType{ot}
 
 			smock.ExpectBegin()
-			cga.EXPECT().GetConceptGroupsByOTIDs(gomock.Any(), gomock.Any(), gomock.Any()).Return(map[string][]*interfaces.ConceptGroup{}, nil).AnyTimes()
 			ota.EXPECT().CheckObjectTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("ot1", true, nil).Times(2)
 			ota.EXPECT().CheckObjectTypeExistByName(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("ot1", true, nil)
 			ota.EXPECT().UpdateObjectType(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
@@ -717,6 +811,35 @@ func Test_objectTypeService_CreateObjectTypes(t *testing.T) {
 			result, err := service.CreateObjectTypes(ctx, nil, objectTypes, interfaces.ImportMode_Overwrite, false, true)
 			So(err, ShouldBeNil)
 			So(len(result), ShouldEqual, 0)
+		})
+
+		Convey("Success overwriting multiple object types through batch access with relation sync deferred\n", func() {
+			objectTypes := []*interfaces.ObjectType{
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "object_type1"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "object_type2"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+			}
+
+			smock.ExpectBegin()
+			ota.EXPECT().GetObjectTypeIdentitiesByIDsOrNames(gomock.Any(), "kn1", interfaces.MAIN_BRANCH,
+				[]string{"ot1", "ot2"}, []string{"object_type1", "object_type2"}).
+				Return([]*interfaces.ObjectType{
+					{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "object_type1"}},
+					{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "object_type2"}},
+				}, nil)
+			ota.EXPECT().UpdateObjectTypes(gomock.Any(), gomock.Any(), objectTypes).Return(nil)
+			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
+			smock.ExpectCommit()
+
+			result, err := service.CreateObjectTypes(ctx, nil, objectTypes, interfaces.ImportMode_Overwrite, false, true)
+
+			So(err, ShouldBeNil)
+			So(result, ShouldHaveLength, 0)
 		})
 
 		Convey("Success with empty OTID generates new ID\n", func() {
@@ -1471,8 +1594,12 @@ func Test_objectTypeService_ListObjectTypes(t *testing.T) {
 
 			smock.ExpectBegin()
 			ota.EXPECT().ListObjectTypes(gomock.Any(), gomock.Any(), gomock.Any()).Return(objectTypes, nil)
-			ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_ObjectType_InternalError))
-			smock.ExpectRollback()
+			smock.ExpectCommit()
+			ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).DoAndReturn(
+				func(context.Context, []*interfaces.AccountInfo) error {
+					So(smock.ExpectationsWereMet(), ShouldBeNil)
+					return rest.NewHTTPError(ctx, 500, berrors.BknBackend_ObjectType_InternalError)
+				})
 
 			result, total, err := service.ListObjectTypes(ctx, nil, query)
 			So(err, ShouldNotBeNil)
@@ -1539,7 +1666,8 @@ func TestObjectTypeServiceListSummariesPushesAuthorizationIntoCountAndPage(t *te
 	ota := bmock.NewMockObjectTypeAccess(ctrl)
 	ps := bmock.NewMockPermissionService(ctrl)
 	ums := bmock.NewMockUserMgmtService(ctrl)
-	service := &objectTypeService{ota: ota, ps: ps, ums: ums}
+	vbs := bmock.NewMockVegaBackendService(ctrl)
+	service := &objectTypeService{ota: ota, ps: ps, ums: ums, vbs: vbs}
 	ctx := context.Background()
 
 	query := interfaces.ObjectTypesQueryParams{
@@ -1556,8 +1684,11 @@ func TestObjectTypeServiceListSummariesPushesAuthorizationIntoCountAndPage(t *te
 	}, nil)
 	ota.EXPECT().GetObjectTypesTotal(gomock.Any(), visibleQuery).Return(2, nil)
 	page := []*interfaces.ObjectType{{
-		ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "orders", OTName: "Orders"},
-		KNID:                   "kn-1", Branch: interfaces.MAIN_BRANCH,
+		ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+			OTID: "orders", OTName: "Orders",
+			DataSource: &interfaces.ResourceInfo{Type: interfaces.DATA_SOURCE_TYPE_RESOURCE, ID: "resource-orders"},
+		},
+		KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
 	}}
 	ota.EXPECT().ListObjectTypeSummaries(gomock.Any(), (*sql.Tx)(nil), visibleQuery).Return(page, nil)
 	ps.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), interfaces.RESOURCE_TYPE_OBJECT_TYPE,
@@ -1566,6 +1697,9 @@ func TestObjectTypeServiceListSummariesPushesAuthorizationIntoCountAndPage(t *te
 			"kn-1/orders": {ResourceID: "kn-1/orders", Operations: []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}},
 		}, nil)
 	ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Len(2)).Return(nil)
+	vbs.EXPECT().GetResourcesByIDs(gomock.Any(), []string{"resource-orders"}).Return([]*interfaces.VegaResource{{
+		ID: "resource-orders", LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+	}}, nil)
 
 	items, total, err := service.ListObjectTypeSummaries(ctx, nil, query)
 	require.NoError(t, err)
@@ -1573,6 +1707,8 @@ func TestObjectTypeServiceListSummariesPushesAuthorizationIntoCountAndPage(t *te
 	require.Len(t, items, 1)
 	assert.Equal(t, "orders", items[0].OTID)
 	assert.Equal(t, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}, items[0].Operations)
+	require.NotNil(t, items[0].IndexStatus)
+	assert.Equal(t, interfaces.ObjectTypeIndexStateAvailable, items[0].IndexStatus.State)
 }
 
 func TestObjectTypeServiceListSummariesFallsBackForWildcardScope(t *testing.T) {
@@ -1580,7 +1716,8 @@ func TestObjectTypeServiceListSummariesFallsBackForWildcardScope(t *testing.T) {
 	ota := bmock.NewMockObjectTypeAccess(ctrl)
 	ps := bmock.NewMockPermissionService(ctrl)
 	ums := bmock.NewMockUserMgmtService(ctrl)
-	service := &objectTypeService{ota: ota, ps: ps, ums: ums}
+	vbs := bmock.NewMockVegaBackendService(ctrl)
+	service := &objectTypeService{ota: ota, ps: ps, ums: ums, vbs: vbs}
 	query := interfaces.ObjectTypesQueryParams{
 		KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
 		PaginationQueryParameters: interfaces.PaginationQueryParameters{Offset: 0, Limit: 1},
@@ -1589,8 +1726,12 @@ func TestObjectTypeServiceListSummariesFallsBackForWildcardScope(t *testing.T) {
 	candidateQuery.Offset = 0
 	candidateQuery.Limit = -1
 	candidates := []*interfaces.ObjectType{
-		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "denied"}, KNID: "kn-1"},
-		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "visible"}, KNID: "kn-1"},
+		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+			OTID: "denied", DataSource: &interfaces.ResourceInfo{Type: interfaces.DATA_SOURCE_TYPE_RESOURCE, ID: "resource-denied"},
+		}, KNID: "kn-1", Branch: interfaces.MAIN_BRANCH},
+		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+			OTID: "visible", DataSource: &interfaces.ResourceInfo{Type: interfaces.DATA_SOURCE_TYPE_RESOURCE, ID: "resource-visible"},
+		}, KNID: "kn-1", Branch: interfaces.MAIN_BRANCH},
 	}
 	ps.EXPECT().ListAccessibleResources(gomock.Any(), interfaces.RESOURCE_TYPE_OBJECT_TYPE,
 		interfaces.OPERATION_TYPE_VIEW_DETAIL).Return(interfaces.PermissionResourceScope{
@@ -1603,12 +1744,17 @@ func TestObjectTypeServiceListSummariesFallsBackForWildcardScope(t *testing.T) {
 			"kn-1/visible": {ResourceID: "kn-1/visible", Operations: []string{interfaces.OPERATION_TYPE_VIEW_DETAIL}},
 		}, nil)
 	ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Len(2)).Return(nil)
+	vbs.EXPECT().GetResourcesByIDs(gomock.Any(), []string{"resource-visible"}).Return([]*interfaces.VegaResource{{
+		ID: "resource-visible", LocalIndexStatus: interfaces.ResourceLocalIndexStatusUnavailable,
+	}}, nil)
 
 	items, total, err := service.ListObjectTypeSummaries(context.Background(), nil, query)
 	require.NoError(t, err)
 	require.Equal(t, 1, total)
 	require.Len(t, items, 1)
 	assert.Equal(t, "visible", items[0].OTID)
+	require.NotNil(t, items[0].IndexStatus)
+	assert.Equal(t, interfaces.ObjectTypeIndexStateUnavailable, items[0].IndexStatus.State)
 }
 
 func Test_objectTypeService_UpdateObjectType(t *testing.T) {
@@ -3209,6 +3355,53 @@ func Test_objectTypeService_handleObjectTypeImportMode(t *testing.T) {
 			So(err, ShouldNotBeNil)
 			So(len(creates), ShouldEqual, 1)
 			So(len(updates), ShouldEqual, 0)
+		})
+
+		Convey("Batch query preserves overwrite create and update order\n", func() {
+			objectTypes := []*interfaces.ObjectType{
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "Object Type 1"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "Object Type 2"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+				{
+					ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot3", OTName: "Object Type 3"},
+					KNID:                   "kn1", Branch: interfaces.MAIN_BRANCH,
+				},
+			}
+			ota.EXPECT().GetObjectTypeIdentitiesByIDsOrNames(gomock.Any(), "kn1", interfaces.MAIN_BRANCH,
+				[]string{"ot1", "ot2", "ot3"}, []string{"Object Type 1", "Object Type 2", "Object Type 3"}).
+				Return([]*interfaces.ObjectType{
+					{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "Object Type 1"}},
+					{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot3", OTName: "Object Type 3"}},
+				}, nil)
+
+			creates, updates, err := service.handleObjectTypeImportMode(ctx, interfaces.ImportMode_Overwrite, objectTypes)
+
+			So(err, ShouldBeNil)
+			So(creates, ShouldResemble, []*interfaces.ObjectType{objectTypes[1]})
+			So(updates, ShouldResemble, []*interfaces.ObjectType{objectTypes[0], objectTypes[2]})
+		})
+
+		Convey("Batch query failure uses the existing conflict-check error\n", func() {
+			objectTypes := []*interfaces.ObjectType{
+				{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot1", OTName: "ot1"}, KNID: "kn1", Branch: interfaces.MAIN_BRANCH},
+				{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot2", OTName: "ot2"}, KNID: "kn1", Branch: interfaces.MAIN_BRANCH},
+			}
+			ota.EXPECT().GetObjectTypeIdentitiesByIDsOrNames(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(nil, errors.New("query failed"))
+
+			creates, updates, err := service.handleObjectTypeImportMode(ctx, interfaces.ImportMode_Normal, objectTypes)
+
+			So(creates, ShouldHaveLength, 0)
+			So(updates, ShouldHaveLength, 0)
+			So(err, ShouldNotBeNil)
+			httpErr := err.(*rest.HTTPError)
+			So(httpErr.BaseError.ErrorCode, ShouldEqual,
+				berrors.BknBackend_ObjectType_InternalError_CheckObjectTypeIfExistFailed)
 		})
 	})
 }

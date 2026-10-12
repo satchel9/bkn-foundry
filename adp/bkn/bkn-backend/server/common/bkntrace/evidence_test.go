@@ -9,21 +9,14 @@ package bkntrace
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"go.opentelemetry.io/otel/trace"
 
 	"bkn-backend/interfaces"
 )
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
 
 func testTraceContext() context.Context {
 	sc := trace.NewSpanContext(trace.SpanContextConfig{
@@ -46,14 +39,76 @@ func testRequestContext() RequestContext {
 	}
 }
 
-func TestProducerStreamIDUsesEnvOrModuleDefault(t *testing.T) {
-	t.Setenv("BKN_TRACE_PRODUCER_STREAM_ID", "custom-stream")
-	if got := producerStreamID(); got != "custom-stream" {
-		t.Fatalf("producerStreamID() = %q, want custom-stream", got)
+func TestEmitSchemaReadEventsDoesNotAdvertiseDroppedEvidence(t *testing.T) {
+	publisher, err := evidencepublisher.New(evidencepublisher.Config{ProducerID: "bkn-backend", BaseStreamID: "backend", WorkloadIdentity: "bkn-backend", ProcessBootID: "boot-1", CapturePolicyRevision: "41"}, &captureEvidenceSender{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Setenv("BKN_TRACE_PRODUCER_STREAM_ID", "  ")
-	if got := producerStreamID(); got != ModuleName {
-		t.Fatalf("producerStreamID() = %q, want %q", got, ModuleName)
+	setEvidencePublisher(publisher)
+	t.Cleanup(func() { setEvidencePublisher(nil); _ = publisher.Close(context.Background()) })
+	reqCtx := testRequestContext()
+	if eventID := EmitSchemaReadEvents(testTraceContext(), reqCtx, ReadSubject{EntityKind: EntityKindObjectType, KNID: "kn_demo"}, nil); eventID != "" {
+		t.Fatalf("event ID = %q, want empty without trusted session scope", eventID)
+	}
+}
+
+func TestBuildSchemaReadEventsCarriesVerifiedOwner(t *testing.T) {
+	req := testRequestContext()
+	req.ApplicationPrincipalID = "openbkn-sdk"
+	req.EffectiveSubjectType = "user"
+	req.EffectiveSubjectID = "user-123"
+	events := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindObjectType, KNID: "kn_demo"}, nil)
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
+	}
+	owner, ok := events[0]["owner"].(map[string]any)
+	if !ok || owner["application_principal_id"] != "openbkn-sdk" || owner["effective_subject_type"] != "user" || owner["effective_subject_id"] != "user-123" {
+		t.Fatalf("owner = %#v, want verified request identity", events[0]["owner"])
+	}
+}
+
+func TestCoreEvidenceEventOmitsLocallyGeneratedOperation(t *testing.T) {
+	req := testRequestContext()
+	req.ConversationID = "conv_real"
+	req.SessionScopePresent = true
+	req.ApplicationPrincipalID = "openbkn-sdk"
+	req.EffectiveSubjectType = "user"
+	req.EffectiveSubjectID = "user-123"
+	event := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindObjectType, KNID: "kn_demo"}, nil)[0]
+	ec, ok := contextFromRequest(testTraceContext(), req)
+	if !ok {
+		t.Fatal("request context not created")
+	}
+	core, err := toCoreEvent(event, ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if core.OperationID != "" {
+		t.Fatalf("core operation ID = %q, want empty for locally generated ID", core.OperationID)
+	}
+	req.OperationScopePresent = true
+	ec, _ = contextFromRequest(testTraceContext(), req)
+	core, err = toCoreEvent(event, ec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if core.OperationID != req.OperationID {
+		t.Fatalf("core operation ID = %q, want trusted upstream %q", core.OperationID, req.OperationID)
+	}
+}
+
+func TestEmitSchemaReadEventsDoesNotAdvertiseMissingOwner(t *testing.T) {
+	publisher, err := evidencepublisher.New(evidencepublisher.Config{ProducerID: "bkn-backend", BaseStreamID: "backend", WorkloadIdentity: "bkn-backend", ProcessBootID: "boot-owner", CapturePolicyRevision: "1"}, &captureEvidenceSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setEvidencePublisher(publisher)
+	t.Cleanup(func() { setEvidencePublisher(nil); _ = publisher.Close(context.Background()) })
+	req := testRequestContext()
+	req.ConversationID = "conv_real"
+	req.SessionScopePresent = true
+	if got := EmitSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindObjectType, KNID: "kn_demo"}, nil); got != "" {
+		t.Fatalf("event ID = %q, want empty without verified owner", got)
 	}
 }
 
@@ -62,79 +117,6 @@ func TestBuildSchemaReadEventsRejectsMissingReplayEnvelope(t *testing.T) {
 	req.ObservedAt = ""
 	if events := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindObjectType}, nil); len(events) != 0 {
 		t.Fatalf("missing bkn-event-observed-at must not create conflicting replay: %#v", events)
-	}
-}
-
-func TestPostBatchWithRetryRetriesNon2xx(t *testing.T) {
-	previous := evidenceHTTPClient
-	t.Cleanup(func() { evidenceHTTPClient = previous })
-	var calls atomic.Int32
-	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		status := http.StatusServiceUnavailable
-		if calls.Add(1) == 3 {
-			status = http.StatusNoContent
-		}
-		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
-	if err := postBatchWithRetry("http://trace.local", time.Second, batch{}); err != nil {
-		t.Fatal(err)
-	}
-	if calls.Load() != 3 {
-		t.Fatalf("calls=%d, want 3", calls.Load())
-	}
-}
-
-func TestPostBatchSendsDedicatedIngestToken(t *testing.T) {
-	t.Setenv("BKN_TRACE_EVIDENCE_INGEST_TOKEN", "producer-token")
-	previous := evidenceHTTPClient
-	t.Cleanup(func() { evidenceHTTPClient = previous })
-	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if got := req.Header.Get("X-BKN-Trace-Ingest-Token"); got != "producer-token" {
-			t.Fatalf("ingest token header=%q", got)
-		}
-		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
-	})}
-	if err := postBatch("http://trace.local", time.Second, batch{}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestPostBatchReportsOnlySafeValidationCodeAndPaths(t *testing.T) {
-	previous := evidenceHTTPClient
-	t.Cleanup(func() { evidenceHTTPClient = previous })
-	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		body := `{
-			"code":"BKN_TRACE_REQUIRED_FIELD_MISSING",
-			"message":"sensitive customer value",
-			"details":[
-				{"code":"BKN_TRACE_REQUIRED_FIELD_MISSING","path":"$.events[0].payload.business_refs","message":"secret one"},
-				{"code":"BKN_TRACE_REFERENCE_ID_INVALID","path":"$.events[0].payload.business_refs[0].ref_id","message":"secret two"}
-			]
-		}`
-		return &http.Response{
-			StatusCode: http.StatusBadRequest,
-			Body:       io.NopCloser(strings.NewReader(body)),
-		}, nil
-	})}
-
-	err := postBatch("http://trace.local", time.Second, batch{})
-	if err == nil {
-		t.Fatal("expected validation failure")
-	}
-	got := err.Error()
-	for _, want := range []string{
-		"HTTP 400",
-		"code=BKN_TRACE_REQUIRED_FIELD_MISSING",
-		"paths=$.events[0].payload.business_refs,$.events[0].payload.business_refs[0].ref_id",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("missing %q from %q", want, got)
-		}
-	}
-	for _, forbidden := range []string{"sensitive customer value", "secret one", "secret two"} {
-		if strings.Contains(got, forbidden) {
-			t.Fatalf("unsafe response value %q leaked in %q", forbidden, got)
-		}
 	}
 }
 

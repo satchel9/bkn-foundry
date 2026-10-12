@@ -311,8 +311,13 @@ func (c *OpenSearchConnector) fetchMappingsForQuery(ctx context.Context, indexNa
 	if idxData, ok := dataMapping[indexName]; ok {
 		parseProperties("", idxData.Mappings.Properties, fields)
 	}
+	resolveIndexAliasTypes(fields)
 	for fieldName, meta := range fields {
-		fieldTypeMap[fieldName] = c.MapType(meta.Type)
+		nativeType := meta.Type
+		if meta.ResolvedType != "" {
+			nativeType = meta.ResolvedType
+		}
+		fieldTypeMap[fieldName] = c.MapType(nativeType)
 	}
 
 	return nil
@@ -339,6 +344,9 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 
 	if indexName == "" {
 		return nil, fmt.Errorf("index name is empty in resource")
+	}
+	if err := c.validateStoredFilterCondition(resource, params); err != nil {
+		return nil, err
 	}
 
 	// Aggregation query: Executed when any of the parameters Aggregation, GroupBy, or Having exists
@@ -380,11 +388,11 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 			}
 
 			aggField := params.Aggregation.Property
-			keyword, err := c.getKeywordSuffix(aggField, resource.SchemaDefinition)
+			resolvedField, err := c.exactMatchFieldName(aggField, resource.SchemaDefinition)
 			if err != nil {
 				return nil, fmt.Errorf("resolve aggregation field %q: %w", aggField, err)
 			}
-			aggField += keyword
+			aggField = resolvedField
 			aggFunc := params.Aggregation.Aggr
 
 			switch aggFunc {
@@ -452,11 +460,11 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 					}
 				} else {
 					groupField := gb.Property
-					keyword, err := c.getKeywordSuffix(groupField, resource.SchemaDefinition)
+					resolvedField, err := c.exactMatchFieldName(groupField, resource.SchemaDefinition)
 					if err != nil {
 						return nil, fmt.Errorf("resolve group_by field %q: %w", groupField, err)
 					}
-					groupField += keyword
+					groupField = resolvedField
 					bucket = map[string]any{
 						"terms": map[string]any{
 							"field": groupField,
@@ -602,12 +610,12 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 	if params != nil && len(params.Sort) > 0 {
 		sort := make([]map[string]any, 0, len(params.Sort))
 		for _, s := range params.Sort {
-			keyword, err := c.getKeywordSuffix(s.Field, resource.SchemaDefinition)
+			resolvedField, err := c.exactMatchFieldName(s.Field, resource.SchemaDefinition)
 			if err != nil {
 				return nil, fmt.Errorf("resolve sort field %q: %w", s.Field, err)
 			}
 			sort = append(sort, map[string]any{
-				s.Field + keyword: map[string]any{
+				resolvedField: map[string]any{
 					"order": s.Direction,
 				},
 			})
@@ -724,6 +732,19 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 		Total:       int64(total),
 		SearchAfter: searchAfter,
 	}, nil
+}
+
+// Compile the saved condition independently before building the merged query.
+// This preserves error provenance when both saved and caller conditions exist.
+func (c *OpenSearchConnector) validateStoredFilterCondition(resource *interfaces.Resource,
+	params *interfaces.ResourceDataQueryParams) error {
+	if params == nil || params.FixedActualFilterCond == nil {
+		return nil
+	}
+	if _, err := c.ConvertFilterCondition(params.FixedActualFilterCond, resource.SchemaDefinition); err != nil {
+		return interfaces.NewStoredConditionBuildError(err)
+	}
+	return nil
 }
 
 // nestedTermsSize sets the size for each layer of terms in the nested group_by: the innermost layer uses limit to control the number of rows "under each parent bucket", and the outer layer uses a larger upper limit to expand the combination.

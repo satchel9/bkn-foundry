@@ -8,7 +8,6 @@ package driveradapters
 
 import (
 	"context"
-	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -23,16 +22,23 @@ const headerBKNEvidenceEventID = "bkn-evidence-event-id"
 
 func ontologyTraceRequestContext(c *gin.Context, ctx context.Context, visitor hydra.Visitor) bkntrace.RequestContext {
 	traceContext, _ := common.GetTraceContextFromCtx(ctx)
+	coreOperationID := ""
+	if strings.HasPrefix(c.Request.URL.Path, "/api/ontology-query/in/v1/") {
+		coreOperationID = common.SanitizeBusinessTraceID(c.GetHeader(common.HeaderBKNParentOperationID))
+	}
 	return bkntrace.RequestContext{
 		RequestID:              traceContext.RequestID,
 		AccountID:              visitor.ID,
 		AccountType:            string(visitor.Type),
-		ApplicationPrincipalID: strings.TrimSpace(os.Getenv("BKN_TRACE_APPLICATION_PRINCIPAL_ID")),
-		EffectiveSubjectID:     visitor.ID,
+		ApplicationPrincipalID: strings.TrimSpace(visitor.ClientID),
+		EffectiveSubjectID:     strings.TrimSpace(visitor.ID),
 		EffectiveSubjectType:   ontologyTraceSubjectType(string(visitor.Type)),
-		DelegationID:           strings.TrimSpace(c.GetHeader("x-bkn-delegation-id")),
+		ConversationID:         traceContext.ConversationID,
 		InteractionID:          traceContext.InteractionID,
+		SessionScopePresent:    traceContext.ConversationID != "" && traceContext.InteractionID != "",
 		OperationID:            traceContext.OperationID,
+		CoreOperationID:        coreOperationID,
+		OperationScopePresent:  coreOperationID != "",
 		CausationEventID:       traceContext.CausationEventID,
 		ClaimID:                traceContext.ClaimID,
 		Attempt:                traceContext.Attempt,
@@ -145,7 +151,7 @@ func safeObjectQueryShape(query *interfaces.ObjectQueryBaseOnObjectType) map[str
 		"limit":                   query.Limit,
 		"include_type_info":       query.IncludeTypeInfo,
 		"include_logic_params":    query.IncludeLogicParams,
-		"ignoring_store":          query.IgnoringStore,
+		"ignore_local_index":      query.IgnoreLocalIndex,
 		"exclude_props_hash":      bkntrace.HashValue(query.ExcludeSystemProperties),
 		"has_actual_condition":    query.ActualCondition != nil,
 		"has_object_query_info":   query.ObjectQueryInfo != nil,

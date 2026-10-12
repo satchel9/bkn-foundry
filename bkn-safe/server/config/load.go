@@ -5,9 +5,9 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 )
 
@@ -38,7 +38,12 @@ func LoadWithOptions(opts LoadOptions) (*Config, error) {
 		cfg = defaultConfig()
 	}
 
-	applyEnv(cfg)
+	if err := applyEnv(cfg); err != nil {
+		return nil, err
+	}
+	if cfg.Hydra.BrowserPublicURL == "" {
+		cfg.Hydra.BrowserPublicURL = cfg.Hydra.PublicURL
+	}
 	return cfg, nil
 }
 
@@ -52,7 +57,7 @@ func Load() *Config {
 	return cfg
 }
 
-func applyEnv(cfg *Config) {
+func applyEnv(cfg *Config) error {
 	if v := os.Getenv("SAFE_HTTP_ADDR"); v != "" {
 		cfg.HTTPAddr = v
 	}
@@ -99,6 +104,23 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("SAFE_HYDRA_PUBLIC_URL"); v != "" {
 		cfg.Hydra.PublicURL = v
 	}
+	if v := os.Getenv("SAFE_HYDRA_BROWSER_PUBLIC_URL"); v != "" {
+		cfg.Hydra.BrowserPublicURL = v
+	}
+	if v, ok := os.LookupEnv("SAFE_OAUTH_STUDIO_BASELINE_REDIRECT_URIS"); ok {
+		var uris []string
+		if err := json.Unmarshal([]byte(v), &uris); err != nil {
+			return fmt.Errorf("SAFE_OAUTH_STUDIO_BASELINE_REDIRECT_URIS: decode JSON array: %w", err)
+		}
+		cfg.OAuth.StudioBaselineRedirectURIs = uris
+	}
+	if v := os.Getenv("SAFE_OAUTH_RECONCILE_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("SAFE_OAUTH_RECONCILE_INTERVAL: %w", err)
+		}
+		cfg.OAuth.ReconcileInterval = d
+	}
 	if v := os.Getenv("SAFE_LDAP_URL"); v != "" {
 		cfg.LDAP.URL = v
 	}
@@ -123,25 +145,6 @@ func applyEnv(cfg *Config) {
 	if v, ok := envBool("SAFE_LICENSE_INSECURE_SKIP_VERIFY"); ok {
 		cfg.License.InsecureSkipVerify = v
 	}
-	if v := os.Getenv("SAFE_AUDIT_CHAIN_HEAD_LOG_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Audit.ChainHeadLogInterval = d
-		}
-	}
-	if v, ok := envBool("SAFE_AUTHZ_DECISION_LOG_ENABLED"); ok {
-		cfg.Audit.DecisionLog.Enabled = v
-	}
-	if v := os.Getenv("SAFE_AUTHZ_DECISION_LOG_ALLOW_SAMPLE_RATE"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			cfg.Audit.DecisionLog.AllowSampleRate = f
-		}
-	}
-	if v, ok := envInt("SAFE_AUTHZ_DECISION_LOG_QUEUE_SIZE"); ok {
-		cfg.Audit.DecisionLog.QueueSize = v
-	}
-	if v, ok := envInt("SAFE_AUTHZ_DECISION_LOG_RETENTION_DAYS"); ok {
-		cfg.Audit.DecisionLog.RetentionDays = v
-	}
 	if v := os.Getenv("SAFE_AUTHZ_POLICY_REFRESH_INTERVAL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Authz.PolicyRefreshInterval = d
@@ -153,6 +156,14 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("SAFE_BKN_BACKEND_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			cfg.Upstreams.BKNBackend.Timeout = d
+		}
+	}
+	if v := os.Getenv("SAFE_BKN_AGENT_BASE_URL"); v != "" {
+		cfg.Upstreams.BKNAgent.BaseURL = v
+	}
+	if v := os.Getenv("SAFE_BKN_AGENT_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			cfg.Upstreams.BKNAgent.Timeout = d
 		}
 	}
 	if v := os.Getenv("SAFE_EXECUTION_FACTORY_BASE_URL"); v != "" {
@@ -179,6 +190,7 @@ func applyEnv(cfg *Config) {
 			cfg.Upstreams.OntologyQuery.Timeout = d
 		}
 	}
+	return nil
 }
 
 func envInt(k string) (int, bool) {

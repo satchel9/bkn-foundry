@@ -145,12 +145,21 @@ Key sections:
 
 Secrets and sensitive values: `server/infra/config/agent-retrieval-secret.yaml` (excluded from version control as needed).
 
+`options.max_concurrency` of the logic-property resolver is limited to 64; larger values are
+rejected with 400 (0 or negative still means the default of 4).
+
 ## Monitoring and Operations
 
 - **Ready**: `GET /health/ready`
 - **Liveness**: `GET /health/alive`
+
 - **Logging**: Structured logging; level and output configurable via config.
 - **Tracing**: OpenTelemetry; enable and configure in `observability` config.
+
+Outside `dev` mode, Helm configures the liveness probe with a 10-second period,
+5-second timeout, and 5 consecutive failures before restart. Override these settings
+through `service.livenessProbe`. The endpoint checks the service process only and
+does not check Trace or other dependencies.
 
 ## Development
 

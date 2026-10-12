@@ -1,6 +1,64 @@
 import asyncio
+from dataclasses import replace
+
+import pytest
 
 from app import evidence, observability
+
+
+@pytest.mark.parametrize("subject_type,account_type", [("user", "user"), ("service", "app")])
+def test_question_and_result_artifact_body_preserves_lifecycle_owner(subject_type, account_type):
+    ctx = replace(
+        _ctx(), application_principal_id="fallback-app",
+        effective_subject_id="fallback-subject",
+    )
+    owner = {
+        "application_principal_id": "oauth-client",
+        "effective_subject_type": subject_type,
+        "effective_subject_id": "lifecycle-subject",
+        "delegation_id": "",
+    }
+    token = observability.set_context(ctx)
+    interaction_token = evidence.begin_interaction(
+        "question", "chat", "agent-1", "bkn.agent.chat", owner=owner
+    )
+    try:
+        artifacts = [
+            evidence.question_artifact("acct-1", account_type),
+            evidence.result_artifact(
+                "answer", claim_id_value="claim-1", business_refs=[],
+                account_id="acct-1", account_type=account_type,
+            ),
+        ]
+        for artifact in artifacts:
+            assert artifact["application_principal_id"] == "oauth-client"
+            assert artifact["effective_subject_id"] == "lifecycle-subject"
+            assert artifact["bkn.account.id"] == "acct-1"
+            assert artifact["bkn.account.type"] == account_type
+            assert artifact["content_hash"] == evidence.artifact_content_hash(artifact["content"])
+        assert ctx.application_principal_id == "fallback-app"
+        assert ctx.effective_subject_id == "fallback-subject"
+    finally:
+        evidence.end_interaction(interaction_token)
+        observability.reset_context(token)
+
+
+@pytest.mark.parametrize("app_id,subject_id", [("trace-app", "trace-subject"), (None, None)])
+def test_artifact_without_lifecycle_owner_uses_trace_identity(app_id, subject_id):
+    ctx = replace(
+        _ctx(), application_principal_id=app_id, effective_subject_id=subject_id,
+    )
+    token = observability.set_context(ctx)
+    interaction_token = evidence.begin_interaction(
+        "question", "task", "agent-1", "bkn.agent.task"
+    )
+    try:
+        artifact = evidence.question_artifact("acct-1", "user")
+        assert artifact["application_principal_id"] == (app_id or "acct-1")
+        assert artifact["effective_subject_id"] == (subject_id or "acct-1")
+    finally:
+        evidence.end_interaction(interaction_token)
+        observability.reset_context(token)
 
 
 def _ctx():
@@ -10,6 +68,7 @@ def _ctx():
         traceparent="00-1234567890abcdef1234567890abcdef-1234567890abcdef-01",
         entry_boundary="external",
         upstream_span_id="1234567890abcdef",
+        conversation_id="conv-1",
     )
 
 
@@ -79,14 +138,13 @@ def test_result_artifact_is_referenced_by_claim_without_copying_answer_into_even
     assert artifact["content"] == answer
 
 
-def test_submit_interaction_started_writes_artifact_before_referencing_event(monkeypatch):
+def test_submit_interaction_started_writes_artifact_before_referencing_event(
+    monkeypatch, accepted_evidence_publisher
+):
     submitted = []
 
     async def fake_artifact_send(artifact):
         submitted.append(("artifact", artifact))
-
-    async def fake_event_send(batch):
-        submitted.append(("event", batch))
 
     monkeypatch.setattr(
         evidence.config,
@@ -94,13 +152,7 @@ def test_submit_interaction_started_writes_artifact_before_referencing_event(mon
         "http://bkn-trace.local/evidence/artifacts",
         raising=False,
     )
-    monkeypatch.setattr(
-        evidence.config,
-        "BKN_TRACE_EVIDENCE_INGEST_URL",
-        "http://bkn-trace.local/evidence/events",
-    )
     monkeypatch.setattr(evidence, "_send_artifact_once", fake_artifact_send, raising=False)
-    monkeypatch.setattr(evidence, "_send_once", fake_event_send)
     token = observability.set_context(_ctx())
     interaction_token = evidence.begin_interaction(
         "需要保留的业务问题", "task", "agent-1", "bkn.agent.task"
@@ -111,22 +163,21 @@ def test_submit_interaction_started_writes_artifact_before_referencing_event(mon
         evidence.end_interaction(interaction_token)
         observability.reset_context(token)
 
-    assert [kind for kind, _ in submitted] == ["artifact", "event"]
+    assert [kind for kind, _ in submitted] == ["artifact"]
+    assert len(accepted_evidence_publisher.events) == 1
     artifact = submitted[0][1]
-    event = submitted[1][1]["events"][0]
+    event = accepted_evidence_publisher.events[0]["envelope"]["event"]
     assert event["payload"]["question_artifact_ref"] == (
         f"artifact:{artifact['artifact_id']}"
     )
 
 
-def test_submit_interaction_started_skips_invalid_2_2_event_when_artifact_fails(monkeypatch):
-    submitted_events = []
+def test_submit_interaction_started_skips_event_when_artifact_fails(
+    monkeypatch, accepted_evidence_publisher
+):
 
     async def reject_artifact(_artifact):
         raise evidence.EvidenceSubmissionError("HTTP 503")
-
-    async def accept_event(batch):
-        submitted_events.append(batch)
 
     monkeypatch.setattr(
         evidence.config,
@@ -134,14 +185,7 @@ def test_submit_interaction_started_skips_invalid_2_2_event_when_artifact_fails(
         "http://bkn-trace.local/evidence/artifacts",
         raising=False,
     )
-    monkeypatch.setattr(
-        evidence.config,
-        "BKN_TRACE_EVIDENCE_INGEST_URL",
-        "http://bkn-trace.local/evidence/events",
-    )
-    monkeypatch.setattr(evidence.config, "BKN_TRACE_EVIDENCE_MAX_ATTEMPTS", 1)
     monkeypatch.setattr(evidence, "_send_artifact_once", reject_artifact, raising=False)
-    monkeypatch.setattr(evidence, "_send_once", accept_event)
     token = observability.set_context(_ctx())
     interaction_token = evidence.begin_interaction(
         "问题仍可通过哈希诊断", "task", "agent-1", "bkn.agent.task"
@@ -152,4 +196,4 @@ def test_submit_interaction_started_skips_invalid_2_2_event_when_artifact_fails(
         evidence.end_interaction(interaction_token)
         observability.reset_context(token)
 
-    assert submitted_events == []
+    assert accepted_evidence_publisher.events == []

@@ -337,11 +337,30 @@ func applySchemaMigration(ctx context.Context, conn *sql.Conn, migration Migrati
 func splitSQLStatements(sqlText string) ([]string, error) {
 	var statements []string
 	start := 0
+	delimiter := ";"
 	var quote byte
 	lineComment := false
 	blockComment := false
 	for index := 0; index < len(sqlText); index++ {
 		current := sqlText[index]
+		if quote == 0 && !lineComment && !blockComment && (index == 0 || sqlText[index-1] == '\n') {
+			lineEnd := strings.IndexByte(sqlText[index:], '\n')
+			if lineEnd < 0 {
+				lineEnd = len(sqlText)
+			} else {
+				lineEnd += index
+			}
+			fields := strings.Fields(sqlText[index:lineEnd])
+			if len(fields) == 2 && strings.EqualFold(fields[0], "DELIMITER") {
+				if strings.TrimSpace(sqlText[start:index]) != "" {
+					return nil, errors.New("delimiter directive follows an unterminated SQL statement")
+				}
+				delimiter = fields[1]
+				start = lineEnd + 1
+				index = lineEnd
+				continue
+			}
+		}
 		if lineComment {
 			if current == '\n' {
 				lineComment = false
@@ -381,10 +400,14 @@ func splitSQLStatements(sqlText string) ([]string, error) {
 		switch current {
 		case '\'', '"', '`':
 			quote = current
-		case ';':
+		default:
+			if !strings.HasPrefix(sqlText[index:], delimiter) {
+				continue
+			}
 			if statement := strings.TrimSpace(sqlText[start:index]); statement != "" {
 				statements = append(statements, statement)
 			}
+			index += len(delimiter) - 1
 			start = index + 1
 		}
 	}
@@ -414,6 +437,11 @@ func (s *Store) WithinTransaction(ctx context.Context, fn func(isessionstore.Tra
 		}
 		callbackErr := fn(adapter)
 		if callbackErr == nil {
+			adapter.flushIntegrityDirty()
+		}
+		// Lookup failures can make the callback report a domain-level not-found.
+		// Preserve the storage error so transaction retries see the real cause.
+		if adapter.err != nil {
 			callbackErr = adapter.err
 		}
 		if callbackErr != nil {
@@ -478,6 +506,7 @@ func retryableTransactionError(err error) bool {
 }
 
 type transaction struct {
+	integrityDirty     map[string]struct{}
 	strictEvidenceJSON bool
 	ctx                context.Context
 	tx                 *sql.Tx
@@ -891,6 +920,10 @@ func (t *transaction) SaveInteraction(interaction sessionvo.Interaction) {
 	if t.err != nil {
 		return
 	}
+	t.markIntegrityDirty(interaction.ID)
+	if t.err != nil {
+		return
+	}
 	manifest := marshalJSON(interaction.ClosureManifest)
 	var assemblerDeadline any
 	if interaction.ClosureManifest != nil {
@@ -1160,6 +1193,10 @@ func (t *transaction) SaveOperationCallFact(fact sessionvo.OperationCallFact) {
 	if t.err != nil {
 		return
 	}
+	t.markIntegrityDirty(fact.InteractionID)
+	if t.err != nil {
+		return
+	}
 	var exists int
 	err := t.tx.QueryRowContext(t.ctx,
 		"SELECT 1 FROM bkn_trace_operation_call_facts WHERE operation_id=? AND attempt_no=?",
@@ -1167,8 +1204,8 @@ func (t *transaction) SaveOperationCallFact(fact sessionvo.OperationCallFact) {
 	).Scan(&exists)
 	input := marshalJSON(fact.Input)
 	capabilityProfile := marshalOptionalCapabilityProfile(fact.CapabilityProfile)
-	output := marshalOptionalPayload(fact.Output)
-	errorPayload := marshalOptionalPayload(fact.Error)
+	output := marshalTerminalPayload(fact.Output, fact.EvidenceCompletion)
+	errorPayload := marshalTerminalPayload(fact.Error, fact.EvidenceCompletion)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		_, t.err = t.tx.ExecContext(t.ctx, `
@@ -1250,6 +1287,10 @@ func (t *transaction) ListReceipts(interactionID string) []sessionvo.Receipt {
 }
 
 func (t *transaction) SaveReceipt(receipt sessionvo.Receipt) {
+	if t.err != nil {
+		return
+	}
+	t.markIntegrityDirty(receipt.InteractionID)
 	if t.err != nil {
 		return
 	}
@@ -1689,7 +1730,8 @@ const interactionSelect = `SELECT interaction_id, conversation_id, ordinal_no,
 	execution_status, evidence_status, start_idempotency_key,
 	COALESCE(terminal_idempotency_key, ''), COALESCE(terminal_payload_hash, ''),
 	COALESCE(closure_manifest, ''), lease_token, lease_epoch, lease_version,
-	lease_expires_at, row_version, created_at, updated_at, terminal_at
+	lease_expires_at, row_version, created_at, updated_at, terminal_at,
+	record_integrity_version, record_integrity_json
 	FROM bkn_trace_interactions`
 
 func (t *transaction) scanInteraction(row rowScanner) (sessionvo.Interaction, bool) {
@@ -1708,12 +1750,14 @@ func scanInteractionRows(row rowScanner) (sessionvo.Interaction, error) {
 	var value sessionvo.Interaction
 	var manifest string
 	var terminalAt sql.NullTime
+	var integrityJSON sql.NullString
 	err := row.Scan(
 		&value.ID, &value.ConversationID, &value.Ordinal, &value.ExecutionStatus,
 		&value.EvidenceStatus, &value.StartIdempotencyKey,
 		&value.TerminalIdempotencyKey, &value.TerminalPayloadHash, &manifest,
 		&value.LeaseToken, &value.LeaseEpoch, &value.LeaseVersion,
 		&value.LeaseExpiresAt, &value.RowVersion, &value.CreatedAt, &value.UpdatedAt, &terminalAt,
+		&value.IntegritySourceVersion, &integrityJSON,
 	)
 	if err != nil {
 		return sessionvo.Interaction{}, err
@@ -1727,6 +1771,14 @@ func scanInteractionRows(row rowScanner) (sessionvo.Interaction, error) {
 	}
 	if terminalAt.Valid {
 		value.TerminalAt = &terminalAt.Time
+	}
+	if integrityJSON.Valid {
+		if len(integrityJSON.String) > isessionstore.MaxStoredRecordIntegrityBytes {
+			return sessionvo.Interaction{}, isessionstore.ErrRecordIntegrityLimit
+		}
+		if err := json.Unmarshal([]byte(integrityJSON.String), &value.StoredRecordIntegrity); err != nil || value.StoredRecordIntegrity == nil {
+			return sessionvo.Interaction{}, fmt.Errorf("%w: interaction.record_integrity", isessionstore.ErrInvalidEvidenceJSON)
+		}
 	}
 	return value, nil
 }
@@ -1807,30 +1859,33 @@ func (t *transaction) scanOperationCallFact(row rowScanner) (sessionvo.Operation
 		}
 	}
 	if output != "" {
-		value.Output = &sessionvo.PayloadEnvelope{}
-		if err := json.Unmarshal([]byte(output), value.Output); err != nil {
+		var err error
+		value.Output, value.EvidenceCompletion, err = decodeTerminalPayload(output)
+		if err != nil {
 			t.err = err
 			return sessionvo.OperationCallFact{}, false
 		}
 	}
 	if errorPayload != "" {
-		value.Error = &sessionvo.PayloadEnvelope{}
-		if err := json.Unmarshal([]byte(errorPayload), value.Error); err != nil {
+		var err error
+		var completion *sessionvo.EvidenceCompletion
+		value.Error, completion, err = decodeTerminalPayload(errorPayload)
+		if err != nil {
 			t.err = err
 			return sessionvo.OperationCallFact{}, false
+		}
+		if value.EvidenceCompletion != nil && completion != nil {
+			t.err = errors.New("confirmation metadata appears in both terminal payloads")
+			return sessionvo.OperationCallFact{}, false
+		}
+		if completion != nil {
+			value.EvidenceCompletion = completion
 		}
 	}
 	if finishedAt.Valid {
 		value.FinishedAt = &finishedAt.Time
 	}
 	return value, true
-}
-
-func marshalOptionalPayload(payload *sessionvo.PayloadEnvelope) string {
-	if payload == nil {
-		return ""
-	}
-	return marshalJSON(*payload)
 }
 
 func marshalOptionalCapabilityProfile(profile *sessionvo.CapabilityProfile) string {

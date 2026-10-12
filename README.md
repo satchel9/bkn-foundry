@@ -6,11 +6,19 @@
   </picture>
 </p>
 
+<div align="center">
+
 # BKN Foundry
 
 [中文](README.zh.md) | English
 
-[![License](https://img.shields.io/badge/license-multi--licensed-blue.svg)](LICENSE)
+🌐 **Website:** [openbkn.ai](https://openbkn.ai)
+
+[![License](https://img.shields.io/badge/license-multi--licensed-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/openbkn-ai/bkn-foundry)](https://github.com/openbkn-ai/bkn-foundry/releases/latest)
+
+<a href="https://trendshift.io/repositories/109706?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-109706" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/109706" alt="openbkn-ai%2Fbkn-foundry | Trendshift" width="250" height="55"/></a>
+
+</div>
 
 OpenBKN is an ontology-driven business knowledge network platform. Through ontology modeling, it turns the data and logic scattered across documents, systems, processes, rules, and expert experience into a business knowledge network that agents can understand, execute, and verify — so agents land accurately, safely, and reliably in real business environments, not just generating answers but continuously creating executable, traceable, and verifiable business value.
 
@@ -406,7 +414,7 @@ F1 Bench is based on the BIRD test set with the Formula-1 database mixed with 30
 
 | Channel | Link | What it's for |
 | --- | --- | --- |
-| Discord | [discord.gg/YTxDbrfNf](https://discord.gg/YTxDbrfNf) | Real-time help, showcases, and announcements. |
+| Discord | [discord.gg/n4ur6jZB5](https://discord.gg/n4ur6jZB5) | Real-time help, showcases, and announcements. |
 | X | [@OpenBKN](https://x.com/OpenBKN) | Follow OpenBKN for release news and project updates. |
 
 ## License
@@ -424,3 +432,11 @@ per-component and per-file breakdown:
   repositories.
 
 The license applicable to each file is stated in that file's header.
+
+## Historical data upgrade
+
+The one-time [015-to-020 upgrade tool](deploy/scripts/upgrades/0.2.0/historical_trace_data/README.md)
+converts retained logs into native Audit data, converts representable Evidence
+into native aggregates, and verifies or rebuilds Core projections from existing
+facts. Conversion losses are reported. No historical query or UI compatibility
+branch is added. Run it after the 020 deployment and schema upgrade are healthy.

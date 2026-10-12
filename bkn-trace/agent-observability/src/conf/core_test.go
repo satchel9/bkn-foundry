@@ -124,6 +124,14 @@ func TestCoreConfigParsesOneShotIdleTTL(t *testing.T) {
 	}
 }
 
+func TestCoreConfigParsesCapturePolicySnapshotTTL(t *testing.T) {
+	t.Setenv("BKN_TRACE_CAPTURE_POLICY_SNAPSHOT_TTL", "10m")
+	config, err := NewCoreConfig()
+	if err != nil || config.CapturePolicySnapshotTTL != 10*time.Minute {
+		t.Fatalf("config = %+v, err = %v", config, err)
+	}
+}
+
 func TestCoreConfigDefaultsMariaDBAutoMigrateToTrue(t *testing.T) {
 	t.Setenv("BKN_TRACE_CORE_STORE", "mariadb")
 	t.Setenv("BKN_TRACE_CORE_AUTO_MIGRATE", "")
@@ -142,6 +150,24 @@ func TestCoreConfigRejectsInvalidAutoMigrate(t *testing.T) {
 
 	if _, err := NewCoreConfig(); err == nil {
 		t.Fatal("expected invalid auto-migrate setting to be rejected")
+	}
+}
+
+func TestCoreConfigParsesCapturePolicyInitialState(t *testing.T) {
+	t.Setenv("BKN_TRACE_EVIDENCE_INITIAL_STATE", "disabled")
+	config, err := NewCoreConfig()
+	if err != nil {
+		t.Fatalf("new core config: %v", err)
+	}
+	if config.CapturePolicyInitialState != "disabled" {
+		t.Fatalf("unexpected capture policy initial state: %#v", config)
+	}
+}
+
+func TestCoreConfigRejectsInvalidCapturePolicyInitialState(t *testing.T) {
+	t.Setenv("BKN_TRACE_EVIDENCE_INITIAL_STATE", "unknown")
+	if _, err := NewCoreConfig(); err == nil {
+		t.Fatal("invalid capture policy initial state must be rejected")
 	}
 }
 

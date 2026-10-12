@@ -5,19 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 )
 
 type knSearchSchemaAccessStub struct {
 	permissions map[string]interfaces.PropertyAccessLevel
-	calls       *int
+	// Atomic because the reads fan out: FilterObjectTypes stopped asking one object
+	// type at a time when a network's worth of them stopped fitting in a timeout.
+	calls *atomic.Int64
 }
 
 func (s knSearchSchemaAccessStub) GetObjectTypeSchema(context.Context, string, string) (*interfaces.ObjectTypeSchemaResp, error) {
 	if s.calls != nil {
-		(*s.calls)++
+		s.calls.Add(1)
 	}
 	return &interfaces.ObjectTypeSchemaResp{EffectivePermissions: s.permissions}, nil
 }
@@ -29,7 +33,6 @@ func TestConceptRetrievalUsesAuthorizationSafeObjectSchema(t *testing.T) {
 		DataProperties: []*interfaces.DataProperty{{Name: "id"}, {Name: "phone"}, {Name: "secret"}},
 	}}}
 	config := DefaultConceptRetrievalConfig()
-	config.EnableCoarseRecall = boolPtr(false)
 	config.TopK = 1
 	service := &localSearchImpl{
 		logger: &mockLogger{}, bknBackend: &mockBknBackend{networkDetail: detail},
@@ -63,14 +66,13 @@ func TestConceptRetrievalAuthorizesOnlySelectedObjectTypes(t *testing.T) {
 		})
 	}
 	config := DefaultConceptRetrievalConfig()
-	config.EnableCoarseRecall = boolPtr(false)
 	config.TopK = 1
-	calls := 0
+	calls := &atomic.Int64{}
 	service := &localSearchImpl{
 		logger: &mockLogger{}, bknBackend: &mockBknBackend{networkDetail: &interfaces.KnowledgeNetworkDetail{ObjectTypes: objects}},
 		schemaAccess: knSearchSchemaAccessStub{
 			permissions: map[string]interfaces.PropertyAccessLevel{"visible": interfaces.PropertyAccessFull},
-			calls:       &calls,
+			calls:       calls,
 		},
 	}
 
@@ -80,8 +82,8 @@ func TestConceptRetrievalAuthorizesOnlySelectedObjectTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls != len(result.ObjectTypes) || calls >= candidateCount {
-		t.Fatalf("schema calls=%d result objects=%d candidates=%d", calls, len(result.ObjectTypes), candidateCount)
+	if got := int(calls.Load()); got != len(result.ObjectTypes) || got >= candidateCount {
+		t.Fatalf("schema calls=%d result objects=%d candidates=%d", got, len(result.ObjectTypes), candidateCount)
 	}
 	for _, objectType := range result.ObjectTypes {
 		if len(objectType.DataProperties) != 1 || objectType.DataProperties[0].Name != "visible" {
@@ -111,7 +113,6 @@ func TestConceptRetrieval_MainFlow(t *testing.T) {
 	// Prepare base test data.
 	mockDetail := createMockNetworkDetail(5, 5, 2)
 	baseConfig := DefaultConceptRetrievalConfig()
-	baseConfig.EnableCoarseRecall = boolPtr(false)
 
 	tests := []struct {
 		name        string
@@ -174,7 +175,6 @@ func TestConceptRetrieval_MainFlow(t *testing.T) {
 			},
 			config: func() *interfaces.KnSearchConceptRetrievalConfig {
 				cfg := DefaultConceptRetrievalConfig()
-				cfg.EnableCoarseRecall = boolPtr(false)
 				return cfg
 			}(),
 			mockSetup: func(m *mockBknBackend, r *mockRerankClient) {
@@ -238,7 +238,6 @@ func TestConceptRetrieval_NoRelations_ObjectTopByScore(t *testing.T) {
 	detail.ObjectTypes[1].Score = 0.7
 
 	cfg := DefaultConceptRetrievalConfig()
-	cfg.EnableCoarseRecall = boolPtr(false)
 	cfg.TopK = 5
 
 	mockManager := &mockBknBackend{networkDetail: detail}
@@ -280,7 +279,6 @@ func TestConceptRetrieval_ObjectFallback_FillByScore(t *testing.T) {
 	detail.ObjectTypes[13].Score = 0.92
 
 	cfg := DefaultConceptRetrievalConfig()
-	cfg.EnableCoarseRecall = boolPtr(false)
 	cfg.TopK = 10
 
 	mockManager := &mockBknBackend{networkDetail: detail}
@@ -316,7 +314,6 @@ func TestConceptRetrieval_ObjectFallback_FillByScore(t *testing.T) {
 // Also GetKnowledgeNetworkDetail and local filtering by group should no longer be triggered.
 func TestConceptRetrieval_GroupScopeDelegatesToBkn(t *testing.T) {
 	cfg := DefaultConceptRetrievalConfig()
-	cfg.EnableCoarseRecall = boolPtr(false)
 	cfg.TopK = 10
 	cfg.ConceptGroups = []string{"supply_chain"}
 
@@ -389,7 +386,6 @@ func TestConceptRetrieval_GroupScopeDelegatesToBkn(t *testing.T) {
 
 func TestConceptRetrieval_GroupScopeCompletesReferencedObjects(t *testing.T) {
 	cfg := DefaultConceptRetrievalConfig()
-	cfg.EnableCoarseRecall = boolPtr(false)
 	cfg.TopK = 10
 	cfg.ConceptGroups = []string{"supply_chain"}
 
@@ -464,7 +460,6 @@ func TestConceptRetrieval_GroupScopeCompletesReferencedObjects(t *testing.T) {
 // "Group does not exist" and "Group is legal but has no concept" are crucial.
 func TestConceptRetrieval_UnknownConceptGroupPropagatesError(t *testing.T) {
 	cfg := DefaultConceptRetrievalConfig()
-	cfg.EnableCoarseRecall = boolPtr(false)
 	cfg.ConceptGroups = []string{"missing_group"}
 
 	bknErr := errors.New("BknBackend.ObjectType.InternalError: all concept group not found")
@@ -492,54 +487,6 @@ func TestConceptRetrieval_UnknownConceptGroupPropagatesError(t *testing.T) {
 	}
 	if mockManager.actionTypesReq != nil {
 		t.Fatal("SearchActionTypes should not be invoked after object-types error")
-	}
-}
-
-func TestConceptRetrieval_CoarseRecall(t *testing.T) {
-	// Create a large number of relationships to trigger coarse recall.
-	mockDetail := createMockNetworkDetail(10, 6000, 10)
-
-	config := DefaultConceptRetrievalConfig()
-	config.CoarseMinRelationCount = 5000 // Set threshold.
-
-	mockManager := &mockBknBackend{
-		networkDetail: mockDetail,
-		// Simulate rough recall to return partial objects and relationships.
-		objectTypesResp: &interfaces.ObjectTypeConcepts{
-			Entries: []*interfaces.ObjectType{
-				{ID: "obj_0"}, {ID: "obj_1"},
-			},
-		},
-		relationTypesResp: &interfaces.RelationTypeConcepts{
-			Entries: []*interfaces.RelationType{
-				{ID: "rel_0"}, {ID: "rel_1"},
-			},
-		},
-	}
-
-	svc := &localSearchImpl{
-		logger:     &mockLogger{},
-		bknBackend: mockManager,
-	}
-
-	req := &interfaces.KnSearchLocalRequest{
-		KnID:  "129",
-		Query: "query",
-	}
-
-	res, err := svc.conceptRetrieval(context.Background(), req, config)
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Verify that the results are filtered.
-	// There are 6000 original relationships, and the rough recall simulation returns 2.
-	if len(res.RelationTypes) > 2 { // Considering that there may be sorting truncation in the future, there should be very few simple verifications here.
-		// Note: The default TopK of rankRelationTypes is 10, so the maximum returned here is 10.
-		// But if rough recall is in effect, there are actually only 2 candidates, so 2 should be returned.
-		if len(res.RelationTypes) != 2 {
-			t.Errorf("Expected 2 relations after coarse recall, got %d", len(res.RelationTypes))
-		}
 	}
 }
 
@@ -790,5 +737,64 @@ func TestFetchSampleData(t *testing.T) {
 	}
 	if mockQuery.callCount != 1 {
 		t.Errorf("Expected 1 query call, got %d", mockQuery.callCount)
+	}
+}
+
+// failingSchemaAccess answers every read except those in fail.
+type failingSchemaAccess struct {
+	fail map[string]error
+}
+
+func (s failingSchemaAccess) GetObjectTypeSchema(_ context.Context, _ string, otID string) (*interfaces.ObjectTypeSchemaResp, error) {
+	if err := s.fail[otID]; err != nil {
+		return nil, err
+	}
+	return &interfaces.ObjectTypeSchemaResp{EffectivePermissions: map[string]interfaces.PropertyAccessLevel{
+		"id": interfaces.PropertyAccessFull,
+	}}, nil
+}
+
+// #1906: one object type whose schema read fails with a dependency fault no
+// longer fails search_schema. It comes back without properties, and the
+// search_schema response message names it so an agent does not read it as an
+// object type with none. Asserted on SearchSchema itself: the notice was once
+// written one layer down and never reached the tool's response.
+func TestSearchSchemaKeepsObjectTypeWhoseSchemaIsUnavailable(t *testing.T) {
+	detail := &interfaces.KnowledgeNetworkDetail{ObjectTypes: []*interfaces.ObjectType{
+		{ID: "customer", Name: "Customer", DataSource: &interfaces.ResourceInfo{Type: "resource", ID: "customers"},
+			DataProperties: []*interfaces.DataProperty{{Name: "id"}}},
+		{ID: "order", Name: "Order", DataSource: &interfaces.ResourceInfo{Type: "resource", ID: "orders"},
+			DataProperties: []*interfaces.DataProperty{{Name: "id"}}},
+	}}
+	local := &localSearchImpl{
+		logger: &mockLogger{}, bknBackend: &mockBknBackend{networkDetail: detail},
+		schemaAccess: failingSchemaAccess{fail: map[string]error{
+			"order": &infraErr.HTTPError{HTTPCode: 503, DownstreamBody: []byte(`{}`)},
+		}},
+	}
+	svc := &knSearchService{Logger: &mockLogger{}, LocalSearch: local}
+	maxConcepts, off := 10, false
+
+	resp, err := svc.SearchSchema(context.Background(), &interfaces.SearchSchemaReq{
+		KnID: "kn-1", Query: "customer order", MaxConcepts: &maxConcepts, EnableRerank: &off,
+		SearchScope: &interfaces.SearchSchemaScope{IncludeMetricTypes: &off},
+	})
+	if err != nil {
+		t.Fatalf("a dependency fault on one schema read failed the search: %v", err)
+	}
+	properties := map[string]int{}
+	for _, item := range resp.ObjectTypes {
+		objectType, ok := item.(map[string]any)
+		if !ok {
+			t.Fatalf("object type item is %T", item)
+		}
+		dataProperties, _ := objectType["data_properties"].([]any)
+		properties[fmt.Sprint(objectType["concept_id"])] = len(dataProperties)
+	}
+	if properties["customer"] != 1 || properties["order"] != 0 {
+		t.Fatalf("properties per object type = %v, want customer=1 order=0", properties)
+	}
+	if !strings.Contains(resp.Message, "order") || strings.Contains(resp.Message, "%!") {
+		t.Fatalf("search_schema message does not name the object type without a schema: %q", resp.Message)
 	}
 }

@@ -149,7 +149,7 @@ func lifecycleToolSchemas(toolKey string) (json.RawMessage, json.RawMessage, boo
 			"type": "string", "minLength": 1,
 			"description": "Use the exact interaction_id returned by start.",
 		}
-		required = append(required, "interaction_id")
+		properties["partial_reasons"] = map[string]any{"type": "array", "maxItems": 64, "uniqueItems": true, "items": map[string]any{"type": "string", "maxLength": 256, "pattern": `^trace_call_unrecorded:[a-zA-Z0-9_-]+:[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$`}, "description": "Copy all trace_call_unrecorded reasons returned in tool Trace metadata during this turn. They preserve known unrecorded calls; never invent reasons or retry completed business calls for Trace."}
 		properties["outcome"] = enumSchema(finishInteractionOutcomes...)
 		properties["outcome"].(map[string]any)["description"] = "Set the final outcome for this turn."
 		required = append(required, "outcome")
@@ -177,17 +177,24 @@ func lifecycleOutputSchema(toolKey string) map[string]any {
 	switch toolKey {
 	case "bkn_start_interaction":
 		return closedSchema(map[string]any{
+			"owner":            ownerOutputSchema(),
 			"interaction_id":   stringSchema(),
 			"conversation_id":  stringSchema(),
 			"execution_status": enumSchema("active"),
-		}, []string{"interaction_id", "conversation_id", "execution_status"})
+			"capture_enabled":  map[string]any{"type": "boolean"},
+			"trace_recorded":   map[string]any{"type": "boolean"}, "trace_available": map[string]any{"type": "boolean"},
+			"stage": stringSchema(), "code": stringSchema(), "required_action": stringSchema(),
+		}, nil)
 	case "bkn_finish_interaction":
 		return closedSchema(map[string]any{
 			"interaction_id":   stringSchema(),
 			"conversation_id":  stringSchema(),
 			"execution_status": enumSchema("completed", "failed", "canceled", "handed_off", "abandoned"),
 			"evidence_status":  enumSchema("not_applicable", "assembling", "complete", "partial", "failed"),
-		}, []string{"interaction_id", "conversation_id", "execution_status", "evidence_status"})
+			"capture_enabled":  map[string]any{"type": "boolean"},
+			"trace_recorded":   map[string]any{"type": "boolean"}, "trace_available": map[string]any{"type": "boolean"},
+			"stage": stringSchema(), "code": stringSchema(), "required_action": stringSchema(),
+		}, nil)
 	case "bkn_get_operation":
 		return operationOutputSchema()
 	case "bkn_retry_operation":
@@ -357,6 +364,9 @@ func businessRefOutputSchema() map[string]any {
 }
 
 func closedSchema(properties map[string]any, required []string) map[string]any {
+	if required == nil {
+		required = []string{}
+	}
 	return map[string]any{
 		"type": "object", "properties": properties, "required": required,
 		"additionalProperties": false,
@@ -417,6 +427,9 @@ func offerBKNContext(input json.RawMessage) json.RawMessage {
 	}
 	properties["bkn_context"] = bknContextInputSchema()
 	required, _ := schema["required"].([]any)
+	if required == nil {
+		required = []any{}
+	}
 	for _, value := range required {
 		if value == "bkn_context" {
 			raw, _ := sonic.ConfigStd.Marshal(schema)
@@ -447,7 +460,7 @@ func offerBKNContext(input json.RawMessage) json.RawMessage {
 func bknContextInputSchema() map[string]any {
 	return map[string]any{
 		"type":        "object",
-		"description": "BKN Trace managed context. Use only IDs returned by lifecycle tools.",
+		"description": "Required managed session context. Copy both IDs from bkn_start_interaction, including when Trace capture is disabled. If start fails without IDs, retry start before business calls. Copy trace_call_unrecorded partial_reasons from tool Trace metadata to finish.",
 		"properties": map[string]any{
 			"conversation_id": describedStringSchema(
 				"Conversation this call belongs to. Copy the conversation_id returned by " +

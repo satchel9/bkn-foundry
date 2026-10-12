@@ -537,6 +537,9 @@ func TestPrepareProxyImportPreflightsRelationAgainstExistingBoundObject(t *testi
 		t.Fatal(err)
 	}
 	defer service.releaseProxyLock(t.Context(), plan)
+	if plan.baseline == nil || len(plan.baseline.ObjectTypes) != 1 || plan.baseline.ObjectTypes[0] != boundObject {
+		t.Fatal("overwrite preflight did not retain the committed index snapshot")
+	}
 	if len(mpa.checked) != 3 {
 		t.Fatalf("import preflight sources = %#v, want complete candidate source set", mpa.checked)
 	}
@@ -1688,8 +1691,9 @@ func TestProxyDeletionLifecycleIsOrdered(t *testing.T) {
 			return nil
 		})
 	kpa := &proxyAccessStub{
-		mapping: &interfaces.KNProxyAccount{KNID: "kn-1", ProxyAccountID: "proxy-1", LifecycleStatus: interfaces.KNProxyLifecycleActive},
-		events:  &events,
+		mapping: &interfaces.KNProxyAccount{KNID: "kn-1", ProxyAccountID: "proxy-1",
+			LifecycleStatus: interfaces.KNProxyLifecycleActive, SyncStatus: interfaces.KNProxySyncReady},
+		events: &events,
 	}
 	mpa := &managedProxyAccessStub{events: &events}
 	service := &knowledgeNetworkService{kpa: kpa, mpa: mpa, ps: permissionService}
@@ -1784,6 +1788,7 @@ func TestDeleteKNRollbackDoesNotDisableProxy(t *testing.T) {
 		Return(int64(0), errors.New("delete failed"))
 	kpa := &proxyAccessStub{mapping: &interfaces.KNProxyAccount{
 		KNID: "kn-1", ProxyAccountID: "proxy-1", LifecycleStatus: interfaces.KNProxyLifecycleActive,
+		SyncStatus: interfaces.KNProxySyncReady,
 	}}
 	mpa := &managedProxyAccessStub{}
 	service := &knowledgeNetworkService{db: db, ps: permissionService, kna: kna, kpa: kpa, mpa: mpa}

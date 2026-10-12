@@ -34,7 +34,8 @@ func cardEligible(name string) bool {
 	_, published := compactProfile.published[name]
 	_, gateway := gatewayTools[name]
 	_, lifecycle := lifecycleToolNames[name]
-	return !published && !gateway && !lifecycle && name != toolKeyRunCode && name != toolKeyRunShell
+	_, retired := retiredTools[name]
+	return !published && !gateway && !lifecycle && !retired
 }
 
 // The compact profile narrows loading, not capability: every assembled tool
@@ -62,7 +63,7 @@ func TestCatalogReachesEveryToolNotPublishedDirectly(t *testing.T) {
 
 func TestLookupRefusesAnythingNotAdmitted(t *testing.T) {
 	catalog := catalogForLocale(t, "zh-CN")
-	for _, name := range []string{toolKeySearchSchema, toolKeyRunCode, toolKeySearchNativeTools, "bkn_start_interaction", "no_such_tool"} {
+	for _, name := range []string{toolKeySearchSchema, toolKeySearchNativeTools, "bkn_start_interaction", "no_such_tool"} {
 		if _, _, ok := catalog.lookup(context.Background(), name); ok {
 			t.Errorf("%s resolved through the gateway catalogue", name)
 		}
@@ -150,6 +151,14 @@ func TestGatewayCardsCoverExactlyTheReachableTools(t *testing.T) {
 		bundle := buildMCPLocaleBundle(locale)
 		for name := range allToolMeta() {
 			card := bundle.ToolMeta(name).Gateway
+			// A retired tool keeps its card, because retirement is a line in
+			// retiredTools and putting it back should not mean writing four
+			// paragraphs of routing copy again in two locales. The card is
+			// unreachable while the tool is: search only reads cards off
+			// catalogue targets.
+			if _, gone := retiredTools[name]; gone {
+				continue
+			}
 			if !cardEligible(name) {
 				if card != nil {
 					t.Errorf("%s: %s cannot be a gateway target but has a card", locale, name)
@@ -260,7 +269,7 @@ func TestGatewayToolsAreDefinedInEveryLocale(t *testing.T) {
 				t.Fatalf("%s %s: %v", locale, name, err)
 			}
 			if _, ok := schema.Properties["bkn_context"]; !ok || !slices.Contains(schema.Required, "bkn_context") {
-				t.Errorf("%s %s: bkn_context is not required", locale, name)
+				t.Errorf("%s %s: bkn_context must be required", locale, name)
 			}
 			if _, ok := schema.Properties["response_format"]; ok {
 				t.Errorf("%s %s: offers response_format", locale, name)

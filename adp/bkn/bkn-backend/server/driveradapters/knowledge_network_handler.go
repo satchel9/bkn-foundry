@@ -12,9 +12,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
@@ -28,6 +28,96 @@ import (
 )
 
 const projectionGrantHeader = "X-BKN-Projection-Grant"
+
+func knowledgeNetworkMutationSummary(kn *interfaces.KN, mode, bindingPolicy string, requestBytes int64) string {
+	operationKind := "knowledge_network_create"
+	if len(kn.ConceptGroups)+len(kn.ObjectTypes)+len(kn.RelationTypes)+len(kn.ActionTypes)+
+		len(kn.RiskTypes)+len(kn.Metrics) > 0 {
+		operationKind = "knowledge_network_import"
+	}
+	branch := kn.Branch
+	if branch == "" {
+		branch = interfaces.MAIN_BRANCH
+	}
+	memberReferences := 0
+	for _, group := range kn.ConceptGroups {
+		if group != nil {
+			memberReferences += len(group.ObjectTypeIDs) + len(group.ObjectTypes)
+		}
+	}
+	return fmt.Sprintf("Knowledge network mutation: operation_kind=%s kn_id=%s branch=%s request_bytes=%d "+
+		"import_mode=%s binding_policy=%s concept_groups=%d object_types=%d relation_types=%d "+
+		"action_types=%d risk_types=%d metrics=%d member_references=%d",
+		operationKind, kn.KNID, branch, requestBytes, mode, bindingPolicy, len(kn.ConceptGroups),
+		len(kn.ObjectTypes), len(kn.RelationTypes), len(kn.ActionTypes), len(kn.RiskTypes),
+		len(kn.Metrics), memberReferences)
+}
+
+func exportContentDisposition(name, fallback string) string {
+	preferredBase := strings.TrimSpace(name)
+	if preferredBase == "" {
+		preferredBase = strings.TrimSpace(fallback)
+	}
+	if preferredBase == "" {
+		preferredBase = "knowledge-network"
+	}
+
+	asciiBase := preferredBase
+	if !isASCII(asciiBase) {
+		asciiBase = strings.TrimSpace(fallback)
+	}
+	asciiBase = sanitizeASCIIFilename(asciiBase)
+	if asciiBase == "" {
+		asciiBase = "knowledge-network"
+	}
+
+	preferredFilename := preferredBase + ".json"
+	return `attachment; filename="` + asciiBase + `.json"; filename*=utf-8''` +
+		encodeRFC5987Value(preferredFilename)
+}
+
+func isASCII(value string) bool {
+	for _, char := range value {
+		if char > 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeASCIIFilename(value string) string {
+	var result strings.Builder
+	for _, char := range value {
+		switch {
+		case char >= 'a' && char <= 'z', char >= 'A' && char <= 'Z', char >= '0' && char <= '9',
+			char == '-', char == '_', char == '.':
+			result.WriteRune(char)
+		default:
+			result.WriteByte('_')
+		}
+	}
+	return strings.Trim(result.String(), ".")
+}
+
+func encodeRFC5987Value(value string) string {
+	const hex = "0123456789ABCDEF"
+	var result strings.Builder
+	for _, currentByte := range []byte(value) {
+		if isRFC5987AttrChar(currentByte) {
+			result.WriteByte(currentByte)
+			continue
+		}
+		result.WriteByte('%')
+		result.WriteByte(hex[currentByte>>4])
+		result.WriteByte(hex[currentByte&0x0f])
+	}
+	return result.String()
+}
+
+func isRFC5987AttrChar(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
+		value >= '0' && value <= '9' || strings.ContainsRune("!#$&+-.^_`|~", rune(value))
+}
 
 const (
 	defaultOverviewGraphNodeLimit = 60
@@ -167,6 +257,32 @@ func (r *restHandler) CreateKNByEx(c *gin.Context) {
 	r.CreateKN(c, visitor)
 }
 
+// parseKnowledgeNetworkImportOptions parses the import behavior shared by JSON and archive imports.
+// strict_mode takes precedence over the deprecated validate_dependency parameter.
+func parseKnowledgeNetworkImportOptions(ctx context.Context, c *gin.Context,
+	defaultMode string, defaultStrictMode bool) (string, bool, *rest.HTTPError) {
+	mode := c.DefaultQuery(interfaces.QueryParam_ImportMode, defaultMode)
+	if httpErr := validateImportMode(ctx, mode); httpErr != nil {
+		return "", false, httpErr
+	}
+
+	strictModeStr := c.Query(interfaces.QueryParam_StrictMode)
+	if strictModeStr == "" {
+		strictModeStr = c.Query("validate_dependency")
+	}
+	if strictModeStr == "" {
+		strictModeStr = strconv.FormatBool(defaultStrictMode)
+	}
+	strictMode, err := strconv.ParseBool(strictModeStr)
+	if err != nil {
+		return "", false, rest.NewHTTPError(ctx, http.StatusBadRequest,
+			berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(commonValidationDetail(ctx, "StrictModeInvalid", map[string]any{"value": strictModeStr}))
+	}
+
+	return mode, strictMode, nil
+}
+
 // Create a knowledge network.
 func (r *restHandler) CreateKN(c *gin.Context, visitor hydra.Visitor) {
 	logger.Debug("Handler CreateKN Start")
@@ -183,9 +299,8 @@ func (r *restHandler) CreateKN(c *gin.Context, visitor hydra.Visitor) {
 	// Set trace attributes for the API.
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
-	// Import mode.
-	mode := c.DefaultQuery(interfaces.QueryParam_ImportMode, interfaces.ImportMode_Normal)
-	httpErr := validateImportMode(ctx, mode)
+	mode, strictMode, httpErr := parseKnowledgeNetworkImportOptions(ctx, c,
+		interfaces.ImportMode_Normal, true)
 	if httpErr != nil {
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -200,26 +315,13 @@ func (r *restHandler) CreateKN(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	// Whether to validate dependencies, default true. Parse priority: strict_mode > validate_dependency (legacy) > true
-	strictModeStr := c.Query(interfaces.QueryParam_StrictMode)
-	if strictModeStr == "" {
-		strictModeStr = c.Query("validate_dependency")
-	}
-	if strictModeStr == "" {
-		strictModeStr = "true"
-	}
-	strictMode, err := strconv.ParseBool(strictModeStr)
-	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-			WithErrorDetails(commonValidationDetail(ctx, "StrictModeInvalid", map[string]any{"value": strictModeStr}))
-		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
-		rest.ReplyError(c, httpErr)
-		return
-	}
-
 	// Bind one knowledge network request object.
 	kn := interfaces.KN{}
-	err = c.ShouldBindJSON(&kn)
+	_, parseSpan := oteltrace.StartNamedInternalSpan(ctx, "Parse knowledge network request")
+	parseStartedAt := time.Now()
+	err := c.ShouldBindJSON(&kn)
+	parseSpan.SetAttributes(attr.Int64("json_parse_duration_ms", time.Since(parseStartedAt).Milliseconds()))
+	parseSpan.End()
 	if err != nil {
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
 			WithErrorDetails(commonValidationDetail(ctx, "RequestBindingFailed", nil))
@@ -233,8 +335,32 @@ func (r *restHandler) CreateKN(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	// Record API request parameters: c.Request.RequestURI and body.
-	otellog.LogInfo(ctx, fmt.Sprintf("创建业务知识网络请求参数: [%s,%v]", c.Request.RequestURI, kn))
+	// Record bounded metadata only. The full model can be very large and may
+	// contain business definitions that must not be copied into logs.
+	requestBytes := c.Request.ContentLength
+	if requestBytes < 0 {
+		requestBytes = 0
+	}
+	operationKind := "knowledge_network_create"
+	if len(kn.ConceptGroups)+len(kn.ObjectTypes)+len(kn.RelationTypes)+len(kn.ActionTypes)+
+		len(kn.RiskTypes)+len(kn.Metrics) > 0 {
+		operationKind = "knowledge_network_import"
+	}
+	otellog.LogInfo(ctx, knowledgeNetworkMutationSummary(&kn, mode, bindingPolicy, requestBytes))
+	span.SetAttributes(
+		attr.String("operation_kind", operationKind),
+		attr.String("kn_id", kn.KNID),
+		attr.String("branch", kn.Branch),
+		attr.Int64("request_bytes", requestBytes),
+		attr.String("import_mode", mode),
+		attr.String("binding_policy", bindingPolicy),
+		attr.Int("concept_group_count", len(kn.ConceptGroups)),
+		attr.Int("object_type_count", len(kn.ObjectTypes)),
+		attr.Int("relation_type_count", len(kn.RelationTypes)),
+		attr.Int("action_type_count", len(kn.ActionTypes)),
+		attr.Int("risk_type_count", len(kn.RiskTypes)),
+		attr.Int("metric_count", len(kn.Metrics)),
+	)
 
 	// Validate that the imported model is a knowledge network.
 	if kn.ModuleType != "" && kn.ModuleType != interfaces.MODULE_TYPE_KN {
@@ -319,10 +445,6 @@ func (r *restHandler) CreateKN(c *gin.Context, visitor hydra.Visitor) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
-
-	// Record an audit log after successful creation.
-	audit.NewInfoLog(audit.OPERATION, audit.CREATE, audit.TransforOperator(visitor),
-		interfaces.GenerateKNAuditObject(knID, kn.KNName), "")
 
 	logger.Debug("Handler CreateKN Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
@@ -596,9 +718,6 @@ func (r *restHandler) UpdateKN(c *gin.Context, visitor hydra.Visitor) {
 		return
 	}
 
-	audit.NewInfoLog(audit.OPERATION, audit.UPDATE, audit.TransforOperator(visitor),
-		interfaces.GenerateKNAuditObject(knID, kn.KNName), "")
-
 	logger.Debug("Handler UpdateKN Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	rest.ReplyOK(c, http.StatusNoContent, nil)
@@ -663,10 +782,6 @@ func (r *restHandler) DeleteKN(c *gin.Context) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
-
-	// Record the audit log.
-	audit.NewWarnLog(audit.OPERATION, audit.DELETE, audit.TransforOperator(visitor),
-		interfaces.GenerateKNAuditObject(knID, kn.KNName), audit.SUCCESS, "")
 
 	logger.Debug("Handler DeleteKN Success")
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
@@ -748,7 +863,7 @@ func (r *restHandler) ListAuthorizationResources(c *gin.Context) {
 		}
 		total, err = count, listErr
 	case "action_type":
-		items, count, listErr := r.ats.ListActionTypes(ctx, interfaces.ActionTypesQueryParams{PaginationQueryParameters: page, NamePattern: name, Branch: interfaces.MAIN_BRANCH, KNID: parentID})
+		items, count, listErr := r.ats.ListActionTypeSummaries(ctx, interfaces.ActionTypesQueryParams{PaginationQueryParameters: page, NamePattern: name, Branch: interfaces.MAIN_BRANCH, KNID: parentID})
 		for _, item := range items {
 			entries = append(entries, &interfaces.AuthorizationResource{ID: parentID + "/" + item.ATID, Name: item.ATName})
 		}
@@ -975,8 +1090,11 @@ func (r *restHandler) GetKN(c *gin.Context, visitor hydra.Visitor) {
 		kn.SlimForSummary()
 	}
 
-	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	logger.Debug("Handler GetKN Success")
+	if mode == interfaces.Mode_Export {
+		c.Header("Content-Disposition", exportContentDisposition(kn.KNName, kn.KNID))
+	}
+	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	rest.ReplyOK(c, http.StatusOK, kn)
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bytedance/sonic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -13,8 +14,86 @@ import (
 )
 
 func TestOpenSearchConnectorConvertFilterCondition(t *testing.T) {
+	t.Run("text aliases use the target keyword field", func(t *testing.T) {
+		conn := &OpenSearchConnector{}
+		target := &interfaces.Property{Name: "title", OriginalName: "physical.title", Type: interfaces.DataType_Text,
+			Features: []interfaces.PropertyFeature{{FeatureName: "raw", FeatureType: interfaces.PropertyFeatureType_Keyword,
+				Config: map[string]any{"ignore_above": 8}}}}
+		alias := &interfaces.Property{Name: "title_alias", OriginalName: "title_alias", OriginalType: "alias",
+			Type: interfaces.DataType_Text, Attributes: map[string]any{"path": "physical.title"}}
+		schema := []*interfaces.Property{target, alias}
+		fields := map[string]*interfaces.Property{target.Name: target, alias.Name: alias}
+		for _, operation := range []string{
+			filter_condition.OperationEqual, filter_condition.OperationNotEqual,
+			filter_condition.OperationIn, filter_condition.OperationNotIn,
+			filter_condition.OperationLike, filter_condition.OperationNotLike,
+		} {
+			t.Run(operation, func(t *testing.T) {
+				var value any = "hello"
+				if operation == filter_condition.OperationIn || operation == filter_condition.OperationNotIn {
+					value = []any{"hello"}
+				}
+				cfg := &interfaces.FilterCondCfg{Name: alias.Name, Operation: operation,
+					ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: value}}
+				condition, err := filter_condition.NewFilterCondition(t.Context(), cfg, fields)
+				require.NoError(t, err)
+				dsl, err := conn.ConvertFilterCondition(condition, schema)
+				require.NoError(t, err)
+				encoded, err := sonic.Marshal(dsl)
+				require.NoError(t, err)
+				assert.Contains(t, string(encoded), `"physical.title.raw"`)
+				assert.NotContains(t, string(encoded), "title_alias")
+			})
+		}
+		for _, operation := range []string{filter_condition.OperationEqual, filter_condition.OperationNotEqual,
+			filter_condition.OperationIn, filter_condition.OperationNotIn} {
+			t.Run(operation+" enforces target ignore_above", func(t *testing.T) {
+				var value any = "too-long-value"
+				if operation == filter_condition.OperationIn || operation == filter_condition.OperationNotIn {
+					value = []any{value}
+				}
+				cfg := &interfaces.FilterCondCfg{Name: alias.Name, Operation: operation,
+					ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: value}}
+				condition, err := filter_condition.NewFilterCondition(t.Context(), cfg, fields)
+				require.NoError(t, err)
+				dsl, err := conn.ConvertFilterCondition(condition, schema)
+				require.ErrorContains(t, err, "ignore_above")
+				assert.Nil(t, dsl)
+			})
+		}
+		t.Run("field comparisons resolve aliases on both sides", func(t *testing.T) {
+			cfg := &interfaces.FilterCondCfg{Name: alias.Name, Operation: filter_condition.OperationEqual,
+				ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Field, Value: alias.Name}}
+			condition, err := filter_condition.NewFilterCondition(t.Context(), cfg, fields)
+			require.NoError(t, err)
+			dsl, err := conn.ConvertFilterCondition(condition, schema)
+			require.NoError(t, err)
+			assert.Equal(t, map[string]any{"script": map[string]any{
+				"source": "doc[params.left].value == doc[params.right].value",
+				"params": map[string]any{"left": "physical.title.raw", "right": "physical.title.raw"},
+			}}, dsl)
+		})
+		t.Run("missing keyword feature is still rejected", func(t *testing.T) {
+			target.Features = nil
+			cfg := &interfaces.FilterCondCfg{Name: alias.Name, Operation: filter_condition.OperationEqual,
+				ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: "hello"}}
+			condition, err := filter_condition.NewFilterCondition(t.Context(), cfg, fields)
+			require.NoError(t, err)
+			dsl, err := conn.ConvertFilterCondition(condition, schema)
+			require.ErrorContains(t, err, "no keyword feature")
+			assert.Nil(t, dsl)
+		})
+	})
 	conn := &OpenSearchConnector{}
 	schema := opensearchConditionSchema()
+	t.Run("rejects numeric boolean predicates", func(t *testing.T) {
+		for _, operation := range []string{filter_condition.OperationTrue, filter_condition.OperationFalse} {
+			condition := mustOSCondition(t, osConstCfg("age", operation, nil))
+			got, err := conn.ConvertFilterCondition(condition, schema)
+			require.ErrorContains(t, err, "requires BOOLEAN")
+			assert.Nil(t, got)
+		}
+	})
 	tests := []struct {
 		name string
 		cfg  *interfaces.FilterCondCfg
@@ -394,8 +473,8 @@ func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, got)
 		assert.ErrorContains(t, err, "no keyword feature")
-		_, ok := filter_condition.AsConditionBuildError(err)
-		assert.True(t, ok)
+		var buildErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &buildErr)
 	})
 
 	t.Run("rejects exact text values above keyword ignore_above", func(t *testing.T) {
@@ -409,8 +488,8 @@ func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, got)
 		assert.ErrorContains(t, err, "exceeds keyword ignore_above 256")
-		_, ok := filter_condition.AsConditionBuildError(err)
-		assert.True(t, ok)
+		var buildErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &buildErr)
 	})
 
 	t.Run("rejects exact string values above keyword ignore_above", func(t *testing.T) {
@@ -428,8 +507,8 @@ func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, got)
 		assert.ErrorContains(t, err, "exceeds keyword ignore_above 5")
-		_, ok := filter_condition.AsConditionBuildError(err)
-		assert.True(t, ok)
+		var buildErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &buildErr)
 	})
 
 	t.Run("rejects oversized exact text value when original name is empty", func(t *testing.T) {
@@ -444,8 +523,8 @@ func TestOpenSearchConnectorConvertFilterConditionEqual(t *testing.T) {
 		require.Error(t, err)
 		assert.Nil(t, got)
 		assert.ErrorContains(t, err, "exceeds keyword ignore_above 256")
-		_, ok := filter_condition.AsConditionBuildError(err)
-		assert.True(t, ok)
+		var buildErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &buildErr)
 	})
 
 	t.Run("counts supplementary characters as UTF-16 code units", func(t *testing.T) {

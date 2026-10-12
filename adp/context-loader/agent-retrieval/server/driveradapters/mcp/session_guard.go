@@ -12,8 +12,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"runtime/debug"
+	"strings"
 
 	"github.com/bytedance/sonic"
 	mcpsdk "github.com/mark3labs/mcp-go/mcp"
@@ -24,12 +26,16 @@ import (
 )
 
 type bknContext struct {
-	ConversationID    string                 `json:"conversation_id"`
-	InteractionID     string                 `json:"interaction_id"`
-	OperationKey      string                 `json:"operation_key"`
-	ParentOperationID string                 `json:"parent_operation_id,omitempty"`
-	CausationEventIDs []string               `json:"causation_event_ids,omitempty"`
-	BusinessRefs      []bkntrace.BusinessRef `json:"business_refs,omitempty"`
+	ConversationID    string   `json:"conversation_id"`
+	InteractionID     string   `json:"interaction_id"`
+	OperationKey      string   `json:"operation_key"`
+	ParentOperationID string   `json:"parent_operation_id,omitempty"`
+	CausationEventIDs []string `json:"causation_event_ids,omitempty"`
+	// BusinessRefs are derived from the validated request; DeclaredBusinessRefs
+	// are what the caller sent. Only the first kind reaches a receipt, see
+	// bkntrace.BusinessContext.
+	BusinessRefs         []bkntrace.BusinessRef `json:"business_refs,omitempty"`
+	DeclaredBusinessRefs []bkntrace.BusinessRef `json:"-"`
 }
 
 type operationIntent struct {
@@ -50,6 +56,7 @@ type operationResult struct {
 }
 
 type lifecycleError struct {
+	HTTPStatus           int    `json:"-"`
 	Code                 string `json:"code"`
 	Message              string `json:"message"`
 	CurrentStatus        string `json:"current_status,omitempty"`
@@ -83,7 +90,23 @@ func guardBusinessToolCallWithCompletion(
 	next func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error),
 ) func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		callerContext := ctx
+		ctx = bkntrace.WithTraceAvailability(ctx)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		var correlationErr error
+		ctx, correlationErr = bkntrace.EnsureTraceCorrelation(ctx)
+		if correlationErr != nil {
+			return nil, correlationErr
+		}
 		arguments := req.GetArguments()
+		if _, supplied := arguments["bkn_context"]; !supplied {
+			return lifecycleToolError(lifecycleError{
+				Code: "conversation_required", Message: "bkn_context is required",
+				RequiredAction: "bkn_start_interaction",
+			}), nil
+		}
 		rawContext, _ := arguments["bkn_context"].(map[string]any)
 		conversationID, _ := rawContext["conversation_id"].(string)
 		if conversationID == "" {
@@ -111,29 +134,29 @@ func guardBusinessToolCallWithCompletion(
 		operationKey := managedOperationKey(
 			ctx, req, conversationID, interactionID, arguments, hints.ClientInvocationID,
 		)
-		if ensure == nil {
-			return nil, fmt.Errorf("lifecycle operation client is not configured")
-		}
 		currentKnID := getStringArg(req, "kn_id", getKnIDFromHeader(req))
-		businessRefs, validationErr := parseBusinessRefs(
+		declaredRefs, validationErr := parseBusinessRefs(
 			rawContext["business_refs"],
 			currentKnID,
 		)
 		if validationErr != nil {
 			return lifecycleToolError(*validationErr), nil
 		}
-		businessRefs = mergeToolBusinessRefs(
-			businessRefs,
-			observedToolBusinessRefs(req.Params.Name, arguments, currentKnID),
-		)
+		if bkntrace.CaptureDisabled() {
+			return executeUntracedBusiness(ctx, req, next, "policy", "capture_disabled")
+		}
+		if ensure == nil {
+			return executeUntracedBusiness(ctx, req, next, "ensure_operation", "feature_not_installed")
+		}
 		intent := operationIntent{
 			Context: bknContext{
-				ConversationID:    conversationID,
-				InteractionID:     interactionID,
-				OperationKey:      operationKey,
-				ParentOperationID: stringValue(rawContext["parent_operation_id"]),
-				CausationEventIDs: stringSliceValue(rawContext["causation_event_ids"]),
-				BusinessRefs:      businessRefs,
+				ConversationID:       conversationID,
+				InteractionID:        interactionID,
+				OperationKey:         operationKey,
+				ParentOperationID:    stringValue(rawContext["parent_operation_id"]),
+				CausationEventIDs:    stringSliceValue(rawContext["causation_event_ids"]),
+				BusinessRefs:         derivedToolBusinessRefs(req.Params.Name, arguments, currentKnID),
+				DeclaredBusinessRefs: declaredRefs,
 			},
 			ToolName:    req.Params.Name,
 			MCPToolName: req.Params.Name,
@@ -144,10 +167,29 @@ func guardBusinessToolCallWithCompletion(
 			Input:              arguments,
 		}
 		ensured, lifecycleErr, err := ensure(ctx, intent)
-		if err != nil {
+		if err != nil || lifecycleErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			var apiErr *bkntrace.APIError
+			if lifecycleErr != nil {
+				value := bkntrace.APIError(*lifecycleErr)
+				apiErr = &value
+			}
+			if bkntrace.IsCaptureDisabledError(apiErr) {
+				return executeUntracedBusiness(ctx, req, next, "policy", "capture_disabled")
+			}
+			if bkntrace.IsTraceInfrastructureFailure(apiErr, err) {
+				code := lifecycleAvailabilityError(err).Code
+				if lifecycleErr != nil {
+					code = lifecycleErr.Code
+				}
+				return executeUntracedBusiness(ctx, req, next, "ensure_operation", code)
+			}
+			if lifecycleErr != nil {
+				return lifecycleToolError(*lifecycleErr), nil
+			}
 			return lifecycleUnavailable(ctx, req.Params.Name, "ensure_operation", err), nil
-		} else if lifecycleErr != nil {
-			return lifecycleToolError(*lifecycleErr), nil
 		}
 		status := ""
 		if ensured != nil {
@@ -171,6 +213,14 @@ func guardBusinessToolCallWithCompletion(
 			traceContext.Attempt = attempt
 			ctx = common.SetTraceContextToCtx(ctx, traceContext)
 		}
+		// Registration may have committed just as the caller cancelled. Leave
+		// that real receipt pending; never claim an execution or retry business.
+		if callerContext.Err() != nil {
+			return nil, callerContext.Err()
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		result, err, failure := callBusinessTool(ctx, req, next)
 		if err != nil {
 			failure = &operationFailure{
@@ -191,17 +241,22 @@ func guardBusinessToolCallWithCompletion(
 			logger.DefaultLogger().WithContext(ctx).Errorf(
 				"[BKN Trace] failed to finalize MCP tool %q: %v", req.Params.Name, err,
 			)
+			bkntrace.MarkTraceUnavailable(ctx, "finish_operation", req.Params.Name, "trace_finish_unconfirmed")
+			attachTraceAvailability(result, ctx)
 			return result, nil
 		}
 		if lifecycleErr != nil {
 			logger.DefaultLogger().WithContext(ctx).Errorf(
 				"[BKN Trace] failed to finalize MCP tool %q: %s", req.Params.Name, lifecycleErr.Code,
 			)
+			bkntrace.MarkTraceUnavailable(ctx, "finish_operation", req.Params.Name, lifecycleErr.Code)
+			attachTraceAvailability(result, ctx)
 			return result, nil
 		}
 		if completed != nil {
 			attachReceipt(result, managedToolReceiptView(req.Params.Name, completed.Receipt))
 		}
+		attachTraceAvailability(result, ctx)
 		return result, nil
 	}
 }
@@ -303,52 +358,14 @@ func parseBusinessRefs(value any, currentKnID string) ([]bkntrace.BusinessRef, *
 	}
 }
 
-// observedToolBusinessRefs derives references only from validated, structured
+// derivedToolBusinessRefs derives references only from validated, structured
 // tool inputs. It is deliberately capability-specific: answer text, labels and
 // domain names never participate in evidence scope.
-func observedToolBusinessRefs(toolName string, arguments map[string]any, currentKnID string) []bkntrace.BusinessRef {
-	if currentKnID == "" {
-		return nil
-	}
-	if inputKnID := stringValue(arguments["kn_id"]); inputKnID != "" && inputKnID != currentKnID {
-		return nil
-	}
-	refs := []bkntrace.BusinessRef{
-		{RefType: "knowledge_network", RefID: "kn:" + currentKnID, Version: "unversioned"},
-	}
-	switch toolName {
-	case toolKeyGetKnDetail:
-		return refs
-	case toolKeyGetObjectTypes, toolKeyGetRelationTypes:
-		// These tools accept a display name as well as a canonical ID. The
-		// operation scope records the known network; the schema snapshot records
-		// the actual returned type IDs after lookup and permission filtering.
-		return refs
-	case toolKeyQueryMetric:
-		metricID := stringValue(arguments["metric_id"])
-		if metricID == "" {
-			return nil
-		}
-		return append(refs, bkntrace.BusinessRef{RefType: "metric", RefID: "metric:" + currentKnID + ":" + metricID, Version: "unversioned"})
-	default:
-		return nil
-	}
-}
-
-func mergeToolBusinessRefs(declared, observed []bkntrace.BusinessRef) []bkntrace.BusinessRef {
-	merged := make([]bkntrace.BusinessRef, 0, len(declared)+len(observed))
-	seen := make(map[string]struct{}, len(declared)+len(observed))
-	for _, refs := range [][]bkntrace.BusinessRef{declared, observed} {
-		for _, ref := range refs {
-			key := ref.RefType + "\x00" + ref.RefID
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			merged = append(merged, ref)
-		}
-	}
-	return merged
+//
+// These are the request tier of the reference hierarchy: what evidence
+// observes outranks them, and what the caller declared never does.
+func derivedToolBusinessRefs(toolName string, arguments map[string]any, currentKnID string) []bkntrace.BusinessRef {
+	return bkntrace.DeriveToolBusinessRefs(toolName, arguments, currentKnID)
 }
 
 func callBusinessTool(
@@ -395,7 +412,42 @@ func lifecycleUnavailable(ctx context.Context, toolName, stage string, err error
 		"[BKN Trace] lifecycle unavailable: tool=%s stage=%s code=%s: %v",
 		toolName, stage, value.Code, err,
 	)
+	if bkntrace.IsTraceInfrastructureFailure(nil, err) {
+		if toolName == toolKeyStartInteraction {
+			return lifecycleToolError(value)
+		}
+		return lifecycleUnrecordedResult(ctx, toolName, stage, value.Code)
+	}
 	return lifecycleToolError(value)
+}
+
+func lifecycleUnrecordedResult(ctx context.Context, toolName, stage, code string) *mcpsdk.CallToolResult {
+	bkntrace.MarkTraceUnavailable(ctx, stage, "", code)
+	result, _ := lifecycleSuccessResult(map[string]any{
+		"trace_recorded": false, "trace_available": false, "stage": stage, "code": code,
+	})
+	attachTraceAvailability(result, ctx)
+	return result
+}
+
+func lifecycleAPIResult(ctx context.Context, toolName, stage string, value bkntrace.APIError) *mcpsdk.CallToolResult {
+	if bkntrace.IsCaptureDisabledError(&value) {
+		return lifecycleToolError(traceCoreError(value))
+	}
+	if bkntrace.IsTraceInfrastructureFailure(&value, nil) {
+		if toolName == toolKeyStartInteraction {
+			startError := traceCoreError(value)
+			if startError.Code == "feature_not_installed" {
+				startError.RequiredAction = "contact_platform_operator"
+			} else {
+				startError.Retryable = true
+				startError.RequiredAction = "retry_later"
+			}
+			return lifecycleToolError(startError)
+		}
+		return lifecycleUnrecordedResult(ctx, toolName, stage, value.Code)
+	}
+	return lifecycleToolError(traceCoreError(value))
 }
 
 func lifecycleAvailabilityError(err error) lifecycleError {
@@ -406,10 +458,10 @@ func lifecycleAvailabilityError(err error) lifecycleError {
 			Code: "feature_not_installed", Message: "BKN Trace Core is not configured",
 		}
 	}
-	// An ingest URL that does not end in /events leaves no artifact endpoint to
-	// derive. Like a missing ingest credential, that is a deployment defect: as a
-	// plain error it read as a transient outage, so the question artifact was
-	// dropped on every start with nothing but a warning to show for it.
+	// A missing artifact endpoint is, like a missing ingest credential, a
+	// deployment defect: as a plain error it read as a transient outage, and a
+	// completed finish without an answer artifact is refused by Core with an
+	// error that points at neither the cause nor the service at fault.
 	if errors.Is(err, bkntrace.ErrEvidenceArtifactURLNotConfigured) {
 		return lifecycleError{
 			Code: "evidence_capture_failed", Message: err.Error(),
@@ -641,4 +693,74 @@ func lifecycleToolErrorWithDetails(value lifecycleError, details map[string]any)
 	}
 	raw, _ := sonic.Marshal(envelope)
 	return mcpsdk.NewToolResultError(string(raw))
+}
+
+const traceAvailabilityMetaKey = "openbkn.ai/trace"
+const traceAvailabilityDiagnosticPrefix = `[BKN_TRACE]`
+
+func attachTraceAvailability(result *mcpsdk.CallToolResult, ctx context.Context) {
+	attachTraceAvailabilityValue(result, bkntrace.TraceAvailabilityFromContext(ctx))
+}
+
+func attachTraceAvailabilityValue(result *mcpsdk.CallToolResult, value map[string]any) {
+	if result == nil {
+		return
+	}
+	if value == nil {
+		return
+	}
+	if result.Meta == nil {
+		result.Meta = &mcpsdk.Meta{}
+	}
+	result.Meta.AdditionalFields = maps.Clone(result.Meta.AdditionalFields)
+	if result.Meta.AdditionalFields == nil {
+		result.Meta.AdditionalFields = map[string]any{}
+	}
+	result.Meta.AdditionalFields[traceAvailabilityMetaKey] = value
+	diagnostic, err := sonic.Marshal(map[string]any{"bkn_trace": value})
+	if err != nil {
+		return
+	}
+	diagnosticIndex := -1
+	for i, content := range result.Content {
+		text, ok := mcpsdk.AsTextContent(content)
+		if !ok || !strings.HasPrefix(text.Text, traceAvailabilityDiagnosticPrefix) {
+			continue
+		}
+		var existing map[string]any
+		if sonic.Unmarshal([]byte(strings.TrimPrefix(text.Text, traceAvailabilityDiagnosticPrefix)), &existing) == nil {
+			if _, ok := existing["bkn_trace"].(map[string]any); ok {
+				diagnosticIndex = i
+				break
+			}
+		}
+	}
+	if diagnosticIndex >= 0 {
+		result.Content[diagnosticIndex] = mcpsdk.NewTextContent(traceAvailabilityDiagnosticPrefix + string(diagnostic))
+	} else {
+		result.Content = append(result.Content, mcpsdk.NewTextContent(traceAvailabilityDiagnosticPrefix+string(diagnostic)))
+	}
+}
+
+func executeUntracedBusiness(ctx context.Context, req mcpsdk.CallToolRequest, next func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error), stage, code string) (*mcpsdk.CallToolResult, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if code != "capture_disabled" {
+		bkntrace.MarkTraceUnavailable(ctx, stage, req.Params.Name, code)
+	}
+	ctx = bkntrace.ClearManagedTraceContext(ctx)
+	arguments := maps.Clone(req.GetArguments())
+	// PTC uses the validated IDs for its sandbox workspace and for nested MCP
+	// calls. Those child calls still require bkn_context when capture is off.
+	if req.Params.Name != "run_code" && req.Params.Name != "run_shell" {
+		delete(arguments, "bkn_context")
+	}
+	req.Params.Arguments = arguments
+	result, err, _ := callBusinessTool(ctx, req, next)
+	if err != nil {
+		result, err = mcpsdk.NewToolResultError(err.Error()), nil
+	}
+	attachTraceAvailability(result, ctx)
+	return result, err
 }

@@ -16,7 +16,7 @@
     "axios": "^1.7.7",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.2"
+    "react-router-dom": "^7.18.4"
   },
   "devDependencies": {
     "@rsbuild/core": "^1.0.1",
@@ -30,6 +30,7 @@
   },
   "overrides": {
     "@rspack/core": "1.7.3",
-    "@rspack/binding": "1.7.3"
+    "@rspack/binding": "1.7.3",
+    "dompurify": "^3.4.13"
   }
 }

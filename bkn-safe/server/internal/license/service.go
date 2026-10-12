@@ -55,6 +55,21 @@ var (
 	ErrOfflineDeployment = errors.New("license: no license server configured (offline deployment)")
 )
 
+// bindingCheckInterval is how often an online cluster asks the issuer whether
+// its certificate is still bound. It runs on the hourly tick, so the real gap
+// is 6–7 hours, and each cluster's phase is set by when its bkn-safe started.
+// Compiled in on purpose: a cluster that wants to dodge the check can simply
+// block egress, so a knob would protect nothing and only add a support case.
+const bindingCheckInterval = 6 * time.Hour
+
+// bindingCheckMinGap throttles checks triggered by an admin opening the
+// license page, so a burst of refreshes is one issuer call, not many.
+const bindingCheckMinGap = time.Minute
+
+// bindingCheckTimeout bounds a check made while an admin waits on the page.
+// Timing out is harmless: no answer means no change.
+const bindingCheckTimeout = 5 * time.Second
+
 // Service owns the license row and the verification/renewal loop. All gating
 // answers come from the embedded licverify.Guard's atomic snapshot.
 type Service struct {
@@ -64,24 +79,40 @@ type Service struct {
 	fp        string
 	serverURL string
 	hc        *http.Client
-	audit     *audit.Store
+	audit     interface {
+		Record(context.Context, audit.Entry) error
+	}
 
 	// mu serializes mutations (import/activate/remove). Reads go through the
 	// guard snapshot and need no lock.
 	mu           sync.Mutex
 	lastRenewErr string
 
+	// binding caches the row's Binding column ("" / "unbound" / "revoked").
+	// It is refreshed on every load of the row, which the guard does on each
+	// evaluation and the distribution endpoint does on each module poll, so
+	// replicas converge without a query on the gating hot path.
+	binding atomic.Value // string
+
 	// firstRunAt caches the resolved first-run time: the guard asks for it on
 	// every state evaluation, and that must not become a query per call. Zero
 	// means "not resolved yet" — see firstRun for why a failure is not cached.
 	firstRunAt atomic.Int64
+
+	// lastPageCheck throttles page-open binding checks on this replica (unix
+	// nanoseconds). It is kept apart from the row's binding_checked_at because
+	// a failed page check must not push the shared schedule forward; see
+	// checkBindingOlderThan.
+	lastPageCheck atomic.Int64
 }
 
 // New builds the service with the official compiled-in key table. The
 // fingerprint comes from licverify (OPENBKN_INSTANCE_ID in K8s); failing to
 // resolve one is an error — the caller decides whether to run without a
 // license hub, bkn-safe itself must not be blocked by licensing.
-func New(db *gorm.DB, cfg config.LicenseConfig, aud *audit.Store) (*Service, error) {
+func New(db *gorm.DB, cfg config.LicenseConfig, aud interface {
+	Record(context.Context, audit.Entry) error
+}) (*Service, error) {
 	return NewWithKeyTable(db, cfg, aud, keys.Official())
 }
 
@@ -89,7 +120,9 @@ func New(db *gorm.DB, cfg config.LicenseConfig, aud *audit.Store) (*Service, err
 // Production code has exactly one caller: New with keys.Official(). Keys are
 // compiled in, never read from config, env, or any endpoint (hard rule — a
 // configurable key is a self-signing hole).
-func NewWithKeyTable(db *gorm.DB, cfg config.LicenseConfig, aud *audit.Store, keyTable map[string]ed25519.PublicKey) (*Service, error) {
+func NewWithKeyTable(db *gorm.DB, cfg config.LicenseConfig, aud interface {
+	Record(context.Context, audit.Entry) error
+}, keyTable map[string]ed25519.PublicKey) (*Service, error) {
 	fp, err := licverify.Fingerprint()
 	if err != nil {
 		return nil, fmt.Errorf("license: resolve instance fingerprint: %w", err)
@@ -130,8 +163,25 @@ func NewWithKeyTable(db *gorm.DB, cfg config.LicenseConfig, aud *audit.Store, ke
 	return s, nil
 }
 
-// State returns the current gating snapshot (atomic, hot-path safe).
-func (s *Service) State() licverify.Snapshot { return s.guard.State() }
+// State returns the current gating snapshot (atomic, hot-path safe). A
+// certificate the issuer has since unbound or revoked reads as unlicensed: its
+// signature is still good, but it no longer belongs to this cluster (#1782).
+// The payload stays, so the admin page can still say which license it was.
+func (s *Service) State() licverify.Snapshot { return s.withBinding(s.guard.State()) }
+
+func (s *Service) withBinding(snap licverify.Snapshot) licverify.Snapshot {
+	if snap.Payload != nil && s.Binding() != "" {
+		snap.State = licverify.StateUnlicensed
+	}
+	return snap
+}
+
+// Binding is the issuer's last definitive answer that took this certificate
+// away: BindingUnbound, BindingRevoked, or "" while it is still ours.
+func (s *Service) Binding() string {
+	b, _ := s.binding.Load().(string)
+	return b
+}
 
 // Gate turns the hub's own verified snapshot into the tier every paid call site
 // judges against. bkn-safe is the cluster's licence holder, not a consumer, so
@@ -159,7 +209,7 @@ func Gate(s *Service) entitlement.Gate {
 		if s == nil {
 			return entitlement.Snapshot{Edition: licverify.EditionCommunity}
 		}
-		snap := s.guard.State()
+		snap := s.State()
 		// Outside valid/grace the certificate grants nothing, even though an
 		// expired one still carries a payload with a paid edition in it.
 		// Reading that edition would hand out capability the licence no longer
@@ -199,16 +249,17 @@ func inForce(snap licverify.Snapshot) bool {
 // There is deliberately no per-feature form of this. Authorisation is by tier
 // (ee-design.md §3.1); the certificate's features[] is display and audit data,
 // and a FeatureEnabled(key) helper is how fine-grained gating creeps back in.
-func (s *Service) InForce() bool { return inForce(s.guard.State()) }
+func (s *Service) InForce() bool { return inForce(s.State()) }
 
 // Fingerprint returns this cluster's instance fingerprint. Available with or
 // without a license — the activation guide shows it before anything is imported.
 func (s *Service) Fingerprint() string { return s.fp }
 
-// Activated reports whether the current license is bound to this instance.
+// Activated reports whether the current license is bound to this instance: the
+// certificate names our fingerprint and the issuer has not since taken it back.
 func (s *Service) Activated() bool {
 	snap := s.guard.State()
-	return snap.Payload != nil && snap.Payload.HWFingerprint != ""
+	return snap.Payload != nil && snap.Payload.HWFingerprint != "" && s.Binding() == ""
 }
 
 // ActivationRequest returns what the customer pastes into the license portal
@@ -230,12 +281,17 @@ func (s *Service) ActivationRequest() (fp, licID string) {
 
 // Current returns the raw license text and its ETag for module distribution.
 // The ETag changes exactly when the text changes (renewal, import).
+//
+// An unbound or revoked certificate is withheld. Modules verify the text
+// themselves and would keep honouring its signature, so not handing it out is
+// the only way the downgrade reaches them; they already read "no license" as
+// community.
 func (s *Service) Current() (text, etag string, err error) {
 	text, err = s.loadText()
 	if err != nil {
 		return "", "", err
 	}
-	if text == "" {
+	if text == "" || s.Binding() != "" {
 		return "", "", ErrNoLicense
 	}
 	return text, ETag(text), nil
@@ -319,6 +375,117 @@ func (s *Service) Remove(ctx context.Context) error {
 	return nil
 }
 
+// CheckBinding asks the issuer whether the installed certificate is still
+// bound to this cluster and records a definitive answer. Every failure to get
+// one (offline deployment, network, older issuer) leaves the state alone and
+// returns the error for logging: an issuer outage must never downgrade anyone.
+//
+// Only a certificate that names our fingerprint is checked; an unactivated one
+// is already shown as pending activation and has nothing to lose.
+//
+// The answer is written only if the row still holds the text that was asked
+// about. An admin re-activating while the check is in flight stores a fresh
+// text, and a late "unbound" about the old one must not land on it.
+func (s *Service) CheckBinding(ctx context.Context) error {
+	return s.checkBinding(ctx, true)
+}
+
+// checkBinding is CheckBinding with a choice about failed attempts.
+// recordFailure stamps binding_checked_at even when no answer came back, so
+// the periodic path retries a dead issuer on its own schedule instead of every
+// tick. The page path passes false: its 5-second budget can fail against an
+// issuer the periodic path's 30 seconds would reach, and stamping those
+// failures would keep pushing the periodic check back for as long as someone
+// keeps opening the page.
+func (s *Service) checkBinding(ctx context.Context, recordFailure bool) error {
+	if s.serverURL == "" {
+		return ErrOfflineDeployment
+	}
+	var row model.License
+	if err := s.db.WithContext(ctx).First(&row, "id = ?", rowID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNoLicense
+		}
+		return err
+	}
+	if _, p := licverify.Eval(row.Text, s.keys); p == nil || p.HWFingerprint == "" {
+		return nil
+	}
+	status, err := checkBinding(ctx, s.hc, s.serverURL, row.Text, s.fp)
+	now := time.Now().Unix()
+	if err != nil {
+		// Keep whatever the last real answer was either way.
+		if recordFailure {
+			s.db.Model(&model.License{}).Where("id = ? AND version = ?", rowID, row.Version).
+				Update("binding_checked_at", now)
+		}
+		return err
+	}
+	binding := ""
+	if status != BindingBound {
+		binding = status
+	}
+	res := s.db.WithContext(ctx).Model(&model.License{}).
+		Where("id = ? AND version = ?", rowID, row.Version).
+		Updates(map[string]any{"binding": binding, "binding_checked_at": now})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected == 0 {
+		return nil // the text changed under us; the next check asks about the new one
+	}
+	if binding != row.Binding {
+		slog.Warn("license: issuer binding changed", "from", bindingLabel(row.Binding), "to", status)
+		s.auditRecord("license.binding-change", fmt.Sprintf("%s -> %s", bindingLabel(row.Binding), status))
+	}
+	s.guard.Refresh()
+	return nil
+}
+
+// CheckBindingIfStale is the page-open trigger: at most one issuer call per
+// bindingCheckMinGap on this replica, bounded by bindingCheckTimeout. Its
+// failures are not recorded in the shared schedule (see checkBinding).
+func (s *Service) CheckBindingIfStale(ctx context.Context) {
+	if s.serverURL == "" {
+		return
+	}
+	now := time.Now()
+	if last := s.lastPageCheck.Load(); last != 0 && now.Sub(time.Unix(0, last)) < bindingCheckMinGap {
+		s.guard.Refresh() // still pick up another replica's answer
+		return
+	}
+	s.lastPageCheck.Store(now.UnixNano())
+	s.checkBindingOlderThan(ctx, bindingCheckMinGap, bindingCheckTimeout, false)
+}
+
+func (s *Service) checkBindingOlderThan(ctx context.Context, age, timeout time.Duration, recordFailure bool) {
+	if s.serverURL == "" {
+		return
+	}
+	var row model.License
+	if err := s.db.WithContext(ctx).Select("binding_checked_at").First(&row, "id = ?", rowID).Error; err != nil {
+		return
+	}
+	if time.Since(time.Unix(row.BindingCheckedAt, 0)) < age {
+		// Another replica may have recorded an answer since this one last
+		// read the row; pick it up so every pod tells the admin the same thing.
+		s.guard.Refresh()
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := s.checkBinding(cctx, recordFailure); err != nil {
+		slog.Info("license: binding check skipped", "err", err)
+	}
+}
+
+func bindingLabel(b string) string {
+	if b == "" {
+		return BindingBound
+	}
+	return b
+}
+
 // RenewNow forces one renewing evaluation (what an hourly tick does). Blocking.
 func (s *Service) RenewNow() licverify.Snapshot {
 	snap := s.guard.RenewNow()
@@ -339,6 +506,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-t.C:
 			s.RenewNow()
 			s.checkClock(time.Now())
+			s.checkBindingOlderThan(ctx, bindingCheckInterval, 30*time.Second, true)
 		}
 	}
 }
@@ -391,11 +559,13 @@ func (s *Service) loadText() (string, error) {
 	var row model.License
 	err := s.db.First(&row, "id = ?", rowID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
+		s.binding.Store("")
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	s.binding.Store(row.Binding)
 	return row.Text, nil
 }
 
@@ -414,7 +584,9 @@ func (s *Service) storeText(text string) error {
 	}
 	res := s.db.Model(&model.License{}).
 		Where("id = ? AND version = ?", rowID, row.Version).
-		Updates(map[string]any{"text": text, "version": row.Version + 1})
+		// A new text is a new answer from the issuer (activation, renewal) or a
+		// deliberate admin import; either way the old verdict no longer applies.
+		Updates(storeUpdates(row, text))
 	if res.Error != nil {
 		return res.Error
 	}
@@ -422,6 +594,23 @@ func (s *Service) storeText(text string) error {
 		return errors.New("license: lost concurrent update, keeping the other writer's text")
 	}
 	return nil
+}
+
+// storeUpdates is the row change for storing text over row.
+//
+// Clearing a verdict is not a fresh one: re-importing the very certificate the
+// issuer revoked stores it without contacting the issuer. So when a verdict is
+// cleared the schedule is reset too, and the next tick or page open asks
+// straight away. Only then, though: near the contract end the guard renews on
+// every hourly tick (the window is measured from the original issue date), and
+// resetting on each of those renewals would turn the 6-hour check hourly.
+func storeUpdates(row model.License, text string) map[string]any {
+	u := map[string]any{"text": text, "version": row.Version + 1}
+	if row.Binding != "" {
+		u["binding"] = ""
+		u["binding_checked_at"] = 0
+	}
+	return u
 }
 
 // checkClock persists the max timestamp ever seen and flags large rollbacks —

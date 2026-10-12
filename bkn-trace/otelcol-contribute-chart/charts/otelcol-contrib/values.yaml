@@ -8,13 +8,27 @@ fullnameOverride: ""
 
 mode: deployment
 image:
-  registry: docker.io
-  repository: otel/opentelemetry-collector-contrib
-  tag: "0.148.0"
+  registry: ghcr.io/openbkn-ai
+  repository: otelcol-openbkn
+  # Replaced by reusable-chart.yml with the product release version. Keeping
+  # this as a placeholder prevents a chart from pointing at an unpublished
+  # OCB development image.
+  tag: "__VERSION__"
   pullPolicy: IfNotPresent
   name: opentelemetry-collector-contrib
 
 replicaCount: 1
+
+# The processor reads policy and reports state through internal cluster endpoints.
+traceAdmission:
+  enabled: true
+  policyURL: http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/policy
+  configurationURL: http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/configuration
+  heartbeatURL: http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat
+  ackURLBase: http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/operations
+  workloadIdentity: "trace-gateway"
+  pollInterval: 10s
+  httpTimeout: 3s
 
 serviceAccount:
   create: true
@@ -136,10 +150,26 @@ config:
       check_interval: 1s
       limit_mib: 512
       spike_limit_mib: 128
+    filter/log-principal:
+      error_mode: ignore
+      logs:
+        log_record:
+          - 'attributes["actor_id"] == nil'
+          - 'attributes["actor_id"] == ""'
+          - 'attributes["actor_id"] == "anonymous"'
+          - 'attributes["actor_id"] == "anonymous-user"'
     batch:
       timeout: 1s
       send_batch_size: 512
       send_batch_max_size: 1024
+    traceadmission:
+      policy_url: ${env:TRACE_ADMISSION_POLICY_URL}
+      configuration_url: ${env:TRACE_ADMISSION_CONFIGURATION_URL}
+      heartbeat_url: ${env:TRACE_ADMISSION_HEARTBEAT_URL}
+      ack_url_base: ${env:TRACE_ADMISSION_ACK_URL_BASE}
+      workload_identity: ${env:TRACE_ADMISSION_WORKLOAD_IDENTITY}
+      poll_interval: ${env:TRACE_ADMISSION_POLL_INTERVAL}
+      http_timeout: ${env:TRACE_ADMISSION_HTTP_TIMEOUT}
 
   service:
     extensions: [health_check]
@@ -154,11 +184,11 @@ config:
     pipelines:
       traces:
         receivers: [otlp]
-        processors: [memory_limiter, batch]
+        processors: [memory_limiter, traceadmission, batch]
         exporters: [opensearch]
       logs:
         receivers: [otlp]
-        processors: [memory_limiter, batch]
+        processors: [memory_limiter, filter/log-principal, batch]
         exporters: [opensearch]
 
 extraArgs: []

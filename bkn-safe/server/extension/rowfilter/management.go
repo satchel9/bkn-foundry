@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/openbkn-ai/licverify"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/permissionproposal"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/entitlement"
 )
 
@@ -34,22 +35,42 @@ type PublishedObjectType struct {
 // authorization, caller expansion and published-model capability resolution
 // happen here; the EE handler never accepts any of them from client input.
 type ManagementServices interface {
-	AuthorizeUserRead(context.Context, string) (bool, error)
-	AuthorizeUserWrite(context.Context, string) (bool, error)
-	AuthorizeRoleRead(context.Context, string) (bool, error)
-	AuthorizeRoleWrite(context.Context, string) (bool, error)
+	AuthorizeUserRead(ctx context.Context, operatorID, objectTypeRef string) (bool, error)
+	AuthorizeUserWrite(ctx context.Context, operatorID, objectTypeRef string) (bool, error)
+	AuthorizeRoleRead(ctx context.Context, operatorID, objectTypeRef string) (bool, error)
+	AuthorizeRoleWrite(ctx context.Context, operatorID, objectTypeRef string) (bool, error)
+	CanInspectRoleMembership(ctx context.Context, operatorID string) (bool, error)
+	GrantSubjectExists(ctx context.Context, subjectType, subjectID string) (bool, error)
 	ResolveCaller(context.Context, string) (Caller, error)
 	ResolvePublishedObjectType(ctx context.Context, operatorID, objectTypeRef string) (PublishedObjectType, error)
 }
 
 type OperatorIDResolver func(*http.Request) (string, bool)
-type ManagementHandlerFactory func(ManagementServices, OperatorIDResolver) http.Handler
+
+type ManagementAuditResult struct {
+	Action        string
+	SubjectType   string
+	SubjectID     string
+	ObjectTypeRef string
+}
+
+type ManagementAuditReporter func(*http.Request, ManagementAuditResult)
+type ManagementHandlerFactory func(ManagementServices, OperatorIDResolver, ManagementAuditReporter) http.Handler
+type PermissionProposalHandlerFactory func(ManagementServices) permissionproposal.Handler
 
 var (
 	managementFactory    ManagementHandlerFactory
 	managementMinEdition licverify.Edition
 	managementFrozen     bool
+	proposalFactory      PermissionProposalHandlerFactory
 )
+
+func RegisterPermissionProposalHandler(factory PermissionProposalHandlerFactory) {
+	if factory == nil || proposalFactory != nil {
+		panic("rowfilter: invalid permission proposal handler registration")
+	}
+	proposalFactory = factory
+}
 
 func RegisterManagementHandler(min licverify.Edition, factory ManagementHandlerFactory) {
 	if factory == nil {
@@ -88,6 +109,11 @@ func ManagementGate() gin.HandlerFunc {
 }
 
 type managementOperatorContextKey struct{}
+type managementAuditContextKey struct{}
+
+type managementAuditHolder struct {
+	result *ManagementAuditResult
+}
 
 func operatorIDFromRequest(request *http.Request) (string, bool) {
 	operatorID, ok := request.Context().Value(managementOperatorContextKey{}).(string)
@@ -102,27 +128,45 @@ func ManagementOperatorID(ctx context.Context) (string, bool) {
 	return operatorID, ok && operatorID != ""
 }
 
+func reportManagementAudit(request *http.Request, result ManagementAuditResult) {
+	if request == nil {
+		return
+	}
+	if holder, ok := request.Context().Value(managementAuditContextKey{}).(*managementAuditHolder); ok && holder != nil {
+		copy := result
+		holder.result = &copy
+	}
+}
+
 // MountManagement returns false until the Enterprise implementation and the
 // published-model resolver are both assembled. This is a fail-closed release
 // gate: a management write surface without field validation is unsafe.
-func MountManagement(group *gin.RouterGroup, services ManagementServices, resolveOperator func(*gin.Context) (string, bool)) bool {
+func MountManagement(group *gin.RouterGroup, services ManagementServices, resolveOperator func(*gin.Context) (string, bool), consumeAudit func(*gin.Context, ManagementAuditResult)) bool {
 	managementFrozen = true
 	if managementFactory == nil {
 		return false
 	}
-	if group == nil || services == nil || resolveOperator == nil {
+	if group == nil || services == nil || resolveOperator == nil || consumeAudit == nil {
 		panic("rowfilter: incomplete management route dependencies")
 	}
-	handler := managementFactory(services, operatorIDFromRequest)
+	handler := managementFactory(services, operatorIDFromRequest, reportManagementAudit)
 	if handler == nil {
 		panic("rowfilter: management handler factory returned nil")
 	}
+	if proposalFactory != nil {
+		permissionproposal.Register("row_filter", proposalFactory(services))
+	}
 	serve := func(c *gin.Context) {
 		request := c.Request
+		holder := &managementAuditHolder{}
+		request = request.WithContext(context.WithValue(request.Context(), managementAuditContextKey{}, holder))
 		if operatorID, ok := resolveOperator(c); ok {
 			request = request.WithContext(context.WithValue(request.Context(), managementOperatorContextKey{}, operatorID))
 		}
 		handler.ServeHTTP(c.Writer, request)
+		if holder.result != nil {
+			consumeAudit(c, *holder.result)
+		}
 	}
 	group.GET("/row-filter-policies", serve)
 	group.PATCH("/row-filter-policies", serve)

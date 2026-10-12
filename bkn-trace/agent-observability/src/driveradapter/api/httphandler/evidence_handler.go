@@ -160,10 +160,14 @@ func (h *EvidenceHandler) IngestEvidenceEvents(w http.ResponseWriter, r *http.Re
 
 	response, validationErrors, err := h.evidenceService.Ingest(r.Context(), body)
 	if err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, rdto.ErrorResponse{
-			Code:    "INGEST_FAILED",
-			Message: "failed to ingest evidence events",
-		})
+		status, code, message := http.StatusInternalServerError, "INGEST_FAILED", "failed to ingest evidence events"
+		if errors.Is(err, evidencesvc.ErrCaptureDisabled) {
+			status, code, message = http.StatusConflict, "CAPTURE_DISABLED", "capture admission is disabled"
+		}
+		if errors.Is(err, evidencesvc.ErrCaptureUnavailable) {
+			status, code, message = http.StatusServiceUnavailable, "TRACE_CORE_UNAVAILABLE", "capture policy is unavailable"
+		}
+		writeJSON(w, r, status, rdto.ErrorResponse{Code: code, Message: message})
 		return
 	}
 	if len(validationErrors) > 0 {
@@ -212,7 +216,14 @@ func (h *EvidenceHandler) IngestEvidenceArtifact(w http.ResponseWriter, r *http.
 	}
 	response, validationErrors, err := h.evidenceService.IngestArtifact(r.Context(), body)
 	if err != nil {
-		writeJSON(w, r, http.StatusInternalServerError, rdto.ErrorResponse{Code: "INGEST_FAILED", Message: "failed to ingest evidence artifact"})
+		status, code, message := http.StatusInternalServerError, "INGEST_FAILED", "failed to ingest evidence artifact"
+		if errors.Is(err, evidencesvc.ErrCaptureDisabled) {
+			status, code, message = http.StatusConflict, "CAPTURE_DISABLED", "capture admission is disabled"
+		}
+		if errors.Is(err, evidencesvc.ErrCaptureUnavailable) {
+			status, code, message = http.StatusServiceUnavailable, "TRACE_CORE_UNAVAILABLE", "capture policy is unavailable"
+		}
+		writeJSON(w, r, status, rdto.ErrorResponse{Code: code, Message: message})
 		return
 	}
 	if len(validationErrors) > 0 {
@@ -808,6 +819,31 @@ func (h *EvidenceHandler) RequireTrustedQueryIdentity(next http.HandlerFunc) htt
 		}
 		ctx := context.WithValue(r.Context(), trustedQueryScopeContextKey{}, scope)
 		next(w, r.WithContext(ctx))
+	}
+}
+
+// RequireTraceEvidenceConfigurationPermission applies the explicit Access
+// Profile permissions for the unified control-plane endpoint. It deliberately
+// does not infer write access from a role, header, or the desired state.
+func (h *EvidenceHandler) RequireTraceEvidenceConfigurationPermission(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scope, ok := trustedQueryScopeFromContext(r.Context())
+		if !ok || scope.AccessProfile == nil {
+			writeQueryAuthorizationError(w, r, http.StatusForbidden, "OBSERVABILITY_CONFIGURATION_FORBIDDEN", "trace/evidence configuration permission is required")
+			return
+		}
+		operation := "read"
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			operation = "write"
+		}
+		if r.Method == http.MethodPost {
+			operation = "reconcile"
+		}
+		if !scope.AccessProfile.HasPermission("trace_evidence_configuration", "global", operation) {
+			writeQueryAuthorizationError(w, r, http.StatusForbidden, "OBSERVABILITY_CONFIGURATION_FORBIDDEN", "the current access profile cannot manage trace/evidence configuration")
+			return
+		}
+		next(w, r)
 	}
 }
 

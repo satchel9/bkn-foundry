@@ -8,6 +8,9 @@ fullnameOverride: ""
 
 replicaCount: 1
 
+# Runtime diagnostic logging: debug, info, warn, or error.
+logLevel: info
+
 image:
   registry: ghcr.io/openbkn-ai
   repository: agent-observability
@@ -39,6 +42,21 @@ networkPolicy:
     - namespace: ""
       podLabels:
         app: agent-retrieval
+    - namespace: ""
+      podLabels:
+        app: agent-operator-integration
+    - namespace: ""
+      podLabels:
+        app: bkn-agent
+    - namespace: openbkn
+      podLabels:
+        module: bkn-backend
+    - namespace: openbkn
+      podLabels:
+        module: ontology-query
+    - namespace: ""
+      podLabels:
+        app.kubernetes.io/name: otelcol-contrib
 
 ingress:
   enabled: true
@@ -67,6 +85,42 @@ evidence:
     # every public lifecycle call answer 503 authorization_unavailable without
     # taking the query surface down with it.
     publicLifecycleEnabled: true
+
+# Kafka consumers are independently opt-in. Credentials are referenced only
+# from externally managed Secrets; no development broker or password defaults.
+kafkaConsumers:
+  evidence:
+    enabled: false
+    brokers: []
+    topic: openbkn.evidence.v1
+    consumerGroup: bkn-trace-evidence-ledger-v1
+    saslMechanism: ""
+    existingSecret:
+      name: ""
+      usernameKey: username
+      passwordKey: password
+  audit:
+    enabled: false
+    brokers: []
+    topic: openbkn.audit.v1
+    consumerGroup: ""
+    saslMechanism: ""
+    existingSecret:
+      name: ""
+      usernameKey: username
+      passwordKey: password
+
+# Optional fail-open producer for Trace/Evidence control Audit events. Use a
+# dedicated principal in production; the consumer credentials are independent.
+auditPublisher:
+  enabled: false
+  environment: ""
+  brokers: []
+  saslMechanism: ""
+  existingSecret:
+    name: ""
+    usernameKey: username
+    passwordKey: password
 
 bknSafe:
   baseURL: http://bkn-safe:3000
@@ -137,6 +191,17 @@ observability:
     sourceID: otel-runtime
     deploymentID: observability/otelcol-contrib
     interval: 30s
+  admissionBudget:
+    # Defaults protect a new installation without manual configuration.
+    # Deployments may override them for their capacity and SLO requirements.
+    # Persist overrides in the values file used for every Helm upgrade; a
+    # runtime env patch is not durable.
+    profile: default
+    collectorMetricsEndpoint: ""
+    opensearchCapacityThreshold: "0.90"
+    opensearchHeapThreshold: "0.90"
+    collectorQueueThreshold: "0.90"
+    storagePoolThreshold: "0.90"
 
 core:
   # Keep existing trace/evidence reads available after an upgrade. Enable
@@ -151,6 +216,17 @@ core:
     maxClaimsPerInteraction: 32
     maxEvidenceRefsPerInteraction: 4096
   evidenceCollectionState: enabled
+  # Initial control-plane state is used only when the v033 singleton is
+  # absent. New installs default to enabled in the deployment template;
+  # upgrade automation must set this explicitly to the last known effective
+  # state and must use disabled when legacy trace flags cannot be mapped safely.
+  # Leave empty only when the installer cannot prove the legacy effective
+  # state. On an upgrade with an absent v033 singleton, the chart then uses
+  # the safe default disabled and emits a bootstrap warning annotation; an
+  # existing singleton always remains authoritative.
+  capturePolicyInitialState: ""
+  # Internal unsigned snapshots retain a freshness deadline.
+  capturePolicySnapshotTTL: 15m
   projection:
     enabled: false
     # Single runtime authority for signed historical-provenance projection.

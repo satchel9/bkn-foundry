@@ -20,7 +20,7 @@ type ResourceService interface {
 	// Get retrieves a Resource by ID.
 	GetByID(ctx context.Context, id string) (*Resource, error)
 	// GetByIDs retrieves Resources by IDs. Callers must provide unique IDs;
-	// includeRowCount controls whether source metadata estimates and dataset document counts are included.
+	// includeRowCount controls whether source metadata counts and dataset document counts are included.
 	GetByIDs(ctx context.Context, ids []string, includeRowCount bool) ([]*Resource, error)
 	// List lists resource summaries with filters.
 	List(ctx context.Context, params ResourcesQueryParams) ([]*ResourceSummary, int64, error)
@@ -33,8 +33,9 @@ type ResourceService interface {
 	// UpdateDiscoverStatus updates a Resource's last discover status.
 	UpdateDiscoverStatus(ctx context.Context, id string, status string) error
 	// DeleteByIDs deletes Resources by IDs. Callers must provide unique IDs;
-	// missing resources are skipped when ignoreMissing is true.
-	DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool) error
+	// missing resources are skipped when ignoreMissing is true, while onlyIfStale
+	// requires every resource to be stale and missing.
+	DeleteByIDs(ctx context.Context, ids []string, ignoreMissing, onlyIfStale bool) error
 
 	// ListAuthResourceEntries lists resource authorization entries with filters.
 	ListAuthResourceEntries(ctx context.Context, params AuthResourceQueryParams) ([]*AuthResourceEntry, int64, error)
@@ -63,8 +64,10 @@ type ResourceService interface {
 		localIndexStatus, localIndexName, syncMark string) (bool, error)
 	// InternalUpdateSemanticMetadata updates only Resource metadata owned by semantic understanding.
 	InternalUpdateSemanticMetadata(ctx context.Context, tx *sql.Tx, resource *Resource, expectedUpdateTime int64) error
-	// InternalUpdateDiscoveryMetadata updates only Resource metadata owned by discovery.
+	// InternalUpdateDiscoveryMetadata 仅保存发现元数据。
 	InternalUpdateDiscoveryMetadata(ctx context.Context, tx *sql.Tx, resource *Resource, expectedUpdateTime int64) error
+	// InternalUpdateRowCount 仅写入精确数量及时间；tx 为 nil 时直接写库，不创建、提交或回滚事务。
+	InternalUpdateRowCount(ctx context.Context, tx *sql.Tx, resource *Resource, count, countTime int64) error
 	// InternalCreate creates a Resource for internal workers within a transaction.
 	InternalCreate(ctx context.Context, tx *sql.Tx, req *ResourceRequest) (*Resource, error)
 	// InternalUpdateStatus updates a Resource status for internal workers within a transaction.

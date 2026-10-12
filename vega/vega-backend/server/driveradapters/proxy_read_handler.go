@@ -102,7 +102,6 @@ func (r *restHandler) GetResourceSchemaByProxy(c *gin.Context) {
 	if schema == nil {
 		schema = []*interfaces.Property{}
 	}
-	emitResourceReadEvidence(c, ctx, "data.resource.schema", []*interfaces.Resource{resource}, 1, map[string]string{"resource_id": resource.ID})
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	rest.ReplyOK(c, http.StatusOK, map[string]any{"schema_definition": schema})
 }
@@ -121,6 +120,7 @@ func (r *restHandler) PostResourceDataByProxy(c *gin.Context) {
 	}
 	ctx = interfaces.WithTrustedProxyRead(ctx)
 	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: request.ProxyID, Type: request.ProxyType})
+	ctx = interfaces.WithCursorQuotaOwner(ctx, request.CallerID)
 	resource, ok := r.loadProxyResource(c, ctx, span, request)
 	if !ok {
 		return

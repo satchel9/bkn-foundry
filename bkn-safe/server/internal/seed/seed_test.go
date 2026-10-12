@@ -5,6 +5,7 @@
 package seed
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -13,10 +14,38 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/database"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
+
+type countingAuditRecorder struct{ entries []audit.Entry }
+
+func (r *countingAuditRecorder) Record(_ context.Context, entry audit.Entry) error {
+	r.entries = append(r.entries, entry)
+	return nil
+}
+
+func TestApplyWithAuditDoesNotRepeatBackfillOnRestart(t *testing.T) {
+	t.Setenv("BKN_SAFE_INITIAL_PASSWORD", "seed-restart-test-password")
+	db := newDB(t)
+	e, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &countingAuditRecorder{}
+	if err := ApplyWithAudit(db, e, recorder); err != nil {
+		t.Fatal(err)
+	}
+	recorder.entries = nil
+	if err := ApplyWithAudit(db, e, recorder); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.entries) != 0 {
+		t.Fatalf("unchanged seed emitted %d backfill audit events on restart", len(recorder.entries))
+	}
+}
 
 func newDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -97,6 +126,43 @@ func TestApplySeedsRolesCatalogGrants(t *testing.T) {
 	}
 	if !ok {
 		t.Error("network_builder should be able to create knowledge networks after seed")
+	}
+}
+
+func TestApplySeedsTraceEvidenceCatalogIdempotently(t *testing.T) {
+	db := newDB(t)
+	e, err := authz.New(db)
+	if err != nil {
+		t.Fatalf("authz: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := Apply(db, e); err != nil {
+			t.Fatalf("apply seed #%d: %v", i+1, err)
+		}
+	}
+
+	want := map[string]map[string]bool{
+		"trace_evidence_configuration": {"read": true, "write": true, "reconcile": true},
+		"trace_evidence_endpoint":      {"heartbeat": true},
+	}
+	for resourceType, operations := range want {
+		var resource model.ResourceType
+		if err := db.First(&resource, "id = ?", resourceType).Error; err != nil {
+			t.Errorf("seeded resource type %q: %v", resourceType, err)
+			continue
+		}
+		var rows []model.Operation
+		if err := db.Where("resource_type_id = ?", resourceType).Order("id").Find(&rows).Error; err != nil {
+			t.Errorf("list %q operations: %v", resourceType, err)
+			continue
+		}
+		got := make(map[string]bool, len(rows))
+		for _, row := range rows {
+			got[row.ID] = true
+		}
+		if !reflect.DeepEqual(got, operations) {
+			t.Errorf("%s operations = %v, want exactly %v", resourceType, got, operations)
+		}
 	}
 }
 

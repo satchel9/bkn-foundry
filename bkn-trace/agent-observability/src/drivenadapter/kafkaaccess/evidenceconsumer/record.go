@@ -8,7 +8,10 @@ package evidenceconsumer
 import (
 	"errors"
 	"fmt"
+	"time"
 )
+
+const Topic = "openbkn.evidence.v1"
 
 type Header struct {
 	Key   string
@@ -16,12 +19,16 @@ type Header struct {
 }
 
 type Record struct {
+	Topic            string
 	Key              string
+	Value            []byte
 	Headers          []Header
+	Partition        int
+	Offset           int64
+	BrokerTime       time.Time
 	ProducerStreamID string
 	ProducerSequence uint64
 	BrokerTimestamp  string
-	TimestampType    string
 }
 
 type ClosureWatermark struct {
@@ -36,6 +43,7 @@ type PolicySnapshot struct {
 	Enabled            bool
 	InstanceID         string
 	RegisteredRevision uint64
+	ProcessBootID      string
 	Closure            ClosureWatermark
 }
 
@@ -58,9 +66,6 @@ func ParseHeaders(headers []Header) (map[string]string, error) {
 }
 
 func ValidateLiveRecordContract(record Record) error {
-	if record.TimestampType != "LogAppendTime" {
-		return fmt.Errorf("timestamp_type must be LogAppendTime")
-	}
 	headers, err := ParseHeaders(record.Headers)
 	if err != nil {
 		return err
@@ -78,6 +83,36 @@ func ValidateLiveRecordContract(record Record) error {
 	for key, value := range want {
 		if got, exists := headers[key]; !exists || got != value || value == "" {
 			return fmt.Errorf("invalid live header %s", key)
+		}
+	}
+	if record.Key != record.ProducerStreamID {
+		return fmt.Errorf("record key must equal producer_stream_id")
+	}
+	return nil
+}
+
+// ValidateMigrationRecordContract keeps the migration control plane separate
+// from live capture: revision 0 is a fixed marker, never a live-policy
+// revision, and the active manifest is the sole admission authority.
+func ValidateMigrationRecordContract(record Record) error {
+	headers, err := ParseHeaders(record.Headers)
+	if err != nil {
+		return err
+	}
+	want := map[string]string{
+		"content-type":              "application/json",
+		"bkn-trace-schema-version":  "3.0.0",
+		"capture_policy_revision":   "0",
+		"producer_instance_id":      headers["producer_instance_id"],
+		"bkn-evidence-record-class": "migration",
+		"bkn-evidence-migration-id": headers["bkn-evidence-migration-id"],
+	}
+	if len(headers) != len(want) {
+		return fmt.Errorf("migration header set mismatch")
+	}
+	for key, value := range want {
+		if got, exists := headers[key]; !exists || got != value || value == "" {
+			return fmt.Errorf("invalid migration header %s", key)
 		}
 	}
 	if record.Key != record.ProducerStreamID {

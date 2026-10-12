@@ -2,6 +2,18 @@
 # policy watcher/version refresh is implemented; the deployment template
 # rejects overrides so authorization decisions cannot diverge between Pods.
 replicaCount: 1
+
+# Safe management Audit is sent to the independent Kafka→Ledger pipeline.
+# Credentials come from an existing Secret; no broker password is rendered
+# into this chart's ConfigMap or values defaults. Missing config is fail-open
+# for administration but remains an explicit Audit coverage gap.
+auditPublisher:
+  enabled: false
+  environment: ""
+  brokers: ""
+  credentialsSecretName: ""
+  usernameSecretKey: username
+  passwordSecretKey: password
 # Namespace follows the Helm release (-n) — templates use .Release.Namespace, so
 # bkn-safe installs into the same namespace as the rest of BKN Foundry (openbkn).
 
@@ -59,6 +71,10 @@ ingress:
     # in-service by RequireUser (introspect); the accessor id comes from the
     # token, so a caller can only read its own grants.
     - /api/safe/v1/me
+    # Permission request submission, review and personal request lists. Every
+    # endpoint is token-gated in-service; bkn-safe evaluates request and review
+    # authorization from the current user's actual permissions.
+    - /api/safe/v1/permission-requests
     # Deployment capability discovery, read on every login to lay out the menu.
     # Token-gated in-service by RequireUser (introspect only — it describes the
     # deployment, not the caller) and it decides nothing: enforcement stays at
@@ -83,7 +99,7 @@ ingress:
 #   openbkn-sdk     — device_code (CLI / headless human login)
 #   openbkn-studio  — authorization_code + PKCE (browser / SPA)
 #   openbkn-cli     — authorization_code + PKCE (CLI headless password login)
-# Idempotent (delete+create). The openbkn-studio SPA callback derives from
+# Idempotent (create or patch; never delete/recreate). The openbkn-studio SPA callback derives from
 # accessAddress (https://host/studio/callback) at install time; webRedirectUri is the
 # dev fallback when no accessAddress is set.
 clientSeed:
@@ -134,6 +150,9 @@ config:
     bknBackend:
       baseURL: "http://bkn-backend-svc:13014"
       timeout: "3s"
+    bknAgent:
+      baseURL: "http://bkn-agent:30800"
+      timeout: "3s"
     executionFactory:
       baseURL: "http://agent-operator-integration:9000"
       timeout: "3s"
@@ -148,6 +167,9 @@ config:
   hydra:
     adminURL: "http://bkn-safe-hydra-admin:4445"
     publicURL: "http://bkn-safe-hydra-public:4444"
+    # Canonical browser-facing issuer origin. Normally derived from
+    # accessAddress; set this only for an external Hydra deployment without it.
+    browserPublicURL: ""
   ldap:
     url: ""                 # empty = LDAP federation disabled
     bindDN: ""
@@ -177,26 +199,6 @@ config:
     # is what made every Helm upgrade invalidate an activated license
     # (openbkn-ai/bkn-foundry#508).
     instanceId: ""
-  # Audit subsystem (#334). The audit trail itself is always on; these tune
-  # the chain-anchor export and the authorization decision log.
-  audit:
-    # How often the audit chain head (seq + hash) is written to the service
-    # log so the log pipeline holds anchors outside the database. Go duration
-    # string; "0s" disables.
-    chainHeadLogInterval: "15m"
-    decisionLog:
-      # Record every authorization decision (/authz/checks, batch summaries for
-      # /resource-filter, admin gate and permission points).
-      # Written off the request path; a full queue drops rows, never blocks.
-      enabled: true
-      # Fraction [0,1] of ALLOW decisions kept. Denies are always kept. Lower
-      # it on a busy cluster; 1 keeps everything.
-      allowSampleRate: "1"
-      # Rows waiting to be written before Record starts dropping.
-      queueSize: "4096"
-      # Purge decision rows older than this many days (daily). 0 = keep all.
-      retentionDays: "90"
-
 resources:
   requests:
     cpu: 200m

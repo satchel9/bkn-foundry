@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.openapi.utils import get_openapi
 from starlette.middleware.base import BaseHTTPMiddleware
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
 
 from app.commons.errors import UnauthorizedError, HydraServiceError, BknSafeServiceError
 from app.commons.locale import (
@@ -92,12 +94,12 @@ async def _verify_app_key(token):
             status_code=400,
             content=BknSafeServiceError
         )
-    if not result.get("active", False):
+    user_id = str(result.get("sub") or "").strip()
+    if not result.get("active", False) or not user_id or user_id.lower() in {"anonymous", "anonymous-user"}:
         return JSONResponse(
             status_code=401,
             content=UnauthorizedError
         )
-    user_id = result.get("sub", "")
     # Treat account_type=app as an application identity; all other values are users.
     role = "app" if result.get("account_type", "") == "app" else "user"
     return user_id, role
@@ -165,10 +167,10 @@ async def auth_middleware(request: Request, call_next):
                         res = await response.text()
                         result = json.loads(res)
                         activate = result.get("active", False)
-                        user_id = result.get("sub", "")
+                        user_id = str(result.get("sub") or "").strip()
                         client_id = result.get("client_id", "")
                         role = "user" if client_id != user_id else "app"
-                    if activate:
+                    if activate and user_id and user_id.lower() not in {"anonymous", "anonymous-user"}:
                         _set_trusted_identity(request, user_id, role)
                     else:
                         return JSONResponse(
@@ -183,6 +185,27 @@ async def auth_middleware(request: Request, call_next):
 
     response = await call_next(request)
     return response
+
+
+async def observability_middleware(request: Request, call_next):
+    """Emit one bounded internal span and product log per HTTP request."""
+    tracer = trace.get_tracer("model-api.http")
+    route = "unmatched"
+    status = 500
+    with tracer.start_as_current_span(
+        "HTTP request", kind=SpanKind.SERVER
+    ) as span:
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            route_object = request.scope.get("route")
+            route = getattr(route_object, "path", None) or "unmatched"
+            return response
+        finally:
+            span.update_name(f"{request.method} {route}")
+            span.set_attribute("http.request.method", request.method)
+            span.set_attribute("http.route", route)
+            span.set_attribute("http.response.status_code", status)
 
 
 class RequestSizeMiddleware(BaseHTTPMiddleware):
@@ -280,6 +303,7 @@ def create_app():
     app.add_middleware(BaseHTTPMiddleware, dispatch=auth_middleware)
     # Added after auth so this ASGI middleware is outermost: it also decorates auth failures.
     app.add_middleware(LocaleResponseMiddleware)
+    app.add_middleware(BaseHTTPMiddleware, dispatch=observability_middleware)
     app.add_exception_handler(Exception, unhandled_exception_handler)
 
     # Initialize logging.

@@ -13,7 +13,7 @@
       },
       "kn_id": {
         "type": "string",
-        "description": "知识网络 ID。也可改用 X-Kn-ID 请求头传入。"
+        "description": "知识网络 ID，来自 list_knowledge_networks 或 get_kn_detail，不可凭名称猜测。"
       },
       "detail_level": {
         "type": "string",
@@ -22,7 +22,7 @@
           "full"
         ],
         "default": "summary",
-        "description": "详情级别。summary（默认）：对象类/关系类/行动类骨架 + 每个属性仅 name+type（扁平同构，TOON 渲染成紧凑表格），不含 display_name/comment/字段映射/查询算子/映射规则，足够理解 schema 与规划查询；需要某对象完整字段映射（含 comment）改调 get_object_types，要关系 mapping_rules 改调 get_relation_types。full：一次返回全量（体积大，慎用）。"
+        "description": "详情级别。summary（默认）：对象类/关系类/行动类骨架 + 每个属性仅 name+type（扁平同构，TOON 渲染成紧凑表格），不含对象类/关系类/行动类的 comment，也不含属性的 display_name/comment、字段映射、查询算子、映射规则与 module_type（概念组的 name/tags/comment 全部保留，选簇就靠它们），足够理解 schema 与规划查询；需要某对象完整字段映射（含 comment）改调 get_object_types，要关系 mapping_rules 改调 get_relation_types，要行动类说明改调 get_action_info。full：一次返回全量（体积大，慎用）。"
       }
     },
     "required": [
@@ -135,7 +135,7 @@
           },
           "additionalProperties": true
         },
-        "description": "对象类型（含 data_source 等）。related_metric_count 为该对象类下已建模指标数，>0 时可用 get_object_types 下钻拿 related_metrics 明细"
+        "description": "对象类型（含 data_source 等）。related_metric_count 为该对象类下已建模指标数，>0 时可用 get_object_types 下钻拿 related_metrics 明细。logic_properties 只给名称与类型，要看取数来源与参数定义（谁来填）用 get_object_types 或 search_schema 知识网络超过 200 个对象类或 600 个关系类时，该字段回 null（notice 会说明），请按 concept_groups 下钻。"
       },
       "relation_types": {
         "type": "array",
@@ -165,7 +165,7 @@
           },
           "additionalProperties": true
         },
-        "description": "关系类型"
+        "description": "关系类型 知识网络超过 200 个对象类或 600 个关系类时，该字段回 null（notice 会说明），请按 concept_groups 下钻。"
       },
       "action_types": {
         "type": "array",
@@ -182,7 +182,7 @@
             },
             "comment": {
               "type": "string",
-              "description": "说明；仅 detail_level=full 时出现——默认的 summary 只给骨架与 name+type 的属性表，照这一条去取会拿到 None，要完整字段映射改调 get_object_types"
+              "description": "说明；仅 detail_level=full 时出现——默认的 summary 只给骨架，照这一条去取会拿到 None，要知道这个行动做什么改调 get_action_info"
             },
             "object_type_id": {
               "type": "string",
@@ -191,7 +191,7 @@
           },
           "additionalProperties": true
         },
-        "description": "行动类型"
+        "description": "行动类型 知识网络超过 200 个对象类或 600 个关系类时，该字段回 null（notice 会说明），请按 concept_groups 下钻。"
       },
       "mounted_capabilities": {
         "type": "object",
@@ -214,6 +214,22 @@
             "description": "MCP 工具数量，同样用 execute_tool 调用"
           }
         }
+      },
+      "object_type_count": {
+        "type": "integer",
+        "description": "该网络的对象类总数。仅当网络超过单次返回上限、本次只给导航壳时出现；其余情况下 object_types 数组本身就是数量。"
+      },
+      "relation_type_count": {
+        "type": "integer",
+        "description": "该网络的关系类总数。出现条件同 object_type_count。"
+      },
+      "action_type_count": {
+        "type": "integer",
+        "description": "该网络的行动类总数。出现条件同 object_type_count。"
+      },
+      "notice": {
+        "type": "string",
+        "description": "本次返回被收窄的原因与下一步指引。出现时 object_types/relation_types/action_types 三个字段都回 null，这不表示该网络没有这些概念——数量见三个 *_count 字段，具体概念按 concept_groups 选簇后用 search_schema 取。 该网络若没划概念组，notice 会改为指向 search_schema。"
       }
     }
   }

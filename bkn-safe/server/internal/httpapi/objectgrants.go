@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -23,8 +24,8 @@ import (
 
 // registerObjectGrants mounts the object-level authorization management API
 // under /admin (admin-only). It manages the "grant a specific object to a
-// specific user" matrix that sits ON TOP of role-based RBAC: each grant binds
-// one user accessor to concrete ops on one concrete resource instance
+// specific user or role" matrix that sits ON TOP of role-based RBAC: each grant
+// binds one accessor to concrete ops on one concrete resource instance
 // (catalog/operator/knowledge_network/…).
 //
 // This is the gateway-exposed, audited management surface for object grants.
@@ -33,10 +34,10 @@ import (
 // validated (known user, concrete resource, catalog-registered ops) so the UI
 // can't mint dead policies.
 //
-// Grantees are USERS only. Departments are intentionally unsupported: casbin
-// holds no user→department membership rules, so a department grant would be a
-// dead policy that never matches at enforce time (see RolePermissions path for
-// the role-based alternative).
+// Grantees are users or custom roles. Departments are intentionally
+// unsupported: casbin holds no user→department membership rules, so a
+// department grant would be a dead policy that never matches at enforce time
+// (see RolePermissions path for the role-based alternative).
 // isConcreteResourceID reports whether an id names ONE instance.
 //
 // Rejecting only the literal "*" is not enough: the casbin matcher is keyMatch,
@@ -66,15 +67,25 @@ func isModelAuthorizationResourceType(resourceType string) bool {
 // network is the sole authorization root.
 const opAuthorize = "authorize"
 
-// grantableUserPageSize caps the owner-facing account picker. Deliberately not
-// caller-tunable: see the Limit comment in the handler.
-const grantableUserPageSize = 20
+// grantableSubjectPageSize caps the owner-facing user and role pickers.
+// Deliberately not caller-tunable: a picker should narrow its search rather
+// than ask the directory to allocate an arbitrary number of rows.
+const grantableSubjectPageSize = 50
 
 // grantAuthority is how a caller earned the right to write grants on one object.
 // It is recorded in the audit trail because "the security administrator opened
 // this up" and "the owner shared their own object" are different acts that would
 // otherwise be indistinguishable — both arrive as the same endpoint call.
 type grantAuthority string
+
+// reviewerInboxSyncer keeps the denormalized permission-request reviewer
+// index current after a successful object grant. The index is not an
+// authority source, so a synchronization failure must not turn a committed
+// authorization write into a misleading failed request; ListTodo retains its
+// realtime refresh as the recovery path.
+type reviewerInboxSyncer interface {
+	SyncReviewerInbox(context.Context, string) error
+}
 
 const (
 	// Platform-wide admin-authz:grant / :revoke. Unrestricted: may write any op
@@ -126,40 +137,12 @@ func resolveGrantAuthority(c *gin.Context, e *authz.Enforcer, db *gorm.DB, admin
 		replyPublicError(c, http.StatusForbidden)
 		return "", false
 	}
-	root, ok, err := grantAuthorizationRoot(c.Request.Context(), db, ref)
-	if err != nil {
-		serverError(c, err)
-		return "", false
-	}
-	if !ok {
-		replyPublicError(c, http.StatusForbidden)
-		return "", false
-	}
-	authorized, err := e.CheckContext(c.Request.Context(), sub, root.Type, root.ID, opAuthorize)
+	root, authorized, err := authorizeDelegatedResourceManagement(c.Request.Context(), e, db, sub, ref)
 	if err != nil {
 		serverError(c, err)
 		return "", false
 	}
 	if !authorized {
-		replyPublicError(c, http.StatusForbidden)
-		return "", false
-	}
-
-	// Holding authorize on the knowledge-network root is necessary but does not
-	// reveal a child the caller cannot otherwise see. Reading or changing that
-	// child's grant configuration therefore also requires its catalog-declared
-	// view operation through the final operation decision (including requires).
-	viewOp, err := resourceViewOperation(c.Request.Context(), db, ref.Type)
-	if err != nil {
-		serverError(c, err)
-		return "", false
-	}
-	visible, err := e.CheckContext(c.Request.Context(), sub, ref.Type, ref.ID, viewOp)
-	if err != nil {
-		serverError(c, err)
-		return "", false
-	}
-	if !visible {
 		replyPublicError(c, http.StatusForbidden)
 		return "", false
 	}
@@ -180,6 +163,33 @@ func resolveGrantAuthority(c *gin.Context, e *authz.Enforcer, db *gorm.DB, admin
 		}
 	}
 	return authorityTypeAuthorize, true
+}
+
+// authorizeDelegatedResourceManagement applies the common non-administrator
+// boundary for every per-resource authorization surface. BKN child resources
+// are managed from their knowledge-network root, while other resource families
+// keep the concrete resource as their root. Root-level authorize never reveals
+// an otherwise hidden child: the caller must also hold the child's registered
+// view operation through the final authorization decision.
+func authorizeDelegatedResourceManagement(ctx context.Context, enforcer *authz.Enforcer, db *gorm.DB,
+	operatorID string, ref resourceRef) (resourceRef, bool, error) {
+	if operatorID == "" || !isConcreteResourceID(ref.ID) {
+		return resourceRef{}, false, nil
+	}
+	root, ok, err := grantAuthorizationRoot(ctx, db, ref)
+	if err != nil || !ok {
+		return resourceRef{}, false, err
+	}
+	authorized, err := enforcer.CheckContext(ctx, operatorID, root.Type, root.ID, opAuthorize)
+	if err != nil || !authorized {
+		return root, authorized, err
+	}
+	viewOp, err := resourceViewOperation(ctx, db, ref.Type)
+	if err != nil {
+		return root, false, err
+	}
+	visible, err := enforcer.CheckContext(ctx, operatorID, ref.Type, ref.ID, viewOp)
+	return root, visible, err
 }
 
 // grantAuthorizationRoot applies the BKN boundary: a knowledge-network is the
@@ -284,7 +294,7 @@ func restrictDelegatedOps(c *gin.Context, e *authz.Enforcer, ref resourceRef, op
 	return true
 }
 
-func registerObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB) {
+func registerObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog, reviewerSync reviewerInboxSyncer) {
 	// GET /policies?resource_type=&resource_id= — the p-lines written directly
 	// against this exact object key, grouped by subject. -> { entries:[
 	// { accessor_id, resource{type,id}, operations:[...] } ] }
@@ -523,18 +533,19 @@ func registerObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB) {
 	// source-scoped allow/deny operation set. The handler derives both provenance
 	// fields, normalizes direct requirements, and applies the same checks on the
 	// administrator and /me delegation routes.
-	g.POST("/object-grants", setObjectGrantHandler(e, db))
+	g.POST("/object-grants", setObjectGrantHandler(e, db, dir, catalog, reviewerSync))
 	g.POST("/object-grants/preview", RequirePermission(e, "admin-authz", "view"), previewObjectGrantHandler(e))
-	g.POST("/object-grants/revoke", revokeObjectGrantBatchHandler(e, db))
+	g.POST("/object-grants/revoke", revokeObjectGrantBatchHandler(e, db, dir, catalog))
 
 	// DELETE /object-grants revokes exactly one stable grant_id. It never deletes
 	// by the Casbin tuple, so a sibling grant with identical runtime semantics but
 	// a different source or lifecycle owner remains intact.
 	//
-	// An administrator gets idempotent 204 for an already-absent id, with
-	// _outcome.removed=false in the audit record. A delegated caller cannot prove
-	// authority over an opaque missing id and therefore receives 403.
-	g.DELETE("/object-grants", revokeObjectGrantHandler(e, db))
+	// An administrator gets idempotent 204 for an already-absent id. Since no
+	// business state changed, that retry does not emit another audit fact. A
+	// delegated caller cannot prove authority over an opaque missing id and
+	// therefore receives 403.
+	g.DELETE("/object-grants", revokeObjectGrantHandler(e, db, dir, catalog))
 }
 
 func previewObjectGrantHandler(e *authz.Enforcer) gin.HandlerFunc {
@@ -692,12 +703,35 @@ func splitGrantOps(value string) []string {
 	return strings.Split(value, ",")
 }
 
-// isUserAccessor reports whether id is a known user row (real user or app
-// account; both are model.User distinguished by account_type).
+// isUserAccessor reports whether id is an enabled directory user. Object-grant
+// writes perform the managed-proxy check separately so the protected identity
+// case keeps its explicit forbidden response.
 func isUserAccessor(c *gin.Context, db *gorm.DB, id string) (bool, error) {
 	var n int64
-	if err := db.WithContext(c.Request.Context()).Model(&model.User{}).
-		Where("id = ? AND enabled = ?", id, true).Count(&n).Error; err != nil {
+	err := db.WithContext(c.Request.Context()).Model(&model.User{}).
+		Where("id = ? AND enabled = ?", id, true).
+		Count(&n).Error
+	return n > 0, err
+}
+
+// grantSubjectExists validates subjects accepted by the shared object-grant,
+// row-filter and property-grant management surfaces. Only custom roles are
+// mutable through those surfaces; seeded system/business roles remain owned by
+// their seed definitions.
+func grantSubjectExists(ctx context.Context, db *gorm.DB, subjectType, id string) (bool, error) {
+	var n int64
+	query := db.WithContext(ctx)
+	switch subjectType {
+	case "user":
+		query = query.Model(&model.User{}).
+			Where("id = ? AND enabled = ?", id, true).
+			Where("NOT EXISTS (SELECT 1 FROM managed_proxy_accounts mpa WHERE mpa.proxy_account_id = users.id)")
+	case "role":
+		query = query.Model(&model.Role{}).Where("id = ? AND source = ?", id, model.RoleSourceCustom)
+	default:
+		return false, nil
+	}
+	if err := query.Count(&n).Error; err != nil {
 		return false, err
 	}
 	return n > 0, nil
@@ -741,7 +775,7 @@ func catalogOpSet(db *gorm.DB, resourceType string) (map[string]bool, error) {
 // The platform-wide listing is deliberately NOT mirrored here. An owner may read
 // and write the grants on an object they own, one object at a time; "show me
 // every grant on the platform" stays with the administrator.
-func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, dir *directory.Service) {
+func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog, reviewerSync reviewerInboxSyncer) {
 	// GET /object-grants?resource_type=&resource_id= — who currently holds what
 	// on ONE object. The share UI opens with this: an owner about to hand their
 	// network to a colleague has to see who already has it. POST replaces only
@@ -814,7 +848,7 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 		c.JSON(http.StatusOK, gin.H{"entries": entries})
 	})
 
-	// GET /grantable-users?resource_type=&resource_id=&search=&limit= — the people
+	// GET /grantable-users?resource_type=&resource_id=&search= — the people
 	// an owner may pick when sharing ONE object.
 	//
 	// The platform user directory is admin-only, which left the owner surface
@@ -831,15 +865,7 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
-		// Search is mandatory. Holding `authorize` on one object says nothing about
-		// being allowed to page through the platform's accounts, and an empty
-		// search turned this into exactly that — the per-object gate below is not
-		// a bound on WHO is listed, only on who may ask.
 		search := strings.TrimSpace(c.Query("search"))
-		if search == "" {
-			replyPublicError(c, http.StatusBadRequest)
-			return
-		}
 		if _, ok := resolveGrantAuthority(c, e, db, "view", ref); !ok {
 			return
 		}
@@ -854,7 +880,7 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 			// pre-allocation inside ListUsers is a memory-exhaustion path for the
 			// sake of nothing (CodeQL go/uncontrolled-allocation-size). Narrow the
 			// search instead of asking for more rows.
-			Limit: grantableUserPageSize,
+			Limit: grantableSubjectPageSize,
 		})
 		if err != nil {
 			serverError(c, err)
@@ -866,9 +892,49 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 		}
 		c.JSON(http.StatusOK, gin.H{"users": out})
 	})
-	g.POST("/object-grants", setObjectGrantHandler(e, db))
-	g.POST("/object-grants/revoke", revokeObjectGrantBatchHandler(e, db))
-	g.DELETE("/object-grants", revokeObjectGrantHandler(e, db))
+	// GET /grantable-roles?resource_type=&resource_id=&search= — custom roles
+	// that may receive a grant on ONE object. This deliberately exposes only
+	// role identity metadata, never role membership or platform permissions.
+	g.GET("/grantable-roles", func(c *gin.Context) {
+		ref := resourceRef{
+			Type: objectGrantQueryParam(c, "resource_type", "obj_type"),
+			ID:   objectGrantQueryParam(c, "resource_id", "obj_id"),
+		}
+		if ref.Type == "" || ref.ID == "" {
+			replyPublicError(c, http.StatusBadRequest)
+			return
+		}
+		roleAdmin, err := e.CheckContext(c.Request.Context(), c.GetString(ctxAccessorID), "admin-role", "*", "view")
+		if err != nil {
+			serverError(c, err)
+			return
+		}
+		if !roleAdmin {
+			if _, ok := resolveGrantAuthority(c, e, db, "view", ref); !ok {
+				return
+			}
+		}
+		search := strings.TrimSpace(c.Query("search"))
+		query := db.WithContext(c.Request.Context()).Model(&model.Role{}).
+			Where("source = ?", model.RoleSourceCustom)
+		if search != "" {
+			like := "%" + strings.ToLower(search) + "%"
+			query = query.Where("LOWER(name) LIKE ? OR LOWER(description) LIKE ?", like, like)
+		}
+		var roles []model.Role
+		if err := query.Order("name ASC, id ASC").Limit(grantableSubjectPageSize).Find(&roles).Error; err != nil {
+			serverError(c, err)
+			return
+		}
+		out := make([]gin.H, 0, len(roles))
+		for _, role := range roles {
+			out = append(out, gin.H{"id": role.ID, "name": role.Name, "description": role.Description})
+		}
+		c.JSON(http.StatusOK, gin.H{"roles": out})
+	})
+	g.POST("/object-grants", setObjectGrantHandler(e, db, dir, catalog, reviewerSync))
+	g.POST("/object-grants/revoke", revokeObjectGrantBatchHandler(e, db, dir, catalog))
+	g.DELETE("/object-grants", revokeObjectGrantHandler(e, db, dir, catalog))
 }
 
 type grantAccessorIdentity struct {
@@ -917,7 +983,7 @@ func grantAccessorIdentities(c *gin.Context, db *gorm.DB, ids []string) (map[str
 	return out, nil
 }
 
-func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
+func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog, reviewerSync reviewerInboxSyncer) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req objectGrantWriteRequest
 		if !bind(c, &req) {
@@ -966,15 +1032,6 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 			replyPublicError(c, http.StatusForbidden)
 			return
 		}
-		managed, err := managedproxy.IsManaged(c.Request.Context(), db, req.AccessorID)
-		if err != nil {
-			serverError(c, err)
-			return
-		}
-		if managed {
-			replyPublicError(c, http.StatusForbidden)
-			return
-		}
 		authority, ok := resolveGrantAuthority(c, e, db, "grant", req.Resource)
 		if !ok {
 			return
@@ -983,16 +1040,45 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 			replyPublicError(c, http.StatusForbidden)
 			return
 		}
-		ok, err = isUserAccessor(c, db, req.AccessorID)
+		accessorType := req.AccessorType
+		if accessorType == "" {
+			accessorType = "user"
+		}
+		// Community bundles are atomic compatibility grants. Role permissions are
+		// edited as individual operations, so expanding a bundle in the role editor
+		// would make a single displayed operation impossible to revoke faithfully.
+		// Roles therefore use only the fine-grained Professional shape.
+		if accessorType == "role" && communityShape {
+			replyPublicError(c, http.StatusBadRequest)
+			return
+		}
+		var accessorExists bool
+		var err error
+		switch accessorType {
+		case "user":
+			accessorExists, err = isUserAccessor(c, db, req.AccessorID)
+			if err == nil && accessorExists {
+				var managed bool
+				managed, err = managedproxy.IsManaged(c.Request.Context(), db, req.AccessorID)
+				if err == nil && managed {
+					replyPublicError(c, http.StatusForbidden)
+					return
+				}
+			}
+		case "role":
+			accessorExists, err = grantSubjectExists(c.Request.Context(), db, accessorType, req.AccessorID)
+		default:
+			replyPublicError(c, http.StatusBadRequest)
+			return
+		}
 		if err != nil {
 			serverError(c, err)
 			return
 		}
-		if !ok {
+		if !accessorExists {
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
-
 		authoritySource := authz.AuthoritySourceAdminAuthz
 		if authority != authorityAdminAuthz {
 			authoritySource = authz.AuthoritySourceOwnerDelegate
@@ -1011,6 +1097,7 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 				serverError(c, err)
 				return
 			}
+			setObjectGrantAuditOperation(c, catalog, db, dir, "grant", req.AccessorID, req.Resource.Type, req.Resource.ID)
 			outcome["bundle"] = authz.ActFullBusinessAccess
 			setAuditOutcome(c, outcome)
 			c.Status(http.StatusNoContent)
@@ -1068,13 +1155,20 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 			serverError(c, err)
 			return
 		}
+		setObjectGrantAuditOperation(c, catalog, db, dir, "grant", req.AccessorID, req.Resource.Type, req.Resource.ID)
+		if reviewerSync != nil && accessorType == "user" {
+			if err := reviewerSync.SyncReviewerInbox(c.Request.Context(), req.AccessorID); err != nil {
+				slog.Error("refresh permission-request reviewer inbox after object grant", "accessor_id", req.AccessorID, "error", err)
+			}
+		}
 		c.Status(http.StatusNoContent)
 	}
 }
 
 type objectGrantWriteRequest struct {
-	AccessorID string      `json:"accessor_id" binding:"required"`
-	Resource   resourceRef `json:"resource" binding:"required"`
+	AccessorID   string      `json:"accessor_id" binding:"required"`
+	AccessorType string      `json:"accessor_type"`
+	Resource     resourceRef `json:"resource" binding:"required"`
 	// Operations is a pointer so an omitted field (Community shape) can be
 	// distinguished from an explicitly empty Professional set.
 	Operations *[]string `json:"operations"`
@@ -1175,7 +1269,7 @@ func addedOps(requested, normalized []string) []string {
 	return out
 }
 
-func revokeObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
+func revokeObjectGrantHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
 			GrantID string `json:"grant_id" binding:"required"`
@@ -1183,7 +1277,14 @@ func revokeObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 		if !bind(c, &req) {
 			return
 		}
-		if result, ok := revokeObjectGrantIDs(c, e, db, []string{req.GrantID}); ok {
+		if result, ok := revokeObjectGrantIDs(c, e, db, dir, catalog, []string{req.GrantID}); ok {
+			if result.removed == 0 {
+				suppressAuditOperation(c)
+			} else if result.snapshotErr != nil {
+				setAuditSnapshotFailure(c, "revoke", req.GrantID, result.snapshotErr)
+			} else {
+				setAuditOperation(c, "revoke", req.GrantID, result.targetName)
+			}
 			outcome := result.sources[0]
 			outcome["removed"] = result.removed > 0
 			setAuditOutcome(c, outcome)
@@ -1196,7 +1297,7 @@ func revokeObjectGrantHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
 // records in one policy transaction. It exists for a UI action that removes a
 // complete source or grantee: individual DELETE requests could otherwise leave
 // half the selected source removed after a transient failure.
-func revokeObjectGrantBatchHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFunc {
+func revokeObjectGrantBatchHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
 			GrantIDs []string `json:"grant_ids" binding:"required"`
@@ -1204,11 +1305,44 @@ func revokeObjectGrantBatchHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFu
 		if !bind(c, &req) {
 			return
 		}
-		if result, ok := revokeObjectGrantIDs(c, e, db, req.GrantIDs); ok {
-			setAuditOutcomeRecords(c, result.auditRecords)
+		if result, ok := revokeObjectGrantIDs(c, e, db, dir, catalog, req.GrantIDs); ok {
+			targetID := objectGrantBatchTargetID(result.grantIDs)
+			if result.removed == 0 {
+				suppressAuditOperation(c)
+			} else if result.snapshotErr != nil {
+				setAuditSnapshotFailure(c, "revoke", targetID, result.snapshotErr)
+			} else {
+				targetName := fmt.Sprintf("%d object grants", result.removed)
+				if result.mixedTargets {
+					targetName += " across multiple subjects or resources"
+				} else {
+					targetName += " · " + result.targetName
+				}
+				setAuditOperation(c, "revoke", targetID, targetName)
+			}
+			grantIDs, truncated := compactGrantIDs(result.sources)
+			setAuditOutcome(c, map[string]any{"grant_count": len(result.sources), "removed_count": result.removed, "grant_ids": grantIDs, "grant_ids_truncated": truncated})
 			c.Status(http.StatusNoContent)
 		}
 	}
+}
+
+func compactGrantIDs(sources []gin.H) ([]string, bool) {
+	// Keep the outcome together with the request snapshot below the audit
+	// detail column limit. The first IDs are enough to correlate the batch;
+	// the count and truncated flag preserve the complete cardinality.
+	const maxIDs = 12
+	ids := make([]string, 0, min(len(sources), maxIDs))
+	for _, source := range sources {
+		id, _ := source["grant_id"].(string)
+		if id != "" {
+			ids = append(ids, id)
+		}
+		if len(ids) == maxIDs {
+			break
+		}
+	}
+	return ids, len(sources) > len(ids)
 }
 
 // objectGrantRevokeResult keeps provenance available for audit after the policy
@@ -1216,16 +1350,14 @@ func revokeObjectGrantBatchHandler(e *authz.Enforcer, db *gorm.DB) gin.HandlerFu
 // audit middleware cannot reconstruct the source once RevokePolicies commits.
 type objectGrantRevokeResult struct {
 	sources      []gin.H
-	auditRecords []auditOutcomeRecord
+	grantIDs     []string
 	removed      int
+	targetName   string
+	mixedTargets bool
+	snapshotErr  error
 }
 
-type objectGrantRevokeAuditChoices struct {
-	kept    auditOutcomeRecord
-	removed auditOutcomeRecord
-}
-
-func revokeObjectGrantIDs(c *gin.Context, e *authz.Enforcer, db *gorm.DB, grantIDs []string) (objectGrantRevokeResult, bool) {
+func revokeObjectGrantIDs(c *gin.Context, e *authz.Enforcer, db *gorm.DB, dir *directory.Service, catalog AuthorizationResourceCatalog, grantIDs []string) (objectGrantRevokeResult, bool) {
 	if len(grantIDs) == 0 || len(grantIDs) > 500 {
 		replyPublicError(c, http.StatusBadRequest)
 		return objectGrantRevokeResult{}, false
@@ -1247,8 +1379,10 @@ func revokeObjectGrantIDs(c *gin.Context, e *authz.Enforcer, db *gorm.DB, grantI
 	}
 
 	result := objectGrantRevokeResult{
-		sources: make([]gin.H, 0, len(normalized)),
+		sources:  make([]gin.H, 0, len(normalized)),
+		grantIDs: normalized,
 	}
+	var targetAccessorID, targetResourceType, targetResourceID string
 	for _, grantID := range normalized {
 		records, err := e.PolicyRecords(authz.PolicyFilter{GrantID: grantID})
 		if err != nil {
@@ -1278,45 +1412,31 @@ func revokeObjectGrantIDs(c *gin.Context, e *authz.Enforcer, db *gorm.DB, grantI
 			return objectGrantRevokeResult{}, false
 		}
 		source := objectGrantRevokeAuditSource(records[0], authority)
+		resourceType, resourceID, _ := strings.Cut(records[0].Object, ":")
+		if targetAccessorID == "" {
+			targetAccessorID, targetResourceType, targetResourceID = records[0].AccessorID, resourceType, resourceID
+		} else if records[0].AccessorID != targetAccessorID || resourceType != targetResourceType || resourceID != targetResourceID {
+			result.mixedTargets = true
+		}
 		// false is the longer JSON spelling, so this also validates the worst-case
 		// per-target audit size before any policy is removed.
 		source["removed"] = false
 		result.sources = append(result.sources, source)
 	}
-	auditChoices := make(map[string]objectGrantRevokeAuditChoices, len(result.sources))
-	for _, source := range result.sources {
-		grantID, _ := source["grant_id"].(string)
-		source["removed"] = false
-		keptRecord, ok := newAuditOutcomeRecord(grantID, source)
-		if !ok {
-			serverError(c, fmt.Errorf("object grant audit detail exceeds storage limit for grant %q", grantID))
-			return objectGrantRevokeResult{}, false
-		}
-		source["removed"] = true
-		removedRecord, ok := newAuditOutcomeRecord(grantID, source)
-		if !ok {
-			serverError(c, fmt.Errorf("object grant audit detail exceeds storage limit for grant %q", grantID))
-			return objectGrantRevokeResult{}, false
-		}
-		source["removed"] = false
-		auditChoices[grantID] = objectGrantRevokeAuditChoices{kept: keptRecord, removed: removedRecord}
+	if targetAccessorID != "" && !result.mixedTargets {
+		result.targetName, result.snapshotErr = resolveObjectGrantAuditName(c.Request.Context(), catalog, db, dir, targetAccessorID, targetResourceType, targetResourceID)
 	}
-
 	removedByID, err := e.RevokePolicies(normalized)
 	if err != nil {
 		serverError(c, err)
 		return objectGrantRevokeResult{}, false
 	}
-	result.auditRecords = make([]auditOutcomeRecord, 0, len(result.sources))
 	for _, source := range result.sources {
 		grantID, _ := source["grant_id"].(string)
 		removed := removedByID[grantID]
 		source["removed"] = removed
 		if removed {
 			result.removed++
-			result.auditRecords = append(result.auditRecords, auditChoices[grantID].removed)
-		} else {
-			result.auditRecords = append(result.auditRecords, auditChoices[grantID].kept)
 		}
 	}
 	return result, true
@@ -1367,11 +1487,12 @@ func authorizeObjectGrantRevoke(c *gin.Context, e *authz.Enforcer, db *gorm.DB, 
 	// A delegated owner may revoke only an ordinary allow produced by that same
 	// delegated writer. Stable source identity prevents cross-grantor removal.
 	if authority != authorityAdminAuthz {
-		ordinaryOwnerGrant := record.PolicySource == authz.PolicySourceProfessionalRule &&
-			record.AuthoritySource == authz.AuthoritySourceOwnerDelegate &&
-			record.CreatedBy == c.GetString(ctxAccessorID) &&
-			record.Effect == authz.EffectAllow && record.Operation != opAuthorize
-		if !ordinaryOwnerGrant {
+		ownerManagedGrant := record.CreatedBy == c.GetString(ctxAccessorID) &&
+			record.Effect == authz.EffectAllow && record.Operation != opAuthorize &&
+			((record.PolicySource == authz.PolicySourceProfessionalRule && record.AuthoritySource == authz.AuthoritySourceOwnerDelegate) ||
+				(record.AuthoritySource == authz.AuthoritySourcePermissionRequest &&
+					(record.PolicySource == authz.PolicySourceProfessionalRule || record.PolicySource == authz.PolicySourceCommunityBundle)))
+		if !ownerManagedGrant {
 			replyPublicError(c, http.StatusForbidden)
 			return "", false
 		}

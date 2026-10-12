@@ -274,7 +274,7 @@ func Test_conceptGroupAccess_ListConceptGroups(t *testing.T) {
 		Convey("ListConceptGroups with Sort ASC\n", func() {
 			sqlStr := fmt.Sprintf("SELECT f_id, f_name, f_tags, f_comment, f_icon, f_color, f_bkn_raw_content, "+
 				"f_kn_id, f_branch, f_creator, f_creator_type, f_create_time, f_updater, f_updater_type, f_update_time "+
-				"FROM %s WHERE f_kn_id = ? AND f_branch = ? ORDER BY f_name ASC LIMIT 20 OFFSET 10", CONCEPT_GROUP_TABLE_NAME)
+				"FROM %s WHERE f_kn_id = ? AND f_branch = ? ORDER BY f_name ASC, f_id ASC LIMIT 20 OFFSET 10", CONCEPT_GROUP_TABLE_NAME)
 
 			rows := sqlmock.NewRows([]string{
 				"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_bkn_raw_content",
@@ -319,6 +319,29 @@ func Test_conceptGroupAccess_ListConceptGroups(t *testing.T) {
 				t.Errorf("there were unfulfilled expectations: %s", err)
 			}
 		})
+	})
+}
+
+func Test_conceptGroupAccess_ListConceptGroupTags(t *testing.T) {
+	Convey("test ListConceptGroupTags\n", t, func() {
+		cga, smock := MockNewConceptGroupAccess(&common.AppSetting{})
+		query := interfaces.ConceptGroupsQueryParams{
+			KNID: "kn1", Branch: interfaces.MAIN_BRANCH, CGIDs: []string{"cg1", "cg2"},
+			ValidAuthorizationIDsOnly: true,
+		}
+		sqlStr, _, err := processQueryCondition(query,
+			sq.Select("f_tags").From(CONCEPT_GROUP_TABLE_NAME)).ToSql()
+		So(err, ShouldBeNil)
+
+		rows := sqlmock.NewRows([]string{"f_tags"}).
+			AddRow(`"zeta","alpha"`).
+			AddRow(`"alpha","beta"`)
+		smock.ExpectQuery(sqlStr).WithArgs("kn1", interfaces.MAIN_BRANCH, "cg1", "cg2").WillReturnRows(rows)
+
+		tags, err := cga.ListConceptGroupTags(testCtx, query)
+		So(err, ShouldBeNil)
+		So(tags, ShouldResemble, []string{"alpha", "beta", "zeta"})
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 
@@ -1059,6 +1082,90 @@ func Test_conceptGroupAccess_GetConceptIDsByConceptGroupIDs(t *testing.T) {
 			if err := smock.ExpectationsWereMet(); err != nil {
 				t.Errorf("there were unfulfilled expectations: %s", err)
 			}
+		})
+	})
+}
+
+func Test_conceptGroupAccess_GetConceptIDsGroupedByConceptGroupIDs(t *testing.T) {
+	Convey("test GetConceptIDsGroupedByConceptGroupIDs\n", t, func() {
+		appSetting := &common.AppSetting{}
+		cga, smock := MockNewConceptGroupAccess(appSetting)
+
+		sqlStr := fmt.Sprintf("SELECT f_group_id, f_concept_id FROM %s WHERE f_kn_id = ? AND f_branch = ? AND f_concept_type = ? AND f_group_id IN (?,?)",
+			CONCEPT_GROUP_RELATION_TABLE_NAME)
+		knID := "kn1"
+		branch := interfaces.MAIN_BRANCH
+		cgIDs := []string{"cg1", "cg2"}
+		conceptType := interfaces.MODULE_TYPE_OBJECT_TYPE
+
+		Convey("groups concept IDs returned by one query\n", func() {
+			rows := sqlmock.NewRows([]string{"f_group_id", "f_concept_id"}).
+				AddRow("cg1", "ot1").
+				AddRow("cg2", "ot2").
+				AddRow("cg1", "ot3")
+			smock.ExpectQuery(sqlStr).WithArgs(knID, branch, conceptType, "cg1", "cg2").WillReturnRows(rows)
+
+			conceptIDsByGroup, err := cga.GetConceptIDsGroupedByConceptGroupIDs(testCtx, knID, branch, cgIDs, conceptType)
+
+			So(err, ShouldBeNil)
+			So(conceptIDsByGroup, ShouldResemble, map[string][]string{
+				"cg1": {"ot1", "ot3"},
+				"cg2": {"ot2"},
+			})
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
+		})
+
+		Convey("returns an empty map without querying for an empty group list\n", func() {
+			conceptIDsByGroup, err := cga.GetConceptIDsGroupedByConceptGroupIDs(testCtx, knID, branch, nil, conceptType)
+
+			So(err, ShouldBeNil)
+			So(conceptIDsByGroup, ShouldResemble, map[string][]string{})
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
+		})
+
+		Convey("returns query errors\n", func() {
+			expectedErr := errors.New("some error")
+			smock.ExpectQuery(sqlStr).WithArgs(knID, branch, conceptType, "cg1", "cg2").WillReturnError(expectedErr)
+
+			conceptIDsByGroup, err := cga.GetConceptIDsGroupedByConceptGroupIDs(testCtx, knID, branch, cgIDs, conceptType)
+
+			So(conceptIDsByGroup, ShouldBeNil)
+			So(err, ShouldResemble, expectedErr)
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
+		})
+
+		Convey("splits large group lists into bounded queries\n", func() {
+			largeGroupIDs := make([]string, conceptGroupRelationQueryBatchSize+1)
+			for index := range largeGroupIDs {
+				largeGroupIDs[index] = fmt.Sprintf("cg-%d", index)
+			}
+
+			buildSQL := func(ids []string) string {
+				sqlText, _, err := sq.Select("f_group_id", "f_concept_id").
+					From(CONCEPT_GROUP_RELATION_TABLE_NAME).
+					Where(sq.Eq{"f_kn_id": knID}).
+					Where(sq.Eq{"f_branch": branch}).
+					Where(sq.Eq{"f_concept_type": conceptType}).
+					Where(sq.Eq{"f_group_id": ids}).
+					ToSql()
+				So(err, ShouldBeNil)
+				return sqlText
+			}
+
+			smock.ExpectQuery(buildSQL(largeGroupIDs[:conceptGroupRelationQueryBatchSize])).
+				WillReturnRows(sqlmock.NewRows([]string{"f_group_id", "f_concept_id"}).AddRow("cg-0", "ot-0"))
+			smock.ExpectQuery(buildSQL(largeGroupIDs[conceptGroupRelationQueryBatchSize:])).
+				WillReturnRows(sqlmock.NewRows([]string{"f_group_id", "f_concept_id"}).AddRow("cg-500", "ot-500"))
+
+			conceptIDsByGroup, err := cga.GetConceptIDsGroupedByConceptGroupIDs(testCtx, knID, branch,
+				largeGroupIDs, conceptType)
+
+			So(err, ShouldBeNil)
+			So(conceptIDsByGroup, ShouldResemble, map[string][]string{
+				"cg-0":   {"ot-0"},
+				"cg-500": {"ot-500"},
+			})
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
 		})
 	})
 }

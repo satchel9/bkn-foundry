@@ -8,11 +8,23 @@ package interfaces
 
 import (
 	"context"
-
-	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
 )
 
 type contextKey string // Customize the exclusive key type
+
+const cursorQuotaOwnerKey contextKey = "cursor-quota-owner"
+
+// WithCursorQuotaOwner associates a trusted caller with cursor quota accounting.
+// Cursor authorization continues to use the authenticated account.
+func WithCursorQuotaOwner(ctx context.Context, callerID string) context.Context {
+	return context.WithValue(ctx, cursorQuotaOwnerKey, callerID)
+}
+
+// CursorQuotaOwner returns the trusted caller, if one was supplied.
+func CursorQuotaOwner(ctx context.Context) string {
+	callerID, _ := ctx.Value(cursorQuotaOwnerKey).(string)
+	return callerID
+}
 
 const (
 	CONTENT_TYPE_NAME = "Content-Type"
@@ -82,28 +94,4 @@ type PaginationQueryParams struct {
 type KeyValue struct {
 	Key   string `json:"key"`
 	Value any    `json:"value"`
-}
-
-func GenerateCatalogAuditObject(id string, name string) audit.AuditObject {
-	return audit.AuditObject{
-		Type: MODULE_TYPE_CATALOG,
-		ID:   id,
-		Name: name,
-	}
-}
-
-func GenerateConnectorTypeAuditObject(typ string, name string) audit.AuditObject {
-	return audit.AuditObject{
-		Type: MODULE_TYPE_CONNECTOR_TYPE,
-		ID:   typ,
-		Name: name,
-	}
-}
-
-func GenerateResourceAuditObject(id string, name string) audit.AuditObject {
-	return audit.AuditObject{
-		Type: MODULE_TYPE_RESOURCE,
-		ID:   id,
-		Name: name,
-	}
 }

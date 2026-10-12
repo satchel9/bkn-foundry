@@ -89,21 +89,55 @@ spec:
               value: {{ .Values.runtime.checkpointerAllowRuntimeDdl | quote }}
             - name: OTEL_ENABLED
               value: {{ .Values.observability.otelEnabled | quote }}
+            - name: OTEL_LOGS_ENABLED
+              value: {{ .Values.observability.logsEnabled | quote }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: {{ .Values.observability.otlpEndpoint | quote }}
-            - name: BKN_TRACE_EVIDENCE_INGEST_URL
-              value: {{ .Values.observability.bknTraceEvidenceIngestUrl | quote }}
             - name: BKN_TRACE_ARTIFACT_INGEST_URL
               value: {{ .Values.observability.bknTraceArtifactIngestUrl | quote }}
-            {{- if .Values.observability.bknTraceEvidenceIngestTokenSecretName }}
-            - name: BKN_TRACE_EVIDENCE_INGEST_TOKEN
+            - name: BKN_TRACE_ARTIFACT_INGEST_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.observability.bknTraceEvidenceIngestTokenSecretName | quote }}
-                  key: {{ .Values.observability.bknTraceEvidenceIngestTokenSecretKey | quote }}
+                  name: {{ required "observability.bknTraceArtifactIngestTokenSecretName is required" .Values.observability.bknTraceArtifactIngestTokenSecretName | quote }}
+                  key: {{ required "observability.bknTraceArtifactIngestTokenSecretKey is required" .Values.observability.bknTraceArtifactIngestTokenSecretKey | quote }}
+            - name: BKN_TRACE_EVIDENCE_PUBLISHER_ENABLED
+              value: {{ .Values.observability.evidencePublisher.enabled | quote }}
+            {{- if .Values.observability.evidencePublisher.enabled }}
+            - name: BKN_TRACE_KAFKA_BROKERS
+              value: {{ required "observability.evidencePublisher.brokers is required" .Values.observability.evidencePublisher.brokers | quote }}
+            - name: BKN_TRACE_KAFKA_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "observability.evidencePublisher.credentialsSecretName is required" .Values.observability.evidencePublisher.credentialsSecretName | quote }}
+                  key: {{ required "observability.evidencePublisher.usernameSecretKey is required" .Values.observability.evidencePublisher.usernameSecretKey | quote }}
+            - name: BKN_TRACE_KAFKA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "observability.evidencePublisher.credentialsSecretName is required" .Values.observability.evidencePublisher.credentialsSecretName | quote }}
+                  key: {{ required "observability.evidencePublisher.passwordSecretKey is required" .Values.observability.evidencePublisher.passwordSecretKey | quote }}
+            - name: TRACE_ADMISSION_POLICY_URL
+              value: {{ .Values.observability.evidencePublisher.traceAdmission.policyURL | quote }}
+            - name: TRACE_ADMISSION_CONFIGURATION_URL
+              value: {{ .Values.observability.evidencePublisher.traceAdmission.configurationURL | quote }}
+            - name: TRACE_ADMISSION_HEARTBEAT_URL
+              value: {{ .Values.observability.evidencePublisher.traceAdmission.heartbeatURL | quote }}
+            - name: TRACE_ADMISSION_ACK_URL_BASE
+              value: {{ .Values.observability.evidencePublisher.traceAdmission.ackURLBase | quote }}
+            - name: BKN_TRACE_EVIDENCE_QUEUE_MAX_RECORDS
+              value: {{ .Values.observability.evidencePublisher.queueMaxRecords | quote }}
+            - name: BKN_TRACE_EVIDENCE_QUEUE_MAX_BYTES
+              value: {{ .Values.observability.evidencePublisher.queueMaxBytes | int64 | quote }}
+            - name: BKN_TRACE_EVIDENCE_MAX_RECORD_BYTES
+              value: {{ .Values.observability.evidencePublisher.maxRecordBytes | int64 | quote }}
+            - name: BKN_TRACE_EVIDENCE_MAX_AGE_S
+              value: {{ .Values.observability.evidencePublisher.maxAgeS | quote }}
+            - name: BKN_TRACE_EVIDENCE_MAX_ATTEMPTS
+              value: {{ .Values.observability.evidencePublisher.maxAttempts | quote }}
+            - name: BKN_TRACE_EVIDENCE_RETRY_BACKOFF_MS
+              value: {{ .Values.observability.evidencePublisher.retryBackoffMs | quote }}
+            - name: BKN_TRACE_EVIDENCE_DRAIN_TIMEOUT_S
+              value: {{ .Values.observability.evidencePublisher.drainTimeoutS | quote }}
             {{- end }}
-            - name: BKN_TRACE_EVIDENCE_TIMEOUT_S
-              value: {{ .Values.observability.bknTraceEvidenceTimeoutS | quote }}
           volumeMounts:
             - name: host-time
               mountPath: /etc/localtime

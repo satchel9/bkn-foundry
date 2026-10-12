@@ -6,13 +6,17 @@ package httpapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/oauthorigin"
 )
 
 // ClientManager is the slice of hydra's OAuth2 client admin that bkn-safe exposes:
@@ -24,30 +28,45 @@ type ClientManager interface {
 	RemoveClientRedirectURI(ctx context.Context, clientID, uri string) ([]string, error)
 }
 
+// StudioOriginManager backs fixed-shape Studio callbacks in the legacy
+// redirect-URI endpoint with the same durable origin store as the dedicated
+// admin API. Other valid legacy callback shapes continue to use Hydra directly.
+type StudioOriginManager interface {
+	Callbacks(context.Context) ([]string, error)
+	AddCallback(context.Context, string, string) ([]string, error)
+	RemoveCallback(context.Context, string) ([]string, error)
+}
+
 // manageableClients are the first-party login clients whose redirect_uris an admin
 // may edit here. Restricting to the platform's own seeded clients (see
 // charts/bkn-safe client-seed-job) keeps this from being a generic hydra client
 // editor. Kept as its own list — not aliased to firstPartyClients — so loosening
 // what is editable never silently loosens what skips the consent screen.
-var manageableClients = map[string]bool{
-	"openbkn-studio": true,
-	"openbkn-cli":    true,
-	"openbkn-sdk":    true,
+var manageableClients = map[string]string{
+	"openbkn-studio": "OpenBKN Studio",
+	"openbkn-cli":    "OpenBKN CLI",
+	"openbkn-sdk":    "OpenBKN SDK",
 }
 
 // registerClientAdmin mounts redirect-uri management for the platform's login
-// clients under the admin group (RequireAdmin + audited). This is a runtime
-// convenience: a helm upgrade re-seeds clients from chart values, so durable
-// redirect_uris still belong in clientSeed.extraWebRedirectUris.
-func registerClientAdmin(g *gin.RouterGroup, mgr ClientManager, e *authz.Enforcer) {
+// clients under the admin group (RequireAdmin + audited). Fixed-shape Studio
+// mutations use the durable access-origin service; other Studio callback shapes
+// plus the CLI and SDK retain legacy direct-Hydra behavior.
+func registerClientAdmin(g *gin.RouterGroup, mgr ClientManager, origins StudioOriginManager, e *authz.Enforcer) {
 	// GET /clients/:id/redirect-uris -> { "redirect_uris": [...] }
 	g.GET("/clients/:id/redirect-uris", RequirePermission(e, "admin-client", "manage"), func(c *gin.Context) {
 		id := c.Param("id")
-		if !manageableClients[id] {
+		if _, ok := manageableClients[id]; !ok {
 			replyPublicError(c, http.StatusForbidden)
 			return
 		}
-		uris, err := mgr.GetClientRedirectURIs(c.Request.Context(), id)
+		var uris []string
+		var err error
+		// Preserve this endpoint's historical Hydra view. In particular, old
+		// Studio installations can have valid callback paths other than
+		// /studio/callback; those are intentionally outside origin management
+		// but must remain visible to existing API consumers.
+		uris, err = mgr.GetClientRedirectURIs(c.Request.Context(), id)
 		if err != nil {
 			serverError(c, err)
 			return
@@ -59,7 +78,8 @@ func registerClientAdmin(g *gin.RouterGroup, mgr ClientManager, e *authz.Enforce
 	// Idempotent: adding an already-registered uri returns the unchanged list.
 	g.POST("/clients/:id/redirect-uris", RequirePermission(e, "admin-client", "manage"), func(c *gin.Context) {
 		id := c.Param("id")
-		if !manageableClients[id] {
+		clientName, ok := manageableClients[id]
+		if !ok {
 			replyPublicError(c, http.StatusForbidden)
 			return
 		}
@@ -73,18 +93,36 @@ func registerClientAdmin(g *gin.RouterGroup, mgr ClientManager, e *authz.Enforce
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
-		uris, err := mgr.AddClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+		var uris []string
+		var err error
+		if id == "openbkn-studio" && origins != nil {
+			uris, err = origins.AddCallback(c.Request.Context(), req.RedirectURI, c.GetString(ctxAccessorID))
+			if errors.Is(err, oauthorigin.ErrInvalidOrigin) {
+				// Keep arbitrary, pre-existing Studio callback paths compatible
+				// with the legacy endpoint. Reconcile preserves these unmanaged
+				// Hydra URIs while the fixed Studio callback stays durable.
+				uris, err = mgr.AddClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+			}
+		} else {
+			uris, err = mgr.AddClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+		}
 		if err != nil {
+			if errors.Is(err, oauthorigin.ErrInvalidOrigin) {
+				replyPublicError(c, http.StatusBadRequest)
+				return
+			}
 			serverError(c, err)
 			return
 		}
+		setAuditOperation(c, "add_redirect_uri", oauthRedirectTargetID(id, req.RedirectURI), fmt.Sprintf("%s redirect URI %s", clientName, req.RedirectURI))
 		c.JSON(http.StatusOK, gin.H{"redirect_uris": uris})
 	})
 
 	// DELETE /clients/:id/redirect-uris { "redirect_uri": "..." } -> { "redirect_uris" }
 	g.DELETE("/clients/:id/redirect-uris", RequirePermission(e, "admin-client", "manage"), func(c *gin.Context) {
 		id := c.Param("id")
-		if !manageableClients[id] {
+		clientName, ok := manageableClients[id]
+		if !ok {
 			replyPublicError(c, http.StatusForbidden)
 			return
 		}
@@ -94,11 +132,29 @@ func registerClientAdmin(g *gin.RouterGroup, mgr ClientManager, e *authz.Enforce
 		if !bind(c, &req) {
 			return
 		}
-		uris, err := mgr.RemoveClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+		var uris []string
+		var err error
+		if id == "openbkn-studio" && origins != nil {
+			uris, err = origins.RemoveCallback(c.Request.Context(), req.RedirectURI)
+			if errors.Is(err, oauthorigin.ErrInvalidOrigin) {
+				uris, err = mgr.RemoveClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+			}
+		} else {
+			uris, err = mgr.RemoveClientRedirectURI(c.Request.Context(), id, req.RedirectURI)
+		}
 		if err != nil {
+			if errors.Is(err, oauthorigin.ErrInvalidOrigin) {
+				replyPublicError(c, http.StatusBadRequest)
+				return
+			}
+			if errors.Is(err, oauthorigin.ErrReadOnly) {
+				replyPublicError(c, http.StatusForbidden)
+				return
+			}
 			serverError(c, err)
 			return
 		}
+		setAuditOperation(c, "remove_redirect_uri", oauthRedirectTargetID(id, req.RedirectURI), fmt.Sprintf("%s redirect URI %s", clientName, req.RedirectURI))
 		c.JSON(http.StatusOK, gin.H{"redirect_uris": uris})
 	})
 }
@@ -116,6 +172,12 @@ func validRedirectURI(raw string) bool {
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			return false
+		}
 	}
 	return u.Host != "" && u.Fragment == ""
 }

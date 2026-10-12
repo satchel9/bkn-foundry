@@ -12,13 +12,14 @@ const (
 	Accepted Disposition = "accepted"
 	Dropped  Disposition = "dropped"
 
-	ReasonInvalidEvent     = "invalid_event"
-	ReasonSerialization    = "serialization_failed"
-	ReasonMessageTooLarge  = "message_too_large"
-	ReasonQueueFull        = "queue_full"
-	ReasonPublisherClosing = "publisher_closing"
-	ReasonRetryExhausted   = "retry_exhausted"
-	ReasonShutdownTimeout  = "shutdown_timeout"
+	ReasonInvalidEvent         = "invalid_event"
+	ReasonSerialization        = "serialization_failed"
+	ReasonMessageTooLarge      = "message_too_large"
+	ReasonQueueFull            = "queue_full"
+	ReasonPublisherClosing     = "publisher_closing"
+	ReasonPublisherUnavailable = "publisher_unavailable"
+	ReasonRetryExhausted       = "retry_exhausted"
+	ReasonShutdownTimeout      = "shutdown_timeout"
 )
 
 type Disposition string
@@ -58,9 +59,15 @@ type Event struct {
 	ObservedAt     string
 	EmittedAt      string
 	Envelope       json.RawMessage
+	// PreviousResult is local admission metadata for an operation-scoped retry.
+	// It is never serialized into a Record or used as a Ledger confirmation.
+	PreviousResult *PublishResult `json:"-"`
 }
 
 type PublishResult struct {
+	EventType   string
+	PayloadHash string
+	ProducerID  string
 	EventID     string
 	Disposition Disposition
 	Reason      string

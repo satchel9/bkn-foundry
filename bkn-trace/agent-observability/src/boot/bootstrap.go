@@ -24,34 +24,38 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/conf"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/archivesvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/assemblysvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/captureadmission"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/capturecontrollersvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/capturepolicysnapshot"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/capturepolicysvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/evidencesvc"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/ledgersvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/logsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/projectionrebuildsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/projectorsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/sessionsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/sourcecoveragesvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/tracesvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/ledgervo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/observabilityvo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/dbaccess/mariadb/archivestore"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/dbaccess/mariadb/auditstore"
+	mariadbevidencemigration "github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/dbaccess/mariadb/evidencemigration"
 	mariadbsessionstore "github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/dbaccess/mariadb/sessionstore"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknbackendaudit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknsafeaccess"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknsafeaudit"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknsafeuseraccess"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/businessresolver"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/executionfactoryaudit"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/modelmanageraudit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchconversationaudit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchcoreprojection"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchevidencestore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchlogaccess"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchprojection"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchruntimeaudit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchtraceaccess"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/ossgatewayarchive"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/otelcolmetrics"
-	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/vegaaudit"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/kafkaaccess/auditconsumer"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/kafkaaccess/auditvalidator"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/kafkaaccess/evidenceconsumer"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/kafkaaccess/kafkaruntime"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/capturepolicystore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/evidencestore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/ledgerstore"
 	memorysessionstore "github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/sessionstore"
@@ -61,7 +65,9 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/infra/opensearch"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/infra/server/httpserver"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/ibusinessresolver"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/icapturepolicy"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/icoremetrics"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/ievidenceadmission"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/ievidenceledger"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/ievidencestore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/iprojectionoutbox"
@@ -70,6 +76,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/isessionstore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/isourcecoveragestore"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/projectiongrant"
+	kafka "github.com/segmentio/kafka-go"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 )
 
@@ -80,6 +87,9 @@ type App struct {
 	stopWorkers    context.CancelFunc
 	workers        sync.WaitGroup
 	projection     *projectorsvc.Worker
+	kafkaRuntimes  []*kafkaruntime.Runtime
+	kafkaHealth    *kafkaHealth
+	captureAudit   *captureAuditSink
 }
 
 const APIBasePath = "/api/agent-observability/v1"
@@ -127,10 +137,259 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	kafkaConfig, err := conf.NewKafkaConsumerConfig()
+	if err != nil {
+		return nil, err
+	}
 	metrics := coremetrics.New()
 	sessionStore, ledgerStore, closeDatabase, err := newCoreStores(coreConfig)
 	if err != nil {
 		return nil, err
+	}
+	ledgerService := newEvidenceLedgerService(ledgerStore, metrics)
+	captureAudit := newCaptureAuditSink()
+	var capturePolicyReader capturepolicysvc.Reader
+	var capturePolicyCommander capturepolicysvc.Commander
+	var captureController *capturecontrollersvc.Controller
+	// Durable policy must be read successfully before Core admits a new write.
+	// The memory fallback below explicitly opens the local development store.
+	captureAdmission := captureadmission.New(0, string(capturepolicysvc.StateDisabled))
+	if durable, ok := sessionStore.(interface {
+		ReadCapturePolicySnapshot(context.Context) (capturepolicysvc.Snapshot, error)
+	}); ok {
+		capturePolicyReader = capturepolicysvc.ReaderFunc(durable.ReadCapturePolicySnapshot)
+		if snapshot, readErr := capturePolicyReader.Read(context.Background()); readErr == nil {
+			captureAdmission.Update(snapshot.Revision, string(snapshot.DesiredState))
+		}
+		if maria, ok := sessionStore.(*mariadbsessionstore.Store); ok {
+			captureController, err = capturecontrollersvc.New(capturecontrollersvc.Options{
+				Store: maria, WorkerID: "agent-observability-control-controller",
+				Lease: 30 * time.Second, Convergence: 10 * time.Minute,
+				OnTerminal: func(_ context.Context, event capturecontrollersvc.TerminalEvent) { captureAudit.terminal(event) },
+				OnState: func(state icapturepolicy.ControlState) {
+					captureAdmission.Update(state.CurrentRevision, state.DesiredState)
+				},
+				RequiredEndpointKinds: []string{icapturepolicy.EndpointTraceGateway, icapturepolicy.EndpointEvidencePublisher},
+			})
+			if err != nil {
+				if closeDatabase != nil {
+					_ = closeDatabase()
+				}
+				return nil, fmt.Errorf("initialize capture policy controller: %w", err)
+			}
+			capturePolicyCommander = captureController
+		}
+	} else {
+		memoryCapturePolicyStore := capturepolicystore.New(capturepolicysvc.Snapshot{
+			Revision: 1, DesiredState: capturepolicysvc.StateEnabled,
+			EffectiveState: capturepolicysvc.StateEnabled, LastStableRevision: 1,
+			Operation: capturepolicysvc.Operation{ID: "bootstrap", Phase: capturepolicysvc.PhaseSucceeded, RequestedState: capturepolicysvc.StateEnabled, ExpectedRevision: 1},
+		})
+		capturePolicyReader = memoryCapturePolicyStore
+		// The memory fallback has no controller callback. Seed the local view and
+		// mirror subsequent requests so development/test mode follows the same
+		// admission boundary as the durable store.
+		captureAdmission = captureadmission.NewStable(1, string(capturepolicysvc.StateEnabled))
+		capturePolicyCommander = memoryCapturePolicyCommander{store: memoryCapturePolicyStore, admission: captureAdmission}
+	}
+	var capturePolicyHandler *httphandler.CapturePolicyHandler
+	var capturePolicyWriter interface {
+		UpsertEndpointLease(context.Context, icapturepolicy.EndpointLease) error
+		RegisterEvidencePublisherHeartbeat(context.Context, icapturepolicy.EndpointLease) error
+		RecordAcknowledgement(context.Context, icapturepolicy.ExpectedAcknowledgement) error
+		RecordEvidencePublisherAcknowledgement(context.Context, icapturepolicy.ExpectedAcknowledgement, time.Time) error
+	}
+	if maria, ok := sessionStore.(*mariadbsessionstore.Store); ok {
+		capturePolicyWriter = maria
+	}
+	capturePolicyHandler = httphandler.NewCapturePolicyHandlerWithInternal(
+		capturePolicyReader, capturePolicyCommander, captureController,
+		capturepolicysnapshot.Builder{
+			TTL: coreConfig.CapturePolicySnapshotTTL,
+		}, capturePolicyWriter,
+	)
+	capturePolicyHandler.SetAuditRequestedObserver(func(_ context.Context, actorID, actorType, actorName, effectiveSubjectID string, before, after capturepolicysvc.Snapshot) {
+		captureAudit.requested(actorID, actorType, actorName, effectiveSubjectID, before, after)
+	})
+	var admissionBudgetSources []capturepolicysvc.AdmissionMeasurementSource
+	admissionBudgetSources = append(admissionBudgetSources,
+		capturepolicysvc.AdmissionMeasurementSourceFunc(func(ctx context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			metrics, err := openSearchClient.ReadAdmissionMetrics(ctx)
+			if err != nil {
+				return capturepolicysvc.AdmissionMeasurement{}, capturepolicysvc.AdmissionSourceError("trace_opensearch_capacity", err)
+			}
+			return capturepolicysvc.AdmissionMeasurement{Metric: "trace_opensearch_capacity", Source: "opensearch-cluster-stats", SampleTime: metrics.SampledAt, Value: metrics.Capacity, Fresh: true}, nil
+		}),
+		capturepolicysvc.AdmissionMeasurementSourceFunc(func(ctx context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			metrics, err := openSearchClient.ReadAdmissionMetrics(ctx)
+			if err != nil {
+				return capturepolicysvc.AdmissionMeasurement{}, capturepolicysvc.AdmissionSourceError("trace_opensearch_heap", err)
+			}
+			return capturepolicysvc.AdmissionMeasurement{Metric: "trace_opensearch_heap", Source: "opensearch-cluster-stats", SampleTime: metrics.SampledAt, Value: metrics.Heap, Fresh: true}, nil
+		}),
+	)
+	collectorMetricsEndpoint, collectorEndpointErr := observabilityConfig.AdmissionCollectorMetricsEndpoint()
+	collectorMetricsField := "BKN_TRACE_ADMISSION_COLLECTOR_METRICS_ENDPOINT"
+	if strings.TrimSpace(observabilityConfig.AdmissionBudgetMetricsEndpoint) == "" && strings.TrimSpace(observabilityConfig.SourceCoverageMetricsEndpoint) != "" {
+		collectorMetricsField = "BKN_OBSERVABILITY_SOURCE_COVERAGE_METRICS_ENDPOINT"
+	}
+	if endpoint := collectorMetricsEndpoint; collectorEndpointErr == nil {
+		collectorMetrics := otelcolmetrics.New(endpoint, &http.Client{Timeout: 3 * time.Second})
+		admissionBudgetSources = append(admissionBudgetSources, capturepolicysvc.AdmissionMeasurementSourceFunc(func(ctx context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			sample, err := collectorMetrics.ReadQueueSample(ctx)
+			if err != nil {
+				return capturepolicysvc.AdmissionMeasurement{}, capturepolicysvc.AdmissionSourceError("trace_collector_queue", err)
+			}
+			return capturepolicysvc.AdmissionMeasurement{Metric: "trace_collector_queue", Source: endpoint, SampleTime: sample.SampledAt, Value: sample.Utilization, Fresh: true}, nil
+		}))
+	} else {
+		admissionBudgetSources = append(admissionBudgetSources, capturepolicysvc.AdmissionMeasurementSourceFunc(func(context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			return capturepolicysvc.AdmissionMeasurement{}, &capturepolicysvc.AdmissionBudgetError{
+				Reason: "invalid_configuration", Metric: "trace_collector_queue",
+				Fields: []string{collectorMetricsField}, Cause: collectorEndpointErr,
+			}
+		}))
+	}
+	if databaseStore, ok := sessionStore.(interface{ Database() *sql.DB }); ok && databaseStore.Database() != nil {
+		database := databaseStore.Database()
+		admissionBudgetSources = append(admissionBudgetSources, capturepolicysvc.AdmissionMeasurementSourceFunc(func(context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			stats := database.Stats()
+			if stats.MaxOpenConnections <= 0 {
+				return capturepolicysvc.AdmissionMeasurement{}, capturepolicysvc.AdmissionSourceError("trace_storage_connection_pool", errors.New("trace storage pool max open connections is not configured"))
+			}
+			value := float64(stats.InUse) / float64(stats.MaxOpenConnections)
+			if value > 1 {
+				value = 1
+			}
+			return capturepolicysvc.AdmissionMeasurement{Metric: "trace_storage_connection_pool", Source: "bkn-trace-mariadb", SampleTime: time.Now().UTC(), Value: value, Fresh: true}, nil
+		}))
+	} else {
+		admissionBudgetSources = append(admissionBudgetSources, capturepolicysvc.AdmissionMeasurementSourceFunc(func(context.Context) (capturepolicysvc.AdmissionMeasurement, error) {
+			return capturepolicysvc.AdmissionMeasurement{}, capturepolicysvc.AdmissionSourceError("trace_storage_connection_pool", errors.New("trace storage pool is not configured"))
+		}))
+	}
+	if collectorEndpointErr != nil {
+		log.Printf("Trace admission Collector configuration unavailable (%s): %v", collectorMetricsField, collectorEndpointErr)
+	}
+	budgetConfig := observabilityConfig.AdmissionBudgetThresholds
+	budgetProvider, budgetErr := capturepolicysvc.NewAdmissionBudgetProvider(
+		observabilityConfig.AdmissionBudgetProfile,
+		capturepolicysvc.AdmissionBudgetThresholds{
+			OpenSearchCapacity: budgetConfig.OpenSearchCapacity,
+			OpenSearchHeap:     budgetConfig.OpenSearchHeap,
+			CollectorQueue:     budgetConfig.CollectorQueue,
+			StoragePool:        budgetConfig.StoragePool,
+		}, admissionBudgetSources...,
+	)
+	if budgetErr != nil {
+		log.Printf("Trace admission budget provider unavailable: %v", budgetErr)
+		capturePolicyHandler.SetAdmissionBudgetReader(httphandler.AdmissionBudgetReaderFunc(func(context.Context) (capturepolicysvc.AdmissionBudget, error) {
+			return capturepolicysvc.AdmissionBudget{}, budgetErr
+		}))
+	} else {
+		capturePolicyHandler.SetAdmissionBudgetReader(budgetProvider)
+	}
+	var kafkaRuntimes []*kafkaruntime.Runtime
+	var evidenceKafkaRuntime *kafkaruntime.Runtime
+	var auditKafkaRuntime *kafkaruntime.Runtime
+	if kafkaConfig.Evidence.Enabled {
+		if !strings.EqualFold(coreConfig.Store, "mariadb") || !coreConfig.AutoMigrate {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, errors.New("enabled Evidence Kafka consumer requires Core MariaDB with AutoMigrate enabled")
+		}
+		databaseStore, ok := sessionStore.(interface{ Database() *sql.DB })
+		if !ok || databaseStore.Database() == nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, errors.New("enabled Evidence Kafka consumer requires the shared MariaDB ledger connection")
+		}
+		migrationStore, err := mariadbevidencemigration.New(databaseStore.Database())
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, err
+		}
+		admission, admissionOK := sessionStore.(ievidenceadmission.ReadOnlySource)
+		ledger := evidenceconsumer.Ledger(ledgerService)
+		rejections, rejectionsOK := sessionStore.(evidenceconsumer.RejectionWriter)
+		if !admissionOK || !rejectionsOK {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, errors.New("enabled Evidence Kafka consumer requires persisted admission, Kafka Ledger, and rejection stores")
+		}
+		evidenceKafkaRuntime, err = newEvidenceKafkaRuntime(
+			kafkaConfig, kafkaConfig.Evidence, admission, migrationStore, migrationStore, ledger, rejections, nil,
+		)
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, fmt.Errorf("initialize Evidence Kafka consumer: %w", err)
+		}
+		kafkaRuntimes = append(kafkaRuntimes, evidenceKafkaRuntime)
+	}
+	if kafkaConfig.Audit.Enabled {
+		if !strings.EqualFold(coreConfig.Store, "mariadb") || !coreConfig.AutoMigrate {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, errors.New("enabled Audit Kafka consumer requires Core MariaDB with AutoMigrate enabled")
+		}
+		databaseStore, ok := sessionStore.(interface{ Database() *sql.DB })
+		if !ok || databaseStore.Database() == nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, errors.New("enabled Audit Kafka consumer requires the shared MariaDB ledger connection")
+		}
+		auditLedger, err := auditstore.New(databaseStore.Database())
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, err
+		}
+		if err := auditLedger.EnsureMonthlyWindow(context.Background(), time.Now().UTC()); err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, fmt.Errorf("ensure Audit monthly schema window: %w", err)
+		}
+		validator, err := auditvalidator.New()
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, err
+		}
+		protocol, err := auditconsumer.New(validator, auditLedger, kafkaNoopCommitter{})
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, err
+		}
+		runtime, err := kafkaruntime.New(kafkaConfig, kafkaConfig.Audit, func(ctx context.Context, message kafka.Message) error {
+			headers := make([]auditconsumer.Header, 0, len(message.Headers))
+			for _, header := range message.Headers {
+				headers = append(headers, auditconsumer.Header{Key: header.Key, Value: append([]byte(nil), header.Value...)})
+			}
+			record := auditconsumer.Record{Topic: message.Topic, Key: message.Key, Value: message.Value, Headers: headers, Partition: message.Partition, Offset: message.Offset, BrokerTime: message.Time.UTC()}
+			return protocol.Process(ctx, record)
+		})
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, err
+		}
+		auditKafkaRuntime = runtime
+		kafkaRuntimes = append(kafkaRuntimes, runtime)
 	}
 	coverageStore, coverageStoreSupported := sessionStore.(isourcecoveragestore.Store)
 	coverageMonitorEnabled := observabilityConfig.SourceCoverageMetricsEndpoint != ""
@@ -151,7 +410,9 @@ func NewApp() (*App, error) {
 	}
 	evidenceOptions := []evidencesvc.Option{
 		evidencesvc.WithSessionStore(sessionStore),
+		evidencesvc.WithCurrentRecordIntegrity(),
 		evidencesvc.WithTraceStatsSource(traceQueryService),
+		evidencesvc.WithCaptureAdmission(captureAdmission),
 	}
 	if resolver != nil {
 		evidenceOptions = append(evidenceOptions, evidencesvc.WithBusinessResolver(resolver))
@@ -175,22 +436,44 @@ func NewApp() (*App, error) {
 		logOptions.CoverageStore = coverageStore
 		logOptions.CoverageDeploymentID = observabilityConfig.SourceCoverageDeploymentID
 	}
-	logSources := []logsvc.Source{
+	runtimeLogSources := []logsvc.Source{
 		opensearchlogaccess.New(openSearchClient, openSearchConfig.LogIndex),
-		bknsafeaudit.New(accessScopeConfig.BKNBaseURL, localizedHTTPClient(accessScopeConfig.Timeout)),
-		bknsafeuseraccess.New(accessScopeConfig.BKNBaseURL, localizedHTTPClient(accessScopeConfig.Timeout)),
-		logsvc.NewNotIntegratedSource("bkn-safe-security", []string{
-			observabilityvo.CategoryAuditSecurity,
-		}, []string{"BKN Safe Authorization"}),
-		bknbackendaudit.New(resolverConfig.BKNBaseURL, localizedHTTPClient(resolverConfig.Timeout)),
-		vegaaudit.New(resolverConfig.VegaBaseURL, localizedHTTPClient(resolverConfig.Timeout)),
-		executionfactoryaudit.New(resolverConfig.ExecutionFactoryURL, localizedHTTPClient(resolverConfig.Timeout)),
-		modelmanageraudit.New(resolverConfig.ModelManagerURL, localizedHTTPClient(resolverConfig.Timeout)),
 	}
 	if coreConfig.ProjectionEnabled {
-		logSources = append(logSources, opensearchconversationaudit.New(openSearchClient, coreConfig.ProjectionIndex))
-		logSources = append(logSources, opensearchruntimeaudit.New(openSearchClient, coreConfig.ProjectionIndex))
+		runtimeLogSources = append(runtimeLogSources, opensearchconversationaudit.New(openSearchClient, coreConfig.ProjectionIndex))
 	}
+	var auditSource logsvc.Source
+	if kafkaConfig.Audit.Enabled {
+		auditQueryDB, err := openMariaDBPool(coreConfig.MariaDBDSN, 8, 2)
+		if err != nil {
+			if closeDatabase != nil {
+				_ = closeDatabase()
+			}
+			return nil, fmt.Errorf("open isolated Audit query pool: %w", err)
+		}
+		primaryClose := closeDatabase
+		closeDatabase = func() error {
+			if primaryClose == nil {
+				return auditQueryDB.Close()
+			}
+			return errors.Join(auditQueryDB.Close(), primaryClose())
+		}
+		reader, err := auditstore.NewReader(auditQueryDB)
+		if err != nil {
+			_ = closeDatabase()
+			return nil, err
+		}
+		if kafkaConfig.Audit.Enabled {
+			auditSource = httphandler.NewAuditLedgerSource(reader)
+		}
+	}
+	if kafkaConfig.Audit.Enabled && auditSource == nil {
+		if closeDatabase != nil {
+			_ = closeDatabase()
+		}
+		return nil, errors.New("audit Kafka query source requires the MariaDB ledger")
+	}
+	logSources := assembleLogSources(runtimeLogSources, auditSource)
 	logHandler := httphandler.NewLogHandler(logsvc.NewWithOptions(logSources, logOptions), evidenceHandler)
 	provenanceHandler := enterpriseroute.HistoricalProvenanceHandler()
 	if coreConfig.HistoricalProvenanceEnabled && provenanceHandler == nil {
@@ -210,7 +493,8 @@ func NewApp() (*App, error) {
 			}
 			return coreConfig.EvidenceCollectionState
 		},
-		Metrics: metrics,
+		CaptureAdmission: captureAdmission,
+		Metrics:          metrics,
 	}
 	if historicalProvenanceEnabled {
 		if len(coreConfig.ProjectionGrantPrivateKey) == 0 {
@@ -225,6 +509,13 @@ func NewApp() (*App, error) {
 		}
 	}
 	sessionService := sessionsvc.New(sessionStore, sessionOptions)
+	// The SQL session/ledger store marks record integrity dirty in the same
+	// transaction as the ledger write. The development memory stores are
+	// deliberately separate, so install the equivalent post-commit hook only
+	// for that backend. Commit has returned (and released the ledger mutex) by
+	// the time this observer runs; invalidation itself only takes the session
+	// map lock and never calls back while holding it.
+	ledgerService.SetDurableObserver(memoryRecordIntegrityObserver(sessionStore, sessionService.ReconcileEvidence))
 	archiveStore := archivesvc.NewMemoryStore()
 	if databaseStore, ok := sessionStore.(interface{ Database() *sql.DB }); ok {
 		archiveStore = archivestore.New(databaseStore.Database())
@@ -240,8 +531,8 @@ func NewApp() (*App, error) {
 			Technical: opensearchtraceaccess.NewArchiveStore(openSearchClient, openSearchConfig.TraceIndex),
 		}
 	}
-	if coreConfig.ProjectionEnabled {
-		archiveSource.Log = opensearchconversationaudit.NewArchiveSource(openSearchClient, coreConfig.ProjectionIndex)
+	if openSearchConfig.LogIndex != "" {
+		archiveSource.Log = opensearchconversationaudit.NewArchiveSource(openSearchClient, openSearchConfig.LogIndex)
 	}
 	archiveHandler := httphandler.NewArchiveHandler(archivesvc.New(archiveStore, archiveSource, archiveObjectStore, archivesvc.Options{}), evidenceHandler)
 	traceHandler := httphandler.NewTraceHandlerWithTechnicalSources(
@@ -251,7 +542,7 @@ func NewApp() (*App, error) {
 		sessionService,
 		assemblysvc.NewQueryServiceWithBusinessResolver(sessionStore, ledgerStore, resolver),
 	)
-	ledgerHandler := httphandler.NewConfiguredLedgerHandler(ledgersvc.NewWithMetrics(ledgerStore, metrics))
+	ledgerHandler := httphandler.NewConfiguredLedgerHandler(ledgerService)
 
 	var captureInput func(context.Context, string, evidencevo.QueryScope) (json.RawMessage, string, bool, error)
 	if snapshots, ok := sessionStore.(isessionstore.EvidenceSnapshotReader); ok {
@@ -268,13 +559,35 @@ func NewApp() (*App, error) {
 		}
 	}
 	enterpriseReader := httphandler.NewEnterpriseInteractionFactsReader(evidenceService, sessionService, captureInput)
-	app := newAppWithArchive(
+	app := newAppWithCapturePolicy(
 		httpServerConfig, traceHandler, evidenceHandler, logHandler, archiveHandler,
-		sessionHandler, ledgerHandler, metrics, enterpriseReader,
+		sessionHandler, ledgerHandler, metrics, capturePolicyHandler, enterpriseReader,
 	)
 	app.closeDatabase = closeDatabase
+	app.captureAudit = captureAudit
+	app.kafkaRuntimes = kafkaRuntimes
+	if evidenceKafkaRuntime != nil {
+		app.kafkaHealth.set("evidence", evidenceKafkaRuntime)
+	}
+	if auditKafkaRuntime != nil {
+		app.kafkaHealth.set("audit", auditKafkaRuntime)
+	}
 	workerContext, stopWorkers := context.WithCancel(context.Background())
 	app.stopWorkers = stopWorkers
+	// Materialized integrity serves lists without fetching stored business bodies.
+	// It also backfills existing terminal interactions, regardless of projection.
+	app.workers.Add(1)
+	go func() {
+		defer app.workers.Done()
+		runRecordIntegritySupervisor(workerContext, evidenceService, 5*time.Second)
+	}()
+	if captureController != nil {
+		app.workers.Add(1)
+		go func() {
+			defer app.workers.Done()
+			runCapturePolicyController(workerContext, captureController)
+		}()
+	}
 	app.workers.Add(1)
 	go func() {
 		defer app.workers.Done()
@@ -360,30 +673,86 @@ func NewApp() (*App, error) {
 	return app, nil
 }
 
+func memoryRecordIntegrityObserver(
+	sessionStore isessionstore.Store,
+	reconcile func(context.Context, ledgervo.Event) error,
+) func(context.Context, ledgervo.Event) error {
+	memorySessions, ok := sessionStore.(*memorysessionstore.Store)
+	if !ok {
+		return reconcile
+	}
+	return func(ctx context.Context, event ledgervo.Event) error {
+		if err := memorySessions.InvalidateRecordIntegrity(ctx, event.InteractionID, event.Owner); err != nil {
+			return err
+		}
+		// This fallback also runs for replayed durable events. It is safe for
+		// the in-memory store and compensates for the absence of SQL's
+		// transaction-level dirty marker.
+		return reconcile(ctx, event)
+	}
+}
+
+type memoryCapturePolicyCommander struct {
+	store     *capturepolicystore.Store
+	admission *captureadmission.View
+}
+
+func (c memoryCapturePolicyCommander) Request(ctx context.Context, request capturepolicysvc.ChangeRequest) (capturepolicysvc.Snapshot, error) {
+	snapshot, err := c.store.Request(ctx, request)
+	if err == nil {
+		c.admission.Update(snapshot.Revision, string(snapshot.DesiredState))
+	}
+	return snapshot, err
+}
+
+func assembleLogSources(runtimeSources []logsvc.Source, centerAuditSource logsvc.Source) []logsvc.Source {
+	sources := make([]logsvc.Source, 0, len(runtimeSources)+1)
+	if centerAuditSource == nil {
+		centerAuditSource = logsvc.NewUnconfiguredAuditSource()
+	}
+	sources = append(sources, centerAuditSource)
+	sources = append(sources, runtimeSources...)
+	return sources
+}
+
 func newCoreStores(config conf.CoreConfig) (isessionstore.Store, ievidenceledger.Store, func() error, error) {
 	if !strings.EqualFold(config.Store, "mariadb") {
-		return memorysessionstore.New(), ledgerstore.New(), nil, nil
+		sessions, ledger := memorysessionstore.New(), ledgerstore.New()
+		sessions.SetEvidenceReader(ledger.ReadEvidenceEventsByIDs)
+		return sessions, ledger, nil, nil
 	}
 	if config.MariaDBDSN == "" {
 		return nil, nil, nil, errors.New("BKN_TRACE_CORE_MARIADB_DSN is required when BKN_TRACE_CORE_STORE=mariadb")
 	}
-	db, err := sql.Open("mysql", config.MariaDBDSN)
+	db, err := openMariaDBPool(config.MariaDBDSN, 16, 4)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("open BKN Trace MariaDB: %w", err)
-	}
-	db.SetMaxOpenConns(16)
-	db.SetMaxIdleConns(4)
-	db.SetConnMaxLifetime(30 * time.Minute)
-	if err := db.PingContext(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, nil, nil, fmt.Errorf("connect BKN Trace MariaDB: %w", err)
+		return nil, nil, nil, err
 	}
 	store := mariadbsessionstore.New(db)
 	if err := store.EnsureSchema(context.Background(), config.AutoMigrate); err != nil {
 		_ = db.Close()
 		return nil, nil, nil, err
 	}
+	if err := store.EnsureControlState(context.Background(), config.CapturePolicyInitialState == "enabled", time.Now().UTC()); err != nil {
+		_ = db.Close()
+		return nil, nil, nil, fmt.Errorf("initialize Trace/Evidence control state: %w", err)
+	}
 	return store, store, db.Close, nil
+}
+
+func openMariaDBPool(dsn string, maxOpen, maxIdle int) (*sql.DB, error) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open BKN Trace MariaDB: %w", err)
+	}
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxIdle)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	if err := db.PingContext(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("connect BKN Trace MariaDB: %w", err)
+	}
+	return db, nil
 }
 
 func runLeaseReaper(
@@ -496,6 +865,21 @@ func newApp(
 	return newAppWithArchive(httpServerConfig, traceHandler, evidenceHandler, logHandler, nil, sessionHandler, ledgerHandler, metrics, enterpriseReaders...)
 }
 
+func newAppWithCapturePolicy(
+	httpServerConfig conf.HTTPServerConfig,
+	traceHandler *httphandler.TraceHandler,
+	evidenceHandler *httphandler.EvidenceHandler,
+	logHandler *httphandler.LogHandler,
+	archiveHandler *httphandler.ArchiveHandler,
+	sessionHandler *httphandler.SessionHandler,
+	ledgerHandler *httphandler.LedgerHandler,
+	metrics http.Handler,
+	capturePolicyHandler *httphandler.CapturePolicyHandler,
+	enterpriseReaders ...enterpriseroute.Reader,
+) *App {
+	return newAppWithArchiveAndCapture(httpServerConfig, traceHandler, evidenceHandler, logHandler, archiveHandler, sessionHandler, ledgerHandler, metrics, capturePolicyHandler, enterpriseReaders...)
+}
+
 func newAppWithArchive(
 	httpServerConfig conf.HTTPServerConfig,
 	traceHandler *httphandler.TraceHandler,
@@ -507,7 +891,29 @@ func newAppWithArchive(
 	metrics http.Handler,
 	enterpriseReaders ...enterpriseroute.Reader,
 ) *App {
+	return newAppWithArchiveAndCapture(httpServerConfig, traceHandler, evidenceHandler, logHandler, archiveHandler, sessionHandler, ledgerHandler, metrics, nil, enterpriseReaders...)
+}
+
+func newAppWithArchiveAndCapture(
+	httpServerConfig conf.HTTPServerConfig,
+	traceHandler *httphandler.TraceHandler,
+	evidenceHandler *httphandler.EvidenceHandler,
+	logHandler *httphandler.LogHandler,
+	archiveHandler *httphandler.ArchiveHandler,
+	sessionHandler *httphandler.SessionHandler,
+	ledgerHandler *httphandler.LedgerHandler,
+	metrics http.Handler,
+	capturePolicyHandler *httphandler.CapturePolicyHandler,
+	enterpriseReaders ...enterpriseroute.Reader,
+) *App {
+	health := newKafkaHealth()
+	disabledEvidence, _ := kafkaruntime.NewWithFactory(conf.KafkaConsumerConfig{}, conf.KafkaTopicConsumerConfig{}, nil, nil)
+	disabledAudit, _ := kafkaruntime.NewWithFactory(conf.KafkaConsumerConfig{}, conf.KafkaTopicConsumerConfig{}, nil, nil)
+	health.set("evidence", disabledEvidence)
+	health.set("audit", disabledAudit)
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health/ready", health.serveHTTP)
+	mux.HandleFunc("/health/live", health.serveLiveHTTP)
 	if metrics != nil {
 		mux.Handle("/metrics", metrics)
 	}
@@ -552,7 +958,20 @@ func newAppWithArchive(
 	mux.HandleFunc(ObservabilityAPIBasePath+"/logs", readAuth(logHandler.ListLogs))
 	mux.HandleFunc(ObservabilityAPIBasePath+"/logs/", readAuth(logHandler.GetLog))
 	mux.HandleFunc(ObservabilityAPIBasePath+"/log-sources", readAuth(logHandler.ListLogSources))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/log-source-inventory", readAuth(logHandler.ListLogSourceInventory))
 	mux.HandleFunc(ObservabilityAPIBasePath+"/log-policies", readAuth(logHandler.ListLogPolicies))
+	if capturePolicyHandler != nil {
+		capturePolicyRoute := evidenceHandler.RequireTraceEvidenceConfigurationPermission(capturePolicyHandler.HandleTraceEvidenceConfiguration)
+		mux.HandleFunc(APIBasePath+"/trace-evidence-configuration", readAuth(capturePolicyRoute))
+		captureOperationRoute := evidenceHandler.RequireTraceEvidenceConfigurationPermission(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				capturePolicyHandler.ReconcileTraceEvidenceOperation(w, r)
+				return
+			}
+			capturePolicyHandler.GetTraceEvidenceOperation(w, r)
+		})
+		mux.HandleFunc(APIBasePath+"/trace-evidence-operations/", readAuth(captureOperationRoute))
+	}
 	if archiveHandler != nil {
 		mux.HandleFunc(ObservabilityAPIBasePath+"/log-archive-overview", readAuth(archiveHandler.Overview(observabilityvo.ArchiveKindLog)))
 		mux.HandleFunc(ObservabilityAPIBasePath+"/trace-archive-overview", readAuth(archiveHandler.Overview(observabilityvo.ArchiveKindTrace)))
@@ -573,11 +992,18 @@ func newAppWithArchive(
 	))
 
 	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("/health/ready", health.serveHTTP)
 	internal := evidenceHandler.InternalLifecycle
 	lifecycle := func(next http.HandlerFunc) http.HandlerFunc {
 		return internal(evidenceHandler.RequireTrustedLifecycleIdentity(next))
 	}
 	httphandler.RegisterSessionRoutes(internalMux, APIBasePath, sessionHandler, lifecycle)
+	if capturePolicyHandler != nil {
+		internalMux.HandleFunc(APIBasePath+"/internal/trace-evidence/policy", capturePolicyHandler.GetInternalTraceEvidencePolicy)
+		internalMux.HandleFunc(APIBasePath+"/internal/trace-evidence/configuration", capturePolicyHandler.GetTraceEvidenceConfiguration)
+		internalMux.HandleFunc(APIBasePath+"/internal/trace-evidence/endpoints:heartbeat", capturePolicyHandler.HeartbeatInternalTraceEvidenceEndpoint)
+		internalMux.HandleFunc(APIBasePath+"/internal/trace-evidence/operations/", capturePolicyHandler.AcknowledgeInternalTraceEvidenceOperation)
+	}
 
 	publicHandler := observabilitylocale.PrivateNoCacheForPrefixes(
 		observabilitylocale.LanguageMiddleware(mux),
@@ -592,20 +1018,37 @@ func newAppWithArchive(
 	return &App{
 		server:         httpserver.New(httpServerConfig.Address, publicHandler),
 		internalServer: httpserver.New(httpServerConfig.InternalAddress, internalHandler),
+		kafkaHealth:    health,
 	}
 }
 
 func (a *App) Start() error {
+	startedKafka := make([]*kafkaruntime.Runtime, 0, len(a.kafkaRuntimes))
+	for _, runtime := range a.kafkaRuntimes {
+		if err := runtime.Start(context.Background()); err != nil {
+			for _, started := range startedKafka {
+				_ = started.Shutdown(context.Background())
+			}
+			return fmt.Errorf("start Kafka consumer runtime: %w", err)
+		}
+		startedKafka = append(startedKafka, runtime)
+	}
 	if a.internalServer == nil {
-		return a.server.Start()
+		err := a.server.Start()
+		if err != nil {
+			stopStartedKafka(startedKafka)
+		}
+		return err
 	}
 	internalResult, err := a.internalServer.StartAsync()
 	if err != nil {
+		stopStartedKafka(startedKafka)
 		return fmt.Errorf("start BKN Trace internal listener: %w", err)
 	}
 	publicResult, err := a.server.StartAsync()
 	if err != nil {
 		_ = a.internalServer.Shutdown(context.Background())
+		stopStartedKafka(startedKafka)
 		return fmt.Errorf("start BKN Trace public listener: %w", err)
 	}
 	select {
@@ -621,8 +1064,11 @@ func (a *App) Start() error {
 
 func (a *App) Shutdown(ctx context.Context) error {
 	var shutdownErr error
+	for _, runtime := range a.kafkaRuntimes {
+		shutdownErr = errors.Join(shutdownErr, runtime.Shutdown(ctx))
+	}
 	if a.server != nil {
-		shutdownErr = a.server.Shutdown(ctx)
+		shutdownErr = errors.Join(shutdownErr, a.server.Shutdown(ctx))
 	}
 	if a.internalServer != nil {
 		shutdownErr = errors.Join(shutdownErr, a.internalServer.Shutdown(ctx))
@@ -634,8 +1080,19 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.closeDatabase != nil {
 		shutdownErr = errors.Join(shutdownErr, a.closeDatabase())
 	}
+	shutdownErr = errors.Join(shutdownErr, a.captureAudit.close())
 	return shutdownErr
 }
+
+func stopStartedKafka(runtimes []*kafkaruntime.Runtime) {
+	for i := len(runtimes) - 1; i >= 0; i-- {
+		_ = runtimes[i].Shutdown(context.Background())
+	}
+}
+
+type kafkaNoopCommitter struct{}
+
+func (kafkaNoopCommitter) Commit(context.Context, int, int64) error { return nil }
 
 func stopAndDrainProjectionWorker(
 	ctx context.Context,

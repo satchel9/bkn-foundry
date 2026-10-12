@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -124,6 +125,21 @@ func Test_relationTypeAccess_CheckRelationTypeExistByID(t *testing.T) {
 	})
 }
 
+func Test_relationTypeAccess_GetRelationTypeIDsByIDs(t *testing.T) {
+	Convey("batch query relation type identities", t, func() {
+		rta, smock := MockNewRelationTypeAccess(&common.AppSetting{})
+		sqlStr := "SELECT f_id FROM t_relation_type WHERE f_kn_id = ? AND f_branch = ? AND f_id IN (?,?)"
+		rows := sqlmock.NewRows([]string{"f_id"}).AddRow("rt1").AddRow("rt2")
+		smock.ExpectQuery(sqlStr).WithArgs("kn1", interfaces.MAIN_BRANCH, "rt1", "rt2").WillReturnRows(rows)
+
+		ids, err := rta.GetRelationTypeIDsByIDs(testCtx, "kn1", interfaces.MAIN_BRANCH, []string{"rt1", "rt2"})
+
+		So(err, ShouldBeNil)
+		So(ids, ShouldResemble, []string{"rt1", "rt2"})
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
+	})
+}
+
 func Test_relationTypeAccess_CreateRelationType(t *testing.T) {
 	Convey("test CreateRelationType\n", t, func() {
 		appSetting := &common.AppSetting{}
@@ -198,6 +214,28 @@ func Test_relationTypeAccess_CreateRelationType(t *testing.T) {
 			err := rta.CreateRelationType(testCtx, tx, invalidRelationType)
 			So(err, ShouldNotBeNil)
 		})
+	})
+}
+
+func Test_relationTypeAccess_CreateRelationTypes(t *testing.T) {
+	Convey("batch create relation types", t, func() {
+		rta, smock := MockNewRelationTypeAccess(&common.AppSetting{})
+		second := *testRelationType
+		second.RTID = "rt2"
+		second.RTName = "Relation Type 2"
+		sqlStr := fmt.Sprintf("INSERT INTO %s (f_id,f_name,f_tags,f_comment,f_icon,f_color,f_bkn_raw_content,"+
+			"f_kn_id,f_branch,f_source_object_type_id,f_target_object_type_id,f_type,f_mapping_rules,"+
+			"f_creator,f_creator_type,f_create_time,f_updater,f_updater_type,f_update_time) "+
+			"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?),(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", RT_TABLE_NAME)
+		smock.ExpectBegin()
+		smock.ExpectExec(sqlStr).WillReturnResult(sqlmock.NewResult(1, 2))
+		tx, err := rta.db.Begin()
+		So(err, ShouldBeNil)
+
+		err = rta.CreateRelationTypes(testCtx, tx, []*interfaces.RelationType{testRelationType, &second})
+
+		So(err, ShouldBeNil)
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 
@@ -443,6 +481,45 @@ func Test_relationTypeAccess_GetRelationTypesTotal(t *testing.T) {
 			}
 		})
 	})
+}
+
+func TestRelationTypeAccessListSummariesReadsListFields(t *testing.T) {
+	rta, smock := MockNewRelationTypeAccess(&common.AppSetting{})
+	query := interfaces.RelationTypesQueryParams{
+		KNID: "kn1", Branch: interfaces.MAIN_BRANCH, ValidAuthorizationIDsOnly: true,
+		PaginationQueryParameters: interfaces.PaginationQueryParameters{
+			Offset: 20, Limit: 10, Sort: "f_update_time", Direction: interfaces.DESC_DIRECTION,
+		},
+	}
+	sqlStr := "SELECT f_id, f_name, f_tags, f_comment, f_icon, f_color, f_kn_id, f_branch, " +
+		"f_source_object_type_id, f_target_object_type_id, f_type, f_mapping_rules, f_creator, " +
+		"f_creator_type, f_create_time, f_updater, f_updater_type, " +
+		"f_update_time FROM t_relation_type WHERE f_kn_id = ? AND f_branch = ? " +
+		"AND f_id <> '' AND f_id = TRIM(f_id) AND instr(f_id, '/') = 0 AND instr(f_id, '*') = 0 " +
+		"ORDER BY f_update_time DESC, f_id ASC LIMIT 10 OFFSET 20"
+	rows := sqlmock.NewRows([]string{
+		"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_kn_id", "f_branch",
+		"f_source_object_type_id", "f_target_object_type_id", "f_type", "f_mapping_rules", "f_creator",
+		"f_creator_type", "f_create_time", "f_updater", "f_updater_type",
+		"f_update_time",
+	}).AddRow("rt1", "Relation 1", `"core"`, "comment", "icon", "#fff", "kn1", "main",
+		"ot1", "ot2", interfaces.RELATION_TYPE_DIRECT, `[]`, "creator", "user", int64(100),
+		"admin", "user", int64(123))
+	smock.ExpectQuery(sqlStr).WithArgs("kn1", interfaces.MAIN_BRANCH).WillReturnRows(rows)
+
+	items, err := rta.ListRelationTypeSummaries(testCtx, query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].RTID != "rt1" || items[0].Comment != "comment" ||
+		!reflect.DeepEqual(items[0].Tags, []string{"core"}) || items[0].Creator.ID != "creator" ||
+		items[0].CreateTime != 100 || items[0].Updater.ID != "admin" ||
+		!reflect.DeepEqual(items[0].MappingRules, []interfaces.Mapping{}) {
+		t.Fatalf("summary = %#v", items)
+	}
+	if err := smock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func Test_relationTypeAccess_GetRelationTypeByID(t *testing.T) {
@@ -699,6 +776,35 @@ func Test_relationTypeAccess_UpdateRelationType(t *testing.T) {
 				t.Errorf("there were unfulfilled expectations: %s", err)
 			}
 		})
+	})
+}
+
+func Test_relationTypeAccess_UpdateRelationTypes(t *testing.T) {
+	Convey("batch update relation types in bounded chunks", t, func() {
+		db, smock, err := sqlmock.New()
+		So(err, ShouldBeNil)
+		rta := &relationTypeAccess{appSetting: &common.AppSetting{}, db: db}
+		relationTypes := make([]*interfaces.RelationType, 0, relationTypeUpdateBatchSize+1)
+		for index := 0; index < relationTypeUpdateBatchSize+1; index++ {
+			relationTypes = append(relationTypes, &interfaces.RelationType{
+				RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{
+					RTID:         fmt.Sprintf("rt%d", index),
+					RTName:       fmt.Sprintf("Relation Type %d", index),
+					MappingRules: []interfaces.Mapping{},
+				},
+				KNID: "kn1", Branch: interfaces.MAIN_BRANCH,
+			})
+		}
+		smock.ExpectBegin()
+		smock.ExpectExec("^UPDATE t_relation_type SET ").WillReturnResult(sqlmock.NewResult(0, relationTypeUpdateBatchSize))
+		smock.ExpectExec("^UPDATE t_relation_type SET ").WillReturnResult(sqlmock.NewResult(0, 1))
+		tx, err := db.Begin()
+		So(err, ShouldBeNil)
+
+		err = rta.UpdateRelationTypes(testCtx, tx, relationTypes)
+
+		So(err, ShouldBeNil)
+		So(smock.ExpectationsWereMet(), ShouldBeNil)
 	})
 }
 

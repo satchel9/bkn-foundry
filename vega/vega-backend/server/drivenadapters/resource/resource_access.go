@@ -43,6 +43,14 @@ type resourceAccess struct {
 	db         *sql.DB
 }
 
+func marshalResourceLogicDefinition(resource *interfaces.Resource) []byte {
+	if resource.LogicDefinition != nil {
+		encoded, _ := sonic.Marshal(resource.LogicDefinition)
+		return encoded
+	}
+	return []byte("[]")
+}
+
 var resourceColumns = []string{
 	"f_id",
 	"f_catalog_id",
@@ -55,6 +63,9 @@ var resourceColumns = []string{
 	"f_status",
 	"f_status_message",
 	"f_last_discover_status",
+	"f_last_discover_time",
+	"f_row_count",
+	"f_row_count_time",
 	"f_schema",
 	"f_source_identifier",
 	"f_source_metadata",
@@ -85,6 +96,7 @@ var resourceSummaryColumns = []string{
 	"f_status",
 	"f_status_message",
 	"f_last_discover_status",
+	"f_last_discover_time",
 	"f_schema",
 	"f_source_identifier",
 	"f_local_status",
@@ -120,6 +132,9 @@ func scanResource(scanner resourceRowScanner) (*interfaces.Resource, error) {
 		&resource.Status,
 		&resource.StatusMessage,
 		&resource.LastDiscoverStatus,
+		&resource.LastDiscoverTime,
+		&resource.RowCount,
+		&resource.RowCountTime,
 		&resource.Schema,
 		&resource.SourceIdentifier,
 		&sourceMetadata,
@@ -150,8 +165,8 @@ func scanResource(scanner resourceRowScanner) (*interfaces.Resource, error) {
 	if indexConfig.Valid && indexConfig.String != "" {
 		_ = sonic.Unmarshal([]byte(indexConfig.String), &resource.IndexConfig)
 	}
-	if logicDefinition.Valid && logicDefinition.String != "" {
-		_ = sonic.Unmarshal([]byte(logicDefinition.String), &resource.LogicDefinition)
+	if resource.Category == interfaces.ResourceCategoryLogicalView && logicDefinition.Valid && logicDefinition.String != "" {
+		_ = common.UnmarshalPreciseJSON([]byte(logicDefinition.String), &resource.LogicDefinition)
 	}
 	return resource, nil
 }
@@ -171,6 +186,7 @@ func scanResourceSummary(scanner resourceRowScanner) (*interfaces.ResourceSummar
 		&summary.Status,
 		&summary.StatusMessage,
 		&summary.LastDiscoverStatus,
+		&summary.LastDiscoverTime,
 		&summary.Schema,
 		&summary.SourceIdentifier,
 		&summary.LocalIndexStatus,
@@ -226,10 +242,7 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 	if resource.IndexConfig == nil {
 		indexConfigBytes = []byte("{}")
 	}
-	logicDefinitionBytes, _ := sonic.Marshal(resource.LogicDefinition)
-	if resource.LogicDefinition == nil {
-		logicDefinitionBytes = []byte("[]")
-	}
+	logicDefinitionBytes := marshalResourceLogicDefinition(resource)
 	if resource.LocalIndexStatus == "" {
 		resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusUnavailable
 	}
@@ -247,6 +260,10 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 			"f_status",
 			"f_status_message",
 			"f_last_discover_status",
+			"f_last_discover_time",
+			"f_row_count",
+			"f_row_count_time",
+
 			"f_schema",
 			"f_source_identifier",
 			"f_source_metadata",
@@ -279,6 +296,10 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 			resource.Status,
 			resource.StatusMessage,
 			resource.LastDiscoverStatus,
+			resource.LastDiscoverTime,
+			resource.RowCount,
+			resource.RowCountTime,
+
 			resource.Schema,
 			resource.SourceIdentifier,
 			string(sourceMetadataBytes),
@@ -405,7 +426,7 @@ func (ra *resourceAccess) GetByIDs(ctx context.Context, ids []string) (map[strin
 }
 
 // GetSummariesByIDs retrieves resource list summaries keyed by ID without loading extended JSON fields.
-// Only lazy extract the scale information (column_count/row_count) from the original JSON, without deserializing the complete structure;
+// Only lazy extract the scale information (column_count/estimated_row_count) from the original JSON, without deserializing the complete structure;
 // Counting is completed on the Go side to be compatible with multi-dialect databases (such as MariaDB/DM8/KDB9, etc.) and does not rely on MySQL JSON functions.
 func (ra *resourceAccess) GetSummariesByIDs(ctx context.Context, ids []string) (map[string]*interfaces.ResourceSummary, error) {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Query resource summaries by IDs")
@@ -505,7 +526,7 @@ func (ra *resourceAccess) ListPermissionRefs(ctx context.Context, params interfa
 	builder := sq.Select("f_id", "f_catalog_id").From(RESOURCE_TABLE_NAME)
 	builder = applyResourceFilters(builder, params)
 
-	builder = builder.OrderBy(resourceListOrderByClause(params.Sort, params.Direction))
+	builder = builder.OrderBy(buildOrderByClause(params.Sort, params.Direction))
 
 	sqlStr, vals, err := builder.ToSql()
 	if err != nil {
@@ -560,7 +581,7 @@ func (ra *resourceAccess) List(ctx context.Context, params interfaces.ResourcesQ
 	}
 
 	// Pagination is applied in service after permission filtering.
-	builder = builder.OrderBy(resourceListOrderByClause(params.Sort, params.Direction))
+	builder = builder.OrderBy(buildOrderByClause(params.Sort, params.Direction))
 
 	sqlStr, vals, err := builder.ToSql()
 	if err != nil {
@@ -615,9 +636,10 @@ func (ra *resourceAccess) Update(ctx context.Context, tx *sql.Tx,
 	if resource.IndexConfig == nil {
 		indexConfigBytes = []byte("{}")
 	}
-	logicDefinitionBytes, _ := sonic.Marshal(resource.LogicDefinition)
-	if resource.LogicDefinition == nil {
-		logicDefinitionBytes = []byte("[]")
+	logicDefinitionBytes := marshalResourceLogicDefinition(resource)
+	sourceMetadataBytes, _ := sonic.Marshal(resource.SourceMetadata)
+	if resource.SourceMetadata == nil {
+		sourceMetadataBytes = []byte("{}")
 	}
 
 	builder := sq.Update(RESOURCE_TABLE_NAME).
@@ -633,6 +655,10 @@ func (ra *resourceAccess) Update(ctx context.Context, tx *sql.Tx,
 		Set("f_update_time", resource.UpdateTime).
 		Where(sq.Eq{"f_id": resource.ID}).
 		Where(sq.Eq{"f_update_time": expectedUpdateTime})
+
+	if resource.Category == interfaces.ResourceCategoryLogicalView {
+		builder = builder.Set("f_source_metadata", string(sourceMetadataBytes))
+	}
 
 	sqlStr, vals, err := builder.ToSql()
 	if err != nil {
@@ -847,6 +873,7 @@ func (ra *resourceAccess) UpdateDiscoveryMetadata(ctx context.Context,
 		Set("f_source_metadata", string(sourceMetadataBytes)).
 		Set("f_schema_definition", string(schemaDefinitionBytes)).
 		Set("f_last_discover_status", resource.LastDiscoverStatus).
+		Set("f_last_discover_time", resource.LastDiscoverTime).
 		Set("f_updater", resource.Updater.ID).
 		Set("f_updater_type", resource.Updater.Type).
 		Set("f_update_time", resource.UpdateTime).
@@ -987,26 +1014,59 @@ func (ra *resourceAccess) UpdateDiscoverStatus(ctx context.Context, id string, s
 	return nil
 }
 
-func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string) error {
+func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string, onlyIfStale bool) error {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Delete resources")
 	defer span.End()
 
-	span.SetAttributes(attr.Key("resource_ids").StringSlice(ids))
+	span.SetAttributes(
+		attr.Key("resource_ids").StringSlice(ids),
+		attr.Key("only_if_stale").Bool(onlyIfStale),
+	)
 
 	if len(ids) == 0 {
 		return nil
 	}
 
-	sqlStr, vals, _ := sq.Delete(RESOURCE_TABLE_NAME).
-		Where(sq.Eq{"f_id": ids}).
-		ToSql()
+	query := sq.Delete(RESOURCE_TABLE_NAME).Where(sq.Eq{"f_id": ids})
+	if onlyIfStale {
+		query = query.Where(sq.Eq{"f_status": interfaces.ResourceStatusStale}).
+			Where(sq.Eq{"f_last_discover_status": interfaces.DiscoverStatusMissing})
+	}
+	sqlStr, vals, err := query.ToSql()
+	if err != nil {
+		span.SetStatus(codes.Error, "Build delete query failed")
+		return err
+	}
+	tx, err := ra.db.BeginTx(ctx, nil)
+	if err != nil {
+		span.SetStatus(codes.Error, "Begin delete transaction failed")
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 
-	_, err := ra.db.ExecContext(ctx, sqlStr, vals...)
+	result, err := tx.ExecContext(ctx, sqlStr, vals...)
 	if err != nil {
 		span.SetStatus(codes.Error, "Delete failed")
 		return err
 	}
-
+	if onlyIfStale {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			span.SetStatus(codes.Error, "Get deleted row count failed")
+			return err
+		}
+		if rows != int64(len(ids)) {
+			if err := tx.Rollback(); err != nil {
+				span.SetStatus(codes.Error, "Rollback conditional deletion failed")
+				return err
+			}
+			return interfaces.ErrResourceDeleteConditionNotMet
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		span.SetStatus(codes.Error, "Commit resource deletion failed")
+		return err
+	}
 	span.SetStatus(codes.Ok, "")
 	return nil
 }
@@ -1189,22 +1249,49 @@ func applyResourceFilters(builder sq.SelectBuilder, params interfaces.ResourcesQ
 	return builder
 }
 
-// resourceListOrderByClause translates API sort fields into a safe ORDER BY clause.
-// Empty or unknown sort values fall back to update time descending.
-func resourceListOrderByClause(sort, direction string) string {
+// buildOrderByClause translates API sort fields into a safe ORDER BY clause.
+// Empty or unknown sort values fall back to update time, preserving direction.
+// The unique ID makes pagination deterministic when primary sort values tie.
+func buildOrderByClause(sort, direction string) string {
 	dir := "DESC"
 	if strings.EqualFold(direction, interfaces.ASC_DIRECTION) {
 		dir = "ASC"
 	}
-
+	var column string
 	switch sort {
 	case interfaces.ResourceSortName:
-		return "f_name " + dir
+		column = "f_name"
 	case interfaces.ResourceSortCreateTime:
-		return "f_create_time " + dir
+		column = "f_create_time"
 	case interfaces.ResourceSortUpdateTime:
-		return "f_update_time " + dir
+		column = "f_update_time"
 	default:
-		return "f_update_time DESC"
+		column = "f_update_time"
 	}
+	return fmt.Sprintf("%s %s, f_id %s", column, dir, dir)
+}
+
+// UpdateRowCount 仅更新统计，原子保留其他元数据及资源版本。
+func (ra *resourceAccess) UpdateRowCount(ctx context.Context, tx *sql.Tx, resource *interfaces.Resource, expectedUpdateTime int64) (int64, error) {
+	query, args, err := sq.Update(RESOURCE_TABLE_NAME).
+		Set("f_row_count", resource.RowCount).
+		Set("f_row_count_time", resource.RowCountTime).
+		Where(sq.Eq{
+			"f_id":          resource.ID,
+			"f_update_time": expectedUpdateTime,
+		}).
+		ToSql()
+	if err != nil {
+		return 0, err
+	}
+	var result sql.Result
+	if tx != nil {
+		result, err = tx.ExecContext(ctx, query, args...)
+	} else {
+		result, err = ra.db.ExecContext(ctx, query, args...)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

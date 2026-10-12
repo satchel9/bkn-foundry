@@ -112,11 +112,12 @@ const (
 
 // HTTPRequest API request.
 type HTTPRequest struct {
-	ClientID          string        `json:"client_id"` // Client ID.
-	Timeout           time.Duration `json:"timeout" validate:"gte=0"`
-	ExecutionMode     ExecutionMode `json:"execution_mode" validate:"required,oneof=sync async stream"`
-	HTTPRouter        `json:",inline"`
-	HTTPRequestParams `json:",inline"`
+	ClientID           string        `json:"client_id"` // Client ID.
+	Timeout            time.Duration `json:"timeout" validate:"gte=0"`
+	ClientTimeoutGrace time.Duration `json:"-"` // Time for the downstream to report an execution timeout.
+	ExecutionMode      ExecutionMode `json:"execution_mode" validate:"required,oneof=sync async stream"`
+	HTTPRouter         `json:",inline"`
+	HTTPRequestParams  `json:",inline"`
 }
 
 // HTTPRouter HTTP routing.
@@ -167,24 +168,4 @@ const (
 	BizStatusPublished BizStatus = "published" // Published.
 	BizStatusOffline   BizStatus = "offline"   // Removed.
 	BizStatusEditing   BizStatus = "editing"   // Published and editing.
-)
-
-// OutboxMessageReq message event request.
-type OutboxMessageReq struct {
-	EventID   string                 `json:"event_id"`
-	EventType OutboxMessageEventType `json:"event_type" validate:"required"`
-	Topic     string                 `json:"topic" validate:"required"`
-	Payload   string                 `json:"payload" validate:"required"`
-}
-
-// OutboxMessageEventType message event type.
-type OutboxMessageEventType string
-
-// String Returns a string.
-func (eventType OutboxMessageEventType) String() string {
-	return string(eventType)
-}
-
-const (
-	OutboxMessageEventTypeAuditLog OutboxMessageEventType = "audit_log" // Audit log.
 )

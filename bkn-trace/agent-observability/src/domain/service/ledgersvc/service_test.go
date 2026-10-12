@@ -16,7 +16,73 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/sessionvo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/ledgerstore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/icoremetrics"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/ievidenceledger"
 )
+
+type kafkaLedgerStore struct {
+	ievidenceledger.Store
+	coordinate ievidenceledger.KafkaCoordinate
+	result     ievidenceledger.KafkaResult
+	err        error
+}
+
+type invalidScopeLedgerStore struct {
+	ievidenceledger.Store
+	err error
+}
+
+func (s invalidScopeLedgerStore) Commit(context.Context, ledgervo.Event) (ledgervo.DurableAck, error) {
+	return ledgervo.DurableAck{}, s.err
+}
+
+func (s *kafkaLedgerStore) CommitKafka(_ context.Context, _ ledgervo.Event, coordinate ievidenceledger.KafkaCoordinate) (ievidenceledger.KafkaResult, error) {
+	s.coordinate = coordinate
+	return s.result, s.err
+}
+
+func TestIngestKafkaClassifiesTrustedOwnerMismatchAsInvalidEvent(t *testing.T) {
+	store := &kafkaLedgerStore{err: ievidenceledger.ErrOwnerMismatch}
+	service := ledgersvc.New(store)
+	_, err := service.IngestKafka(context.Background(), testEvent(), ievidenceledger.KafkaCoordinate{Topic: "openbkn.evidence.v1", Partition: 0, Offset: 5})
+	if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
+		t.Fatalf("owner mismatch = %v, want invalid_evidence_event terminal decision", err)
+	}
+}
+
+func TestIngestKafkaClassifiesMissingTrustedScopeAsInvalidEvent(t *testing.T) {
+	store := &kafkaLedgerStore{err: ievidenceledger.ErrMissingScope}
+	service := ledgersvc.New(store)
+	_, err := service.IngestKafka(context.Background(), testEvent(), ievidenceledger.KafkaCoordinate{Topic: "openbkn.evidence.v1", Partition: 0, Offset: 18})
+	if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
+		t.Fatalf("missing trusted scope = %v, want invalid_evidence_event terminal decision", err)
+	}
+}
+
+func TestIngestClassifiesPermanentOwnershipFailuresAsInvalidEvent(t *testing.T) {
+	for _, storeErr := range []error{ievidenceledger.ErrMissingScope, ievidenceledger.ErrOwnerMismatch} {
+		service := ledgersvc.New(invalidScopeLedgerStore{err: storeErr})
+		_, err := service.Ingest(context.Background(), testEvent())
+		if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
+			t.Fatalf("store error %v mapped to %v, want invalid_evidence_event", storeErr, err)
+		}
+	}
+}
+
+func TestIngestKafkaPassesCoordinateAndPreservesDurableConflictDecision(t *testing.T) {
+	store := &kafkaLedgerStore{result: ievidenceledger.KafkaResult{Decision: ievidenceledger.KafkaConflict, ReasonCode: "event_payload_conflict"}}
+	service := ledgersvc.New(store)
+	coordinate := ievidenceledger.KafkaCoordinate{Topic: "openbkn.evidence.v1", Partition: 3, Offset: 27}
+	result, err := service.IngestKafka(context.Background(), testEvent(), coordinate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.coordinate != coordinate {
+		t.Fatalf("coordinate passed to store = %+v", store.coordinate)
+	}
+	if result.Decision != ievidenceledger.KafkaConflict || result.ReasonCode != "event_payload_conflict" {
+		t.Fatalf("terminal conflict result = %+v", result)
+	}
+}
 
 func TestEvidenceLedgerReturnsDurableAckOnlyAfterOutboxCommit(t *testing.T) {
 	t.Parallel()

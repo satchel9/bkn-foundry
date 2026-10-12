@@ -17,12 +17,12 @@
   "search_instance": {
     "title": "Instance Semantic Search",
     "group_title": "Instance Queries",
-    "description": "Recall instances straight from a natural-language question, without knowing object types or field names first. It locates the relevant object types from the query, runs semantic instance recall over them (vector and full-text channels issued in parallel and fused by rank), and returns the instance rows **together with the trimmed definitions of the object types they came from** (only those that actually produced rows) — so one call is enough and no follow-up schema lookup is needed. Use it as the entry point for \"which rows is this sentence about\"; use search_schema when you only want to explore the network's structure without fetching data, and query_object_instance when the object type and filters are already known. Only properties whose condition_operations include match or knn take part, so object types without an index return nothing. Results are ordered by rank fusion by default; pass rerank=true to have a cross-encoder score each candidate against the query and reorder them, which separates cases rank fusion cannot (a debt record from a repayment record) at the cost of one extra model call."
+    "description": "Recall instances straight from a natural-language question, without knowing object types or field names first. It locates the relevant object types from the query, runs semantic instance recall over them (vector and full-text channels issued in parallel and fused by rank), and returns the instance rows **together with the trimmed definitions of the object types they came from** (only those that actually produced rows) — so one call is enough and no follow-up schema lookup is needed. Use it as the entry point for \"which rows is this sentence about\"; use search_schema when you only want to explore the network's structure without fetching data, and query_object_instance when the object type and filters are already known. Only indexed properties take part — those marked indexed=true whose object type's index_operations include match or knn, or those carrying match or knn in their own condition_operations — so object types without an index return nothing. Results are ordered by rank fusion by default; pass rerank=true to have a cross-encoder score each candidate against the query and reorder them, which separates cases rank fusion cannot (a debt record from a repayment record) at the cost of one extra model call."
   },
   "query_object_instance": {
     "title": "Query Instances",
     "group_title": "Instance Queries",
-    "description": "Query instances of one known object type with filters, sorting, selected properties, and cursor-style pagination. Use this for row-level object retrieval, not joins or aggregation."
+    "description": "Query instances of one known object type with filters, sorting, selected properties, and cursor-style pagination. Use this for row-level object retrieval, not joins or aggregation. Permission-request links: whenever a result or error carries permission_guidance, the final answer must show its message and every available request_permission_url even if business rows were also returned; use each link as is and never present only the business data. Otherwise build one yourself. Property levels: none is invisible, schema shows the name only, masked returns a masked value, full returns the raw value. For a 403 use requestPermission=1&operations=query_data; for schema or masked properties in effective_permissions use requestPermission=3&properties=<those names, comma-separated>; to widen the row access scope use requestPermission=2. Format: /studio/knowledge-network/workspace/<kn_id>/object-types/<ot_id>/detail?requestPermission=<1|2|3>[&operations=…|&properties=…]&reason=<URL-encoded reason>&source=agent. Include only the parameters of that kind and never invent a host; an empty result or empty value alone is not a sign of missing access."
   },
   "query_instance_subgraph": {
     "title": "Query Subgraph",
@@ -73,7 +73,7 @@
   "query_metric": {
     "title": "Query Metrics",
     "group_title": "Instance Queries",
-    "description": "Compute a modelled metric by its own definition (step 3 of the OT-first metric path). Recall the object type with search_schema / get_kn_detail, pick a metric_id from get_object_types' related_metrics, then call this tool — the formula lives in the MetricDefinition, so do not re-derive it with run_sql. Routing: instance-level values of a bound logic property go through get_logic_properties_values; class-level metrics, and metrics not bound to any logic property, come here. Optional condition filter, analysis_dimensions breakdown, and a time block for a single point or a series. Time window: omitting instant means a trend query, which requires step; start and end must both be set or both omitted."
+    "description": "Compute a modelled metric by its own definition (step 3 of the OT-first metric path). Recall the object type with search_schema / get_kn_detail, pick a metric_id from get_object_types' related_metrics, then call this tool — the formula lives in the MetricDefinition, so do not re-derive it yourself. Routing: instance-level values of a bound logic property go through get_logic_properties_values; class-level metrics, and metrics not bound to any logic property, come here. Optional condition filter, analysis_dimensions breakdown, and a time block for a single point or a series. Time window: omitting instant means a trend query, which requires step; start and end must both be set or both omitted."
   },
   "get_action_info": {
     "title": "Action Info",
@@ -100,7 +100,7 @@
   "get_action_execution": {
     "title": "Action Result",
     "group_title": "Actions",
-    "description": "Query the status and results of a single action execution. Use the execution_id returned by execute_action to fetch the overall status and per-object results.",
+    "description": "Query one action execution by its execution_id. Use results_total, results_offset, and the current results length to decide whether to fetch another page. When pagination is requested, the default page size is 100 and the maximum is 1000; pages cannot pass result 10000.",
     "gateway": {
       "summary": "Look up one action execution by its ID: overall status and the result for each object.",
       "use_when": "You have an execution ID and want to know whether it succeeded and what each object's result was.",
@@ -127,17 +127,17 @@
   "get_kn_detail": {
     "title": "Network Structure",
     "group_title": "Networks & Schema",
-    "description": "Get full knowledge network details, including concept groups, object types, relation types, and action types. Use this when a known kn_id needs a complete schema snapshot. Object type entries carry related_metric_count, the number of metrics modelled on that object type, so you can tell whether drilling in for metrics is worth it. Concept groups carry name/tags/comment and are the entry point for narrowing recall: pick the 1-3 relevant groups here, then pass them to search_schema's search_scope.concept_groups. The top level carries mounted_capabilities: how many capabilities the network has mounted, by kind (skill / function / mcp_tool, where function covers API tools). It answers whether the layer is there and how big it is; for the capabilities themselves — names, descriptions and the input_schema needed to call one — use search_capabilities. An absent field means the bindings could not be read on this call, or that the caller may not read this network — neither is the same as none being mounted. It counts what is mounted, not what you can call: a tool box you cannot see makes search_capabilities return fewer, and the two numbers differing is expected."
+    "description": "Get full knowledge network details, including concept groups, object types, relation types, and action types. Use this when a known kn_id needs a complete schema snapshot. Object type entries carry related_metric_count, the number of metrics modelled on that object type, so you can tell whether drilling in for metrics is worth it. Concept groups carry name/tags/comment and are the entry point for narrowing recall: pick the 1-3 relevant groups here, then pass them to search_schema's search_scope.concept_groups. The top level carries mounted_capabilities: how many capabilities the network has mounted, by kind (skill / function / mcp_tool, where function covers API tools). It answers whether the layer is there and how big it is; for the capabilities themselves — names, descriptions and the input_schema needed to call one — use search_capabilities. An absent field means the bindings could not be read on this call, or that the caller may not read this network — neither is the same as none being mounted. It counts what is mounted, not what you can call: a tool box you cannot see makes search_capabilities return fewer, and the two numbers differing is expected.**A network of more than 200 object types, or more than 600 relation types, answers with its navigation shell**: the concept groups, the three counts object_type_count / relation_type_count / action_type_count, and notice, with the three concept arrays null. The full schema of such a network runs past a megabyte, which no caller can read and none should: pick concept groups and call search_schema. detail_level=full withholds the arrays at this size too. When the network defines no concept groups, the notice sends you straight to search_schema instead."
   },
   "get_object_types": {
     "title": "Object Type Detail",
     "group_title": "Networks & Schema",
-    "description": "Fetch full object type definitions by id (data_properties carry mapped_field/condition_operations, logic_properties carry data_source/parameters). For progressive drill-down: call get_kn_detail (summary) for the object ids first, then expand only the ones you need. ids takes several at once; ids that match nothing come back under missing.",
+    "description": "Fetch full object type definitions by id (data_properties carry mapped_field/condition_operations, logic_properties carry data_source/parameters). For progressive drill-down: call get_kn_detail (summary) for the object ids first, then expand only the ones you need. ids takes several at once; ids that match nothing come back under missing. **Leave ids out to list the network's object type index** by offset/limit: id, name, comment, tags and data source, without fields or metrics (50 per page, 200 at most; the response carries total_count and next_offset). A network past get_kn_detail's caps answers with its navigation shell, and this is the only way to the ids from there -- name them back here for the definitions.",
     "gateway": {
-      "summary": "Get the full definition of object types by ID: fields, the query operators each field supports, logic properties and related metrics.",
-      "use_when": "You need an object type's fields and how they can be filtered, or its metrics and logic properties.",
-      "not_for": "Without the object type ID, use search_schema or get_kn_detail first.",
-      "next_step": "Query instances with query_object_instance; query related metrics with query_metric."
+      "summary": "Full definition of object types by ID, or one page of them when given no ID.",
+      "use_when": "You need an object type's fields and filters, or want to walk the network's object types.",
+      "not_for": "To find which object type is relevant, use search_schema.",
+      "next_step": "Instances: query_object_instance. Metrics: query_metric."
     }
   },
   "get_relation_types": {
@@ -165,7 +165,7 @@
   "run_cypher": {
     "title": "Cypher Query",
     "group_title": "Instance Queries",
-    "description": "Ask a knowledge network in the terms it is modelled in: write Cypher over object type and relation type names, and the server compiles it into a single read-only SQL statement. Division with run_sql — this tool speaks the model (a label is an object type, a relationship is a modelled relation, a property is its logical name), so physical table and column names are never needed; run_sql is for what the model cannot express.\nAccepted: one MATCH or several, and several comma-separated paths in one; a variable written twice is the same node, and paths sharing no variable are a cartesian product. A relationship is written -[:R]->, <-[:R]- or undirected -[:R]-, and names exactly one relation type; a node names exactly one object type on first mention and may carry an inline property map {prop: value}. WHERE takes =, <>, <, >, <=, >=, IN [...] (or IN $list, the whole list passed as one parameter: a non-empty array of scalars of one kind, at most 500 elements), IS NULL / IS NOT NULL, STARTS WITH / ENDS WITH / CONTAINS (the right side is a string literal or a string parameter and is matched as a literal substring -- % and _ are not wildcards; string properties only; case sensitivity follows the data source collation), combined with AND / OR / NOT and grouped by parentheses; values are literals or $name parameters supplied in `parameters` — parameters are values only, never table or column names. RETURN takes properties, AS aliases, DISTINCT, and the aggregates count/sum/avg/min/max including count(*) and DISTINCT forms; Cypher has no GROUP BY, so aggregating groups by whatever else is returned. ORDER BY takes a property, a returned column name, or an aggregate. SKIP / LIMIT page the result.\nRefused, each by name with the construct and its position: OPTIONAL MATCH, WITH, UNION, variable-length paths [:R*1..3], XOR, returning a whole node, function calls and arithmetic, relationship variables. A query holds at most 8 relationships and 9 nodes; a query without LIMIT is capped at 1000 rows and LIMIT itself at 10000. A result collapsed by an aggregate or by DISTINCT can only be ordered by a value it returns.",
+    "description": "Ask a knowledge network in the terms it is modelled in: write Cypher over object type and relation type names, and the server compiles it into a single read-only SQL statement. This tool speaks the model (a label is an object type, a relationship is a modelled relation, a property is its logical name), so physical table and column names are never needed.\nAccepted: one MATCH or several, and several comma-separated paths in one; a variable written twice is the same node, and paths sharing no variable are a cartesian product. A relationship is written -[:R]->, <-[:R]- or undirected -[:R]-, and names exactly one relation type; a node names exactly one object type on first mention and may carry an inline property map {prop: value}. WHERE takes =, <>, <, >, <=, >=, IN [...] (or IN $list, the whole list passed as one parameter: a non-empty array of scalars of one kind, at most 500 elements), IS NULL / IS NOT NULL, STARTS WITH / ENDS WITH / CONTAINS (the right side is a string literal or a string parameter and is matched as a literal substring -- % and _ are not wildcards; string properties only; case sensitivity follows the data source collation), combined with AND / OR / NOT and grouped by parentheses; values are literals or $name parameters supplied in `parameters` — parameters are values only, never table or column names. RETURN takes properties, AS aliases, DISTINCT, and the aggregates count/sum/avg/min/max including count(*) and DISTINCT forms; Cypher has no GROUP BY, so aggregating groups by whatever else is returned. RETURN also computes + - * / % over numeric properties, aggregates, numbers and numeric parameters, as in count(*) * 2, sum(o.price * o.qty) or count(o.x) * 1.0 / count(*); dividing two integers is refused (Cypher drops the remainder and SQL databases disagree), so multiply one side by 1.0 for a fraction; % takes integers; arithmetic also works on either side of a WHERE comparison (o.amount * o.rate > $floor) and in ORDER BY (count(g.id) * 0.5 + p.rank * 0.3 DESC); once rows are aggregated, a property read outside an aggregate in a sort key must also be returned, and a DISTINCT result is sorted by a computed value through its alias. ORDER BY takes a property, a returned column name, or an aggregate. SKIP / LIMIT page the result. OPTIONAL MATCH writes one relationship attaching one new node to a node an earlier clause already found: when nothing matches, the row stays and the new node's columns are null, so count over a property of the optional side is 0 instead of the row being gone (count(*) still counts the row as 1). The WHERE and the inline property map it carries decide what the relationship matched, not which rows survive. The first clause must be MATCH; one OPTIONAL MATCH holds exactly one relationship and introduces exactly one node; and what it introduces may not be required again by a later MATCH or by the query's WHERE, which would drop the very rows it kept.\nRefused, each by name with the construct and its position: WITH, UNION, variable-length paths [:R*1..3], XOR, returning a whole node, function calls, exponentiation ^, relationship variables. A query holds at most 8 relationships and 9 nodes; a query without LIMIT is capped at 1000 rows and LIMIT itself at 10000. A result collapsed by an aggregate or by DISTINCT can only be ordered by a value it returns.",
     "gateway": {
       "summary": "Write read-only Cypher over object type and relation type names; the server compiles it into one SQL statement. For multi-hop queries and aggregates across objects.",
       "use_when": "Statistics, rankings and totals across relations (count/sum/avg/min/max), or multi-hop queries with filters on the path.",
@@ -241,11 +241,47 @@
   },
   "run_code": {
     "title": "Run Code",
-    "group_title": "Code Execution"
+    "group_title": "Code Execution",
+    "gateway": {
+      "summary": "Run Python in the sandbox, with this service's tools callable from the code; for combining, reshaping or batching the results of several queries locally.",
+      "use_when": "One question needs several queries and then a computation, or a loop, paging sweep or throwaway script.",
+      "not_for": "A single query goes to the matching query tool; sellable quantity, kitting, capacity and other business measures go to published functions (search_capabilities).",
+      "next_step": "Call this service's tools by name from the code; run_code and run_shell share one session-isolated working directory.",
+      "keywords": [
+        "run code",
+        "python",
+        "script",
+        "batch",
+        "loop",
+        "local computation",
+        "sandbox"
+      ],
+      "example_arguments": {
+        "code": "print(1 + 1)"
+      }
+    }
   },
   "run_shell": {
     "title": "Run Command",
-    "group_title": "Code Execution"
+    "group_title": "Code Execution",
+    "gateway": {
+      "summary": "Run one shell command in the sandbox and return stdout and stderr; for inspecting the environment and what run_code wrote.",
+      "use_when": "Looking at files, directories or the environment in the sandbox, usually to check what run_code produced.",
+      "not_for": "Do not fetch knowledge network data with it: object types, instances and SQL each have their own tool.",
+      "next_step": "The command runs under sh -c, in the same working directory as run_code.",
+      "keywords": [
+        "run shell",
+        "command",
+        "shell",
+        "inspect files",
+        "directory",
+        "sandbox",
+        "ls"
+      ],
+      "example_arguments": {
+        "command": "ls -la"
+      }
+    }
   },
   "search_capabilities": {
     "title": "Capability Search",
@@ -276,7 +312,7 @@
   "search_native_tools": {
     "title": "Find Query Tools",
     "group_title": "On-demand Queries",
-    "description": "Find the right tool for a task among the tools this entry offers on demand. Returns up to 5 candidates with their name, purpose, when to use them, when not to, the next step and an argument signature. The search covers every capability this entry does not publish directly, including statistics, actions, skills and the tool that finds mounted functions. Candidates cannot be called by name: get the arguments schema with describe_native_tool, then run them through the executor; when you know the name and arguments, run them directly. Tools this entry publishes directly are not searched."
+    "description": "Find the right tool for a task among the tools this entry offers on demand. Returns up to 5 candidates with their name, purpose, when to use them, when not to, the next step and an argument signature. The search covers every capability this entry does not publish directly, including statistics, actions, skills and the tool that finds mounted functions. Candidates cannot be called by name; run them through the executor. When the result carries `ready`, that is the top candidate's executable arguments schema and a call template for it: go straight to execute_native_tool with them and skip describe_native_tool. Ask describe_native_tool only when there is no `ready` — several candidates tied, or that tool's schema is too large to carry. Tools this entry publishes directly are not searched."
   },
   "describe_native_tool": {
     "title": "Describe Query Tool",

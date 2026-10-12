@@ -14,7 +14,11 @@
 
 ## 2. Managed lifecycle
 
-All REST and MCP business tool calls must belong to an active Conversation and an active Interaction:
+While evidence capture is enabled, MCP business tool calls and the REST execution
+endpoints `execute_action`, `execute_tool`, and `execute_skill` require an active
+Conversation and Interaction in `bkn_context`. REST reads, including `run_sql` and `run_cypher`,
+and `/mcp/proxy/.../call` may run ad hoc without it; when supplied, the context
+is validated and Trace capture is attempted:
 
 ```json
 {
@@ -28,9 +32,45 @@ All REST and MCP business tool calls must belong to an active Conversation and a
 ```
 
 - Conversation and Interaction must be created through `bkn_start_interaction`, `Mcp-Session-Id` cannot replace business Conversation.
-- When the context is missing, invalid, unauthorized, expired or final, the Context Loader returns a stable error code, `required_action` and a security prompt, and the number of downstream business calls must be 0.
+- When required context is missing while Trace Core is available, or stated context is invalid, unauthorized, expired or final, the Context Loader returns a stable error code and `required_action`, and the number of downstream business calls is 0. A REST execution with an absent or empty context returns HTTP 400 `conversation_required` and `required_action: create_conversation` while Trace Core is available.
+- When the verified capture policy is disabled, `bkn_start_interaction` issues no IDs and directs callers to continue without `bkn_context`. REST execution and MCP business calls then run without managed Trace capture; the missing-context refusal above applies only while capture is enabled.
+- When Trace Core cannot issue IDs because it is unavailable, REST execution uses a bounded, read-only Core probe. A verified infrastructure failure admits the call without managed Trace and reports Trace as unavailable. A healthy Core response, including a missing probe operation, still requires context.
 - The Context Loader uses a trusted authentication context to determine the application principal and effective subject; the caller cannot override the Owner in JSON.
 - The Context Loader derives the Operation idempotent identity from the trusted request association, tool name, and normalized input. Network retry reuses `bkn-request-id`, or carries a stable `X-OpenBKN-Client-Invocation-Id`; an existing pending Receipt returns `receipt_pending`, and downstream side effects must not be repeated.
+
+### 2.1 Managed and ad-hoc calls
+
+A REST read or proxy call may state a managed interaction. The three REST
+execution endpoints must state one while capture is enabled and Trace Core is available.
+
+| | Managed | Ad hoc |
+|---|---|---|
+| How it is chosen | `bkn_context` carries `conversation_id` and `interaction_id` | On eligible reads and proxy calls, when capture is disabled, or while Trace Core is unavailable, `bkn_context` is absent or empty |
+| What is recorded | an Operation under that Interaction, a Receipt on the response, evidence for what was read | nothing |
+| What it depends on | BKN Trace Core when available, besides the downstream the call queries | only that downstream |
+
+Only those two shapes select ad hoc mode on eligible routes, when capture is disabled, or while Trace Core is unavailable. A `bkn_context` holding one id and not the
+other, only `parent_operation_id`, or a misspelt field is a caller wiring the
+context up and getting it wrong, and is refused rather than quietly downgraded.
+
+Use a managed call when the answer has to enter the evidence chain: an agent turn
+someone may audit, or any reading a later decision will be justified by. REST
+action, tool, and Skill execution requires the context while capture is enabled and Trace Core is available. Use an ad-hoc
+call for ordinary reads, such as Studio answering a click, an
+operator at the CLI, one service asking another for a schema. An Interaction
+records one agent turn, so minting a Conversation and an Interaction to satisfy
+the guard produces single-operation records that dilute the concept rather than
+document anything.
+
+The MCP tool surface keeps the requirement because that is where agents call, and an
+agent turn is exactly what an Interaction records. A Skill has no choice to make
+here: its sandbox calls Context Loader over MCP with the session's own context
+injected, so everything a Skill reads is on the evidence chain.
+
+It follows that a managed call retried through a Trace Core outage, for an answer
+that never needed provenance, is paying for provenance twice over. Route that
+call to its REST equivalent without a `bkn_context`. See #1691 for what the
+managed path costs per call.
 
 ## 3. Downstream sub-call contract
 
@@ -54,12 +94,12 @@ Different transports preserve the native shape of the business response, so Rece
 | MCP executes normally | `structuredContent.bkn_receipt` | Returned together with tool structured results as a projection: `receipt_status`, `evidence_durability`, `observed_evidence_refs`, `business_refs`, plus `partial_reasons` when set. The complete Receipt stays in Core |
 | MCP terminal replay or pending | `receipt` field of text content JSON | The downstream is no longer executed and the persistent state is returned; the error result does not carry `structuredContent` |
 
-`receipt_status` indicates whether the business Attempt has been completed, and `evidence_durability` indicates whether the evidence has received Core durable ACK. The two cannot be mixed:
+`receipt_status` indicates whether the business Attempt has been completed, and `evidence_durability` indicates whether the evidence has received Core Evidence Ledger durable ACK. The two cannot be mixed:
 
-- Without Evidence Ledger durable ACK, successful calls can only be completed with `receipt_status=completed`, `evidence_durability=pending`.
+- Agent Retrieval publishes Evidence events asynchronously to the canonical Kafka producer. Queue acceptance and Kafka broker ACK do not prove that Core has written the event to its Evidence Ledger and Projection Outbox. Successful calls therefore remain `receipt_status=completed`, `evidence_durability=pending` until the authoritative consumer/ledger evidence is observed; do not upgrade the lifecycle receipt based on producer flush results.
 - `evidence_durability=durable` cannot be submitted until the Evidence event has been written to the Core Evidence Ledger and Projection Outbox and received `durable_ack=true`.
 - Failed Attempts use `receipt_status=failed`, `evidence_durability=failed`.
-- Currently #541 lifecycle access does not forge durable ACK; #544's 3.0 Evidence Producer is responsible for passing the real ACK and evidence refs to the Attempt completion interface after access.
+- This producer does not reconcile Kafka ACKs back into Core lifecycle receipts. If authoritative evidence is not observed by the assembler deadline, the Interaction retains partial / coverage-gap semantics rather than treating broker delivery as durable completion.
 
 ## 5. Facts and references
 
@@ -74,19 +114,20 @@ Different transports preserve the native shape of the business response, so Rece
 
 - `event_id = evt_ + sha256(trace_id|operation_id|event_type|attempt)`.
 - `observed_at/emitted_at` reuse the stable time from the caller envelope.
-- The emission function explicitly returns the real event ID; the HTTP object query also returns `bkn-evidence-event-id`.
-- Existing 2.1 fire-and-forget transmitters do not constitute 3.0 durable ACKs and cannot be used to mark Receipts as durable.
+- Artifact content remains on the artifact-only HTTP endpoint; only `RecordInteractionArtifact` uses this path. It is separate from Evidence event delivery.
+- Evidence events are serialized and published with the canonical `comm-go/bkntrace/evidencepublisher` Kafka contract. The bounded in-memory queue is fail-open for business operations; queue/retry failures are observable in logs and producer metrics.
+- Kafka broker ACKs and producer flush results do not constitute Core Evidence Ledger durable ACKs and cannot be used to mark Receipts as durable.
 - When there is no valid inbound OTel Span, in order to satisfy the Core correlation field constraints, the Context Loader stably derives the synthesized trace/span ID from `request_id`; this ID is only used for lifecycle correlation and does not mean that the corresponding Span must exist in the OTel backend.
-- 3.0 Evidence Producer must use #533 durable Outbox and only mark local events as delivered after Core returns durable ACK.
+- Agent Retrieval does not use the retired HTTP Evidence-event ingest path or a source-side outbox. Core's authoritative consumer/ledger and assembler remain responsible for evidence durability and convergence.
 
 ## 7. Acceptance
 
-- Given a missing or invalid managed context, when any business tool is called, then a stable lifecycle error is returned and the number of downstream calls is 0.
+- Given a missing or invalid managed context while capture is enabled and Trace Core is available, when an MCP business tool or REST execution endpoint is called, then a stable lifecycle error is returned and the number of downstream calls is 0. A REST read without context remains admitted; business calls remain admitted without context when verified capture policy is disabled or Trace Core is unavailable.
 - Given the same managed call correlation and normalized input are replayed, when the Receipt is terminal, then the original Receipt is returned and the number of downstream calls remains 1.
 - Given the downstream returns an error or panic, when Context Loader completes the Attempt, then the Receipt becomes failed, no permanent pending state remains, and panic details are not leaked to the caller.
 - Given a retryable failed Attempt, when the trusted adapter creates the next Attempt and re-invokes the business tool, then the new Attempt executes only once; concurrent replays return only the pending Receipt.
 - Given a third-party Agent obtains a pending Receipt, when lifecycle tools are enumerated, then there is no finalize tool that lets it declare platform output or terminal state by itself.
-- Given Core durable ACK has not been received, when the Attempt completes successfully, then the Receipt is completed + pending.
+- Given an event is accepted by the producer and Kafka flush receives a broker ACK, when the Attempt completes successfully, then the Receipt is still completed + pending until Core Evidence Ledger durability is authoritative.
 - Given there is no valid OTel Span and the same request is replayed, when the Attempt completes, then the same synthetic trace ID is used; different requests use different IDs.
 
 ## 8. Known limitations

@@ -1,0 +1,268 @@
+// Copyright (c) 2026 OpenBKN
+// SPDX-License-Identifier: LicenseRef-OpenBKN
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt.
+
+package capturecontrollersvc
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/capturepolicysvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/icapturepolicy"
+)
+
+type fakeStore struct {
+	state    icapturepolicy.ControlState
+	op       icapturepolicy.Operation
+	acks     []icapturepolicy.ExpectedAcknowledgement
+	leases   []icapturepolicy.EndpointLease
+	claimErr error
+}
+
+func (f *fakeStore) ReadControlState(context.Context) (icapturepolicy.ControlState, error) {
+	return f.state, nil
+}
+func (f *fakeStore) NextCapturePolicyRevision(context.Context) (uint64, error) {
+	return f.state.CurrentRevision + 1, nil
+}
+func (f *fakeStore) ListReadyEndpointLeases(context.Context, time.Time) ([]icapturepolicy.EndpointLease, error) {
+	return f.leases, nil
+}
+func (f *fakeStore) StartOperation(_ context.Context, _ icapturepolicy.ControlState, operation icapturepolicy.Operation, expected []icapturepolicy.ExpectedAcknowledgement) error {
+	f.op, f.acks = operation, expected
+	f.state.CurrentRevision, f.state.DesiredState, f.state.ActiveOperationID = operation.PolicyRevision, operation.RequestedState, operation.ID
+	return nil
+}
+func (f *fakeStore) ClaimCapturePolicyOperation(_ context.Context, workerID string, lease time.Duration, now time.Time) (icapturepolicy.Operation, bool, error) {
+	if f.claimErr != nil {
+		return icapturepolicy.Operation{}, false, f.claimErr
+	}
+	if f.state.ActiveOperationID == "" {
+		return icapturepolicy.Operation{
+			CurrentRevision: f.state.CurrentRevision,
+			DesiredState:    f.state.DesiredState,
+			EffectiveState:  f.state.EffectiveState,
+		}, false, nil
+	}
+	if f.op.Phase == icapturepolicy.PhasePending {
+		if f.op.RequestedState == icapturepolicy.StateEnabled {
+			f.op.Phase = icapturepolicy.PhaseEnabling
+		} else {
+			f.op.Phase = icapturepolicy.PhaseDisabling
+		}
+	}
+	f.op.LeaseOwner, f.op.LeaseToken, f.op.LeaseExpiresAt = workerID, f.op.LeaseToken+1, ptr(now.Add(lease))
+	return f.op, true, nil
+}
+
+func TestReconcileRefreshesIdleControlView(t *testing.T) {
+	now := time.Now().UTC()
+	store := &fakeStore{state: icapturepolicy.ControlState{
+		CurrentRevision: 5, DesiredState: icapturepolicy.StateEnabled,
+		EffectiveState: icapturepolicy.StateEnabled,
+	}}
+	var got icapturepolicy.ControlState
+	controller, err := New(Options{
+		Store: store, WorkerID: "worker", Lease: time.Second,
+		Convergence: time.Minute, Now: func() time.Time { return now },
+		OnState: func(state icapturepolicy.ControlState) { got = state },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		claimed, err := controller.Reconcile(context.Background())
+		if err != nil || claimed {
+			t.Fatalf("idle reconcile claimed=%v err=%v", claimed, err)
+		}
+	}
+	if got.CurrentRevision != 5 || got.DesiredState != icapturepolicy.StateEnabled || got.EffectiveState != icapturepolicy.StateEnabled {
+		t.Fatalf("idle control view was not refreshed: %+v", got)
+	}
+}
+
+func TestReconcileDoesNotRefreshControlViewOnClaimError(t *testing.T) {
+	store := &fakeStore{
+		state:    icapturepolicy.ControlState{CurrentRevision: 5, DesiredState: icapturepolicy.StateEnabled, EffectiveState: icapturepolicy.StateEnabled},
+		claimErr: errors.New("control read failed"),
+	}
+	called := 0
+	controller, err := New(Options{
+		Store: store, WorkerID: "worker", Lease: time.Second,
+		Convergence: time.Minute, OnState: func(icapturepolicy.ControlState) { called++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Reconcile(context.Background()); err == nil {
+		t.Fatal("expected claim error")
+	}
+	if called != 0 {
+		t.Fatalf("error path refreshed control view %d times", called)
+	}
+}
+func (f *fakeStore) ReadCapturePolicyAcknowledgements(context.Context, string, uint64) ([]icapturepolicy.ExpectedAcknowledgement, error) {
+	return append([]icapturepolicy.ExpectedAcknowledgement(nil), f.acks...), nil
+}
+func (f *fakeStore) BeginRollback(_ context.Context, _ string, token, revision uint64, restored string, expected []icapturepolicy.ExpectedAcknowledgement, now time.Time) error {
+	f.op.Phase, f.op.CompensationRevision, f.op.RestoredState, f.op.LeaseToken, f.op.ConvergenceDeadline = icapturepolicy.PhaseRollingBack, revision, restored, token, now.Add(10*time.Minute)
+	f.state.CurrentRevision, f.state.DesiredState = revision, restored
+	f.acks = expected
+	return nil
+}
+func (f *fakeStore) CompleteSucceeded(context.Context, string, uint64, time.Time) error {
+	f.op.Phase, f.state.EffectiveState, f.state.ActiveOperationID = icapturepolicy.PhaseSucceeded, f.op.RequestedState, ""
+	return nil
+}
+func (f *fakeStore) CompleteFailed(context.Context, string, uint64, time.Time) error {
+	f.op.Phase, f.state.ActiveOperationID = icapturepolicy.PhaseFailed, ""
+	return nil
+}
+func (f *fakeStore) CompleteRollback(context.Context, string, uint64, time.Time) error {
+	f.op.Phase, f.state.EffectiveState, f.state.ActiveOperationID = icapturepolicy.PhaseRollbackCompleted, f.op.RestoredState, ""
+	return nil
+}
+func (f *fakeStore) CompleteRollbackFailed(context.Context, string, uint64, time.Time) error {
+	f.op.Phase, f.state.ActiveOperationID = icapturepolicy.PhaseRollbackFailed, ""
+	return nil
+}
+
+func ptr(value time.Time) *time.Time { return &value }
+
+func TestRequestRequiredEndpointCoverage(t *testing.T) {
+	base := icapturepolicy.ControlState{CurrentRevision: 1, DesiredState: icapturepolicy.StateEnabled, EffectiveState: icapturepolicy.StateEnabled}
+	newController := func(leases ...string) *Controller {
+		store := &fakeStore{state: base}
+		for i, kind := range leases {
+			store.leases = append(store.leases, icapturepolicy.EndpointLease{EndpointKind: kind, InstanceID: kind, WorkloadIdentity: kind, ProcessBootID: string(rune('a' + i))})
+		}
+		controller, err := New(Options{Store: store, WorkerID: "worker", Lease: time.Minute, Convergence: time.Minute, RequiredEndpointKinds: []string{icapturepolicy.EndpointTraceGateway, icapturepolicy.EndpointEvidencePublisher}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return controller
+	}
+	request := capturepolicysvc.ChangeRequest{ExpectedRevision: 1, DesiredState: capturepolicysvc.StateDisabled}
+	if _, err := newController(icapturepolicy.EndpointEvidencePublisher).Request(context.Background(), request); err != ErrTargetSet {
+		t.Fatalf("publisher-only error = %v", err)
+	}
+	if _, err := newController(icapturepolicy.EndpointTraceGateway).Request(context.Background(), request); err != ErrTargetSet {
+		t.Fatalf("gateway-only error = %v", err)
+	}
+	if _, err := newController(icapturepolicy.EndpointTraceGateway, icapturepolicy.EndpointEvidencePublisher).Request(context.Background(), request); err != nil {
+		t.Fatalf("complete endpoint set error = %v", err)
+	}
+}
+
+func TestControllerRequestAndReconcileUsesFrozenExpectedSet(t *testing.T) {
+	now := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	store := &fakeStore{state: icapturepolicy.ControlState{CurrentRevision: 1, DesiredState: icapturepolicy.StateEnabled, EffectiveState: icapturepolicy.StateEnabled, LastStableRevision: 1, ActiveOperationID: "", CoverageGapUpdatedAt: now, UpdatedAt: now}}
+	var terminal []TerminalEvent
+	controller, err := New(Options{Store: store, WorkerID: "controller-1", Lease: time.Minute, Convergence: time.Minute, Targets: []Target{{EndpointKind: icapturepolicy.EndpointTraceGateway, InstanceID: "gateway-1", WorkloadIdentity: "sa/gateway", ProcessBootID: "boot-1"}}, Now: func() time.Time { return now }, OperationID: func() (string, error) { return "op-1", nil }, OnTerminal: func(_ context.Context, event TerminalEvent) { terminal = append(terminal, event) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := controller.Request(context.Background(), capturepolicysvc.ChangeRequest{DesiredState: capturepolicysvc.StateDisabled, ExpectedRevision: 1})
+	if err != nil || snapshot.Operation.ID != "op-1" || len(store.acks) != 1 {
+		t.Fatalf("request = %#v, err=%v acks=%#v", snapshot, err, store.acks)
+	}
+	exported, dropped, unaccounted := uint64(3), uint64(2), uint64(0)
+	ackTime := now.Add(time.Second)
+	store.acks[0].AckState, store.acks[0].Ready, store.acks[0].AcknowledgedAt = icapturepolicy.AckDisabled, true, &ackTime
+	store.acks[0].ExportedCount, store.acks[0].DroppedCount, store.acks[0].UnaccountedCount = &exported, &dropped, &unaccounted
+	store.acks[0].TraceDisposition = icapturepolicy.DispositionComplete
+	if _, err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.op.Phase != icapturepolicy.PhaseSucceeded || store.state.EffectiveState != icapturepolicy.StateDisabled {
+		t.Fatalf("operation did not converge: op=%+v state=%+v", store.op, store.state)
+	}
+	if len(terminal) != 1 || terminal[0].Phase != icapturepolicy.PhaseSucceeded || terminal[0].OperationID != "op-1" || terminal[0].EffectiveState != icapturepolicy.StateDisabled {
+		t.Fatalf("terminal observer = %+v", terminal)
+	}
+	if claimed, err := controller.Reconcile(context.Background()); err != nil || claimed || len(terminal) != 1 {
+		t.Fatalf("duplicate terminal callback: claimed=%v err=%v events=%+v", claimed, err, terminal)
+	}
+}
+
+func TestControllerReconcilesEnabledGatewayAndPublisherAcks(t *testing.T) {
+	now := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	store := &fakeStore{state: icapturepolicy.ControlState{CurrentRevision: 41, DesiredState: icapturepolicy.StateDisabled, EffectiveState: icapturepolicy.StateDisabled, LastStableRevision: 41, CoverageGapUpdatedAt: now, UpdatedAt: now}}
+	controller, err := New(Options{Store: store, WorkerID: "controller-1", Lease: time.Minute, Convergence: time.Minute, Targets: []Target{
+		{EndpointKind: icapturepolicy.EndpointTraceGateway, InstanceID: "gateway#boot-1", WorkloadIdentity: "sa/gateway", ProcessBootID: "boot-1"},
+		{EndpointKind: icapturepolicy.EndpointEvidencePublisher, InstanceID: "publisher#boot-1", WorkloadIdentity: "sa/publisher", ProcessBootID: "boot-1"},
+	}, Now: func() time.Time { return now }, OperationID: func() (string, error) { return "op-enable", nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Request(context.Background(), capturepolicysvc.ChangeRequest{DesiredState: capturepolicysvc.StateEnabled, ExpectedRevision: 41}); err != nil {
+		t.Fatal(err)
+	}
+	ackTime := now.Add(time.Second)
+	zero := uint64(0)
+	queueEmpty := true
+	for i := range store.acks {
+		ack := &store.acks[i]
+		ack.AckState, ack.Ready, ack.AcknowledgedAt = icapturepolicy.AckReady, true, &ackTime
+		if ack.EndpointKind == icapturepolicy.EndpointTraceGateway {
+			ack.TraceDisposition = icapturepolicy.DispositionNotApplicable
+			continue
+		}
+		ack.LastAcceptedSequence, ack.PublishedCount, ack.DroppedCount = &zero, &zero, &zero
+		ack.QueueEmpty, ack.EvidenceDisposition = &queueEmpty, icapturepolicy.DispositionNotApplicable
+	}
+	if _, err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.op.Phase != icapturepolicy.PhaseSucceeded || store.state.EffectiveState != icapturepolicy.StateEnabled {
+		t.Fatalf("enabled operation did not converge across both endpoint kinds: op=%+v state=%+v", store.op, store.state)
+	}
+}
+
+func TestControllerDeadlineStartsCompensationRevision(t *testing.T) {
+	now := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	store := &fakeStore{state: icapturepolicy.ControlState{CurrentRevision: 1, DesiredState: icapturepolicy.StateEnabled, EffectiveState: icapturepolicy.StateEnabled, LastStableRevision: 1, CoverageGapUpdatedAt: now, UpdatedAt: now}}
+	var terminal []TerminalEvent
+	controller, err := New(Options{Store: store, WorkerID: "controller-1", Lease: time.Minute, Convergence: time.Minute, Targets: []Target{{EndpointKind: icapturepolicy.EndpointTraceGateway, InstanceID: "gateway-1", WorkloadIdentity: "sa/gateway", ProcessBootID: "boot-1"}}, Now: func() time.Time { return now }, OperationID: func() (string, error) { return "op-2", nil }, OnTerminal: func(_ context.Context, event TerminalEvent) { terminal = append(terminal, event) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Request(context.Background(), capturepolicysvc.ChangeRequest{DesiredState: capturepolicysvc.StateDisabled, ExpectedRevision: 1}); err != nil {
+		t.Fatal(err)
+	}
+	store.op.ConvergenceDeadline = now.Add(-time.Second)
+	if _, err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.op.Phase != icapturepolicy.PhaseRollingBack || store.op.CompensationRevision != 3 || store.state.DesiredState != icapturepolicy.StateEnabled {
+		t.Fatalf("compensation was not started: op=%+v state=%+v", store.op, store.state)
+	}
+	ackTime := now.Add(time.Second)
+	store.acks[0].AckState, store.acks[0].Ready, store.acks[0].AcknowledgedAt = icapturepolicy.AckReady, true, &ackTime
+	store.acks[0].TraceDisposition = icapturepolicy.DispositionNotApplicable
+	if _, err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(terminal) != 1 || terminal[0].Phase != icapturepolicy.PhaseRollbackCompleted || terminal[0].PolicyRevision != 3 || terminal[0].DesiredState != icapturepolicy.StateEnabled || terminal[0].EffectiveState != icapturepolicy.StateEnabled {
+		t.Fatalf("rollback audit must describe the compensation revision and restored state: %+v", terminal)
+	}
+}
+
+func TestControllerRollbackFailureAuditsTerminalFailureWithoutFakingEffectiveState(t *testing.T) {
+	now := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	store := &fakeStore{state: icapturepolicy.ControlState{CurrentRevision: 3, DesiredState: icapturepolicy.StateEnabled, EffectiveState: icapturepolicy.StateDisabled, ActiveOperationID: "op-3"}, op: icapturepolicy.Operation{ID: "op-3", PolicyRevision: 2, CompensationRevision: 3, RequestedState: icapturepolicy.StateDisabled, RestoredState: icapturepolicy.StateEnabled, Phase: icapturepolicy.PhaseRollingBack, ConvergenceDeadline: now.Add(-time.Second)}}
+	var terminal []TerminalEvent
+	controller, err := New(Options{Store: store, WorkerID: "controller-1", Lease: time.Minute, Convergence: time.Minute, Now: func() time.Time { return now }, OnTerminal: func(_ context.Context, event TerminalEvent) { terminal = append(terminal, event) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(terminal) != 1 || terminal[0].Phase != icapturepolicy.PhaseRollbackFailed || terminal[0].PolicyRevision != 3 || terminal[0].DesiredState != icapturepolicy.StateEnabled || terminal[0].EffectiveState != icapturepolicy.StateDisabled || terminal[0].FailureCode != "TRACE_EVIDENCE_ROLLBACK_FAILED" {
+		t.Fatalf("rollback failure audit must retain actual effective state: %+v", terminal)
+	}
+}

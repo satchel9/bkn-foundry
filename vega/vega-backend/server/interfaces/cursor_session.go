@@ -13,11 +13,14 @@ import "sync"
 type CursorSession struct {
 	mu sync.Mutex
 
-	ID          string
-	AccountID   string
-	CatalogID   string
-	ResourceIDs []string
-	CompiledSQL string
+	ID        string
+	AccountID string
+	// QuotaOwnerID may be the trusted caller behind an internal access account.
+	// AccountID remains the authority for cursor continuation and close.
+	QuotaOwnerID string
+	CatalogID    string
+	ResourceIDs  []string
+	CompiledSQL  string
 
 	QueryFormat     QueryFormat
 	OpenSearchQuery map[string]any
@@ -28,6 +31,7 @@ type CursorSession struct {
 	ResourceDataUpdateTime int64
 	ResourceDataParams     *ResourceDataQueryParams
 	ResourceDataCategory   string
+	ResourceDataSource     *ResourceDataCursorSource
 
 	PageOffset int
 	PageLimit  int
@@ -42,6 +46,15 @@ type CursorSession struct {
 	CreatedAtSec            int64
 	LastSuccessfulPageAtSec int64
 	ExpiresAtSec            int64
+}
+
+// ResourceDataCursorSource records the source state used by a virtual resource cursor.
+type ResourceDataCursorSource struct {
+	ID               string
+	UpdateTime       int64
+	Category         string
+	LocalIndexName   string
+	LocalIndexStatus string
 }
 
 func (s *CursorSession) Lock()         { s.mu.Lock() }

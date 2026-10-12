@@ -71,8 +71,19 @@ ghcr.io/<github_org_or_user>/charts/otelcol-contrib
 默认 collector 镜像：
 
 ```text
-docker.io/otel/opentelemetry-collector-contrib:0.148.0
+ghcr.io/openbkn-ai/otelcol-openbkn:<release-version>
 ```
+
+该镜像由 `builder-config.yaml` 生成，额外包含 traces-only 的
+`traceadmission` processor。Processor 通过集群内部接口直接拉取不签名的
+`TraceEvidencePolicySnapshotV1`，校验 revision、模式与有效期，并在 policy revision
+与 configuration GET 的 active operation/revision 一致时发送 heartbeat/ACK。
+内部控制面不使用 OAuth、BKN Safe 服务身份或策略签名密钥。
+
+policy、configuration GET、heartbeat 和 ACK 均使用
+`agent-observability-internal:8081` Service（private listener）。部署平台应保证
+Collector Pod 可以访问该内部 Service；workload identity 从部署配置读取并作为状态
+上报字段。Processor 不读取或改变 logs pipeline。
 
 默认会渲染以下 exporter 结构：
 
@@ -185,8 +196,13 @@ bash scripts/test_4c8g_baseline.sh charts/otelcol-contrib
 安装示例：
 
 ```bash
-helm upgrade --install otelcol-contrib charts/otelcol-contrib -n observability --create-namespace
+helm upgrade --install otelcol-contrib charts/otelcol-contrib \
+  -n observability \
+  --create-namespace \
+  --set 'image.tag=<built-version>'
 ```
+
+源码 Chart 的 `image.tag` 是供 release workflow 替换的 `__VERSION__` 占位符，不能直接用于本地部署。上例中的 `<built-version>` 必须是已经构建并可被集群拉取的 OCB 镜像 tag；发布后的 OCI Chart 会由 `reusable-chart.yml` 自动替换为对应 release version。
 
 如果你在本地开发阶段使用 Docker 启动的 OpenSearch，可覆盖为宿主机地址，例如：
 
@@ -194,6 +210,7 @@ helm upgrade --install otelcol-contrib charts/otelcol-contrib -n observability -
 helm upgrade --install otelcol-contrib charts/otelcol-contrib \
   -n observability \
   --create-namespace \
+  --set 'image.tag=<built-version>' \
   --set opensearchExporter.http.endpoint=http://192.168.139.3:9200
 ```
 
@@ -203,6 +220,7 @@ helm upgrade --install otelcol-contrib charts/otelcol-contrib \
 helm upgrade --install otelcol-contrib charts/otelcol-contrib \
   -n observability \
   --create-namespace \
+  --set 'image.tag=<built-version>' \
   --set opensearchExporter.http.endpoint=http://opensearch-cluster-master.observability.svc.cluster.local:9200
 ```
 

@@ -6,11 +6,21 @@
 package opensearch
 
 import (
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+type admissionMetricsRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f admissionMetricsRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
 
 func TestEnsureIndexDoesNotCreateAnExistingIndex(t *testing.T) {
 	createCalls := 0
@@ -42,5 +52,63 @@ func TestEnsureIndexDoesNotCreateAnExistingIndex(t *testing.T) {
 	}
 	if mappingCalls != 1 {
 		t.Fatalf("existing index received %d mapping requests", mappingCalls)
+	}
+}
+
+func TestReadAdmissionMetricsAggregatesNodeStats(t *testing.T) {
+	client := NewWithHTTPClient("http://opensearch.test", AuthConfig{}, &http.Client{Transport: admissionMetricsRoundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodGet || request.URL.Path != "/_nodes/stats/jvm,fs" {
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"nodes":{"one":{"fs":{"total":{"total_in_bytes":1000,"available_in_bytes":200}},"jvm":{"mem":{"heap_used_in_bytes":300,"heap_max_in_bytes":500}}},"two":{"fs":{"total":{"total_in_bytes":1000,"available_in_bytes":500}},"jvm":{"mem":{"heap_used_in_bytes":100,"heap_max_in_bytes":500}}}}}`)), Header: make(http.Header)}, nil
+	})})
+	metrics, err := client.ReadAdmissionMetrics(t.Context())
+	if err != nil {
+		t.Fatalf("read admission metrics: %v", err)
+	}
+	if metrics.Capacity != 0.65 {
+		t.Fatalf("capacity = %v, want 0.65", metrics.Capacity)
+	}
+	if metrics.Heap != 0.4 {
+		t.Fatalf("heap = %v, want 0.4", metrics.Heap)
+	}
+	if metrics.SampledAt.IsZero() {
+		t.Fatal("sample timestamp is required")
+	}
+}
+
+func TestReadAdmissionMetricsFailsWhenTotalsAreMissing(t *testing.T) {
+	client := NewWithHTTPClient("http://opensearch.test", AuthConfig{}, &http.Client{Transport: admissionMetricsRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"nodes":{}}`)), Header: make(http.Header)}, nil
+	})})
+	if _, err := client.ReadAdmissionMetrics(t.Context()); err == nil {
+		t.Fatal("missing node totals must fail closed")
+	}
+}
+
+func TestGetMappingsReadsConcreteTargetsWithConfiguredAuthentication(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, password, ok := r.BasicAuth()
+		if r.Method != http.MethodGet || r.URL.Path != "/projection-alias/_mapping" || !ok || user != "test-user" || password != "test-password" {
+			t.Error("mapping inspection must use the configured read request and authentication")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"concrete-v1":{"mappings":{"properties":{"envelope":{"type":"keyword"}}}},"concrete-v2":{"mappings":{"properties":{}}}}`))
+	}))
+	t.Cleanup(server.Close)
+	client := New(server.URL, AuthConfig{Enabled: true, Username: "test-user", Password: "test-password"}, time.Second)
+	mappings, err := client.GetMappings(context.Background(), "projection-alias")
+	if err != nil || len(mappings) != 2 {
+		t.Fatalf("expected each concrete mapping: mappings=%v err=%v", mappings, err)
+	}
+	var legacy struct {
+		Properties map[string]struct {
+			Type string `json:"type"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(mappings["concrete-v1"], &legacy); err != nil || legacy.Properties["envelope"].Type != "keyword" {
+		t.Fatal("read must retain legacy type for caller compatibility decisions")
 	}
 }

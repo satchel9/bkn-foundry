@@ -11,6 +11,9 @@ agent_chart="${root_dir}/agent-observability/charts/agent-observability"
 collector_chart="${root_dir}/otelcol-contribute-chart/charts/otelcol-contrib"
 secret_name="bkn-trace-opensearch"
 sentinel_password="must-not-appear-in-rendered-manifests"
+collector_admission_args=(
+  --set traceAdmission.workloadIdentity=spiffe://cluster-a/ns/openbkn/sa/otelcol
+)
 
 assert_contains() {
   local rendered="$1"
@@ -52,7 +55,7 @@ assert_requires_secret() {
 }
 
 agent_default="$(helm template agent-observability "${agent_chart}")"
-collector_default="$(helm template otelcol-contrib "${collector_chart}")"
+collector_default="$(helm template otelcol-contrib "${collector_chart}" "${collector_admission_args[@]}")"
 assert_not_contains "${agent_default}" "OPENSEARCH_AUTH_USERNAME"
 assert_not_contains "${agent_default}" "OPENSEARCH_AUTH_PASSWORD"
 assert_not_contains "${collector_default}" "OPENSEARCH_AUTH_USERNAME"
@@ -62,6 +65,7 @@ assert_requires_secret agent-observability "${agent_chart}" opensearch.auth "ope
 assert_requires_secret otelcol-contrib "${collector_chart}" opensearchExporter.auth "opensearchExporter.auth.existingSecret is required"
 
 agent_secure="$(helm template agent-observability "${agent_chart}" \
+  \
   --set evidence.store=opensearch \
   --set opensearch.auth.enabled=true \
   --set opensearch.auth.existingSecret="${secret_name}" \
@@ -72,6 +76,7 @@ assert_contains "${agent_secure}" "${secret_name}"
 assert_not_contains "${agent_secure}" "${sentinel_password}"
 
 collector_secure="$(helm template otelcol-contrib "${collector_chart}" \
+  "${collector_admission_args[@]}" \
   --set opensearchExporter.auth.enabled=true \
   --set opensearchExporter.auth.existingSecret="${secret_name}" \
   --set-string opensearchExporter.auth.password="${sentinel_password}")"

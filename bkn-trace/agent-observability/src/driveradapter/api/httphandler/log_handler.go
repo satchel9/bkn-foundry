@@ -7,6 +7,7 @@ package httphandler
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -16,6 +17,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/logsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/evidencevo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/observabilityvo"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/kafkaaccess/auditvalidator"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/driveradapter/api/rdto"
 )
 
@@ -73,10 +75,14 @@ func (handler *LogHandler) ListLogs(w http.ResponseWriter, r *http.Request) {
 			writeObservabilityError(w, r, http.StatusBadRequest, "cursor_invalid", "the pagination cursor is invalid")
 		case errors.Is(err, logsvc.ErrCursorStale):
 			writeObservabilityError(w, r, http.StatusConflict, "cursor_stale", "the authorization scope, sources, or query changed; restart from the first page")
+		case errors.Is(err, logsvc.ErrNumberedPaginationUnsupported):
+			writeObservabilityError(w, r, http.StatusBadRequest, "pagination_not_supported", "this log source does not support direct page jumps; use cursor pagination")
 		case errors.Is(err, logsvc.ErrInvalidQuery):
 			writeObservabilityError(w, r, http.StatusBadRequest, "invalid_log_filter", "the log time window exceeds the supported range")
 		case errors.Is(err, logsvc.ErrAccessDenied):
 			writeObservabilityError(w, r, http.StatusForbidden, "observability_access_denied", "the current access profile cannot search the requested logs")
+		case errors.Is(err, logsvc.ErrAuditNotConfigured):
+			writeAuditNotConfigured(w, r)
 		case errors.Is(err, logsvc.ErrSourcesUnavailable):
 			writeObservabilityError(w, r, http.StatusServiceUnavailable, "sources_unavailable", "all authorized log sources are unavailable")
 		default:
@@ -96,9 +102,14 @@ func (handler *LogHandler) ListLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	requestID := optionalString(query.RequestID)
 	currentTraceID := optionalString(query.TraceID)
-	relatedTraceIDs := uniqueTraceIDs(result.Records)
+	publicRecords := make([]observabilityvo.LogRecord, 0, len(result.Records))
+	for _, record := range result.Records {
+		projected, _ := projectClientIP(record, false, false)
+		publicRecords = append(publicRecords, projected)
+	}
+	relatedTraceIDs := uniqueTraceIDs(publicRecords)
 	writeJSON(w, r, http.StatusOK, rdto.LogListResponse{
-		Data: rdto.NewOperationAuditRecords(result.Records), NextCursor: nextCursor, Partial: result.Partial,
+		Data: rdto.NewOperationAuditRecords(publicRecords), NextCursor: nextCursor, Partial: result.Partial,
 		Count: rdto.LogCount{Value: &count, Accuracy: accuracy}, SourceStatus: result.SourceStatus,
 		Pagination: rdto.PageMetadata{Page: result.Page, PageSize: result.PageSize},
 		RequestTraceContext: rdto.RequestTraceContext{
@@ -127,14 +138,34 @@ func (handler *LogHandler) GetLog(w http.ResponseWriter, r *http.Request) {
 		writeLogServiceError(w, r, err)
 		return
 	}
+	record, clientIPRedacted := projectClientIP(record, true, observabilityvo.CapabilitiesFor(profile).LogSensitiveFields)
+	redactedFields := []string{}
+	if clientIPRedacted {
+		redactedFields = append(redactedFields, "client_ip")
+	}
 	writeJSON(w, r, http.StatusOK, rdto.LogDetailResponse{
 		Data:            rdto.NewOperationAuditRecord(record),
-		FieldProjection: rdto.LogFieldProjection{PolicyRevision: "operation-audit-1.0", RedactedFields: []string{}},
+		FieldProjection: rdto.LogFieldProjection{PolicyRevision: "operation-audit-1.0", RedactedFields: redactedFields},
 		RequestTraceContext: rdto.RequestTraceContext{
 			RequestID: optionalString(record.RequestID), CurrentTraceID: optionalString(record.TraceID),
 			RelatedTraceIDs: uniqueTraceIDs([]observabilityvo.LogRecord{record}),
 		},
 	})
+}
+
+func projectClientIP(record observabilityvo.LogRecord, detail, sensitiveFields bool) (observabilityvo.LogRecord, bool) {
+	if _, present := record.Attributes["client_ip"]; !present ||
+		(detail && sensitiveFields && record.Category == observabilityvo.CategoryAuditSecurity) {
+		return record, false
+	}
+	attributes := make(map[string]any, len(record.Attributes)-1)
+	for key, value := range record.Attributes {
+		if key != "client_ip" {
+			attributes[key] = value
+		}
+	}
+	record.Attributes = attributes
+	return record, true
 }
 
 func (handler *LogHandler) ListLogSources(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +180,49 @@ func (handler *LogHandler) ListLogSources(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, r, http.StatusOK, rdto.LogSourcesResponse{Data: data})
+}
+
+// ListLogSourceInventory exposes the pinned contract roster separately from
+// queryable sources. A declared Kafka method is never reported as E2E coverage.
+func (handler *LogHandler) ListLogSourceInventory(w http.ResponseWriter, r *http.Request) {
+	profile, ok := handler.authorizedProfile(w, r)
+	if !ok {
+		return
+	}
+	version, registered, err := auditvalidator.RegisteredSources()
+	if err != nil {
+		writeObservabilityError(w, r, http.StatusServiceUnavailable, "source_registry_unavailable", "the source registry is unavailable")
+		return
+	}
+	queryStatus := make(map[string]observabilityvo.SourceStatus)
+	sourceContext := observabilityvo.WithSourceAuthorization(r.Context(), r.Header.Get("Authorization"))
+	queryable, queryErr := handler.service.SourceInventory(sourceContext, profile)
+	if queryErr == nil {
+		for _, source := range queryable {
+			queryStatus[source.SourceID] = source
+		}
+	}
+	type inventoryEntry struct {
+		auditvalidator.RegisteredSource
+		QueryStatus    string `json:"query_status"`
+		QueryReason    string `json:"query_reason,omitempty"`
+		CoverageStatus string `json:"coverage_status"`
+	}
+	data := make([]inventoryEntry, 0, len(registered))
+	for _, source := range registered {
+		entry := inventoryEntry{RegisteredSource: source, QueryStatus: "not_listed", CoverageStatus: "unverified"}
+		if queryErr != nil {
+			entry.QueryStatus = "query_unavailable"
+		} else if status, found := queryStatus[source.SourceID]; found {
+			entry.QueryStatus = status.Status
+			entry.QueryReason = status.Reason
+		}
+		data = append(data, entry)
+	}
+	writeJSON(w, r, http.StatusOK, struct {
+		RegistryVersion string           `json:"registry_version"`
+		Data            []inventoryEntry `json:"data"`
+	}{RegistryVersion: version, Data: data})
 }
 
 func (handler *LogHandler) ListLogPolicies(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +267,8 @@ func writeLogServiceError(w http.ResponseWriter, r *http.Request, err error) {
 		writeObservabilityError(w, r, http.StatusBadRequest, "invalid_log_filter", "the log time window exceeds the supported range")
 	case errors.Is(err, logsvc.ErrAccessDenied):
 		writeObservabilityError(w, r, http.StatusForbidden, "observability_access_denied", "the current access profile cannot access the requested logs")
+	case errors.Is(err, logsvc.ErrAuditNotConfigured):
+		writeAuditNotConfigured(w, r)
 	case errors.Is(err, logsvc.ErrSourcesUnavailable):
 		writeObservabilityError(w, r, http.StatusServiceUnavailable, "sources_unavailable", "all authorized log sources are unavailable")
 	default:
@@ -204,6 +280,13 @@ func writeObservabilityError(w http.ResponseWriter, r *http.Request, status int,
 	retryable := status == http.StatusServiceUnavailable || status == http.StatusInternalServerError
 	writeJSON(w, r, status, observabilityErrorEnvelope{Error: observabilityError{
 		Code: code, Message: message, Retryable: retryable, RequestID: requestIDFromRequest(r),
+	}})
+}
+
+func writeAuditNotConfigured(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, r, http.StatusServiceUnavailable, observabilityErrorEnvelope{Error: observabilityError{
+		Code: "audit_consumer_not_configured", Message: "audit Kafka consumer is not configured",
+		Retryable: false, RequiredAction: logsvc.AuditConfigurationAction, RequestID: requestIDFromRequest(r),
 	}})
 }
 
@@ -232,16 +315,16 @@ func parseLogQuery(r *http.Request) (observabilityvo.LogQuery, error) {
 	if timeFrom != nil && timeTo != nil && timeTo.Before(*timeFrom) {
 		return observabilityvo.LogQuery{}, errors.New("time_to must not be before time_from")
 	}
-	limit, err := parseBoundedInteger(values.Get("limit"), 50, 1, 200, "limit")
+	limit, err := parseBoundedInteger(values.Get("limit"), 50, logsvc.MinLogPageSize, 200, "limit")
 	if err != nil {
 		return observabilityvo.LogQuery{}, err
 	}
-	page, err := parseBoundedInteger(values.Get("page"), 1, 1, 100, "page")
+	page, err := parseBoundedInteger(values.Get("page"), 1, 1, math.MaxInt, "page")
 	if err != nil {
 		return observabilityvo.LogQuery{}, err
 	}
 	if rawPageSize := strings.TrimSpace(values.Get("page_size")); rawPageSize != "" {
-		limit, err = parseBoundedInteger(rawPageSize, 50, 1, 200, "page_size")
+		limit, err = parseBoundedInteger(rawPageSize, 50, logsvc.MinLogPageSize, 200, "page_size")
 		if err != nil {
 			return observabilityvo.LogQuery{}, err
 		}
@@ -268,7 +351,7 @@ func parseLogQuery(r *http.Request) (observabilityvo.LogQuery, error) {
 	}
 	return observabilityvo.LogQuery{
 		Query: values.Get("q"), TimeFrom: timeFrom, TimeTo: timeTo,
-		BusinessModule: businessModule, Action: strings.TrimSpace(values.Get("action")),
+		BusinessModule: businessModule, SourceID: strings.TrimSpace(values.Get("source_id")), Action: strings.TrimSpace(values.Get("action")),
 		TargetType: strings.TrimSpace(values.Get("target_type")), TargetID: strings.TrimSpace(values.Get("target_id")),
 		Outcomes: outcomes, Categories: categories,
 		ActorID: strings.TrimSpace(values.Get("actor_id")), ActorQuery: strings.TrimSpace(values.Get("actor")), ApplicationID: values.Get("application_id"),

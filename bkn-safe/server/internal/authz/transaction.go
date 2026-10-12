@@ -62,6 +62,23 @@ func (tx *PolicyTransaction) GrantPolicy(grant PolicyGrant) (bool, error) {
 	return tx.enforcer.addPolicyGrant(grant)
 }
 
+// GrantCommunityBundleBy writes one independently recoverable Community
+// bundle inside the caller's existing transaction. It is used by workflows
+// that own a stable grant ID and need to retain the approving actor.
+func (tx *PolicyTransaction) GrantCommunityBundleBy(grantID, accessorID, resourceType, resourceID string, authority AuthoritySource, createdBy string) (bool, error) {
+	if authority != AuthoritySourceAdminAuthz && authority != AuthoritySourcePermissionRequest && authority != AuthoritySourceSystem {
+		return false, fmt.Errorf("community bundle authority %q is not permitted", authority)
+	}
+	if err := validateCommunityBundleTarget(resourceType, resourceID); err != nil {
+		return false, err
+	}
+	return tx.GrantPolicy(PolicyGrant{
+		GrantID: grantID, AccessorID: accessorID, Object: obj(resourceType, resourceID),
+		Operation: ActFullBusinessAccess, Effect: EffectAllow,
+		PolicySource: PolicySourceCommunityBundle, AuthoritySource: authority, CreatedBy: createdBy,
+	})
+}
+
 func (tx *PolicyTransaction) RevokePolicy(grantID string) (bool, error) {
 	removed, _, err := tx.enforcer.revokePolicyGrant(grantID)
 	return removed, err
@@ -154,8 +171,18 @@ func (tx *PolicyTransaction) GrantNormalizedRolePermissions(roleID, resourceType
 }
 
 func (tx *PolicyTransaction) RevokeRolePermission(roleID, resourceType, idPattern, operation string) error {
-	return tx.enforcer.removePolicy(roleID, obj(resourceType, idPattern), operation, EffectAllow,
-		PolicySourceRolePermission, AuthoritySourceAdminAuthz)
+	// The role-permission editor is the authoritative administration surface for
+	// a custom role. Its read side intentionally collapses every active source,
+	// including object-owner professional rules, so revocation must remove every
+	// source behind the displayed operation rather than silently deleting only a
+	// role_permission projection.
+	_, err := tx.enforcer.removePolicyGrants(PolicyFilter{
+		AccessorID: roleID,
+		Object:     obj(resourceType, idPattern),
+		Operation:  operation,
+		Effect:     EffectAllow,
+	})
+	return err
 }
 
 func (tx *PolicyTransaction) RolePermissions(roleID string) ([]RoleGrant, error) {

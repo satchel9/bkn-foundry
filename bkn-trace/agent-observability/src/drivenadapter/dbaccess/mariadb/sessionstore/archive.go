@@ -61,6 +61,17 @@ func (source *TraceArchiveSource) Freeze(ctx context.Context, kind observability
 	return candidates, rows.Err()
 }
 
+// Count uses exactly the Freeze eligibility predicate without fetching or
+// serializing Interaction packages for a read-only archive overview.
+func (source *TraceArchiveSource) Count(ctx context.Context, kind observabilityvo.ArchiveKind, archiveRange observabilityvo.ArchiveRange) (int, error) {
+	if kind != observabilityvo.ArchiveKindTrace {
+		return 0, nil
+	}
+	var count int
+	err := source.store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM bkn_trace_interactions WHERE execution_status<>? AND terminal_at<?`, sessionvo.InteractionActive, archiveRange.To.UTC()).Scan(&count)
+	return count, err
+}
+
 func (source *TraceArchiveSource) packageInteraction(ctx context.Context, interactionID string) ([]byte, time.Time, error) {
 	var interaction sessionvo.Interaction
 	var conversation sessionvo.Conversation
@@ -95,7 +106,14 @@ func (source *TraceArchiveSource) packageInteraction(ctx context.Context, intera
 	if err != nil {
 		return nil, time.Time{}, err
 	}
-	value := map[string]any{"conversation": conversation, "interaction": interaction, "operations": operations, "receipts": receipts, "call_facts": facts}
+	// Lifecycle JSON omits these internal CAS fields. Archive them explicitly
+	// with the interaction so the package does not lose derived source metadata.
+	archivedInteraction := struct {
+		sessionvo.Interaction
+		IntegritySourceVersion uint64                           `json:"record_integrity_version"`
+		StoredRecordIntegrity  *sessionvo.StoredRecordIntegrity `json:"stored_record_integrity,omitempty"`
+	}{Interaction: interaction, IntegritySourceVersion: interaction.IntegritySourceVersion, StoredRecordIntegrity: interaction.StoredRecordIntegrity}
+	value := map[string]any{"conversation": conversation, "interaction": archivedInteraction, "operations": operations, "receipts": receipts, "call_facts": facts}
 	if source.revisionInputs {
 		value["revision_evidence"] = sealed
 	}

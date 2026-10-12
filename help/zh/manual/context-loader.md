@@ -74,7 +74,7 @@ Token 可通过 `openbkn auth token` 命令获取。配置保存后，Cursor 会
 |------|------|
 | `search_schema` | 搜索对象类 / 关系类 / 行动类 / 指标的 Schema |
 | `get_kn_detail` | 取知识网络 Schema，支持 `summary` 骨架与逐层下钻 |
-| `get_object_types` / `get_relation_types` | 按 id 取对象类 / 关系类的完整定义 |
+| `get_object_types` / `get_relation_types` | 按 id 取对象类 / 关系类的完整定义；`get_object_types` 不传 id 时按页列举对象类索引 |
 | `query_object_instance` | 条件查询对象实例 |
 | `query_instance_subgraph` | 沿关系类路径查询实例子图 |
 | `get_logic_properties_values` | 计算逻辑属性（派生字段）取值 |
@@ -83,9 +83,12 @@ Token 可通过 `openbkn auth token` 命令获取。配置保存后，Cursor 会
 | `get_action_execution` / `list_action_executions` | 查询行动执行状态与历史 |
 | `search_capabilities` | 在一个排序空间里检索该网络已挂载的全部能力:Skill、函数工具、API 工具与 MCP 工具 |
 | `list_knowledge_networks` | 列出知识网络 |
-| `list_resources` / `describe_resource` | 列出与描述 Vega 资源 |
-| `run_sql` | 直接对资源执行 SQL |
 | `bkn_start_interaction` / `bkn_finish_interaction` | 会话生命周期（业务可追溯性） |
+
+`run_sql`、`list_resources`、`describe_resource` 不在 MCP 面上：它们按调用者自己的数据资源授权返回物理列，绕开知识网络的属性级规则，只保留 REST 入口
+（`POST /kn/run_sql` 等）。模型侧要聚合用 `run_cypher`，要指标用 `query_metric`。
+
+`get_kn_detail` 在对象类超过 200、或关系类超过 600 的知识网络上只返回导航壳：概念组、三类概念的数量与一条 `notice`，三个概念数组回 `null`（`detail_level=full` 同样如此）。这类网络的全量 Schema 有一兆多，模型读不进去；该规模下先用概念组把范围收敛到 1-3 个分组，再用 `search_schema` 取概念；网络没划概念组时，`notice` 会改为让你直接调 `search_schema`。要按页走完这类网络的全部对象类，用 `get_object_types` 不传 `ids` 列举对象类索引（只有 id/name/comment，默认 50 条一页，响应带 `total_count` 与 `next_offset`），挑好再把 id 传回去取完整定义。
 
 每个工具调用需要 `kn_id`（知识网络 ID），可用 `openbkn bkn list` 获取。
 
@@ -192,7 +195,7 @@ openbkn context find-skills <kn-id> ot_customer --top-k 5
 工具目录会随版本增长，CLI 未必为每个工具都配了子命令。`tool-call` 按名调用任意 MCP 工具，`call-method` 调任意 MCP 方法：
 
 ```bash
-openbkn context tool-call <kn-id> run_sql --args '{"sql":"SELECT 1"}'
+openbkn context tool-call <kn-id> run_cypher --args '{"query":"MATCH (o:orders) RETURN count(*) AS n"}'
 openbkn context tool-call <kn-id> execute_action --args '{
   "at_id": "at_send_coupon",
   "_instance_identities": [{"...": "同上"}],
@@ -302,7 +305,9 @@ const actions = await bkn.context.actionInfo(knId, {
 const skills = await bkn.context.findSkills(knId, 'ot_customer', 5);
 
 // 目录之外的工具：按名调用
-const sql = await bkn.context.toolCall(knId, 'run_sql', { sql: 'SELECT 1' });
+const counted = await bkn.context.toolCall(knId, 'run_cypher', {
+  query: 'MATCH (o:orders) RETURN count(*) AS n',
+});
 ```
 
 ---

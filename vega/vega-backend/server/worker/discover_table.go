@@ -7,11 +7,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
@@ -20,6 +23,7 @@ type tableDiscoverItem struct {
 	resource        *interfaces.Resource
 	tableMeta       *interfaces.TableMeta
 	markAfterEnrich bool
+	countOnly       bool
 }
 
 // discoverTableResources discovers table resources from a table connector.
@@ -53,7 +57,7 @@ func (dtw *DiscoverTaskWorker) discoverTableResources(ctx context.Context,
 	logger.Infof("Loaded %d existing resources for table discovery", len(existingResources))
 
 	// Step 3: Compare and create/update Resources (basic information)
-	result, items, err := dtw.reconcileTableResources(ctx, task, catalog, sourceTables, existingResources)
+	result, items, err := dtw.reconcileTableResources(ctx, task, catalog, sourceTables, existingResources, tableConnector)
 	if err != nil {
 		return nil, fmt.Errorf("failed to reconcile resources: %w", err)
 	}
@@ -82,9 +86,9 @@ func (dtw *DiscoverTaskWorker) discoverTableResources(ctx context.Context,
 }
 
 // reconcileTableResources reconciles source tables with existing resources.
-func (dtw *DiscoverTaskWorker) reconcileTableResources(ctx context.Context,
-	task *interfaces.DiscoverTask, catalog *interfaces.Catalog, sourceTables []*interfaces.TableMeta,
-	existingResources []*interfaces.Resource) (*interfaces.DiscoverResult, []tableDiscoverItem, error) {
+func (dtw *DiscoverTaskWorker) reconcileTableResources(ctx context.Context, task *interfaces.DiscoverTask,
+	catalog *interfaces.Catalog, sourceTables []*interfaces.TableMeta, existingResources []*interfaces.Resource,
+	connector interfaces.TableConnector) (*interfaces.DiscoverResult, []tableDiscoverItem, error) {
 
 	actions := task.DiscoverActions
 
@@ -104,25 +108,20 @@ func (dtw *DiscoverTaskWorker) reconcileTableResources(ctx context.Context,
 		existingMap[r.SourceIdentifier] = r
 	}
 
-	// Build the map of the source table
+	// Handle newly added and retained resources, and record the source tables for missing detection.
 	sourceMap := make(map[string]*interfaces.TableMeta)
-	for _, t := range sourceTables {
-		sourceIdentifier := dtw.buildSourceIdentifier(t)
-		sourceMap[sourceIdentifier] = t
-	}
-
-	// Handle newly added and retained resources
 	for _, table := range sourceTables {
 		if dtw.stopped.Load() {
 			return nil, nil, ErrWorkerManagerStopping
 		}
-		sourceIdentifier := dtw.buildSourceIdentifier(table)
+		sourceIdentifier := connector.BuildSourceIdentifier(table)
+		sourceMap[sourceIdentifier] = table
 
 		if resource, ok := existingMap[sourceIdentifier]; ok {
 			// Existing. Check the status
-			if actions != nil && actions.Refresh {
-				markAfterEnrich := true
-				if resource.Status == interfaces.ResourceStatusStale {
+			if actions != nil && (actions.Refresh || actions.Count) {
+				markAfterEnrich := actions.Refresh
+				if actions.Refresh && resource.Status == interfaces.ResourceStatusStale {
 					// Previously marked as stale, now reactivated
 					if err := dtw.rs.UpdateStatus(ctx, resource.ID, interfaces.ResourceStatusActive, ""); err != nil {
 						logger.Errorf("Failed to reactivate resource %s: %v", resource.ID, err)
@@ -138,6 +137,7 @@ func (dtw *DiscoverTaskWorker) reconcileTableResources(ctx context.Context,
 					resource:        resource,
 					tableMeta:       table,
 					markAfterEnrich: markAfterEnrich,
+					countOnly:       !actions.Refresh,
 				})
 			}
 		} else {
@@ -187,17 +187,13 @@ func (dtw *DiscoverTaskWorker) createTableResource(ctx context.Context, catalog 
 	req := &interfaces.ResourceRequest{
 		CatalogID:        catalog.ID,
 		Builtin:          &catalog.Builtin,
-		Name:             sourceIdentifier,
+		Name:             table.Name,
 		Description:      table.Description,
 		Category:         interfaces.ResourceCategoryTable,
 		Enabled:          true,
 		Status:           interfaces.ResourceStatusActive,
 		Schema:           table.Schema,
 		SourceIdentifier: sourceIdentifier,
-		SourceMetadata: map[string]any{
-			"original_name":        sourceIdentifier,
-			"original_description": table.Description,
-		},
 	}
 	resource, err := dtw.rs.Create(ctx, req)
 	if err != nil {
@@ -224,16 +220,38 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 	progress.SetMetadataTotal(len(items))
 
 	// Traverse all tables to discover items
-	for _, item := range items {
+	for itemIndex, item := range items {
 		if dtw.stopped.Load() {
 			return ErrWorkerManagerStopping
 		}
 		table := item.tableMeta   // Obtain the table metadata
 		resource := item.resource // Obtain resource information
+
+		if item.countOnly {
+			if err := dtw.enrichResourceTableRowCount(ctx, task, resource, tableConnector, result); err != nil {
+				return err
+			}
+			if err := dtw.updateProgress(ctx, task.ID, 5+90*(itemIndex+1)/len(items), fmt.Sprintf("Exact count processed: %d/%d", itemIndex+1, len(items))); err != nil {
+				return err
+			}
+			continue
+		}
 		beforeHash := sourceSnapshotHash(resource)
 
 		// Obtain detailed metadata
 		if err := tableConnector.GetTableMeta(ctx, table); err != nil {
+			// 首次探查失败也保留已知源身份，使单资源刷新能够重试。
+			if len(resource.SourceMetadata) == 0 {
+				data, marshalErr := sonic.Marshal(table)
+				if marshalErr != nil {
+					return fmt.Errorf("serialize table metadata: %w", marshalErr)
+				}
+				sourceMetadata := make(map[string]any)
+				if decodeErr := common.UnmarshalPreciseJSON(data, &sourceMetadata); decodeErr != nil {
+					return fmt.Errorf("decode table metadata: %w", decodeErr)
+				}
+				resource.SourceMetadata = sourceMetadata
+			}
 			logger.Warnf("Failed to get metadata for table %s: %v", table.Name, err)
 			resource.LastDiscoverStatus = interfaces.DiscoverStatusError
 			resource.StatusMessage = fmt.Sprintf("discover metadata failed: %v", err)
@@ -252,6 +270,27 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 				}
 			}
 			continue
+		}
+
+		var exactCount *int64
+		var countErr error
+		if task.DiscoverActions != nil && task.DiscoverActions.Count {
+			queryCtx, cancel := context.WithTimeout(ctx, resourceCountTimeout)
+			count, err := tableConnector.CountRows(queryCtx, resource.SourceIdentifier)
+			cancel()
+
+			if parentErr := ctx.Err(); parentErr != nil {
+				return parentErr
+			}
+			if err == nil && count < 0 {
+				err = fmt.Errorf("invalid negative row count")
+			}
+			if err != nil {
+				countErr = err
+				logger.Warnf("Failed to count table %s during discovery: %v", table.Name, err)
+			} else {
+				exactCount = &count
+			}
 		}
 
 		// Fill in the Resource metadata: schema_definition field
@@ -286,44 +325,42 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 
 		resource.Description = resolveSourceDescription(resource.Description, sourceOriginalDescription(resource.SourceMetadata), table.Description)
 
-		// Fill in the Resource metadata: source_metadata field
+		// 源元数据完整保存 TableMeta，不保留旧的额外字段。
+		data, err := sonic.Marshal(table)
+		if err != nil {
+			return fmt.Errorf("serialize table metadata: %w", err)
+		}
 		sourceMetadata := make(map[string]any)
-		if resource.SourceMetadata != nil {
-			sourceMetadata = resource.SourceMetadata
-		}
-		sourceMetadata["original_name"] = resource.SourceIdentifier
-		sourceMetadata["original_description"] = table.Description
-		sourceMetadata["columns"] = table.Columns
-		if table.TableType != "" {
-			sourceMetadata["table_type"] = table.TableType
-		}
-		if len(table.Properties) > 0 {
-			sourceMetadata["properties"] = table.Properties
-		}
-		if len(table.PKs) > 0 {
-			sourceMetadata["primary_keys"] = table.PKs
-		}
-		if len(table.Indices) > 0 {
-			sourceMetadata["indices"] = table.Indices
-		}
-		if len(table.ForeignKeys) > 0 {
-			sourceMetadata["foreign_keys"] = table.ForeignKeys
+		if err := common.UnmarshalPreciseJSON(data, &sourceMetadata); err != nil {
+			return fmt.Errorf("decode table metadata: %w", err)
 		}
 		resource.SourceMetadata = sourceMetadata
+		observedAt := time.Now().UnixMilli()
+		if exactCount != nil {
+			resource.RowCount = exactCount
+			resource.RowCountTime = &observedAt
+		}
 
 		discoverStatus := resource.LastDiscoverStatus
-		if item.markAfterEnrich {
+		if countErr != nil {
+			discoverStatus = interfaces.DiscoverStatusError
+			updateDiscoverResultForEnrichStatus(result, discoverStatus)
+		} else if item.markAfterEnrich {
 			discoverStatus = discoverStatusAfterEnrich(resource, beforeHash)
 			updateDiscoverResultForEnrichStatus(result, discoverStatus)
 		}
 
+		expectedUpdateTime := resource.UpdateTime
 		// Update Resource
 		resource.LastDiscoverStatus = discoverStatus
+		resource.LastDiscoverTime = observedAt
 		resource.StatusMessage = ""
-		expectedUpdateTime := resource.UpdateTime
+		if countErr != nil {
+			resource.StatusMessage = fmt.Sprintf("discover count failed: %v", countErr)
+		}
 		resource.Updater = task.Creator
-		resource.UpdateTime = time.Now().UnixMilli()
-		if err := dtw.rs.InternalUpdateDiscoveryMetadata(ctx, nil, resource, expectedUpdateTime); err != nil {
+		resource.UpdateTime = observedAt
+		if err := dtw.saveDiscoveredResource(ctx, resource, expectedUpdateTime, exactCount, observedAt); err != nil {
 			logger.Errorf("Failed to update metadata for table %s: %v", table.Name, err)
 			return err
 		}
@@ -339,22 +376,39 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 	return nil
 }
 
-// buildSourceIdentifier builds the source identifier for a table.
-func (dtw *DiscoverTaskWorker) buildSourceIdentifier(table *interfaces.TableMeta) string {
-	identifier := table.Name
-	if table.Schema != "" {
-		return fmt.Sprintf("%s.%s", table.Schema, identifier)
-	}
-	if table.Database != "" {
-		identifier = fmt.Sprintf("%s.%s", table.Database, identifier)
-	}
-	return identifier
-}
-
 // resolveSourceDescription keeps a business description unless it is absent or still matches the previous source description.
 func resolveSourceDescription(description, originalDescription, discoveredDescription string) string {
 	if description == "" || description == originalDescription {
 		return discoveredDescription
 	}
 	return description
+}
+
+// enrichResourceTableRowCount 采集并保存单个表的数量。
+func (dtw *DiscoverTaskWorker) enrichResourceTableRowCount(ctx context.Context, task *interfaces.DiscoverTask, resource *interfaces.Resource, connector interfaces.TableConnector, result *interfaces.DiscoverResult) error {
+
+	queryCtx, cancel := context.WithTimeout(ctx, resourceCountTimeout)
+	count, err := connector.CountRows(queryCtx, resource.SourceIdentifier)
+	cancel()
+
+	if parentErr := ctx.Err(); parentErr != nil {
+		return parentErr
+	}
+	if err == nil && count < 0 {
+		err = fmt.Errorf("invalid negative row count")
+	}
+	if err == nil {
+		err = dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli())
+	}
+	if err != nil {
+		if errors.Is(err, interfaces.ErrRowCountUnavailable) && task.ResourceID == "" {
+			result.SkippedCount++
+		} else {
+			result.FailedCount++
+		}
+		logger.Warnf("Resource exact count failed: resource_id=%s error=%v", resource.ID, err)
+	} else {
+		result.UpdatedCount++
+	}
+	return nil
 }

@@ -50,7 +50,7 @@ service:
     failureThreshold: 5
   livenessProbe:
     initialDelaySeconds: 0
-    periodSeconds: 5
+    periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 5
   startupProbe:
@@ -61,6 +61,8 @@ service:
   concept_search_config:
     concept_recall_size: 100
     knn_k: 300
+    # Per-object schema read limit in search_schema; a slower read keeps its object type without properties.
+    schema_read_timeout_ms: 5000
   instance_search_config:
     # 0 keeps the relevance gate off. See agent-retrieval.yaml for how to calibrate it.
     min_reranker_score: 0
@@ -70,6 +72,13 @@ service:
 auth:
   # Per-request batch size; this is not a cap on total retrieval candidates.
   resourceFilterChunkSize: 200
+
+# Studio links attached to permission guidance in MCP results. The host is
+# always the one the caller used; only the route is configured here.
+permissionRequest:
+  # Set true when the deployed Studio has no permission-request flow.
+  disabled: false
+  pathTemplate: "/studio/knowledge-network/workspace/{kn_id}/object-types/{ot_id}/detail?requestPermission={scope_code}"
 
 depServices:
   rds:
@@ -175,13 +184,30 @@ observability:
     # on public port 8080; existing custom values must migrate to this URL.
     core_url: "http://agent-observability-internal:8081"
   evidence:
-    ingest_url: "http://agent-observability:8080/api/agent-observability/v1/evidence/events"
-    timeout_ms: 2000
-    # Standard installs create this Secret through agent-observability. A
-    # standalone retrieval install must clear ingest_url to disable evidence;
-    # otherwise a missing Secret leaves evidence delivery unauthorized.
-    ingest_token_secret_name: "bkn-trace-evidence-ingest"
-    ingest_token_secret_key: "token"
+    # Core-backed Artifact persistence, rendered as BKN_TRACE_ARTIFACT_ENDPOINT.
+    # Required: a completed bkn_finish_interaction needs an answer artifact, so
+    # clearing this makes every completed finish fail with
+    # evidence_capture_failed. It is not derived from the Evidence ingest URL.
+    artifact_endpoint: "http://agent-observability:8080/api/agent-observability/v1/evidence/artifacts"
+    # Artifact has its own endpoint/token env contract; existing Core installs
+    # provide the credential through the standard Evidence token Secret.
+    artifact_secret_name: "bkn-trace-evidence-ingest"
+    artifact_secret_key: "token"
+  evidencePublisher:
+    enabled: false
+    brokers: ""
+    usernameSecretName: ""
+    passwordSecretName: ""
+    traceAdmission:
+      policyURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/policy"
+      configurationURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/configuration"
+      heartbeatURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat"
+      ackURLBase: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/operations"
+    queueMaxRecords: 4096
+    queueMaxBytes: 67108864
+    maxRecordBytes: 1048576
+    maxAttempts: 5
+    retryBackoffMs: 100
   log:
     enabled: false
     level: info

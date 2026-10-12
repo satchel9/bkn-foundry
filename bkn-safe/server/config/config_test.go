@@ -7,11 +7,34 @@ package config_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/config"
 )
+
+func TestOAuthBaselineRedirectURIsEnv(t *testing.T) {
+	t.Setenv("SAFE_OAUTH_STUDIO_BASELINE_REDIRECT_URIS", `["https://public.example/studio/callback","http://10.0.0.8:30080/studio/callback"]`)
+	cfg, err := config.LoadWithOptions(config.LoadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://public.example/studio/callback", "http://10.0.0.8:30080/studio/callback"}
+	if !reflect.DeepEqual(cfg.OAuth.StudioBaselineRedirectURIs, want) {
+		t.Fatalf("baseline redirects = %v, want %v", cfg.OAuth.StudioBaselineRedirectURIs, want)
+	}
+	if cfg.OAuth.ReconcileInterval != 5*time.Minute {
+		t.Fatalf("reconcile interval = %v", cfg.OAuth.ReconcileInterval)
+	}
+}
+
+func TestOAuthBaselineRedirectURIsRejectInvalidJSON(t *testing.T) {
+	t.Setenv("SAFE_OAUTH_STUDIO_BASELINE_REDIRECT_URIS", `not-json`)
+	if _, err := config.LoadWithOptions(config.LoadOptions{}); err == nil {
+		t.Fatal("expected invalid baseline JSON to fail configuration loading")
+	}
+}
 
 func TestLoadFromFile(t *testing.T) {
 	dir := t.TempDir()
@@ -51,6 +74,9 @@ hydra:
 	if cfg.Upstreams.ExecutionFactory.BaseURL != "http://agent-operator-integration:9000" {
 		t.Fatalf("execution factory base_url = %q", cfg.Upstreams.ExecutionFactory.BaseURL)
 	}
+	if cfg.Upstreams.BKNAgent.BaseURL != "http://bkn-agent:30800" {
+		t.Fatalf("bkn agent base_url = %q", cfg.Upstreams.BKNAgent.BaseURL)
+	}
 	if cfg.Upstreams.VegaBackend.BaseURL != "http://vega-backend-svc:13014" {
 		t.Fatalf("vega backend base_url = %q", cfg.Upstreams.VegaBackend.BaseURL)
 	}
@@ -74,12 +100,17 @@ db:
 	}
 
 	t.Setenv("SAFE_DB_HOST", "from-env")
+	t.Setenv("SAFE_BKN_AGENT_BASE_URL", "http://agent-directory.example")
+	t.Setenv("SAFE_BKN_AGENT_TIMEOUT", "7s")
 	cfg, err := config.LoadWithOptions(config.LoadOptions{ConfigPath: path})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.DB.Host != "from-env" {
 		t.Fatalf("host = %q, want from-env", cfg.DB.Host)
+	}
+	if cfg.Upstreams.BKNAgent.BaseURL != "http://agent-directory.example" || cfg.Upstreams.BKNAgent.Timeout != 7*time.Second {
+		t.Fatalf("bkn agent upstream = %+v", cfg.Upstreams.BKNAgent)
 	}
 }
 

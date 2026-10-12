@@ -19,6 +19,7 @@ import (
 	berrors "bkn-backend/errors"
 	"bkn-backend/interfaces"
 	bmock "bkn-backend/interfaces/mock"
+	"bkn-backend/logics/permission"
 )
 
 func metricAuthorizationDefinition(scopeRef string) *interfaces.MetricDefinition {
@@ -31,6 +32,89 @@ func metricAuthorizationDefinition(scopeRef string) *interfaces.MetricDefinition
 			Aggregation: interfaces.MetricAggregation{Property: "amount", Aggr: interfaces.MetricAggrSum},
 		},
 	}
+}
+
+func TestMetricCreateMetricsUsesBatchAccess(t *testing.T) {
+	newDefinitions := func() []*interfaces.MetricDefinition {
+		return []*interfaces.MetricDefinition{
+			{ID: "metric-1", Name: "Metric 1", KnID: "kn-1", Branch: interfaces.MAIN_BRANCH},
+			{ID: "metric-2", Name: "Metric 2", KnID: "kn-1", Branch: interfaces.MAIN_BRANCH},
+		}
+	}
+	newService := func(t *testing.T) (*metricService, sqlmock.Sqlmock, *bmock.MockMetricAccess,
+		*bmock.MockPermissionService, *bmock.MockVegaBackendService) {
+		t.Helper()
+		ctrl := gomock.NewController(t)
+		db, dbMock, err := sqlmock.New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		ma := bmock.NewMockMetricAccess(ctrl)
+		ps := bmock.NewMockPermissionService(ctrl)
+		vbs := bmock.NewMockVegaBackendService(ctrl)
+		return &metricService{appSetting: &common.AppSetting{}, db: db, ma: ma, ps: ps, vbs: vbs},
+			dbMock, ma, ps, vbs
+	}
+
+	t.Run("creates multiple metrics through batch access", func(t *testing.T) {
+		service, dbMock, ma, ps, vbs := newService(t)
+		definitions := newDefinitions()
+		ctx := permission.WithKNImportPermissionPrechecked(context.Background())
+		dbMock.ExpectBegin()
+		ma.EXPECT().GetMetricIdentitiesByIDsOrNames(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH,
+			[]string{"metric-1", "metric-2"}, []string{"Metric 1", "Metric 2"}).Return(nil, nil)
+		ma.EXPECT().CreateMetrics(gomock.Any(), gomock.Any(), definitions).Return(nil)
+		ps.EXPECT().UpsertResourceParents(gomock.Any(), interfaces.RESOURCE_TYPE_METRIC,
+			interfaces.RESOURCE_TYPE_KN, []interfaces.PermissionResourceParent{
+				{ResourceID: "kn-1/metric-1", ParentID: "kn-1"},
+				{ResourceID: "kn-1/metric-2", ParentID: "kn-1"},
+			}).Return(nil)
+		vbs.EXPECT().WriteDatasetDocument(gomock.Any(), interfaces.BKN_DATASET_ID, gomock.Any(), gomock.Any()).
+			Return(nil).Times(2)
+		dbMock.ExpectCommit()
+
+		ids, err := service.CreateMetrics(ctx, nil, definitions, false, interfaces.ImportMode_Normal)
+
+		if err != nil {
+			t.Fatalf("CreateMetrics() error = %v", err)
+		}
+		if len(ids) != 2 || ids[0] != "metric-1" || ids[1] != "metric-2" {
+			t.Fatalf("CreateMetrics() ids = %#v", ids)
+		}
+		if err := dbMock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("database expectations were not met: %v", err)
+		}
+	})
+
+	t.Run("overwrites multiple metrics through batch access", func(t *testing.T) {
+		service, dbMock, ma, _, vbs := newService(t)
+		definitions := newDefinitions()
+		ctx := permission.WithKNImportPermissionPrechecked(context.Background())
+		dbMock.ExpectBegin()
+		ma.EXPECT().GetMetricIdentitiesByIDsOrNames(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH,
+			[]string{"metric-1", "metric-2"}, []string{"Metric 1", "Metric 2"}).
+			Return([]*interfaces.MetricDefinition{
+				{ID: "metric-1", Name: "Metric 1"},
+				{ID: "metric-2", Name: "Metric 2"},
+			}, nil)
+		ma.EXPECT().UpdateMetrics(gomock.Any(), gomock.Any(), definitions).Return(nil)
+		vbs.EXPECT().WriteDatasetDocument(gomock.Any(), interfaces.BKN_DATASET_ID, gomock.Any(), gomock.Any()).
+			Return(nil).Times(2)
+		dbMock.ExpectCommit()
+
+		ids, err := service.CreateMetrics(ctx, nil, definitions, false, interfaces.ImportMode_Overwrite)
+
+		if err != nil {
+			t.Fatalf("CreateMetrics() error = %v", err)
+		}
+		if len(ids) != 2 || ids[0] != "metric-1" || ids[1] != "metric-2" {
+			t.Fatalf("CreateMetrics() ids = %#v", ids)
+		}
+		if err := dbMock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("database expectations were not met: %v", err)
+		}
+	})
 }
 
 func metricAuthorizationObjectType(id string) *interfaces.ObjectType {
@@ -158,6 +242,47 @@ func TestMetricDependencyAuthorizationDoesNotEnableStrictValidation(t *testing.T
 	service := &metricService{ps: ps, ots: ots}
 	if err := service.authorizeMetricDependencies(context.Background(), nil, definition); err != nil {
 		t.Fatalf("authorizeMetricDependencies() error = %v", err)
+	}
+}
+
+func TestMetricMissingScopeObjectTypeIsInvalidParameter(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		ot       *interfaces.ObjectType
+		otErr    error
+		wantCode int
+		wantErr  string
+	}{
+		{name: "structured not found", otErr: rest.NewHTTPError(context.Background(), http.StatusNotFound,
+			berrors.BknBackend_ObjectType_ObjectTypeNotFound),
+			wantCode: http.StatusBadRequest, wantErr: berrors.BknBackend_Metric_InvalidParameter},
+		{name: "nil object type",
+			wantCode: http.StatusBadRequest, wantErr: berrors.BknBackend_Metric_InvalidParameter},
+		{name: "internal error", otErr: rest.NewHTTPError(context.Background(), http.StatusInternalServerError,
+			berrors.BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed),
+			wantCode: http.StatusInternalServerError, wantErr: berrors.BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			ps := bmock.NewMockPermissionService(ctrl)
+			ots := bmock.NewMockObjectTypeService(ctrl)
+			ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{
+				Type: interfaces.RESOURCE_TYPE_OBJECT_TYPE, ID: "kn-1/missing",
+			}, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL, interfaces.OPERATION_TYPE_QUERY_DATA}).Return(nil)
+			ots.EXPECT().GetObjectTypeByID(gomock.Any(), nil, "kn-1", interfaces.MAIN_BRANCH, "missing").
+				Return(tc.ot, tc.otErr)
+
+			service := &metricService{ps: ps, ots: ots}
+			err := service.authorizeMetricDependencies(context.Background(), nil, metricAuthorizationDefinition("missing"))
+			var httpErr *rest.HTTPError
+			if !errors.As(err, &httpErr) {
+				t.Fatalf("authorizeMetricDependencies() error = %v, want HTTP error", err)
+			}
+			if httpErr.HTTPCode != tc.wantCode || httpErr.BaseError.ErrorCode != tc.wantErr {
+				t.Fatalf("authorizeMetricDependencies() = %d %s, want %d %s",
+					httpErr.HTTPCode, httpErr.BaseError.ErrorCode, tc.wantCode, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -393,22 +518,22 @@ func TestMetricListAuthorizationFiltersBeforeTotalAndPagination(t *testing.T) {
 			Limit:  1,
 		},
 	}
-	ma.EXPECT().ListMetrics(gomock.Any(), gomock.AssignableToTypeOf(query)).DoAndReturn(
-		func(_ context.Context, candidateQuery interfaces.MetricsListQueryParams) ([]*interfaces.MetricDefinition, error) {
-			if candidateQuery.Offset != 0 || candidateQuery.Limit != -1 {
-				t.Fatalf("candidate query offset/limit = %d/%d", candidateQuery.Offset, candidateQuery.Limit)
-			}
-			return []*interfaces.MetricDefinition{
-				{ID: "metric-1", KnID: "kn-1"},
-				{ID: "metric-2", KnID: "kn-1"},
-				{ID: "metric-3", KnID: "kn-1"},
-			}, nil
-		})
+	ps.EXPECT().ListAccessibleResources(gomock.Any(), interfaces.RESOURCE_TYPE_METRIC,
+		interfaces.OPERATION_TYPE_VIEW_DETAIL).Return(interfaces.PermissionResourceScope{
+		ResourceIDs: []string{"kn-1/metric-1", "kn-1/metric-3"},
+	}, nil)
+	visibleQuery := query
+	visibleQuery.Branch = interfaces.MAIN_BRANCH
+	visibleQuery.ValidAuthorizationIDsOnly = true
+	visibleQuery.MetricIDs = []string{"metric-1", "metric-3"}
+	ma.EXPECT().GetMetricsTotal(gomock.Any(), visibleQuery).Return(2, nil)
+	ma.EXPECT().ListMetrics(gomock.Any(), visibleQuery).Return([]*interfaces.MetricDefinition{
+		{ID: "metric-3", KnID: "kn-1"},
+	}, nil)
 	ps.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), interfaces.RESOURCE_TYPE_METRIC,
-		[]string{"kn-1/metric-1", "kn-1/metric-2", "kn-1/metric-3"},
+		[]string{"kn-1/metric-3"},
 		[]string{interfaces.OPERATION_TYPE_VIEW_DETAIL}).
 		Return(map[string]interfaces.PermissionResourceOps{
-			"kn-1/metric-1": {ResourceID: "kn-1/metric-1"},
 			"kn-1/metric-3": {ResourceID: "kn-1/metric-3"},
 		}, nil)
 
@@ -458,12 +583,12 @@ func TestMetricBatchOverwriteAuthorizationRejectsAndRollsBackBeforeBusinessWrite
 	}
 
 	dbMock.ExpectBegin()
-	for _, entry := range entries {
-		ma.EXPECT().CheckMetricExistByID(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH, entry.ID).
-			Return(entry.Name, true, nil)
-		ma.EXPECT().CheckMetricExistByName(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH, entry.Name).
-			Return(entry.ID, true, nil)
-	}
+	ma.EXPECT().GetMetricIdentitiesByIDsOrNames(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH,
+		[]string{"metric-1", "metric-2"}, []string{"Metric 1", "Metric 2"}).
+		Return([]*interfaces.MetricDefinition{
+			{ID: "metric-1", Name: "Metric 1"},
+			{ID: "metric-2", Name: "Metric 2"},
+		}, nil)
 	ps.EXPECT().RequirePermissions(gomock.Any(), []interfaces.PermissionRequirement{
 		{Resource: interfaces.PermissionResource{Type: interfaces.RESOURCE_TYPE_METRIC, ID: "kn-1/metric-1"}, Operation: interfaces.OPERATION_TYPE_MODIFY},
 		{Resource: interfaces.PermissionResource{Type: interfaces.RESOURCE_TYPE_METRIC, ID: "kn-1/metric-2"}, Operation: interfaces.OPERATION_TYPE_MODIFY},

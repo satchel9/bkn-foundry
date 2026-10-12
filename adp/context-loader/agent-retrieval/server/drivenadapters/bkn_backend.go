@@ -130,7 +130,7 @@ func (b *bknBackendAccess) ListKnowledgeNetworks(ctx context.Context, req *inter
 //
 // On error the returned detail carries only the id.
 func (b *bknBackendAccess) GetKnowledgeNetworkDetail(ctx context.Context, knID string) (*interfaces.KnowledgeNetworkDetail, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s", b.baseURL, knID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s", b.baseURL, url.PathEscape(knID))
 
 	network := &interfaces.KnowledgeNetworkDetail{ID: knID}
 	if err := b.getKnowledgeNetworkJSON(ctx, src, "bkn.knowledge_network.get", url.Values{}, network); err != nil {
@@ -255,7 +255,7 @@ func (b *bknBackendAccess) getKnowledgeNetworkJSON(ctx context.Context, src, ope
 // own. Proxying the query does not widen what the caller may read; it only
 // saves them from having to speak SQL.
 func (b *bknBackendAccess) RunCypherQuery(ctx context.Context, req *interfaces.CypherQueryReq) (*interfaces.CypherQueryResp, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/cypher-queries", b.baseURL, req.KnID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/cypher-queries", b.baseURL, url.PathEscape(req.KnID))
 	if branch := strings.TrimSpace(req.Branch); branch != "" {
 		src = fmt.Sprintf("%s?branch=%s", src, url.QueryEscape(branch))
 	}
@@ -286,6 +286,7 @@ func (b *bknBackendAccess) RunCypherQuery(ctx context.Context, req *interfaces.C
 			Solution:     baseError.Solution,
 			ErrorLink:    baseError.ErrorLink,
 			ErrorDetails: baseError.ErrorDetails,
+			Metadata:     baseError.Metadata,
 		}
 	}
 
@@ -294,21 +295,23 @@ func (b *bknBackendAccess) RunCypherQuery(ctx context.Context, req *interfaces.C
 		return resp, nil
 	}
 	var wire struct {
-		Columns []interfaces.CypherQueryColumn `json:"columns"`
-		Entries []map[string]any               `json:"entries"`
-		Trace   json.RawMessage                `json:"_trace"`
+		Columns           []interfaces.CypherQueryColumn      `json:"columns"`
+		Entries           []map[string]any                    `json:"entries"`
+		Trace             json.RawMessage                     `json:"_trace"`
+		PermissionImpacts []interfaces.ObjectPermissionImpact `json:"permission_impacts"`
 	}
 	if err := sonic.Unmarshal(respBody, &wire); err != nil {
 		b.logger.Errorf("[BknBackendAccess] RunCypherQuery unmarshal response failed: %v\n", err)
 		return nil, err
 	}
 	resp.Columns, resp.Entries, resp.TraceDescriptor = wire.Columns, wire.Entries, wire.Trace
+	resp.PermissionImpacts = wire.PermissionImpacts
 	return resp, nil
 }
 
 // SearchObjectTypes searches object types.
 func (b *bknBackendAccess) SearchObjectTypes(ctx context.Context, query *interfaces.QueryConceptsReq) (objectTypes *interfaces.ObjectTypeConcepts, err error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/object-types", b.baseURL, query.KnID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/object-types", b.baseURL, url.PathEscape(query.KnID))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.object_type.search", 1)
 	header["Content-Type"] = "application/json"
 	header["x-http-method-override"] = "GET"
@@ -359,9 +362,60 @@ func (b *bknBackendAccess) SearchObjectTypes(ctx context.Context, query *interfa
 	return objectTypes, nil
 }
 
+// pathIDList writes ids as one path segment, each escaped on its own and then
+// joined by the comma the batch endpoints split on. Ids and network ids reach
+// this adapter from callers, and one holding a % or a control character written
+// raw made the URL fail to parse before any request was sent -- an error with
+// no status code, which no caller could tell apart from the service being down.
+func pathIDList(ids []string) string {
+	escaped := make([]string, len(ids))
+	for i, id := range ids {
+		escaped[i] = url.PathEscape(id)
+	}
+	return strings.Join(escaped, ",")
+}
+
+// knPagedEnvelope is the list wrapper above, plus the total bkn-backend reports
+// when the read is paged.
+type knPagedEnvelope[T any] struct {
+	Entries    []T   `json:"entries"`
+	TotalCount int64 `json:"total_count"`
+}
+
+// ListObjectTypes reads one page of a knowledge network's object type index.
+//
+// An index entry, not a definition: bkn-backend's list endpoint selects
+// f_id / f_name / f_tags / f_comment / f_data_source and the audit columns, with
+// no property columns and no include_detail to ask for them. That is the right
+// shape for this call. What a caller without ids needs is ids -- something to
+// choose by, and then to name in a by-id read. Answering with full definitions
+// would hand back roughly 60KB an object type on the network of #1877, so a page
+// of twenty would be over a megabyte: the answer #1877 exists to prevent, and it
+// would cost one property-plan read per object type to build.
+//
+// bkn-backend filters by the caller's authorization before it pages, so the total
+// and the offsets are over what this caller may see, not over what the network
+// holds.
+func (b *bknBackendAccess) ListObjectTypes(ctx context.Context, knID string, offset, limit int) (*interfaces.ObjectTypePage, error) {
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/object-types", b.baseURL, url.PathEscape(knID))
+	query := url.Values{}
+	query.Set("offset", strconv.Itoa(offset))
+	query.Set("limit", strconv.Itoa(limit))
+	query.Set("sort", "name")
+	query.Set("direction", "asc")
+
+	page := &knPagedEnvelope[*interfaces.ObjectType]{}
+	if err := b.getKnowledgeNetworkJSON(ctx, src, "bkn.object_type.list", query, page); err != nil {
+		return nil, err
+	}
+	return &interfaces.ObjectTypePage{
+		Entries: page.Entries, TotalCount: page.TotalCount, Scanned: len(page.Entries),
+	}, nil
+}
+
 // GetObjectTypeDetail gets object type details.
 func (b *bknBackendAccess) GetObjectTypeDetail(ctx context.Context, knID string, otIds []string, includeDetail bool) ([]*interfaces.ObjectType, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/object-types/%s", b.baseURL, knID, strings.Join(otIds, ","))
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/object-types/%s", b.baseURL, url.PathEscape(knID), pathIDList(otIds))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.object_type.get", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -420,7 +474,7 @@ func (b *bknBackendAccess) GetObjectTypeDetail(ctx context.Context, knID string,
 
 // SearchRelationTypes searches relation types.
 func (b *bknBackendAccess) SearchRelationTypes(ctx context.Context, query *interfaces.QueryConceptsReq) (releationTypes *interfaces.RelationTypeConcepts, err error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/relation-types", b.baseURL, query.KnID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/relation-types", b.baseURL, url.PathEscape(query.KnID))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.relation_type.search", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -472,7 +526,7 @@ func (b *bknBackendAccess) SearchRelationTypes(ctx context.Context, query *inter
 
 // GetRelationTypeDetail gets relation type details.
 func (b *bknBackendAccess) GetRelationTypeDetail(ctx context.Context, knID string, rtIDs []string, includeDetail bool) ([]*interfaces.RelationType, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/relation-types/%s", b.baseURL, knID, strings.Join(rtIDs, ","))
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/relation-types/%s", b.baseURL, url.PathEscape(knID), pathIDList(rtIDs))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.relation_type.get", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -531,7 +585,7 @@ func (b *bknBackendAccess) GetRelationTypeDetail(ctx context.Context, knID strin
 
 // SearchActionTypes searches action types.
 func (b *bknBackendAccess) SearchActionTypes(ctx context.Context, query *interfaces.QueryConceptsReq) (actionTypes *interfaces.ActionTypeConcepts, err error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/action-types", b.baseURL, query.KnID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/action-types", b.baseURL, url.PathEscape(query.KnID))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.action_type.search", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -583,7 +637,7 @@ func (b *bknBackendAccess) SearchActionTypes(ctx context.Context, query *interfa
 
 // SearchMetricTypes searches metric types.
 func (b *bknBackendAccess) SearchMetricTypes(ctx context.Context, query *interfaces.QueryConceptsReq) (metricTypes *interfaces.MetricTypeConcepts, err error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/metrics", b.baseURL, query.KnID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/metrics", b.baseURL, url.PathEscape(query.KnID))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.metric.search", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -635,7 +689,7 @@ func (b *bknBackendAccess) SearchMetricTypes(ctx context.Context, query *interfa
 
 // GetActionTypeDetail gets action type details.
 func (b *bknBackendAccess) GetActionTypeDetail(ctx context.Context, knID string, atIDs []string, includeDetail bool) ([]*interfaces.ActionType, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/action-types/%s", b.baseURL, knID, strings.Join(atIDs, ","))
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/action-types/%s", b.baseURL, url.PathEscape(knID), pathIDList(atIDs))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.action_type.get", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
@@ -879,7 +933,7 @@ const capabilityListNoLimit = "-1"
 // widen that into "everything": an unconfigured network having no scope is the intended answer.
 func (b *bknBackendAccess) ListKNCapabilities(ctx context.Context, knID, branch,
 	capabilityType string) ([]*interfaces.CapabilityRef, error) {
-	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/capabilities", b.baseURL, knID)
+	src := fmt.Sprintf("%s/in/v1/knowledge-networks/%s/capabilities", b.baseURL, url.PathEscape(knID))
 	header := common.GetHeaderForChildOperation(ctx, "bkn.capability.list", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 

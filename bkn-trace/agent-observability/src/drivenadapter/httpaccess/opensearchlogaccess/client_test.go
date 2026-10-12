@@ -26,7 +26,7 @@ func (client *fakeSearchClient) Search(_ context.Context, _ string, query []byte
 	return client.response, nil
 }
 
-func TestSearchPushesTrustedScopeAndMapsSS4ODocuments(t *testing.T) {
+func TestSearchUsesRegisteredLogFieldsWithoutAnExtraTrustGate(t *testing.T) {
 	backend := &fakeSearchClient{response: []byte(`{
 		"hits":{"total":{"value":1,"relation":"eq"},"hits":[{"_id":"source-log-a","_source":{
 				"attributes":{"log_id":"context-loader:source-log-a","source_id":"context-loader","source_log_id":"source-log-a","log_category":"runtime.business","event_name":"knowledge.read.completed","effective_subject_id":"builder-a","request_id":"req-a","conversation_id":"conversation-a","interaction_id":"interaction-a","operation_id":"operation-a","knowledge_network_ids":["kn-a"],"ingress_principal":"otel-gateway","trust_level":"trusted"},
@@ -35,6 +35,9 @@ func TestSearchPushesTrustedScopeAndMapsSS4ODocuments(t *testing.T) {
 			"severity":{"text":"INFO","number":9},"traceId":"trace-a","spanId":"span-a"
 			},"sort":["2026-08-01T11:35:46.123456Z","source-log-a"]}]}}`)}
 	client := New(backend, "ss4o_logs-default-namespace")
+	if client.ID() != "otel-runtime" {
+		t.Fatal("OpenSearch aggregate query adapter ID must remain stable")
+	}
 	page, err := client.Search(context.Background(), observabilityvo.LogQuery{
 		TraceID: "trace-a", Limit: 20,
 		AuthorizedSubjectID:           "builder-a",
@@ -50,6 +53,12 @@ func TestSearchPushesTrustedScopeAndMapsSS4ODocuments(t *testing.T) {
 		t.Fatalf("decode native query: %v", err)
 	}
 	encoded, _ := json.Marshal(query)
+	if containsBytes(encoded, "trust_level") || containsBytes(encoded, "ingress_principal") {
+		t.Fatalf("internal log query must not add a second trust model: %s", encoded)
+	}
+	if containsBytes(encoded, "attributes.event_name.keyword") {
+		t.Fatalf("registry inventory must not become an implicit event rejection filter: %s", encoded)
+	}
 	for _, expected := range []string{"attributes.log_category.keyword", "attributes.knowledge_network_ids.keyword", "traceId.keyword"} {
 		if !containsBytes(encoded, expected) {
 			t.Fatalf("trusted filter %s was not pushed down: %s", expected, encoded)
@@ -73,12 +82,36 @@ func TestSearchPushesTrustedScopeAndMapsSS4ODocuments(t *testing.T) {
 	}
 }
 
+func TestSearchPushesEventNamesOnlyWhenCallerRequestsThem(t *testing.T) {
+	query := buildQuery(observabilityvo.LogQuery{
+		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeBusiness},
+		EventNames:           []string{"custom.internal.event"},
+	})
+	body, err := json.Marshal(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"attributes.event_name.keyword":["custom.internal.event"]`) {
+		t.Fatalf("explicit event filter was not preserved: %s", body)
+	}
+}
+
+func TestDetailQueryDoesNotRequireLegacyTrustFields(t *testing.T) {
+	body, err := json.Marshal(buildDetailQuery("context-loader:source-log-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "trust_level") || strings.Contains(string(body), "ingress_principal") {
+		t.Fatalf("detail query must not hide internal logs behind legacy trust fields: %s", body)
+	}
+}
+
 func TestSearchReplaysNativeSearchAfterValues(t *testing.T) {
 	backend := &fakeSearchClient{response: []byte(`{"hits":{"total":{"value":0,"relation":"eq"},"hits":[]}}`)}
 	client := New(backend, "logs")
 	positionTime := time.Date(2026, 8, 1, 10, 0, 0, 123456789, time.UTC)
 	_, err := client.Search(context.Background(), observabilityvo.LogQuery{
-		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeSystem},
+		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeBusiness},
 		PageBefore: &observabilityvo.SourcePosition{
 			EventTimestamp: positionTime, LogID: "source-log-a",
 			SearchAfter: []any{"2026-08-01T10:00:00.123456Z", "context-loader", "source-log-a"},
@@ -100,7 +133,7 @@ func TestSearchReplaysNativeSearchAfterValues(t *testing.T) {
 
 func TestBuildQueryReplaysNativeSearchAfterWithoutAParsedTimestamp(t *testing.T) {
 	query := buildQuery(observabilityvo.LogQuery{
-		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeSystem},
+		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeBusiness},
 		PageBefore: &observabilityvo.SourcePosition{
 			LogID: "source-log-a", SearchAfter: []any{"invalid-legacy-time", "context-loader", "source-log-a"},
 		},
@@ -113,7 +146,7 @@ func TestBuildQueryReplaysNativeSearchAfterWithoutAParsedTimestamp(t *testing.T)
 
 func TestBuildQueryUsesTheContractTieBreakers(t *testing.T) {
 	query := buildQuery(observabilityvo.LogQuery{
-		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeSystem},
+		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeBusiness},
 	})
 	sorts, _ := query["sort"].([]any)
 	encoded, _ := json.Marshal(sorts)
@@ -126,7 +159,7 @@ func TestBuildQueryUsesTheContractTieBreakers(t *testing.T) {
 func TestBuildQueryFreezesObservedTimestampAtTheGatewayWatermark(t *testing.T) {
 	watermark := time.Date(2026, 8, 1, 12, 0, 0, 123, time.UTC)
 	body, err := json.Marshal(buildQuery(observabilityvo.LogQuery{
-		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeSystem},
+		AuthorizedCategories: []string{observabilityvo.CategoryRuntimeBusiness},
 		ObservedBefore:       &watermark,
 	}))
 	if err != nil {

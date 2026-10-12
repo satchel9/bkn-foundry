@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -45,10 +46,46 @@ func (stubVerifier) VerifyToken(_ context.Context, token string) (string, error)
 
 const adminSub = "admin-1" // seeded as super-admin in newAdminServer
 
+type discardAccessRecorder struct{}
+
+func (discardAccessRecorder) Record(context.Context, accesslog.Entry) error { return nil }
+
+type testAuthorizationResourceCatalog struct{}
+
+func (testAuthorizationResourceCatalog) List(context.Context, string, AuthorizationResourceQuery) (AuthorizationResourceList, error) {
+	return AuthorizationResourceList{}, nil
+}
+
+func (testAuthorizationResourceCatalog) Resolve(_ context.Context, resourceType, resourceID string) (AuthorizationResource, error) {
+	return AuthorizationResource{ID: resourceID, Name: "Test " + resourceType + " " + resourceID}, nil
+}
+
+type collectedDecisions struct {
+	mu   sync.Mutex
+	rows []decisionlog.Entry
+}
+
+func (c *collectedDecisions) Record(entry decisionlog.Entry) {
+	c.mu.Lock()
+	c.rows = append(c.rows, entry)
+	c.mu.Unlock()
+}
+
+func (c *collectedDecisions) Snapshot() []decisionlog.Entry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]decisionlog.Entry(nil), c.rows...)
+}
+
 // newAdminServer builds a full server with the admin API mounted: a stub token
 // verifier (token==subject) and adminSub seeded as super-admin (wildcard grant)
 // so RequireAdmin passes for Bearer adminSub.
 func newAdminServer(t *testing.T) (*gin.Engine, *authz.Enforcer, *gorm.DB, *auth.UserStore) {
+	r, e, db, users, _ := newAdminServerWithDecisions(t)
+	return r, e, db, users
+}
+
+func newAdminServerWithDecisions(t *testing.T) (*gin.Engine, *authz.Enforcer, *gorm.DB, *auth.UserStore, *collectedDecisions) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -81,16 +118,16 @@ func newAdminServer(t *testing.T) (*gin.Engine, *authz.Enforcer, *gorm.DB, *auth
 	}))
 	adminwrite.RegisterMounter(licverify.EditionProfessional, adminwrite.Routes)
 	finegrained.Register(licverify.EditionProfessional)
+	decisions := &collectedDecisions{}
 	r := New(Deps{
 		Enforcer: e, DB: db, Directory: directory.New(db), Users: users,
-		Audit:     audit.New(db),
-		AccessLog: accesslog.New(db),
-		// Synchronous so a test can read a decision right after the request
-		// that produced it; production writes through the queue.
-		Decisions:     decisionlog.New(db, decisionlog.Options{Enabled: true, AllowSampleRate: 1, Synchronous: true}),
-		TokenVerifier: stubVerifier{},
+		Audit:                  audit.New(db),
+		AccessLog:              discardAccessRecorder{},
+		Decisions:              decisions,
+		TokenVerifier:          stubVerifier{},
+		AuthorizationResources: testAuthorizationResourceCatalog{},
 	})
-	return r, e, db, users
+	return r, e, db, users, decisions
 }
 
 // adminReq issues a request authenticated as the seeded super-admin.
@@ -229,17 +266,17 @@ func TestThreeAdminRolesUseEndpointLevelPermissions(t *testing.T) {
 		{"admin creates user", adminUser, http.MethodPost, "/api/safe/v1/admin/users", createUser("admin-created"), http.StatusCreated},
 		{"admin cannot create role", adminUser, http.MethodPost, "/api/safe/v1/admin/roles", createRole("admin-role-created"), http.StatusForbidden},
 		{"admin cannot bind role", adminUser, http.MethodPost, "/api/safe/v1/admin/role-bindings", bindTarget, http.StatusForbidden},
-		{"admin reads audit", adminUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusOK},
+		{"old audit query retired for admin", adminUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusNotFound},
 		{"security cannot create user", securityUser, http.MethodPost, "/api/safe/v1/admin/users", createUser("security-created-user"), http.StatusForbidden},
 		{"security toggles user", securityUser, http.MethodPut, "/api/safe/v1/admin/users/target-user", gin.H{"enabled": false}, http.StatusNoContent},
 		{"security cannot edit user profile", securityUser, http.MethodPut, "/api/safe/v1/admin/users/target-user", gin.H{"name": "changed"}, http.StatusForbidden},
 		{"security creates role", securityUser, http.MethodPost, "/api/safe/v1/admin/roles", createRole("security-role-created"), http.StatusCreated},
 		{"security binds role", securityUser, http.MethodPost, "/api/safe/v1/admin/role-bindings", bindTarget, http.StatusNoContent},
-		{"security cannot read audit", securityUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusForbidden},
+		{"old audit query retired for security", securityUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusNotFound},
 		{"audit cannot create user", auditUser, http.MethodPost, "/api/safe/v1/admin/users", createUser("audit-created-user"), http.StatusForbidden},
 		{"audit cannot create role", auditUser, http.MethodPost, "/api/safe/v1/admin/roles", createRole("audit-role-created"), http.StatusForbidden},
 		{"audit cannot bind role", auditUser, http.MethodPost, "/api/safe/v1/admin/role-bindings", bindTarget, http.StatusForbidden},
-		{"audit reads audit", auditUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusOK},
+		{"old audit query retired for auditor", auditUser, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil, http.StatusNotFound},
 
 		// Authorization management: security owns the writes, audit reviews them,
 		// admin (system operations) holds neither.
@@ -905,8 +942,8 @@ func TestAuditTrail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// three mutations: create dept (POST, no :id), rename it (PUT, :id), and
-	// delete a ghost user (DELETE, :id -> 404 but still audited).
+	// Three committed mutations: create dept (POST, no :id), rename it (PUT,
+	// :id), and delete it. A missing-user delete is a 404, not a business fact.
 	adminReq(t, r, http.MethodPost, "/api/safe/v1/admin/departments",
 		map[string]any{"id": "d-1", "name": "Root"})
 	adminReq(t, r, http.MethodPut, "/api/safe/v1/admin/departments/d-1",
@@ -918,101 +955,49 @@ func TestAuditTrail(t *testing.T) {
 
 	var total int64
 	db.Model(&model.AuditLog{}).Count(&total)
-	if total != 4 {
-		t.Fatalf("audit rows = %d, want 4 (GET excluded)", total)
+	if total != 3 {
+		t.Fatalf("audit rows = %d, want 3 (GET and failed delete excluded)", total)
 	}
 
-	type logRow struct {
-		ID                string `json:"id"`
-		ActorID           string `json:"actor_id"`
-		ActorNameSnapshot string `json:"actor_name_snapshot"`
-		ActorType         string `json:"actor_type"`
-		AuthMethod        string `json:"auth_method"`
-		RequestID         string `json:"request_id"`
-		SourceChannel     string `json:"source_channel"`
-		Method            string `json:"method"`
-		Resource          string `json:"resource"`
-		Action            string `json:"action"`
-		TargetID          string `json:"target_id"`
-		TargetName        string `json:"target_name"`
-		Status            int    `json:"status"`
+	store := audit.New(db)
+	// The retired HTTP adapter stays absent; historical rows remain readable
+	// directly for migration/verification without creating a second query API.
+	if w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs", nil); w.Code != http.StatusNotFound {
+		t.Fatalf("retired audit query = %d, want 404", w.Code)
 	}
-	type listResp struct {
-		Logs  []logRow `json:"logs"`
-		Total int      `json:"total"`
+	users, count, err := store.List(t.Context(), audit.Filter{Resource: "users"})
+	if err != nil || count != 0 || len(users) != 0 {
+		t.Fatalf("failed user delete created audit facts: total=%d len=%d err=%v", count, len(users), err)
 	}
 
-	// filter by resource=users -> the single ghost-delete, recorded with its 404
-	w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs?resource=users", nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list audit: %d (%s)", w.Code, w.Body.String())
+	depts, count, err := store.List(t.Context(), audit.Filter{Resource: "departments"})
+	if err != nil || count != 3 {
+		t.Errorf("resource=departments: total=%d, err=%v, want 3", count, err)
 	}
-	var users listResp
-	_ = json.Unmarshal(w.Body.Bytes(), &users)
-	if users.Total != 1 || len(users.Logs) != 1 {
-		t.Fatalf("resource=users: total=%d len=%d", users.Total, len(users.Logs))
-	}
-	got := users.Logs[0]
-	if got.ActorID != adminSub || got.Method != http.MethodDelete || got.Action != "delete" ||
-		got.TargetID != "ghost" || got.Status != http.StatusNotFound {
-		t.Errorf("ghost-delete entry = %+v", got)
-	}
-	if got.ActorNameSnapshot != "Administrator" || got.ActorType != "user" || got.AuthMethod != "oauth" ||
-		got.RequestID == "" || got.SourceChannel != "api" {
-		t.Errorf("ghost-delete identity/correlation facts = %+v", got)
-	}
-
-	// The list API exposes the same request correlation key, so an operator can
-	// recover every audit row from a batch mutation without relying on timing.
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs?request_id="+got.RequestID, nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("list audit by request id: %d (%s)", w.Code, w.Body.String())
-	}
-	var correlated listResp
-	_ = json.Unmarshal(w.Body.Bytes(), &correlated)
-	if correlated.Total != 1 || len(correlated.Logs) != 1 || correlated.Logs[0].ID != got.ID {
-		t.Fatalf("request_id=%q returned %+v, want only %+v", got.RequestID, correlated, got)
-	}
-
-	// Detail lookup uses the same audit permission and returns exactly one source row.
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs/"+got.ID, nil)
-	if w.Code != http.StatusOK {
-		t.Fatalf("get audit detail: %d (%s)", w.Code, w.Body.String())
-	}
-	var detail logRow
-	_ = json.Unmarshal(w.Body.Bytes(), &detail)
-	if detail.ID != got.ID || detail.TargetID != "ghost" {
-		t.Fatalf("unexpected audit detail: %+v", detail)
-	}
-	missing := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs/missing", nil)
-	if missing.Code != http.StatusNotFound {
-		t.Fatalf("missing audit detail: want 404, got %d (%s)", missing.Code, missing.Body.String())
-	}
-
-	// filter by resource=departments -> the create + rename + delete
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs?resource=departments", nil)
-	var depts listResp
-	_ = json.Unmarshal(w.Body.Bytes(), &depts)
-	if depts.Total != 3 {
-		t.Errorf("resource=departments: total=%d, want 3", depts.Total)
-	}
-	var deleteDept *logRow
-	for i := range depts.Logs {
-		if depts.Logs[i].Method == http.MethodDelete {
-			deleteDept = &depts.Logs[i]
+	var deleteDept *model.AuditLog
+	for i := range depts {
+		if depts[i].Method == http.MethodDelete {
+			deleteDept = &depts[i]
 			break
 		}
 	}
 	if deleteDept == nil || deleteDept.TargetName != "Renamed" {
 		t.Errorf("delete department target snapshot = %+v, want target_name Renamed", deleteDept)
 	}
+	var createDept *model.AuditLog
+	for i := range depts {
+		if depts[i].Method == http.MethodPost {
+			createDept = &depts[i]
+			break
+		}
+	}
+	if createDept == nil || createDept.TargetID != "d-1" || createDept.TargetName != "Root" {
+		t.Errorf("create department target snapshot = %+v, want d-1/Root", createDept)
+	}
 
-	// Source adapters must filter failures before pagination, not after reading one page.
-	w = adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs?failed_only=true", nil)
-	var failed listResp
-	_ = json.Unmarshal(w.Body.Bytes(), &failed)
-	if failed.Total != 1 || len(failed.Logs) != 1 || failed.Logs[0].Status < http.StatusBadRequest {
-		t.Errorf("failed_only: total=%d logs=%+v", failed.Total, failed.Logs)
+	failed, count, err := store.List(t.Context(), audit.Filter{FailedOnly: true})
+	if err != nil || count != 0 || len(failed) != 0 {
+		t.Errorf("failed_only must stay empty: total=%d logs=%+v err=%v", count, failed, err)
 	}
 }
 
@@ -1074,8 +1059,11 @@ func TestRoleManagementSuccessPersistsAuditBeforeChainAppend(t *testing.T) {
 		if err := db.Where("request_id = ?", requestID).First(&bindingAudit).Error; err != nil {
 			t.Fatal(err)
 		}
-		if bindingAudit.TargetID != memberUser {
-			t.Fatalf("%s target_id = %q, want accessor %q", requestID, bindingAudit.TargetID, memberUser)
+		if want := roleBindingTargetID(memberUser, roleID); bindingAudit.TargetID != want {
+			t.Fatalf("%s target_id = %q, want binding %q", requestID, bindingAudit.TargetID, want)
+		}
+		if !strings.Contains(bindingAudit.TargetName, memberUser) || !strings.Contains(bindingAudit.TargetName, "Renamed role") {
+			t.Fatalf("%s target_name = %q, want accessor and role snapshots", requestID, bindingAudit.TargetName)
 		}
 	}
 	request("role-delete", http.MethodDelete, "/api/safe/v1/admin/roles/"+roleID, nil, http.StatusNoContent)
@@ -1095,8 +1083,8 @@ func TestRoleManagementSuccessPersistsAuditBeforeChainAppend(t *testing.T) {
 	if err := db.Where("request_id = ?", "role-update-missing").Find(&failedLogs).Error; err != nil {
 		t.Fatal(err)
 	}
-	if len(failedLogs) != 1 || failedLogs[0].Status != http.StatusNotFound {
-		t.Fatalf("missing role update audit = %+v, want exactly one 404 event", failedLogs)
+	if len(failedLogs) != 0 {
+		t.Fatalf("missing role update created audit facts: %+v", failedLogs)
 	}
 }
 
@@ -1124,7 +1112,7 @@ func TestRolePermissionBatchAuditsOneRequestOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	request := func(requestID string, operations []string, want int) {
+	request := func(requestID string, operations []string, want int, wantAudit bool) {
 		t.Helper()
 		body, err := json.Marshal(gin.H{
 			"resource":   gin.H{"type": "catalog", "id": "*"},
@@ -1146,13 +1134,17 @@ func TestRolePermissionBatchAuditsOneRequestOutcome(t *testing.T) {
 		if err := db.Where("request_id = ?", requestID).Find(&logs).Error; err != nil {
 			t.Fatal(err)
 		}
-		if len(logs) != 1 || logs[0].Status != want {
-			t.Fatalf("request %q audit logs = %+v, want exactly one status %d", requestID, logs, want)
+		if wantAudit {
+			if len(logs) != 1 || logs[0].Status != want {
+				t.Fatalf("request %q audit logs = %+v, want exactly one status %d", requestID, logs, want)
+			}
+		} else if len(logs) != 0 {
+			t.Fatalf("failed request %q created audit facts: %+v", requestID, logs)
 		}
 	}
 
-	request("role-permission-batch-success", []string{"view_detail", "resource_manage"}, http.StatusNoContent)
-	request("role-permission-batch-invalid", []string{"view_detail", "not-grantable"}, http.StatusBadRequest)
+	request("role-permission-batch-success", []string{"view_detail", "resource_manage"}, http.StatusNoContent, true)
+	request("role-permission-batch-invalid", []string{"view_detail", "not-grantable"}, http.StatusBadRequest, false)
 	grants, err := e.RolePermissions(roleID)
 	if err != nil {
 		t.Fatal(err)
@@ -1281,17 +1273,11 @@ func TestAuditDetailCapture(t *testing.T) {
 		map[string]any{"password": "s3cr3t-should-not-appear"})
 
 	detailFor := func(action string) string {
-		w := adminReq(t, r, http.MethodGet, "/api/safe/v1/admin/audit-logs?action="+action, nil)
-		var resp struct {
-			Logs []struct {
-				Detail string `json:"detail"`
-			} `json:"logs"`
+		rows, total, err := audit.New(db).List(t.Context(), audit.Filter{Action: action})
+		if err != nil || total != 1 || len(rows) != 1 {
+			t.Fatalf("action=%s: want 1 historical row, got %d (total=%d, err=%v)", action, len(rows), total, err)
 		}
-		_ = json.Unmarshal(w.Body.Bytes(), &resp)
-		if len(resp.Logs) != 1 {
-			t.Fatalf("action=%s: want 1 log, got %d", action, len(resp.Logs))
-		}
-		return resp.Logs[0].Detail
+		return rows[0].Detail
 	}
 
 	if d := detailFor("create"); !strings.Contains(d, "研发部") {

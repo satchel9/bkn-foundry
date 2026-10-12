@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from contextvars import ContextVar
@@ -13,6 +14,8 @@ import aiohttp
 
 from app import observability
 from app.config import config
+from app.evidence_kafka import EvidenceKafkaConfig, EvidenceKafkaPublisher
+from app.evidence_policy import EvidencePolicyRuntime, TraceAdmissionClient
 
 logger = logging.getLogger("bkn-agent.evidence")
 
@@ -20,7 +23,7 @@ CONTRACT_VERSION = "2.2.0"
 LEDGER_CONTRACT_VERSION = "3.0.0"
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[0-9A-Za-z_.:-]{1,128}$")
-_background: set[asyncio.Task] = set()
+_publisher: EvidencePolicyRuntime | EvidenceKafkaPublisher | None = None
 _REF_FIELDS = {
     "ref_id",
     "ref_type",
@@ -48,6 +51,7 @@ class InteractionEvidence:
     observed_at: str
     question: Any
     agent_id: str
+    owner: dict[str, str] | None = None
     operation_sequence: int = 0
     fact_candidates: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_candidate_sets: dict[str, set[str]] = field(default_factory=dict)
@@ -56,8 +60,8 @@ class InteractionEvidence:
     adopted_evidence_refs: list[dict[str, Any]] = field(default_factory=list)
     adopted_business_refs: list[dict[str, Any]] = field(default_factory=list)
     adoption_status: str = "partial"
-    confirmed_event_ids: set[str] = field(default_factory=set)
-    submission_tail: asyncio.Task[bool] | None = None
+    locally_admitted_event_ids: set[str] = field(default_factory=set)
+    downstream_durable_event_ids: set[str] = field(default_factory=set)
 
 
 _interaction: ContextVar[InteractionEvidence | None] = ContextVar(
@@ -258,6 +262,7 @@ def begin_interaction(
     *,
     conversation_id: str | None = None,
     interaction_id: str | None = None,
+    owner: dict[str, str] | None = None,
 ):
     """Open one interaction.
 
@@ -294,6 +299,7 @@ def begin_interaction(
             observed_at=ctx.observed_at,
             question=intent,
             agent_id=agent_id,
+            owner=dict(owner) if owner else None,
         )
     )
 
@@ -363,6 +369,14 @@ def _artifact(
         "content": content,
         "bkn.account.id": account_id,
         "bkn.account.type": account_type,
+        "application_principal_id": (
+            current.owner["application_principal_id"]
+            if current.owner else ctx.application_principal_id or account_id
+        ),
+        "effective_subject_id": (
+            current.owner["effective_subject_id"]
+            if current.owner else ctx.effective_subject_id or account_id
+        ),
         "agent_or_app": current.agent_id,
     }
 
@@ -411,7 +425,7 @@ def new_operation() -> tuple[str, str | None]:
     )
     if current.adopted_source_event_ids:
         parent = current.adopted_source_event_ids[-1]
-    elif current.started_event["event_id"] in current.confirmed_event_ids:
+    elif _causally_available(current.started_event["event_id"], current):
         parent = current.started_event["event_id"]
     else:
         parent = None
@@ -515,7 +529,7 @@ def record_downstream_fact(
         "business_refs": _safe_refs(business_refs),
         "context_hash": context_hash if _valid_hash(context_hash) else None,
     }
-    current.confirmed_event_ids.add(event_id)
+    current.downstream_durable_event_ids.add(event_id)
 
 
 def record_fact_receipt(
@@ -640,7 +654,6 @@ def record_model_fact(
         current.adopted_business_refs.extend(
             current.fact_candidates[source]["business_refs"]
         )
-    current.confirmed_event_ids.add(event_id)
     current.adoption_status = (
         "complete" if not current.fact_candidates or bool(selected) else "partial"
     )
@@ -720,6 +733,13 @@ def build_batch(
         "bkn.effective.subject.id": ctx.effective_subject_id or account_id,
         "bkn.delegation.id": ctx.delegation_id,
     }
+    if current and current.owner:
+        trace.update({
+            "bkn.application.principal.id": current.owner["application_principal_id"],
+            "bkn.effective.subject.type": current.owner["effective_subject_type"],
+            "bkn.effective.subject.id": current.owner["effective_subject_id"],
+            "bkn.delegation.id": current.owner.get("delegation_id", ""),
+        })
     if conversation_id:
         trace["bkn.conversation.id"] = conversation_id
     return {
@@ -793,6 +813,20 @@ def build_ledger_events(batch: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(trace, dict) or not isinstance(events, list):
         return []
     conversation_id = str(trace.get("bkn.conversation.id") or "").strip()
+    owner = {
+        "application_principal_id": str(
+            trace.get("bkn.application.principal.id") or ""
+        ).strip(),
+        "effective_subject_type": str(
+            trace.get("bkn.effective.subject.type") or ""
+        ).strip(),
+        "effective_subject_id": str(
+            trace.get("bkn.effective.subject.id") or ""
+        ).strip(),
+    }
+    delegation_id = str(trace.get("bkn.delegation.id") or "").strip()
+    if delegation_id:
+        owner["delegation_id"] = delegation_id
     result: list[dict[str, Any]] = []
     for event in events:
         if not isinstance(event, dict):
@@ -812,7 +846,7 @@ def build_ledger_events(batch: dict[str, Any]) -> list[dict[str, Any]]:
             "bkn.trace.schema.version": LEDGER_CONTRACT_VERSION,
             "event_id": event_id,
             "event_type": event_type,
-            "payload_hash": canonical_payload_hash(event),
+            "payload_hash": canonical_payload_hash({"event": event, "owner": owner}),
             "conversation_id": conversation_id,
             "interaction_id": interaction_id,
             "attempt": attempt,
@@ -826,7 +860,7 @@ def build_ledger_events(batch: dict[str, Any]) -> list[dict[str, Any]]:
             "started_at": observed_at,
             "observed_at": observed_at,
             "emitted_at": emitted_at,
-            "envelope": event,
+            "envelope": {"event": event, "owner": owner},
         }
         if operation_id:
             ledger["operation_id"] = operation_id
@@ -858,24 +892,35 @@ async def submit_events(
     if not account_id or not account_type:
         return False
     batch = build_batch(events, account_id, account_type)
-    if not batch or not config.BKN_TRACE_EVIDENCE_INGEST_URL:
+    if not batch or _publisher is None:
         return False
     current = _interaction.get()
-    previous = current.submission_tail if current else None
-    task = asyncio.create_task(_send_after(previous, batch))
-    if current:
-        current.submission_tail = task
-    _background.add(task)
-    task.add_done_callback(_background.discard)
-    try:
-        confirmed = await asyncio.shield(task)
-    except asyncio.CancelledError:
-        raise
-    if confirmed and current:
-        current.confirmed_event_ids.update(
-            event["event_id"] for event in events if event
-        )
-    return confirmed
+    ledger_events = build_ledger_events(batch)
+    if not ledger_events:
+        return False
+    accepted = True
+    dropped_reasons: dict[str, int] = {}
+    for ledger_event in ledger_events:
+        result = _publisher.try_publish(ledger_event)
+        if result.disposition == "accepted":
+            if current:
+                current.locally_admitted_event_ids.add(result.event_id)
+        else:
+            accepted = False
+            reason = result.reason if result.reason in {
+                "publisher_unavailable", "publisher_closing", "queue_full",
+                "invalid_event", "message_too_large", "serialization_failed",
+            } else "other"
+            dropped_reasons[reason] = dropped_reasons.get(reason, 0) + 1
+    for reason, count in sorted(dropped_reasons.items()):
+        if reason == "publisher_closing":
+            logger.info("bkn_trace_evidence_disabled producer_id=bkn-agent dropped=%d", count)
+        else:
+            logger.warning(
+                "bkn_trace_coverage_gap producer_id=bkn-agent reason=%s dropped=%d",
+                reason, count,
+            )
+    return accepted
 
 
 async def submit_artifact(artifact: dict[str, Any] | None) -> bool:
@@ -893,50 +938,14 @@ async def submit_interaction_started(account_id: str, account_type: str) -> bool
     return await submit_events([event] if event else [], account_id, account_type)
 
 
-async def _send_after(
-    previous: asyncio.Task[bool] | None, batch: dict[str, Any]
-) -> bool:
-    if previous is not None:
-        try:
-            if not await previous:
-                return False
-        except Exception:
-            return False
-    return await _send_batch(batch)
-
-
-async def _send_once(batch: dict[str, Any]) -> None:
-    ledger_events = build_ledger_events(batch)
-    if not ledger_events:
-        raise EvidenceSubmissionError("Trace 3.0 event conversion produced no events")
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=config.BKN_TRACE_EVIDENCE_TIMEOUT_S)
-    ) as session:
-        for ledger_event in ledger_events:
-            async with session.post(
-                config.BKN_TRACE_EVIDENCE_INGEST_URL,
-                json=ledger_event,
-                headers=_ingest_headers(batch.get("trace")),
-            ) as resp:
-                if not 200 <= resp.status < 300:
-                    try:
-                        response = await resp.json(content_type=None)
-                    except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError):
-                        response = {}
-                    raise EvidenceSubmissionError(
-                        f"HTTP {resp.status}",
-                        safe_summary=_safe_ingest_failure_summary(resp.status, response),
-                    )
-
-
 async def _send_artifact_once(artifact: dict[str, Any]) -> None:
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=config.BKN_TRACE_EVIDENCE_TIMEOUT_S)
+        timeout=aiohttp.ClientTimeout(total=config.BKN_TRACE_ARTIFACT_TIMEOUT_S)
     ) as session:
         async with session.post(
             config.BKN_TRACE_ARTIFACT_INGEST_URL,
             json=artifact,
-            headers=_ingest_headers(observability.current_context()),
+            headers=_artifact_headers(observability.current_context()),
         ) as resp:
             if not 200 <= resp.status < 300:
                 try:
@@ -972,8 +981,8 @@ def _safe_ingest_failure_summary(status: int, response: Any) -> str:
     return " ".join(parts)
 
 
-def _ingest_headers(identity: Any = None) -> dict[str, str]:
-    token = str(getattr(config, "BKN_TRACE_EVIDENCE_INGEST_TOKEN", "") or "").strip()
+def _artifact_headers(identity: Any = None) -> dict[str, str]:
+    token = str(getattr(config, "BKN_TRACE_ARTIFACT_INGEST_TOKEN", "") or "").strip()
     headers = {"X-BKN-Trace-Ingest-Token": token} if token else {}
     if isinstance(identity, observability.TraceContext):
         values = {
@@ -992,6 +1001,14 @@ def _ingest_headers(identity: Any = None) -> dict[str, str]:
         }
     else:
         return headers
+    current = _interaction.get()
+    if isinstance(identity, observability.TraceContext) and current and current.owner:
+        values = {
+            "application": current.owner["application_principal_id"],
+            "subject_type": current.owner["effective_subject_type"],
+            "subject": current.owner["effective_subject_id"],
+            "delegation": current.owner.get("delegation_id", ""),
+        }
     mapping = {
         "X-BKN-Application-Principal-ID": values["application"],
         "X-BKN-Effective-Subject-Type": values["subject_type"],
@@ -1002,27 +1019,8 @@ def _ingest_headers(identity: Any = None) -> dict[str, str]:
     return headers
 
 
-async def _send_batch(batch: dict[str, Any]) -> bool:
-    attempts = max(config.BKN_TRACE_EVIDENCE_MAX_ATTEMPTS, 1)
-    for attempt in range(1, attempts + 1):
-        try:
-            await _send_once(batch)
-            return True
-        except Exception as exc:
-            if attempt == attempts:
-                failure = getattr(exc, "safe_summary", "") or type(exc).__name__
-                logger.error(
-                    "BKN Trace evidence ingestion failed after %s attempts: %s",
-                    attempts,
-                    failure,
-                )
-                return False
-            await asyncio.sleep(config.BKN_TRACE_EVIDENCE_RETRY_BACKOFF_S * attempt)
-    return False
-
-
 async def _send_artifact(artifact: dict[str, Any]) -> bool:
-    attempts = max(config.BKN_TRACE_EVIDENCE_MAX_ATTEMPTS, 1)
+    attempts = max(config.BKN_TRACE_ARTIFACT_MAX_ATTEMPTS, 1)
     for attempt in range(1, attempts + 1):
         try:
             await _send_artifact_once(artifact)
@@ -1036,23 +1034,55 @@ async def _send_artifact(artifact: dict[str, Any]) -> bool:
                     failure,
                 )
                 return False
-            await asyncio.sleep(config.BKN_TRACE_EVIDENCE_RETRY_BACKOFF_S * attempt)
+            await asyncio.sleep(config.BKN_TRACE_ARTIFACT_RETRY_BACKOFF_S * attempt)
     return False
 
 
 async def drain_pending() -> bool:
-    pending = list(_background)
-    if not pending:
+    global _publisher
+    publisher, _publisher = _publisher, None
+    if publisher is None:
         return True
     try:
-        async with asyncio.timeout(config.BKN_TRACE_EVIDENCE_DRAIN_TIMEOUT_S):
-            results = await asyncio.gather(*pending, return_exceptions=True)
-        return all(result is True for result in results)
-    except TimeoutError:
-        logger.error(
-            "BKN Trace evidence drain timed out with %s pending batches", len(pending)
-        )
+        ack = await publisher.close()
+        if ack.dropped:
+            logger.warning(
+                "BKN Trace Evidence coverage gap: published=%s dropped=%s queue_empty=%s",
+                ack.published,
+                ack.dropped,
+                ack.queue_empty,
+            )
+        return ack.queue_empty
+    except Exception:
+        logger.exception("BKN Trace Evidence publisher shutdown failed")
         return False
+
+
+async def start_publisher() -> None:
+    global _publisher
+    if os.getenv("BKN_TRACE_EVIDENCE_PUBLISHER_ENABLED", "true").lower() == "false":
+        _publisher = None
+        return
+    _publisher = None
+    try:
+        publisher_config = EvidenceKafkaConfig.from_env()
+        control = TraceAdmissionClient.from_env()
+        publisher = EvidenceKafkaPublisher(publisher_config, policy_controlled=True)
+        runtime = EvidencePolicyRuntime(publisher, control)
+    except Exception as exc:
+        # Configuration failure is a coverage gap, not an Agent startup failure.
+        # Exception messages can contain connection strings or credentials.
+        logger.error("Evidence publisher initialization failed (%s); check Kafka and internal control configuration", type(exc).__name__)
+        return
+    runtime.start()
+    _publisher = runtime
+
+
+def _causally_available(event_id: str, current: InteractionEvidence) -> bool:
+    return (
+        event_id in current.locally_admitted_event_ids
+        or event_id in current.downstream_durable_event_ids
+    )
 
 
 def claim_created(
@@ -1160,7 +1190,7 @@ def action_recommended(
         )
     ):
         return None
-    if not current or causation_event_id not in current.confirmed_event_ids:
+    if not current or not _causally_available(causation_event_id, current):
         return None
     if not _valid_hash(reason_hash):
         return None
@@ -1202,7 +1232,7 @@ def action_approval_requested(
         )
     ):
         return None
-    if not current or causation_event_id not in current.confirmed_event_ids:
+    if not current or not _causally_available(causation_event_id, current):
         return None
     return _event(
         "action.approval_requested",
@@ -1235,8 +1265,8 @@ def action_execution_headers(
         or recommended.get("event_type") != "action.recommended"
         or approval_requested.get("event_type") != "action.approval_requested"
         or approval_requested.get("causation_event_id") != recommended.get("event_id")
-        or recommended.get("event_id") not in current.confirmed_event_ids
-        or approval_requested.get("event_id") not in current.confirmed_event_ids
+        or not _causally_available(str(recommended.get("event_id") or ""), current)
+        or not _causally_available(str(approval_requested.get("event_id") or ""), current)
         or recommended.get("claim_id") != approval_requested.get("claim_id")
         or recommended.get("operation_id") != approval_requested.get("operation_id")
         or payload.get("action_instance_id")

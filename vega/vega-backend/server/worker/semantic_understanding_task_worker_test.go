@@ -9,13 +9,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"net/http"
+	"fmt"
+	// "net/http" // Catalog 父目录测试恢复时启用。
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/bytedance/sonic"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	// "github.com/openbkn-ai/bkn-foundry/comm-go/rest" // Catalog 父目录测试恢复时启用。
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -150,6 +151,26 @@ func TestSemanticUnderstandingTaskWorkerKeepsPendingTaskWhenClaimFails(t *testin
 	err := worker.Run(context.Background(), "semantic-task-1")
 
 	require.ErrorContains(t, err, "temporary database error")
+}
+
+func TestSemanticUnderstandingTaskWorkerRejectsPendingCatalogTask(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+	taskService := vmock.NewMockSemanticUnderstandingTaskService(ctrl)
+	worker := &SemanticUnderstandingTaskWorker{suts: taskService}
+	taskService.EXPECT().InternalGetByID(gomock.Any(), "semantic-task-1").Return(
+		&interfaces.SemanticUnderstandingTask{
+			ID:     "semantic-task-1",
+			Scope:  interfaces.SemanticUnderstandingTaskScopeCatalog,
+			Status: interfaces.SemanticUnderstandingTaskStatusPending,
+		}, nil,
+	)
+	taskService.EXPECT().InternalMarkRunning(gomock.Any(), "semantic-task-1").Return(true, nil)
+	taskService.EXPECT().InternalMarkFailed(gomock.Any(), "semantic-task-1",
+		"catalog semantic understanding tasks are temporarily unavailable").Return(true, nil)
+
+	err := worker.Run(context.Background(), "semantic-task-1")
+	require.ErrorContains(t, err, "catalog semantic understanding tasks are temporarily unavailable")
 }
 
 func TestSemanticUnderstandingTaskWorkerRecoversTaskPanic(t *testing.T) {
@@ -425,6 +446,7 @@ func TestSemanticUnderstandingTaskWorkerRun(t *testing.T) {
 		require.NoError(t, worker.Run(context.Background(), "semantic-task-1"))
 	})
 
+	/* Catalog 任务暂不支持；保留旧用例供后续恢复。
 	t.Run("cancels active catalog task when catalog was deleted", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -445,6 +467,7 @@ func TestSemanticUnderstandingTaskWorkerRun(t *testing.T) {
 
 		require.NoError(t, worker.Run(context.Background(), "semantic-task-1"))
 	})
+	*/
 
 	t.Run("skips completed task", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
@@ -610,6 +633,132 @@ func TestSemanticUnderstandingTaskWorkerRun(t *testing.T) {
 }
 
 func TestSemanticUnderstandingTaskWorkerApplyResourceResult(t *testing.T) {
+	for _, category := range []string{
+		interfaces.ResourceCategoryTable,
+		interfaces.ResourceCategoryDataset,
+		interfaces.ResourceCategoryLogicalView,
+	} {
+		t.Run("trims field display name for "+category, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			resourceService := vmock.NewMockResourceService(ctrl)
+			worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
+			resource := &interfaces.Resource{
+				ID: "resource-1", Category: category,
+				SchemaDefinition: []*interfaces.Property{{Name: "first", DisplayName: "Old", Type: interfaces.DataType_String}},
+			}
+			resourceService.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil)
+			resourceService.EXPECT().InternalUpdateSemanticMetadata(gomock.Any(), gomock.Any(), resource, gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+					assert.Equal(t, "New Name", got.SchemaDefinition[0].DisplayName)
+					return nil
+				})
+
+			got, err := worker.applyResult(context.Background(), &sql.Tx{}, &interfaces.SemanticUnderstandingTask{
+				Scope: interfaces.SemanticUnderstandingTaskScopeResource, ResourceID: "resource-1",
+				ApplyMode: interfaces.SemanticUnderstandingApplyModeForce,
+			}, `{"fields":[{"name":"first","display_name":" New Name "}]}`, 0.9)
+
+			require.NoError(t, err)
+			assert.True(t, got.Applied)
+		})
+
+		t.Run("skips duplicate field display name for "+category, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			resourceService := vmock.NewMockResourceService(ctrl)
+			worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
+			resource := &interfaces.Resource{
+				ID: "resource-1", Category: category,
+				SchemaDefinition: []*interfaces.Property{
+					{Name: "first", DisplayName: "Old", Type: interfaces.DataType_String},
+					{Name: "second", DisplayName: " Taken ", Type: interfaces.DataType_String},
+				},
+			}
+			resourceService.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil)
+			resourceService.EXPECT().InternalUpdateSemanticMetadata(gomock.Any(), gomock.Any(), resource, gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+					assert.Equal(t, "Old", got.SchemaDefinition[0].DisplayName)
+					assert.Equal(t, "new description", got.SchemaDefinition[0].Description)
+					return nil
+				})
+
+			got, err := worker.applyResult(context.Background(), &sql.Tx{}, &interfaces.SemanticUnderstandingTask{
+				Scope: interfaces.SemanticUnderstandingTaskScopeResource, ResourceID: "resource-1",
+				ApplyMode: interfaces.SemanticUnderstandingApplyModeForce,
+			}, `{"fields":[{"name":"first","display_name":" Taken ","description":"new description"}]}`, 0.9)
+
+			require.NoError(t, err)
+			assert.True(t, got.Applied)
+			assert.JSONEq(t, `{"resource_updated":false,"updated_fields":["first"],"skipped_fields":["first: display_name duplicates another field"],"field_details":[{"name":"first","status":"partial","updated":["description"],"reasons":["display_name duplicates another field"]}]}`, got.DetailJSON)
+		})
+	}
+
+	t.Run("prevents duplicates between accepted suggestions", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		resourceService := vmock.NewMockResourceService(ctrl)
+		worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
+		resource := &interfaces.Resource{
+			ID: "resource-1", Category: interfaces.ResourceCategoryDataset,
+			SchemaDefinition: []*interfaces.Property{
+				{Name: "first", DisplayName: "Old First", Type: interfaces.DataType_String},
+				{Name: "second", DisplayName: "Old Second", Type: interfaces.DataType_String},
+			},
+		}
+		resourceService.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil)
+		resourceService.EXPECT().InternalUpdateSemanticMetadata(gomock.Any(), gomock.Any(), resource, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+				assert.Equal(t, "New Name", got.SchemaDefinition[0].DisplayName)
+				assert.Equal(t, "Old Second", got.SchemaDefinition[1].DisplayName)
+				return nil
+			})
+
+		got, err := worker.applyResult(context.Background(), &sql.Tx{}, &interfaces.SemanticUnderstandingTask{
+			Scope: interfaces.SemanticUnderstandingTaskScopeResource, ResourceID: "resource-1",
+			ApplyMode: interfaces.SemanticUnderstandingApplyModeForce,
+		}, `{"fields":[{"name":"first","display_name":" New Name "},{"name":"second","display_name":"New Name"}]}`, 0.9)
+
+		require.NoError(t, err)
+		assert.True(t, got.Applied)
+		assert.JSONEq(t, `{"resource_updated":false,"updated_fields":["first"],"skipped_fields":["second: display_name duplicates another field"],"field_details":[{"name":"first","status":"updated","updated":["display_name"]},{"name":"second","status":"unchanged","reasons":["display_name duplicates another field"]}]}`, got.DetailJSON)
+	})
+
+	for _, tc := range []struct {
+		name       string
+		secondName string
+	}{
+		{name: "accepts chained renames", secondName: "Gamma"},
+		{name: "accepts swapped names", secondName: "Alpha"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			resourceService := vmock.NewMockResourceService(ctrl)
+			worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
+			resource := &interfaces.Resource{
+				ID: "resource-1", Category: interfaces.ResourceCategoryDataset,
+				SchemaDefinition: []*interfaces.Property{
+					{Name: "first", DisplayName: "Alpha", Type: interfaces.DataType_String},
+					{Name: "second", DisplayName: "Beta", Type: interfaces.DataType_String},
+				},
+			}
+			resourceService.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil)
+			resourceService.EXPECT().InternalUpdateSemanticMetadata(gomock.Any(), gomock.Any(), resource, gomock.Any()).
+				DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+					assert.Equal(t, "Beta", got.SchemaDefinition[0].DisplayName)
+					assert.Equal(t, tc.secondName, got.SchemaDefinition[1].DisplayName)
+					return nil
+				})
+
+			resultJSON := fmt.Sprintf(`{"fields":[{"name":"first","display_name":"Beta"},{"name":"second","display_name":%q}]}`, tc.secondName)
+			got, err := worker.applyResult(context.Background(), &sql.Tx{}, &interfaces.SemanticUnderstandingTask{
+				Scope: interfaces.SemanticUnderstandingTaskScopeResource, ResourceID: "resource-1",
+				ApplyMode: interfaces.SemanticUnderstandingApplyModeForce,
+			}, resultJSON, 0.9)
+
+			require.NoError(t, err)
+			assert.True(t, got.Applied)
+			assert.JSONEq(t, `{"resource_updated":false,"updated_fields":["first","second"],"field_details":[{"name":"first","status":"updated","updated":["display_name"]},{"name":"second","status":"updated","updated":["display_name"]}]}`, got.DetailJSON)
+		})
+	}
+
 	t.Run("fails when applied marker is not updated", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -799,40 +948,63 @@ func TestSemanticUnderstandingTaskWorkerApplyResourceResult(t *testing.T) {
 		assert.JSONEq(t, `{"resource_updated":false,"skipped_fields":["supplier_id: display_name equals technical field name"],"field_details":[{"name":"supplier_id","status":"unchanged","reasons":["display_name equals technical field name"]}]}`, got.DetailJSON)
 	})
 
-	t.Run("fills resource name when it still equals the source identifier", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		t.Cleanup(ctrl.Finish)
+	for _, tc := range []struct {
+		name, current string
+		metadata      map[string]any
+		wantUpdate    bool
+	}{
+		{"source identifier default", "public.v_product_review_summary", nil, true},
+		{"current raw table name", "v_product_review_summary", map[string]any{"name": "v_product_review_summary", "schema": "public"}, true},
+		{"legacy source name", "public.v_product_review_summary", map[string]any{"original_name": "public.v_product_review_summary"}, true},
+		{"legacy name after metadata refresh", "public.v_product_review_summary", map[string]any{"name": "v_product_review_summary", "schema": "public"}, true},
+		{"preserves business name", "Existing Business Name", map[string]any{"name": "v_product_review_summary", "schema": "public"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			t.Cleanup(ctrl.Finish)
 
-		resourceService := vmock.NewMockResourceService(ctrl)
-		worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
-		task := &interfaces.SemanticUnderstandingTask{
-			Scope:               interfaces.SemanticUnderstandingTaskScopeResource,
-			ResourceID:          "resource-1",
-			ApplyMode:           interfaces.SemanticUnderstandingApplyModeFillEmpty,
-			ConfidenceThreshold: 0.75,
-		}
-		resource := &interfaces.Resource{
-			ID:               "resource-1",
-			Name:             "public.v_product_review_summary",
-			SourceIdentifier: "public.v_product_review_summary",
-		}
-		resourceService.EXPECT().
-			GetByID(gomock.Any(), "resource-1").
-			Return(resource, nil)
-		resourceService.EXPECT().
-			InternalUpdateSemanticMetadata(gomock.Any(), gomock.Not(gomock.Nil()), resource, gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
-				assert.Equal(t, "商品评价汇总视图", got.Name)
-				return nil
-			})
+			resourceService := vmock.NewMockResourceService(ctrl)
+			worker := &SemanticUnderstandingTaskWorker{rs: resourceService}
+			task := &interfaces.SemanticUnderstandingTask{
+				Scope:               interfaces.SemanticUnderstandingTaskScopeResource,
+				ResourceID:          "resource-1",
+				ApplyMode:           interfaces.SemanticUnderstandingApplyModeFillEmpty,
+				ConfidenceThreshold: 0.75,
+			}
+			resource := &interfaces.Resource{
+				ID:               "resource-1",
+				Name:             tc.current,
+				Category:         interfaces.ResourceCategoryTable,
+				SourceIdentifier: `"public"."v_product_review_summary"`,
+				SourceMetadata:   tc.metadata,
+			}
+			resourceService.EXPECT().
+				GetByID(gomock.Any(), "resource-1").
+				Return(resource, nil)
+			if tc.metadata == nil {
+				resource.SourceIdentifier = tc.current
+			}
+			if tc.wantUpdate {
+				resourceService.EXPECT().
+					InternalUpdateSemanticMetadata(gomock.Any(), gomock.Not(gomock.Nil()), resource, gomock.Any()).
+					DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+						assert.Equal(t, "商品评价汇总视图", got.Name)
+						return nil
+					})
+			}
 
-		got, err := worker.applyResult(context.Background(), &sql.Tx{}, task, `{"confidence":0.9,"resource":{"display_name":"商品评价汇总视图","confidence":0.9}}`, 0.9)
+			got, err := worker.applyResult(context.Background(), &sql.Tx{}, task, `{"confidence":0.9,"resource":{"display_name":"商品评价汇总视图","confidence":0.9}}`, 0.9)
 
-		require.NoError(t, err)
-		assert.True(t, got.Applied)
-		assert.JSONEq(t, `{"resource_updated":true,"updated_resource":["name"]}`, got.DetailJSON)
-	})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantUpdate, got.Applied)
+			if tc.wantUpdate {
+				assert.JSONEq(t, `{"resource_updated":true,"updated_resource":["name"]}`, got.DetailJSON)
+			} else {
+				assert.Equal(t, tc.current, resource.Name)
+			}
+		})
 
+	}
 	t.Run("fills descriptions that still equal their source descriptions", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
@@ -849,7 +1021,7 @@ func TestSemanticUnderstandingTaskWorkerApplyResourceResult(t *testing.T) {
 			ID:          "resource-1",
 			Description: "source resource description",
 			SourceMetadata: map[string]any{
-				"original_description": "source resource description",
+				"description": "source resource description",
 			},
 			SchemaDefinition: []*interfaces.Property{
 				{Name: "product_id", Description: "source field description", OriginalDescription: "source field description", Type: interfaces.DataType_String},
@@ -889,6 +1061,26 @@ func TestSemanticUnderstandingTaskWorkerApplyResourceResult(t *testing.T) {
 	})
 }
 
+func TestSemanticUnderstandingTaskWorkerApplyResultRejectsCatalogScope(t *testing.T) {
+	worker := &SemanticUnderstandingTaskWorker{}
+	for _, mode := range []string{
+		interfaces.SemanticUnderstandingApplyModeDryRun,
+		interfaces.SemanticUnderstandingApplyModeForce,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			task := &interfaces.SemanticUnderstandingTask{
+				Scope:               interfaces.SemanticUnderstandingTaskScopeCatalog,
+				ApplyMode:           mode,
+				ConfidenceThreshold: 0.75,
+			}
+			got, err := worker.applyResult(context.Background(), &sql.Tx{}, task, `{}`, 0.1)
+			assert.Nil(t, got)
+			require.ErrorContains(t, err, "catalog semantic understanding tasks are temporarily unavailable")
+		})
+	}
+}
+
+/* Catalog 结果应用暂停；保留原测试。
 func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
@@ -913,7 +1105,7 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 		InternalGetByCatalogID(gomock.Any(), "catalog-1").
 		Return([]*interfaces.Resource{
 			{ID: "resource-1", CatalogID: "catalog-1", Name: "orders", Category: interfaces.ResourceCategoryTable},
-			{ID: "view-2", CatalogID: "catalog-1", Name: "old_view", Category: interfaces.ResourceCategoryLogicView},
+			{ID: "view-2", CatalogID: "catalog-1", Name: "old_view", Category: interfaces.ResourceCategoryLogicalView},
 		}, nil)
 	resourceService.EXPECT().
 		InternalCreate(gomock.Any(), gomock.Not(gomock.Nil()), gomock.AssignableToTypeOf(&interfaces.ResourceRequest{})).
@@ -922,7 +1114,7 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 			assert.Equal(t, "customer_order_summary", req.Name)
 			assert.Equal(t, "customer_order_summary", req.SourceIdentifier)
 			assert.Equal(t, "summary view", req.Description)
-			assert.Equal(t, interfaces.ResourceCategoryLogicView, req.Category)
+			assert.Equal(t, interfaces.ResourceCategoryLogicalView, req.Category)
 			assert.Equal(t, logicDefinition, req.LogicDefinition)
 			require.NotNil(t, req.Builtin)
 			assert.True(t, *req.Builtin)
@@ -932,7 +1124,7 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 		InternalUpdateStatus(gomock.Any(), gomock.Not(gomock.Nil()), "view-2", interfaces.ResourceStatusStale, "obsolete").
 		Return(nil)
 
-	resultJSON := `{"confidence":0.84,"logic_views":[{"action":"create","name":"customer_order_summary","source_identifier":"customer_order_summary","description":"summary view","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"},{"id":"output","type":"output","inputs":["source"]}],"confidence":0.82}],"obsolete_logic_views":[{"target_resource_id":"view-2","reason":"obsolete","confidence":0.91}]}`
+	resultJSON := `{"confidence":0.84,"logical_views":[{"action":"create","name":"customer_order_summary","source_identifier":"customer_order_summary","description":"summary view","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"},{"id":"output","type":"output","inputs":["source"]}],"confidence":0.82}],"obsolete_logical_views":[{"target_resource_id":"view-2","reason":"obsolete","confidence":0.91}]}`
 	got, err := worker.applyResult(context.Background(), &sql.Tx{}, task, resultJSON, 0.84)
 
 	require.NoError(t, err)
@@ -959,11 +1151,12 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResultRejectsInvalidSourceId
 		InternalGetByCatalogID(gomock.Any(), "catalog-1").
 		Return([]*interfaces.Resource{{ID: "resource-1", CatalogID: "catalog-1", Category: interfaces.ResourceCategoryTable}}, nil)
 
-	resultJSON := `{"logic_views":[{"action":"create","name":"订单汇总","source_identifier":"order-summary","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"}]}]}`
+	resultJSON := `{"logical_views":[{"action":"create","name":"订单汇总","source_identifier":"order-summary","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"}]}]}`
 	_, err := worker.applyCatalogResult(context.Background(), &sql.Tx{}, task, resultJSON)
 
 	require.ErrorContains(t, err, "source_identifier must be lower snake_case")
 }
+*/
 
 func TestParseBknAgentResult(t *testing.T) {
 	t.Run("parses pure json", func(t *testing.T) {
@@ -979,13 +1172,13 @@ func TestParseBknAgentResult(t *testing.T) {
 
 	t.Run("extracts json object from agent text", func(t *testing.T) {
 		gotResult, gotConfidence, gotDetail, err := parseBknAgentResult(&interfaces.BknAgentTask{
-			Result: []byte(`No knowledge networks exist. {"confidence":0.8,"logic_views":[],"warnings":["keep {braces} in string"],"obsolete_logic_views":[]} extra text`),
+			Result: []byte(`No knowledge networks exist. {"confidence":0.8,"logical_views":[],"warnings":["keep {braces} in string"],"obsolete_logical_views":[]} extra text`),
 		})
 
 		require.NoError(t, err)
-		assert.JSONEq(t, `{"confidence":0.8,"logic_views":[],"warnings":["keep {braces} in string"],"obsolete_logic_views":[]}`, gotResult)
+		assert.JSONEq(t, `{"confidence":0.8,"logical_views":[],"warnings":["keep {braces} in string"],"obsolete_logical_views":[]}`, gotResult)
 		assert.Equal(t, 0.8, gotConfidence)
-		assert.JSONEq(t, `{"logic_views":[],"warnings":["keep {braces} in string"],"obsolete_logic_views":[]}`, gotDetail)
+		assert.JSONEq(t, `{"logical_views":[],"warnings":["keep {braces} in string"],"obsolete_logical_views":[]}`, gotDetail)
 	})
 }
 

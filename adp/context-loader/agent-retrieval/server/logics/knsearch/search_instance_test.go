@@ -6,11 +6,41 @@
 package knsearch
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 )
+
+func TestFilterSearchInstanceRespReportsMaskedHitFields(t *testing.T) {
+	resp := &interfaces.KnSearchResp{
+		Nodes: []map[string]any{{"object_type_id": "ot-order"}},
+		ObjectTypes: []map[string]any{
+			{
+				"concept_id": "ot-order",
+				"effective_permissions": map[string]any{
+					"id": "full", "customer_name": "masked", "internal_note": "schema",
+				},
+			},
+			{
+				"concept_id":            "ot-no-hit",
+				"effective_permissions": map[string]any{"secret": "masked"},
+			},
+		},
+	}
+
+	got := FilterSearchInstanceResp(resp, false)
+	want := []interfaces.ObjectPermissionImpact{{
+		ObjectTypeID: "ot-order", Properties: []string{"customer_name", "internal_note"},
+	}}
+	if !reflect.DeepEqual(got.PermissionImpacts, want) {
+		t.Fatalf("permission impacts = %+v, want %+v", got.PermissionImpacts, want)
+	}
+	if got.ObjectTypes != nil {
+		t.Fatalf("object_types = %+v, want omitted when include_object_types=false", got.ObjectTypes)
+	}
+}
 
 func intPtr(v int) *int { return &v }
 
@@ -214,9 +244,6 @@ func TestNormalizeSearchInstanceReq_DoesNotClobberDefaultSwitches(t *testing.T) 
 	if !boolValue(merged.SemanticInstanceRetrieval.EnableGlobalFinalScoreRatioFilter) {
 		t.Error("global score ratio filter must stay enabled; an unset switch became an explicit false")
 	}
-	if !boolValue(merged.ConceptRetrieval.EnableCoarseRecall) {
-		t.Error("coarse recall must stay enabled; an unset switch became an explicit false")
-	}
 	if merged.SemanticInstanceRetrieval.GlobalFinalScoreRatio != 0.25 {
 		t.Errorf("expected the default ratio 0.25, got %v", merged.SemanticInstanceRetrieval.GlobalFinalScoreRatio)
 	}
@@ -300,5 +327,22 @@ func TestNormalizeSearchInstanceReq_PassesObjectTypeScope(t *testing.T) {
 	}
 	if len(concept.ExcludeObjectTypes) != 1 || concept.ExcludeObjectTypes[0] != "audit_log" {
 		t.Fatalf("deny list lost on the way to concept retrieval: %v", concept.ExcludeObjectTypes)
+	}
+}
+
+// A host that configures X-Kn-ID once per connection and a caller that passes
+// kn_id for this call used to disagree: the managed guard derived its business
+// refs from the argument while retrieval ran against the header, so a receipt
+// recorded one network and the query read another. The argument wins
+// everywhere now, and the header stays as the per-connection default.
+func TestNormalizeSearchInstanceReqPrefersTheArgumentOverTheHeader(t *testing.T) {
+	knReq, err := NormalizeSearchInstanceReq(&interfaces.SearchInstanceReq{
+		Query: "q", KnID: "kn-argument", XKnID: "kn-header",
+	})
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if knReq.KnID != "kn-argument" {
+		t.Errorf("kn id = %q, want the argument", knReq.KnID)
 	}
 }

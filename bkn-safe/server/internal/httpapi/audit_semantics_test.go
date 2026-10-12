@@ -5,9 +5,222 @@
 package httpapi
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/auditpublisher"
+	"gorm.io/gorm"
 )
+
+type safeAuditPublisherStub struct {
+	values      [][]byte
+	disposition auditpublisher.Disposition
+}
+
+func (p *safeAuditPublisherStub) TryPublish(value []byte) auditpublisher.Disposition {
+	p.values = append(p.values, append([]byte(nil), value...))
+	if p.disposition != "" {
+		return p.disposition
+	}
+	return auditpublisher.Accepted
+}
+
+func TestSafeAdminSnapshotFailureFailsOpenAndLogsCoverageGap(t *testing.T) {
+	publisher := &safeAuditPublisherStub{}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.ManagedProxyAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "verified-admin", Name: "Administrator", Account: "administrator", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(ctxAccessorID, "verified-admin"); c.Next() })
+	router.Use(auditMiddleware(audit.NewKafkaRecorder(publisher, "test"), directory.New(db), db))
+	router.POST("/api/safe/v1/admin/object-grants", func(c *gin.Context) {
+		setAuditSnapshotFailure(c, "grant", "object-grant:user-1:catalog:c-1", errors.New("catalog timed out"))
+		c.Status(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/safe/v1/admin/object-grants", nil)
+	request.Header.Set("x-request-id", "req-snapshot-gap")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("business status = %d, want 204", response.Code)
+	}
+	if len(publisher.values) != 0 {
+		t.Fatalf("incomplete facts published = %d, want 0", len(publisher.values))
+	}
+	logLine := output.String()
+	for _, want := range []string{`"msg":"safe audit coverage gap"`, `"request_id":"req-snapshot-gap"`, `"resource":"object-grants"`, `"reason":"target_snapshot_unavailable"`, `"stage":"snapshot"`} {
+		if !strings.Contains(logLine, want) {
+			t.Fatalf("coverage-gap log missing %s: %s", want, logLine)
+		}
+	}
+}
+
+func TestScopedEnterpriseAuditTargetUsesSubjectAndObjectTypeSnapshots(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.ManagedProxyAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "user-1", Name: "Alice", Account: "alice", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	targetID, targetName, err := resolveScopedAuditTarget(t.Context(), testAuthorizationResourceCatalog{}, db, directory.New(db),
+		"row-filter-policy", "row filter policy", "user", "user-1", objectTypeResourceType, "kn-1/order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetID != "row-filter-policy:user:user-1:kn-1/order" || targetName != "Alice · row filter policy for Test object_type kn-1/order" {
+		t.Fatalf("scoped audit target = id=%q name=%q", targetID, targetName)
+	}
+}
+
+func TestSafeAdminMiddlewarePublishesKafkaWithoutLegacyStore(t *testing.T) {
+	publisher := &safeAuditPublisherStub{}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.ManagedProxyAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "verified-admin", Name: "Administrator", Account: "administrator", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(ctxAccessorID, "verified-admin"); c.Next() })
+	router.Use(auditMiddleware(audit.NewKafkaRecorder(publisher, "test"), directory.New(db), db))
+	router.POST("/api/safe/v1/admin/users", func(c *gin.Context) {
+		setAuditOperation(c, "create", "user-1", "用户 A")
+		c.Status(http.StatusCreated)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/safe/v1/admin/users", nil)
+	request.Header.Set("x-request-id", "req-safe-kafka-user")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || len(publisher.values) != 1 {
+		t.Fatalf("business status=%d, Kafka records=%d", response.Code, len(publisher.values))
+	}
+	var record map[string]any
+	if err := json.Unmarshal(publisher.values[0], &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["source_id"] != "bkn-safe-admin" || record["event_name"] != "safe.admin.operation.observed" {
+		t.Fatalf("wrong Safe event: %+v", record)
+	}
+}
+
+func TestSafeAdminMiddlewareDoesNotDuplicateKafkaCoverageGap(t *testing.T) {
+	publisher := &safeAuditPublisherStub{disposition: auditpublisher.DroppedQueueFull}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.ManagedProxyAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "verified-admin", Name: "Administrator", Account: "administrator", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(ctxAccessorID, "verified-admin"); c.Next() })
+	router.Use(auditMiddleware(audit.NewKafkaRecorder(publisher, "test"), directory.New(db), db))
+	router.POST("/api/safe/v1/admin/users", func(c *gin.Context) {
+		setAuditOperation(c, "create", "user-1", "User One")
+		c.Status(http.StatusCreated)
+	})
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/api/safe/v1/admin/users", nil))
+	if response.Code != http.StatusCreated {
+		t.Fatalf("business status = %d, want 201", response.Code)
+	}
+	if count := strings.Count(output.String(), `"msg":"safe audit coverage gap"`); count != 1 {
+		t.Fatalf("coverage-gap log count = %d, want 1: %s", count, output.String())
+	}
+}
+
+func TestSafeAdminMiddlewareUsesManagedProxyAccountSnapshotWhenDirectoryOmitsIt(t *testing.T) {
+	publisher := &safeAuditPublisherStub{}
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.User{}, &model.ManagedProxyAccount{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.User{ID: "managed-proxy", Account: "bkn-proxy-catalog", Name: "Catalog proxy", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&model.ManagedProxyAccount{ProxyAccountID: "managed-proxy", ManagedBy: "bkn", ManagedResourceType: "catalog", ManagedResourceID: "catalog-1", LifecycleStatus: "active"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set(ctxAccessorID, "managed-proxy"); c.Next() })
+	router.Use(auditMiddleware(audit.NewKafkaRecorder(publisher, "test"), directory.New(db), db))
+	router.POST("/api/safe/v1/admin/users", func(c *gin.Context) {
+		setAuditOperation(c, "create", "user-1", "User One")
+		c.Status(http.StatusCreated)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/safe/v1/admin/users", nil)
+	request.Header.Set("x-request-id", "req-managed-proxy-audit")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || len(publisher.values) != 1 {
+		t.Fatalf("business status=%d, Kafka records=%d", response.Code, len(publisher.values))
+	}
+	var record struct {
+		Actor struct {
+			DisplayNameSnapshot string `json:"display_name_snapshot"`
+		} `json:"actor"`
+	}
+	if err := json.Unmarshal(publisher.values[0], &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Actor.DisplayNameSnapshot != "Catalog proxy" {
+		t.Fatalf("managed proxy actor snapshot=%q", record.Actor.DisplayNameSnapshot)
+	}
+}
+
+func TestSafeAuditRuntimeDoesNotMountHistoricalQueryRoute(t *testing.T) {
+	publisher := &safeAuditPublisherStub{}
+	kafka := audit.NewKafkaRecorder(publisher, "test")
+	router := New(Deps{Audit: kafka})
+	request := httptest.NewRequest(http.MethodGet, "/api/safe/v1/admin/audit-logs", nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("retired query returned %d, want 404", response.Code)
+	}
+}
 
 func TestAuditActionUsesStableBusinessSemantics(t *testing.T) {
 	tests := []struct {
@@ -36,11 +249,48 @@ func TestAuditActionUsesStableBusinessSemantics(t *testing.T) {
 		{http.MethodPost, "/api/safe/v1/admin/license/import", "import"},
 		{http.MethodPost, "/api/safe/v1/admin/license/activate", "activate"},
 		{http.MethodDelete, "/api/safe/v1/admin/license", "remove"},
+		{http.MethodPost, "/api/safe/v1/admin/oauth/access-origins", "add_access_origin"},
+		{http.MethodPost, "/api/safe/v1/admin/oauth/access-origins/reconcile", "reconcile_access_origins"},
+		{http.MethodDelete, "/api/safe/v1/admin/oauth/access-origins/:id", "remove_access_origin"},
+		{http.MethodPost, "/api/safe/v1/me/permission-requests/:id/cancel", "cancel"},
+		{http.MethodPost, "/api/safe/v1/me/permission-requests/:id/decision", "decide"},
 		{http.MethodPut, "/api/safe/v1/me", "update_profile"},
 	}
 	for _, test := range tests {
 		if got := auditAction(test.method, test.path); got != test.want {
 			t.Errorf("%s %s: action=%q, want %q", test.method, test.path, got, test.want)
+		}
+	}
+}
+
+func TestPermissionRequestAuditNameKeepsBusinessSnapshot(t *testing.T) {
+	request := &model.PermissionRequest{ResourceType: "object_type", ResourceID: "orders", ResourceName: "Orders"}
+	if got := permissionRequestAuditName(request); got != "Orders" {
+		t.Fatalf("named permission request snapshot = %q", got)
+	}
+	request.ResourceName = ""
+	if got := permissionRequestAuditName(request); got != "" {
+		t.Fatalf("fallback permission request snapshot = %q", got)
+	}
+}
+
+func TestAuditedManagementOperationExcludesPostQueries(t *testing.T) {
+	for _, path := range []string{
+		"/api/safe/v1/authz/explain",
+		"/api/safe/v1/admin/object-grants/preview",
+		"/api/safe/v1/admin/row-filter-policies/explain",
+	} {
+		if isAuditedManagementOperation(http.MethodPost, path) {
+			t.Fatalf("POST query classified as management mutation: %s", path)
+		}
+	}
+	for _, path := range []string{
+		"/api/safe/v1/admin/users",
+		"/api/safe/v1/admin/object-grants",
+		"/api/safe/v1/admin/roles/:id/permissions",
+	} {
+		if !isAuditedManagementOperation(http.MethodPost, path) {
+			t.Fatalf("management mutation was omitted: %s", path)
 		}
 	}
 }

@@ -41,7 +41,7 @@ const (
 	//
 	// Query parameters are assembled with url.Values at call time rather than baked
 	// into this format string: the set is no longer fixed (exclude_system_properties
-	// repeats, ignoring_store_cache is conditional), and ot_id reaches us straight
+	// repeats, ignore_local_index is conditional), and ot_id reaches us straight
 	// from an agent, so an unescaped "?" or "&" in it would smuggle parameters into
 	// the downstream request — the same hazard queryMetricDataURI documents below.
 	queryObjectInstancesURI  = "/in/v1/knowledge-networks/%s/object-types/%s"
@@ -54,6 +54,7 @@ const (
 	executeActionsURI = "/in/v1/knowledge-networks/%s/action-types/%s/execute"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/action-executions/:execution_id
 	getActionExecutionURI = "/in/v1/knowledge-networks/%s/action-executions/%s"
+	getActionLogURI       = "/in/v1/knowledge-networks/%s/action-logs/%s"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/action-logs
 	listActionExecutionsURI = "/in/v1/knowledge-networks/%s/action-logs"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/subgraph
@@ -84,6 +85,20 @@ func NewOntologyQueryAccess() interfaces.DrivenOntologyQuery {
 // schema-only capability used by Context Loader object surfaces.
 func NewObjectSchemaAccess() interfaces.ObjectSchemaAccess {
 	return NewOntologyQueryAccess().(interfaces.ObjectSchemaAccess)
+}
+
+// Only a credential verified at the public boundary may supply the
+// application principal for downstream Evidence ownership.
+func withVerifiedApplicationPrincipal(ctx context.Context, headers map[string]string) map[string]string {
+	auth, ok := common.GetAccountAuthContextFromCtx(ctx)
+	if !ok || auth == nil || auth.TokenInfo == nil ||
+		(auth.AuthMethod != "oauth" && auth.AuthMethod != "api_key") {
+		return headers
+	}
+	if clientID := strings.TrimSpace(auth.TokenInfo.ClientID); clientID != "" {
+		headers["X-BKN-Application-Principal-ID"] = clientID
+	}
+	return headers
 }
 
 // GetObjectTypeSchema retrieves the authorization-safe schema and effective
@@ -176,15 +191,15 @@ func (o *ontologyQueryClient) QueryObjectInstances(ctx context.Context, req *int
 	query := url.Values{}
 	query.Set("include_type_info", strconv.FormatBool(req.IncludeTypeInfo))
 	query.Set("include_logic_params", strconv.FormatBool(req.IncludeLogicParams))
-	if req.IgnoringStoreCache {
-		query.Set("ignoring_store_cache", "true")
+	if req.IgnoreLocalIndex {
+		query.Set("ignore_local_index", "true")
 	}
 	for _, prop := range req.ExcludeSystemProperties {
 		query.Add("exclude_system_properties", prop)
 	}
 	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
 
-	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.object.query", ontologyQueryIdentity(uri+"?"+query.Encode(), req))
+	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx, "ontology.object.query", ontologyQueryIdentity(uri+"?"+query.Encode(), req)))
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
 	_, respBody, err := o.httpClient.PostBytes(ctx, target, header, req)
@@ -470,6 +485,17 @@ func (o *ontologyQueryClient) ExecuteActions(ctx context.Context, req *interface
 // GetActionExecution queries the status and result of a single action execution.
 func (o *ontologyQueryClient) GetActionExecution(ctx context.Context, req *interfaces.GetActionExecutionRequest) (map[string]any, error) {
 	uri := fmt.Sprintf(getActionExecutionURI, req.KnID, req.ExecutionID)
+	if req.ResultsLimit != nil || req.ResultsOffset != nil {
+		uri = fmt.Sprintf(getActionLogURI, url.PathEscape(req.KnID), url.PathEscape(req.ExecutionID))
+		query := url.Values{}
+		if req.ResultsLimit != nil {
+			query.Set("results_limit", strconv.Itoa(*req.ResultsLimit))
+		}
+		if req.ResultsOffset != nil {
+			query.Set("results_offset", strconv.Itoa(*req.ResultsOffset))
+		}
+		uri += "?" + query.Encode()
+	}
 	reqURL := fmt.Sprintf("%s%s", o.baseURL, uri)
 
 	o.logger.WithContext(ctx).Debugf("[OntologyQuery#GetActionExecution] URL: %s", reqURL)
@@ -573,15 +599,15 @@ func (o *ontologyQueryClient) ExploreSubgraph(ctx context.Context, req *interfac
 	// Query_type is explicitly left blank: the downstream selects the exploration branch according to the empty string, and it becomes another mode when written as relation_path.
 	query.Set("query_type", "")
 	query.Set("include_logic_params", strconv.FormatBool(req.IncludeLogicParams))
-	if req.IgnoringStoreCache {
-		query.Set("ignoring_store_cache", "true")
+	if req.IgnoreLocalIndex {
+		query.Set("ignore_local_index", "true")
 	}
 	for _, prop := range req.ExcludeSystemProperties {
 		query.Add("exclude_system_properties", prop)
 	}
 	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
 
-	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.subgraph.explore", ontologyQueryIdentity(uri+"?"+query.Encode(), req))
+	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx, "ontology.subgraph.explore", ontologyQueryIdentity(uri+"?"+query.Encode(), req)))
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
 
@@ -635,7 +661,7 @@ func (o *ontologyQueryClient) QueryInstanceSubgraph(ctx context.Context, req *in
 	o.logger.WithContext(ctx).Debugf("[OntologyQuery#QueryInstanceSubgraph] kn=%s", req.KnID)
 
 	// Build request headers.
-	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.subgraph.query", ontologyQueryIdentity(uri, body))
+	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx, "ontology.subgraph.query", ontologyQueryIdentity(uri, body)))
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
 
@@ -673,7 +699,7 @@ func (o *ontologyQueryClient) QueryMetricData(ctx context.Context, knID, metricI
 	if req == nil {
 		req = &interfaces.MetricQueryDownstreamReq{}
 	}
-	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.metric.query", ontologyQueryIdentity(uri+"?"+query.Encode(), req))
+	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx, "ontology.metric.query", ontologyQueryIdentity(uri+"?"+query.Encode(), req)))
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	_, respBody, err := o.httpClient.PostBytes(ctx, target, header, req)
 	if err != nil {

@@ -499,20 +499,23 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 		assert.Equal(t, []string{"r2", "r1"}, []string{got[0].ID, got[1].ID})
 	})
 
-	t.Run("includes metadata and dataset row counts when requested", func(t *testing.T) {
+	t.Run("includes stored and dataset row counts when requested", func(t *testing.T) {
+		count := int64(42)
 		rs, mockRA, mockPS, mockDS, mockUMS, _, _ := newTestService(t)
 		table := &interfaces.Resource{
 			ID:             "table-1",
+			RowCount:       &count,
 			Category:       interfaces.ResourceCategoryTable,
-			SourceMetadata: map[string]any{"properties": map[string]any{"row_count": float64(42)}},
+			SourceMetadata: map[string]any{"properties": map[string]any{"row_count": float64(42), "estimated_row_count": float64(41)}},
 		}
 		fileset := &interfaces.Resource{
 			ID:             "fileset-1",
 			Category:       interfaces.ResourceCategoryFileset,
-			SourceMetadata: map[string]any{"properties": map[string]any{"row_count": json.Number("9007199254740993")}},
+			SourceMetadata: map[string]any{"properties": map[string]any{"estimated_row_count": json.Number("9007199254740993")}},
 		}
 		withoutMetadata := &interfaces.Resource{ID: "api-1", Category: interfaces.ResourceCategoryAPI}
-		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset}
+		staleTime := int64(100)
+		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset, RowCountTime: &staleTime}
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"table-1", "fileset-1", "api-1", "dataset-1"}).
 			Return(map[string]*interfaces.Resource{"table-1": table, "fileset-1": fileset, "api-1": withoutMetadata, "dataset-1": dataset}, nil)
 		mockPS.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, gomock.Any(), gomock.Any(), interfaces.VISIBILITY_MATCH_ALL).Return(map[string]interfaces.PermissionResourceOps{"table-1": {ResourceID: "table-1"}, "fileset-1": {ResourceID: "fileset-1"}, "api-1": {ResourceID: "api-1"}, "dataset-1": {ResourceID: "dataset-1"}}, nil)
@@ -528,8 +531,11 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, resources[0].RowCount)
 		assert.Equal(t, int64(42), *resources[0].RowCount)
-		require.NotNil(t, resources[1].RowCount)
-		assert.Equal(t, int64(9007199254740993), *resources[1].RowCount)
+		require.NotNil(t, resources[0].EstimatedRowCount)
+		assert.Equal(t, int64(41), *resources[0].EstimatedRowCount)
+		assert.Nil(t, resources[1].RowCount)
+		require.NotNil(t, resources[1].EstimatedRowCount)
+		assert.Equal(t, int64(9007199254740993), *resources[1].EstimatedRowCount)
 		assert.Nil(t, resources[2].RowCount)
 		require.NotNil(t, resources[3].RowCount)
 		assert.Equal(t, int64(7), *resources[3].RowCount)
@@ -560,7 +566,8 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 
 	t.Run("keeps dataset details available when counting rows fails", func(t *testing.T) {
 		rs, mockRA, mockPS, mockDS, mockUMS, _, _ := newTestService(t)
-		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset}
+		staleTime := int64(100)
+		dataset := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset, RowCountTime: &staleTime}
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"dataset-1"}).
 			Return(map[string]*interfaces.Resource{"dataset-1": dataset}, nil)
 		mockPS.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, gomock.Any(), gomock.Any(), interfaces.VISIBILITY_MATCH_ALL).Return(map[string]interfaces.PermissionResourceOps{"dataset-1": {ResourceID: "dataset-1"}}, nil)
@@ -575,6 +582,7 @@ func TestResourceServiceGetByIDs(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Nil(t, resources[0].RowCount)
+		assert.Nil(t, resources[0].RowCountTime)
 	})
 
 	t.Run("get by ids success", func(t *testing.T) {
@@ -654,15 +662,30 @@ func TestResourceUpdateUsesFeatureSemanticsForEverySupportedCategory(t *testing.
 	}
 }
 
+func TestValidateResourceUpdateScopeRejectsLogicTypeChange(t *testing.T) {
+	resource := &interfaces.Resource{
+		CatalogID: "catalog-1", Category: interfaces.ResourceCategoryLogicalView,
+		LogicType: interfaces.LogicType_Derived,
+	}
+	for _, logicType := range []string{"", interfaces.LogicType_Composite} {
+		changed, err := (&resourceService{}).validateResourceUpdateScope(context.Background(), resource,
+			&interfaces.ResourceRequest{
+				CatalogID: "catalog-1", Category: interfaces.ResourceCategoryLogicalView, LogicType: logicType,
+			})
+		assert.False(t, changed)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "logic_type cannot be changed")
+	}
+}
+
 func TestSourceMetadataRowCountHandlesMissingMetadata(t *testing.T) {
 	for _, metadata := range []map[string]any{
 		nil,
 		{},
 		{"properties": map[string]any{}},
 	} {
-		count, ok := sourceMetadataRowCount(metadata)
-		assert.False(t, ok)
-		assert.Zero(t, count)
+		properties, _ := metadata["properties"].(map[string]any)
+		assert.Nil(t, sourceMetadataRowCount(properties["estimated_row_count"]))
 	}
 }
 
@@ -679,6 +702,61 @@ func TestResourceServiceInternalGetByCatalogID(t *testing.T) {
 }
 
 func TestResourceServiceList(t *testing.T) {
+	t.Run("preserves page prefixes and covers authorized resources with tied timestamps", func(t *testing.T) {
+		allIDs := []string{"r4", "r3", "r2", "r1"}
+		listPage := func(offset, limit int) []string {
+			rs, mockRA, mockPS, _, mockUMS, _, _ := newTestService(t)
+			params := interfaces.ResourcesQueryParams{
+				PaginationQueryParams: interfaces.PaginationQueryParams{
+					Sort: interfaces.ResourceSortUpdateTime, Direction: interfaces.DESC_DIRECTION,
+					Offset: offset, Limit: limit,
+				},
+			}
+			// The access layer supplies the full order including the ID tiebreaker.
+			refs := []interfaces.ResourcePermissionRef{{ResourceID: "r4"}, {ResourceID: "hidden"},
+				{ResourceID: "r3"}, {ResourceID: "r2"}, {ResourceID: "r1"}}
+			mockRA.EXPECT().ListPermissionRefs(gomock.Any(), params).Return(refs, nil)
+			mockPS.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), gomock.Any(),
+				[]string{"r4", "hidden", "r3", "r2", "r1"}, gomock.Any(), interfaces.VISIBILITY_MATCH_ALL).
+				Return(map[string]interfaces.PermissionResourceOps{
+					"r1": {ResourceID: "r1"}, "r3": {ResourceID: "r3"},
+					"r2": {ResourceID: "r2"}, "r4": {ResourceID: "r4"},
+				}, nil)
+			end := offset + limit
+			if end > len(allIDs) {
+				end = len(allIDs)
+			}
+			pageIDs := allIDs[offset:end]
+			mockRA.EXPECT().GetSummariesByIDs(gomock.Any(), pageIDs).
+				DoAndReturn(func(_ context.Context, ids []string) (map[string]*interfaces.ResourceSummary, error) {
+					result := make(map[string]*interfaces.ResourceSummary, len(ids))
+					for i := len(ids) - 1; i >= 0; i-- {
+						result[ids[i]] = &interfaces.ResourceSummary{ID: ids[i], UpdateTime: 100}
+					}
+					return result, nil
+				})
+			mockUMS.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
+			result, total, err := rs.List(context.Background(), params)
+			require.NoError(t, err)
+			assert.Equal(t, int64(len(allIDs)), total)
+			ids := make([]string, 0, len(result))
+			for _, summary := range result {
+				ids = append(ids, summary.ID)
+			}
+			return ids
+		}
+		full := listPage(0, 4)
+		assert.Equal(t, allIDs, full)
+		for _, limit := range []int{1, 2, 3} {
+			assert.Equal(t, full[:limit], listPage(0, limit))
+			var traversed []string
+			for offset := 0; offset < len(allIDs); offset += limit {
+				traversed = append(traversed, listPage(offset, limit)...)
+			}
+			assert.Equal(t, allIDs, traversed)
+		}
+	})
+
 	t.Run("includes internal candidates for built-in admin", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
 		mockRA.EXPECT().ListPermissionRefs(gomock.Any(), interfaces.ResourcesQueryParams{IncludeBuiltin: true}).
@@ -956,11 +1034,40 @@ func TestResourceServiceValidateIndexConfigModelsRejectsReferencedVectorConfig(t
 		},
 	}
 
-	err := rs.validateIndexConfigModels(context.Background(), schema, nil)
+	err := rs.validateIndexConfigModels(context.Background(), schema, nil, interfaces.ResourceCategoryTable)
 
 	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
 	assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
 	assert.Contains(t, httpErr.BaseError.ErrorDetails, `vector feature on field "content" that references "embedding" must not define config`)
+}
+
+func TestResourceServiceValidateIndexConfigModelsLogicalViewHiddenVectorReference(t *testing.T) {
+	schema := []*interfaces.Property{{
+		Name: "content_alias",
+		Type: interfaces.DataType_Text,
+		Features: []interfaces.PropertyFeature{{
+			FeatureType: interfaces.PropertyFeatureType_Vector,
+			RefProperty: "source_embedding",
+		}},
+	}}
+	rs := &resourceService{}
+
+	// The EE view preparation has already checked the reference against the full
+	// source schema. The target may be omitted from the public view schema.
+	require.NoError(t, rs.validateIndexConfigModels(context.Background(), schema, nil,
+		interfaces.ResourceCategoryLogicalView))
+
+	err := rs.validateIndexConfigModels(context.Background(), schema, nil,
+		interfaces.ResourceCategoryTable)
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, "references invalid vector field")
+
+	schema[0].Features[0].Config = map[string]any{"embedding_model": "invalid"}
+	err = rs.validateIndexConfigModels(context.Background(), schema, nil,
+		interfaces.ResourceCategoryLogicalView)
+	httpErr = requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, "must not define config")
 }
 
 func TestValidateKeywordConfig(t *testing.T) {
@@ -1001,6 +1108,26 @@ func TestValidateSchemaDefinitionRejectsNullField(t *testing.T) {
 
 	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
 	assert.Contains(t, httpErr.BaseError.ErrorDetails, "cannot contain null fields")
+}
+
+func TestJSONNumbersEqual(t *testing.T) {
+	stored := map[string]any{
+		"source_resource_id": "source-1",
+		"filter_condition":   map[string]any{"operation": "eq", "value": float64(1)},
+	}
+	prepared := &interfaces.DerivedLogicDefinition{
+		SourceResourceID: "source-1",
+		FilterCondition:  map[string]any{"operation": "eq", "value": json.Number("1.0")},
+	}
+	assert.True(t, jsonNumbersEqual(stored, prepared))
+	assert.False(t, jsonNumbersEqual(stored, &interfaces.DerivedLogicDefinition{
+		SourceResourceID: "source-2",
+		FilterCondition:  prepared.FilterCondition,
+	}))
+	assert.False(t, jsonNumbersEqual(
+		map[string]any{"filter_condition": map[string]any{"value": json.Number("9007199254740993")}},
+		map[string]any{"filter_condition": map[string]any{"value": json.Number("9007199254740992")}},
+	))
 }
 
 func TestResourceServiceCreate(t *testing.T) {
@@ -1075,8 +1202,8 @@ func TestResourceServiceCreate(t *testing.T) {
 		rs.ps = parentPS
 		expectResourceServiceTransaction(t, rs, true)
 		mockRA.EXPECT().Create(gomock.Any(), gomock.Not(nil), gomock.Any()).Return(nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), gomock.Any()).DoAndReturn(
-			func(_ context.Context, ids []string) error {
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), gomock.Any(), false).DoAndReturn(
+			func(_ context.Context, ids []string, _ bool) error {
 				require.Len(t, ids, 1)
 				require.NotEmpty(t, ids[0])
 				return nil
@@ -1438,9 +1565,15 @@ func expectDeleteGrantedByCatalog(_ *vmock.MockResourceAccess,
 }
 
 func TestResourceServiceDeleteByIDs(t *testing.T) {
+	t.Run("rejects incompatible delete options", func(t *testing.T) {
+		rs, _, _, _, _, _, _ := newTestService(t)
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, true, true)
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_InvalidParameter)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+	})
 	t.Run("delete by ids empty", func(t *testing.T) {
 		rs, _, _, _, _, _, _ := newTestService(t)
-		err := rs.DeleteByIDs(context.Background(), []string{}, false)
+		err := rs.DeleteByIDs(context.Background(), []string{}, false, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1454,9 +1587,9 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).
 			Return(map[string]*interfaces.Resource{"r1": {ID: "r1", Category: "table", LocalIndexName: "vega-build-r1-t1"}}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil)
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
-		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false)
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1470,7 +1603,7 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			}}, nil)
 
 		httpErr := requireResourceHTTPError(t,
-			rs.DeleteByIDs(context.Background(), []string{"probe"}, false),
+			rs.DeleteByIDs(context.Background(), []string{"probe"}, false, false),
 			rest.PublicError_Forbidden)
 		assert.Equal(t, http.StatusForbidden, httpErr.HTTPCode)
 	})
@@ -1485,10 +1618,10 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable},
 		}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil)
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
 
-		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1", "missing"}, true))
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1", "missing"}, true, false))
 	})
 	t.Run("returns missing only after authorizing existing resources", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, _, _ := newTestService(t)
@@ -1498,7 +1631,7 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 		}, nil)
 
 		httpErr := requireResourceHTTPError(t,
-			rs.DeleteByIDs(context.Background(), []string{"r1", "missing"}, false),
+			rs.DeleteByIDs(context.Background(), []string{"r1", "missing"}, false, false),
 			verrors.VegaBackend_Resource_NotFound)
 		assert.Equal(t, http.StatusNotFound, httpErr.HTTPCode)
 	})
@@ -1514,9 +1647,9 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			"r1": {ID: "r1", CatalogID: "cat1"},
 		}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(errors.New("delete resource failed"))
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(errors.New("delete resource failed"))
 
-		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false)
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false)
 		require.Error(t, err)
 		assert.Zero(t, parentPS.deleteParentCalls)
 		assert.Zero(t, parentPS.upsertParentCalls)
@@ -1540,15 +1673,15 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			"r1": {ID: "r1", CatalogID: "cat1"},
 		}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).DoAndReturn(
-			func(_ context.Context, _ []string) error {
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).DoAndReturn(
+			func(_ context.Context, _ []string, _ bool) error {
 				localDeleted = true
 				return nil
 			})
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE,
 			[]string{"r1"}).Return(nil)
 
-		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false))
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false))
 		assert.Equal(t, 1, parentPS.deleteParentCalls)
 	})
 	t.Run("finishes external cleanup after request cancellation", func(t *testing.T) {
@@ -1572,11 +1705,11 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			"r1": {ID: "r1", CatalogID: "cat1"},
 		}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		require.NoError(t, rs.DeleteByIDs(ctx, []string{"r1"}, false))
+		require.NoError(t, rs.DeleteByIDs(ctx, []string{"r1"}, false, false))
 	})
 	t.Run("does not fail after durable deletion when permission cleanup fails", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
@@ -1593,9 +1726,9 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			"r1": {ID: "r1", CatalogID: "cat1"},
 		}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil)
 
-		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false))
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false))
 	})
 	t.Run("rejects deletion while resource refresh is pending or running", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, _, _ := newTestService(t)
@@ -1613,7 +1746,7 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 				return []*interfaces.DiscoverTaskSummary{{ID: "discover-1", ResourceID: "r1"}}, nil
 			})
 
-		httpErr := requireResourceHTTPError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false),
+		httpErr := requireResourceHTTPError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false),
 			verrors.VegaBackend_DiscoverTask_ResourceRefreshInProgress)
 		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
 	})
@@ -1630,12 +1763,12 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 					assert.Equal(t, 1, params.Limit)
 					return nil, nil
 				}),
-			mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil),
+			mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil),
 			mockDS.EXPECT().Delete(gomock.Any(), gomock.Any()).Return(nil),
 			mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil),
 		)
 
-		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false))
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false))
 	})
 	t.Run("does not delete dataset when resource deletion fails", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
@@ -1643,9 +1776,9 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).
 			Return(map[string]*interfaces.Resource{"r1": {ID: "r1", Category: interfaces.ResourceCategoryDataset}}, nil)
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(errors.New("delete resource failed"))
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(errors.New("delete resource failed"))
 
-		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false)
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false)
 		require.Error(t, err)
 	})
 	t.Run("rejects deletion while build task is active", func(t *testing.T) {
@@ -1657,7 +1790,7 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			ID: "task-1", ResourceID: "r1", Status: interfaces.BuildTaskStatusRunning,
 		}})
 
-		httpErr := requireResourceHTTPError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false), verrors.VegaBackend_BuildTask_HasRunningExecution)
+		httpErr := requireResourceHTTPError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false), verrors.VegaBackend_BuildTask_HasRunningExecution)
 		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
 	})
 	t.Run("allows deletion while build task is pending", func(t *testing.T) {
@@ -1667,10 +1800,88 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 			Return(map[string]*interfaces.Resource{"r1": {ID: "r1"}}, nil)
 		// The access query excludes pending tasks when deleting a resource.
 		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
-		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, false).Return(nil)
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
 
-		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false))
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, false))
+	})
+	t.Run("rejects a resource that became active before deletion", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, _, _ := newTestService(t)
+		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).Return(map[string]*interfaces.Resource{
+			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusActive, LastDiscoverStatus: interfaces.DiscoverStatusRestored},
+		}, nil)
+
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, true)
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_DeleteConflict)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+	})
+
+	t.Run("does not clean up when the SQL condition no longer matches", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
+		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).Return(map[string]*interfaces.Resource{
+			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusStale, LastDiscoverStatus: interfaces.DiscoverStatusMissing},
+		}, nil)
+		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, true).
+			Return(interfaces.ErrResourceDeleteConditionNotMet)
+
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, true)
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_DeleteConflict)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+	})
+
+	t.Run("reports a guarded delete rollback failure as an internal error", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
+		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).Return(map[string]*interfaces.Resource{
+			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusStale, LastDiscoverStatus: interfaces.DiscoverStatusMissing},
+		}, nil)
+		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, true).
+			Return(errors.New("rollback failed"))
+
+		err := rs.DeleteByIDs(context.Background(), []string{"r1"}, false, true)
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_InternalError_DeleteFailed)
+		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
+	})
+
+	t.Run("deletes a still-missing resource", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
+		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
+		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).Return(map[string]*interfaces.Resource{
+			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusStale, LastDiscoverStatus: interfaces.DiscoverStatusMissing},
+		}, nil)
+		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}, true).Return(nil)
+		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
+
+		require.NoError(t, rs.DeleteByIDs(context.Background(), []string{"r1"}, false, true))
+	})
+
+	t.Run("does not clean up a partially matched batch", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
+		ids := []string{"r1", "r2"}
+		expectDeleteGrantedByCatalog(mockRA, mockPS, ids, "cat1")
+		mockRA.EXPECT().GetByIDs(gomock.Any(), ids).Return(map[string]*interfaces.Resource{
+			"r1": {ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusStale, LastDiscoverStatus: interfaces.DiscoverStatusMissing},
+			"r2": {ID: "r2", CatalogID: "cat1", Category: interfaces.ResourceCategoryTable,
+				Status: interfaces.ResourceStatusStale, LastDiscoverStatus: interfaces.DiscoverStatusMissing},
+		}, nil)
+		expectResourceBuildTasksForDelete(t, mockBTA, "r1", nil)
+		expectResourceBuildTasksForDelete(t, mockBTA, "r2", nil)
+		mockRA.EXPECT().DeleteByIDs(gomock.Any(), ids, true).
+			Return(interfaces.ErrResourceDeleteConditionNotMet)
+
+		err := rs.DeleteByIDs(context.Background(), ids, false, true)
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_DeleteConflict)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
 	})
 }
 
@@ -1780,6 +1991,66 @@ func updateResourceForTest(t *testing.T, rs *resourceService, resource *interfac
 }
 
 func TestResourceServiceUpdate(t *testing.T) {
+	t.Run("rejects existing dataset analyzer changes before side effects", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, current, next string
+		}{
+			{"standard to english", "standard", "english"},
+			{"default mapping to english", "", "english"},
+			{"default mapping to explicit standard", "", "standard"},
+			{"english to standard", "english", "standard"},
+			{"standard to ik_max_word", "standard", "ik_max_word"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rs, _, mockPS, _, _, _, _ := newTestService(t)
+				mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+				property := func(analyzer string) *interfaces.Property {
+					return &interfaces.Property{Name: "content", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{
+						{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove}},
+						{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext, Config: map[string]any{"analyzer": analyzer}},
+					}}
+				}
+				resource := &interfaces.Resource{ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryDataset,
+					LocalIndexName: "dataset-index", SchemaDefinition: []*interfaces.Property{property(tc.current)}}
+				req := &interfaces.ResourceRequest{CatalogID: "cat1", Category: interfaces.ResourceCategoryDataset,
+					SchemaDefinition: []*interfaces.Property{property(tc.next)}}
+				err := updateResourceForTest(t, rs, resource, req)
+				httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+				assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+				assert.Contains(t, httpErr.BaseError.ErrorDetails, "content")
+				assert.Contains(t, httpErr.BaseError.ErrorDetails, "rebuild")
+				assert.Equal(t, "dataset-index", resource.LocalIndexName)
+				assert.Equal(t, tc.current, resource.SchemaDefinition[0].Features[1].Config["analyzer"])
+			})
+		}
+	})
+	t.Run("allows changing only the default analyzer on an empty dataset", func(t *testing.T) {
+		rs, mockRA, mockPS, mockDS, _, mockCS, mockBTA := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
+		lim := vmock.NewMockLocalIndexManager(gomock.NewController(t))
+		rs.lim = lim
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "english").Return(true, nil)
+		resource := &interfaces.Resource{ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryDataset,
+			LocalIndexName: "dataset-index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "standard"},
+			SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{
+				{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, Config: map[string]any{"ignore_above": interfaces.DefaultTextKeywordIgnoreAbove}},
+				{FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			}}}}
+		mockDS.EXPECT().ListDocuments(gomock.Any(), resource, gomock.Any()).Return(nil, int64(0), nil)
+		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), resource, int64(0)).Return(int64(1), nil)
+		mockDS.EXPECT().Update(gomock.Any(), resource).DoAndReturn(func(_ context.Context, updated *interfaces.Resource) error {
+			assert.Equal(t, "dataset-index", updated.LocalIndexName)
+			assert.Equal(t, "", fulltextAnalyzerConfigValue(updated.SchemaDefinition[0].Features[1].Config))
+			return nil
+		})
+		err := updateResourceForTest(t, rs, resource, &interfaces.ResourceRequest{CatalogID: "cat1", Category: interfaces.ResourceCategoryDataset,
+			IndexConfig: &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "english"}})
+		require.NoError(t, err)
+		assert.Equal(t, "english", resource.IndexConfig.DefaultFulltextAnalyzer)
+	})
 	t.Run("authorizes before rejecting an enabled change", func(t *testing.T) {
 		rs, _, mockPS, _, _, _, _ := newTestService(t)
 		resource := &interfaces.Resource{ID: "r1", Enabled: true}
@@ -2820,4 +3091,272 @@ func newS2STestService(t *testing.T) (
 	ums := vmock.NewMockUserMgmtService(ctrl)
 	rs := &resourceService{ra: ra, ps: ps, ums: ums}
 	return rs, ra, ps, ums
+}
+
+func TestResourceServicePopulateResourceRowCounts(t *testing.T) {
+	for _, includeCount := range []bool{true, false} {
+		t.Run(fmt.Sprintf("include_count_%t", includeCount), func(t *testing.T) {
+			rs, _, _, ds, _, _, _ := newTestService(t)
+			staleTime, zero, legacyCount := int64(100), int64(0), int64(42)
+			table := &interfaces.Resource{Category: interfaces.ResourceCategoryTable, RowCount: &zero, RowCountTime: &staleTime, SourceMetadata: map[string]any{
+				"properties": map[string]any{"row_count": 888, "estimated_row_count": 12, "row_count_time": 777},
+			}}
+			legacy := &interfaces.Resource{Category: interfaces.ResourceCategoryTable, RowCount: &legacyCount, SourceMetadata: map[string]any{
+				"properties": map[string]any{"row_count": 42},
+			}}
+			dataset := &interfaces.Resource{Category: interfaces.ResourceCategoryDataset, RowCountTime: &staleTime, SourceMetadata: table.SourceMetadata}
+			if includeCount {
+				ds.EXPECT().CountDocuments(gomock.Any(), dataset).Return(int64(0), nil)
+			}
+			before := time.Now().UnixMilli()
+			rs.populateResourceRowCounts(context.Background(), []*interfaces.Resource{table, legacy, dataset}, includeCount)
+			after := time.Now().UnixMilli()
+			assert.Nil(t, legacy.RowCountTime)
+			assert.Nil(t, dataset.EstimatedRowCount)
+			if includeCount {
+				require.NotNil(t, table.RowCountTime)
+				assert.Equal(t, staleTime, *table.RowCountTime)
+				require.NotNil(t, table.RowCount)
+				assert.Zero(t, *table.RowCount)
+				require.NotNil(t, table.EstimatedRowCount)
+				assert.Equal(t, int64(12), *table.EstimatedRowCount)
+				require.NotNil(t, legacy.RowCount)
+				assert.Equal(t, int64(42), *legacy.RowCount)
+				require.NotNil(t, dataset.RowCount)
+				assert.Zero(t, *dataset.RowCount)
+				require.NotNil(t, dataset.RowCountTime)
+				assert.GreaterOrEqual(t, *dataset.RowCountTime, before)
+				assert.LessOrEqual(t, *dataset.RowCountTime, after)
+				assert.Equal(t, 777, dataset.SourceMetadata["properties"].(map[string]any)["row_count_time"])
+			} else {
+				assert.Nil(t, dataset.RowCountTime)
+				for _, resource := range []*interfaces.Resource{table, legacy, dataset} {
+					assert.Nil(t, resource.RowCount)
+					assert.Nil(t, resource.EstimatedRowCount)
+					assert.Nil(t, resource.RowCountTime)
+				}
+			}
+		})
+	}
+}
+
+func TestResourceServiceInternalUpdateRowCount(t *testing.T) {
+	for _, scenario := range []string{"atomic merge", "logical view", "dataset", "unknown category", "nil metadata", "missing properties", "invalid properties", "resource changed or deleted", "write failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			ra := vmock.NewMockResourceAccess(gomock.NewController(t))
+			rs := &resourceService{ra: ra}
+			source := &interfaces.Resource{ID: "res", CatalogID: "cat", Category: interfaces.ResourceCategoryTable, SourceIdentifier: "app.orders", UpdateTime: 10, LastDiscoverTime: 5, Updater: interfaces.AccountInfo{ID: "user"}, SourceMetadata: map[string]any{
+				"properties": map[string]any{"estimated_row_count": int64(99), "row_count": int64(40), "row_count_time": int64(100)}, "custom": "keep",
+			}}
+			switch scenario {
+			case "logical view":
+				source.Category = interfaces.ResourceCategoryLogicalView
+			case "dataset":
+				source.Category = interfaces.ResourceCategoryDataset
+			case "unknown category":
+				source.Category = "unknown"
+			case "nil metadata":
+				source.SourceMetadata = nil
+			case "missing properties":
+				delete(source.SourceMetadata, "properties")
+			case "invalid properties":
+				source.SourceMetadata["properties"] = "invalid"
+			}
+			beforeMetadata, marshalErr := json.Marshal(source.SourceMetadata)
+			require.NoError(t, marshalErr)
+			ra.EXPECT().UpdateRowCount(gomock.Any(), nil, gomock.Any(), int64(10)).DoAndReturn(func(_ context.Context, _ *sql.Tx, res *interfaces.Resource, _ int64) (int64, error) {
+				assert.Same(t, source, res)
+				props, _ := res.SourceMetadata["properties"].(map[string]any)
+				assert.Equal(t, int64(0), *res.RowCount)
+				assert.Equal(t, int64(1234), *res.RowCountTime)
+				if scenario != "nil metadata" {
+					assert.Equal(t, "keep", res.SourceMetadata["custom"])
+				}
+				if scenario != "nil metadata" && scenario != "missing properties" && scenario != "invalid properties" {
+					assert.Equal(t, int64(99), props["estimated_row_count"])
+				}
+				assert.Equal(t, int64(5), res.LastDiscoverTime)
+				assert.Equal(t, interfaces.AccountInfo{ID: "user"}, res.Updater)
+				assert.Equal(t, "cat", res.CatalogID)
+				assert.Equal(t, "app.orders", res.SourceIdentifier)
+				assert.Equal(t, int64(10), res.UpdateTime)
+				switch scenario {
+				case "resource changed or deleted":
+					return 0, nil
+				case "write failure":
+					return 0, errors.New("write failed")
+				default:
+					return 1, nil
+				}
+			})
+			err := rs.InternalUpdateRowCount(context.Background(), nil, source, 0, 1234)
+			switch scenario {
+			case "resource changed or deleted":
+				httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_UpdateConflict)
+				assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+			case "write failure":
+				require.ErrorContains(t, err, strings.Split(scenario, " ")[0]+" failed")
+			default:
+				require.NoError(t, err)
+			}
+			assert.Equal(t, int64(0), *source.RowCount)
+			assert.Equal(t, int64(1234), *source.RowCountTime)
+			afterMetadata, marshalErr := json.Marshal(source.SourceMetadata)
+			require.NoError(t, marshalErr)
+			assert.Equal(t, string(beforeMetadata), string(afterMetadata))
+			assert.Equal(t, int64(10), source.UpdateTime)
+		})
+	}
+	t.Run("invalid input", func(t *testing.T) {
+		rs := &resourceService{}
+		for _, tt := range []struct {
+			source           *interfaces.Resource
+			count, timestamp int64
+		}{
+			{nil, 0, 1}, {&interfaces.Resource{Category: interfaces.ResourceCategoryTable}, -1, 1},
+			{&interfaces.Resource{Category: interfaces.ResourceCategoryTable}, 0, 0},
+		} {
+			err := rs.InternalUpdateRowCount(context.Background(), nil, tt.source, tt.count, tt.timestamp)
+			httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+			assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		}
+	})
+}
+
+func TestResourceServiceDiscoveryDoesNotSaveStatistics(t *testing.T) {
+	rs, ra, _, _, _, _, _ := newTestService(t)
+	expectResourceServiceTransaction(t, rs, true)
+	count, timestamp := int64(0), int64(1234)
+	resource := &interfaces.Resource{ID: "r1", UpdateTime: 43, RowCount: &count, RowCountTime: &timestamp,
+		SchemaDefinition: []*interfaces.Property{{Name: "id"}}}
+	current := &interfaces.Resource{ID: "r1", UpdateTime: 42, SchemaDefinition: resource.SchemaDefinition}
+	ra.EXPECT().GetByID(gomock.Any(), gomock.Not(gomock.Nil()), "r1").Return(current, nil)
+	ra.EXPECT().UpdateDiscoveryMetadata(gomock.Any(), gomock.Not(gomock.Nil()), resource, int64(42)).Return(int64(1), nil)
+	require.NoError(t, rs.InternalUpdateDiscoveryMetadata(context.Background(), nil, resource, 42))
+}
+
+func TestResourceServiceRowCountReusesCallerTransaction(t *testing.T) {
+	for _, scenario := range []string{"success", "write failure", "conflict"} {
+		t.Run(scenario, func(t *testing.T) {
+			rs, ra, _, _, _, _, _ := newTestService(t)
+			tx := &sql.Tx{}
+			source := &interfaces.Resource{ID: "r1", UpdateTime: 43}
+			rows := int64(1)
+			var writeErr error
+			if scenario == "write failure" {
+				writeErr = errors.New("write failed")
+			}
+			if scenario == "conflict" {
+				rows = 0
+			}
+			ra.EXPECT().UpdateRowCount(gomock.Any(), tx, source, int64(43)).Return(rows, writeErr)
+			err := rs.InternalUpdateRowCount(context.Background(), tx, source, 0, 1234)
+			if scenario == "success" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestApplyMutableSchemaFields(t *testing.T) {
+	for _, attributes := range []map[string]any{nil, {"enabled": true}, {"enabled": false}} {
+		t.Run(fmt.Sprintf("existing attributes %v", attributes), func(t *testing.T) {
+			originalEnabled := attributes["enabled"]
+			existing := &interfaces.Property{Name: "payload", Type: interfaces.DataType_Json, Attributes: attributes}
+			requested := []*interfaces.Property{
+				{Name: "payload", Type: interfaces.DataType_Json, DisplayName: "Updated", Attributes: map[string]any{"enabled": originalEnabled != true}},
+				{Name: "new_payload", Type: interfaces.DataType_Json, Attributes: map[string]any{"enabled": true, "source": "jsonb"}},
+				{Name: "new_without_attributes", Type: interfaces.DataType_Json},
+			}
+			got := applyMutableSchemaFields([]*interfaces.Property{existing}, requested, true)
+			require.Len(t, got, 3)
+			assert.Equal(t, attributes, got[0].Attributes)
+			assert.Equal(t, originalEnabled, got[0].Attributes["enabled"])
+			assert.Equal(t, "Updated", got[0].DisplayName)
+			assert.Equal(t, map[string]any{"enabled": false, "source": "jsonb"}, got[1].Attributes)
+			assert.Equal(t, map[string]any{"enabled": false}, got[2].Attributes)
+		})
+	}
+	t.Run("table updates cannot add properties", func(t *testing.T) {
+		got := applyMutableSchemaFields(nil, []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json}}, false)
+		assert.Empty(t, got)
+	})
+}
+
+func TestValidateMutableSchemaUpdateJSONEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		current, requested map[string]any
+		wantError          bool
+	}{
+		{"omitted attributes", map[string]any{"enabled": false}, nil, true},
+		{"empty attributes", map[string]any{"enabled": false}, map[string]any{}, true},
+		{"explicit unchanged", map[string]any{"enabled": false}, map[string]any{"enabled": false}, false},
+		{"explicit change", map[string]any{"enabled": false}, map[string]any{"enabled": true}, true},
+		{"legacy unchanged", nil, nil, false},
+		{"legacy enabled omitted", map[string]any{"enabled": true}, nil, true},
+		{"legacy explicit change", nil, map[string]any{"enabled": false}, true},
+		{"omitted enabled", map[string]any{"enabled": false, "source": "jsonb"}, map[string]any{"source": "jsonb"}, true},
+		{"preserves all attributes", map[string]any{"enabled": false, "source": "jsonb"}, map[string]any{"enabled": false, "source": "jsonb"}, false},
+		{"rejects other attribute change", map[string]any{"enabled": false, "source": "jsonb"}, map[string]any{"source": "json"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalAttributes, err := json.Marshal(tc.current)
+			require.NoError(t, err)
+			current := []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json, Attributes: tc.current}}
+			requested := []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json, Attributes: tc.requested, DisplayName: "Updated"}}
+			changed, err := validateMutableSchemaUpdate(context.Background(), current, requested, true)
+			if tc.wantError {
+				var httpErr *rest.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+			} else {
+				require.NoError(t, err)
+				assert.False(t, changed)
+				updated := applyMutableSchemaFields(current, requested, true)
+				assert.Equal(t, tc.current, updated[0].Attributes)
+				assert.Equal(t, "Updated", updated[0].DisplayName)
+			}
+			assert.Equal(t, tc.current, current[0].Attributes)
+			actualAttributes, err := json.Marshal(current[0].Attributes)
+			require.NoError(t, err)
+			assert.Equal(t, string(originalAttributes), string(actualAttributes))
+		})
+	}
+}
+
+func TestChangedDatasetFulltextAnalyzer(t *testing.T) {
+	property := func(name, fieldType, analyzer string) *interfaces.Property {
+		return &interfaces.Property{Name: name, Type: fieldType, Features: []interfaces.PropertyFeature{{
+			FeatureName: "fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext,
+			Config: map[string]any{"analyzer": analyzer},
+		}}}
+	}
+	for _, tc := range []struct {
+		name                        string
+		current, requested          []*interfaces.Property
+		currentDefault, nextDefault string
+		changedField                string
+	}{
+		{name: "same explicit analyzer", current: []*interfaces.Property{property("content", "string", "english")}, requested: []*interfaces.Property{property("content", "string", "english")}},
+		{name: "description only", current: []*interfaces.Property{property("content", "string", "english")}},
+		{name: "explicit override ignores default change", current: []*interfaces.Property{property("content", "string", "english")}, currentDefault: "standard", nextDefault: "ik_max_word"},
+		{name: "unused default", current: []*interfaces.Property{{Name: "id", Type: "integer"}}, currentDefault: "standard", nextDefault: "english"},
+		{name: "default change does not change dataset mapping", current: []*interfaces.Property{property("content", "text", "")}, currentDefault: "english", nextDefault: "standard"},
+		{name: "text analyzer change", current: []*interfaces.Property{property("content", "text", "standard")}, requested: []*interfaces.Property{property("content", "text", "english")}, changedField: "content"},
+		{name: "new fulltext field", current: []*interfaces.Property{{Name: "content", Type: "string"}}, requested: []*interfaces.Property{property("content", "string", "english")}},
+		{name: "removes feature", current: []*interfaces.Property{property("content", "string", "standard")}, requested: []*interfaces.Property{{Name: "content", Type: "string"}}},
+		{name: "normalizes whitespace", current: []*interfaces.Property{property("content", "string", "english")}, requested: []*interfaces.Property{property("content", "string", " english ")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resource := &interfaces.Resource{SchemaDefinition: tc.current, IndexConfig: &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: tc.currentDefault}}
+			req := &interfaces.ResourceRequest{SchemaDefinition: tc.requested}
+			if tc.nextDefault != "" {
+				req.IndexConfig = &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: tc.nextDefault}
+			}
+			assert.Equal(t, tc.changedField, changedDatasetFulltextAnalyzer(resource, req))
+		})
+	}
 }

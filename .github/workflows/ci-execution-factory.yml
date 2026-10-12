@@ -3,11 +3,13 @@ name: ci-execution-factory
 on:
   pull_request:
     paths:
+      - 'comm-go/**'
       - 'adp/execution-factory/**'
       - '.github/workflows/ci-execution-factory.yml'
   push:
     branches: [main]
     paths:
+      - 'comm-go/**'
       - 'adp/execution-factory/**'
       - '.github/workflows/ci-execution-factory.yml'
   workflow_dispatch:
@@ -42,6 +44,11 @@ jobs:
           python -m pytest testcases/openbkn-smoke
           --confcutdir=testcases/openbkn-smoke
           --collect-only -q
+
+      # Offline checks for shared test helpers (no backend needed), e.g. the
+      # RSA password encryption the smoke suite logs in with.
+      - name: Run offline helper tests
+        run: python -m pytest common/test_get_token_rsa.py -q
 
   operator-integration-go-test:
     name: operator-integration unit tests

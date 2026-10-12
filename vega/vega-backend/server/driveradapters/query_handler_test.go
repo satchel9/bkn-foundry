@@ -51,7 +51,7 @@ func Test_RawQueryRestHandler_RawQuery(t *testing.T) {
 			DoAndReturn(func(_ context.Context, req *interfaces.RawQueryRequest) (*interfaces.RawQueryResponse, error) {
 				totalCount := int64(0)
 				assert.Equal(t, interfaces.QueryFormatSQL, req.QueryFormat)
-				assert.Equal(t, "postgres", req.EffectiveInputDialect())
+				assert.Equal(t, "mysql", req.EffectiveInputDialect())
 				assert.Equal(t, 60, req.QueryTimeoutSec)
 				assert.True(t, req.NeedTotal)
 				return &interfaces.RawQueryResponse{
@@ -119,4 +119,24 @@ func Test_RawQueryRestHandler_RawQuery(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
 		assert.Contains(t, w.Body.String(), "VegaBackend.Query.InvalidParameter.QueryTimeout")
 	})
+}
+
+func TestRestHandlerCloseCursor(t *testing.T) {
+	restoreGinMode := setGinMode()
+	defer restoreGinMode()
+
+	engine := setupRawQueryHandlerTest(t)
+	const path = "/api/vega-backend/in/v1/resources/cursors/cursor-1"
+	patches := gomonkey.ApplyFunc(query.CloseCursorSession, func(_ context.Context, accountID, cursor string) error {
+		assert.Equal(t, "account-a", accountID)
+		assert.Equal(t, "cursor-1", cursor)
+		return nil
+	})
+	defer patches.Reset()
+	req := httptest.NewRequest(http.MethodDelete, path, nil)
+	req.Header.Set(interfaces.HTTP_HEADER_ACCOUNT_ID, "account-a")
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusNoContent, w.Code)
+	assert.Empty(t, w.Body.String())
 }

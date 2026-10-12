@@ -25,6 +25,7 @@ data:
     concept_search_config:
       concept_recall_size: {{ .Values.service.concept_search_config.concept_recall_size }}
       knn_k: {{ .Values.service.concept_search_config.knn_k }}
+      schema_read_timeout_ms: {{ .Values.service.concept_search_config.schema_read_timeout_ms | default 5000 }}
     instance_search_config:
       min_reranker_score: {{ .Values.service.instance_search_config.min_reranker_score }}
       min_object_type_score_ratio: {{ .Values.service.instance_search_config.min_object_type_score_ratio }}
@@ -58,6 +59,11 @@ data:
       private_port: {{ index .Values "depServices" "bkn-safe" "privatePort" }}
     auth:
       resource_filter_chunk_size: {{ .Values.auth.resourceFilterChunkSize | default 200 }}
+    permission_request:
+      disabled: {{ (.Values.permissionRequest).disabled | default false }}
+      {{- with (.Values.permissionRequest).pathTemplate }}
+      path_template: {{ . | quote }}
+      {{- end }}
     redis:
       connectType: {{ .Values.depServices.redis.connectType | quote }}
       enableSSL: {{ .Values.depServices.redis.enableSSL }}

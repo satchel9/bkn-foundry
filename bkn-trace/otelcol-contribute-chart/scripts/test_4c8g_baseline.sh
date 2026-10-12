@@ -7,7 +7,10 @@
 set -euo pipefail
 
 chart_dir="${1:-charts/otelcol-contrib}"
-rendered="$(helm template otelcol-contrib "${chart_dir}")"
+admission_args=(
+  --set traceAdmission.workloadIdentity=spiffe://cluster-a/ns/openbkn/sa/otelcol
+)
+rendered="$(helm template otelcol-contrib "${chart_dir}" "${admission_args[@]}")"
 
 assert_contains() {
   local needle="$1"
@@ -57,7 +60,7 @@ if grep -Fq "kind: PrometheusRule" <<<"${rendered}" || grep -Fq "kind: NetworkPo
   exit 1
 fi
 
-governed_rendered="$(helm template otelcol-contrib "${chart_dir}" \
+governed_rendered="$(helm template otelcol-contrib "${chart_dir}" "${admission_args[@]}" \
   --set monitoring.prometheusRule.enabled=true \
   --set networkPolicy.enabled=true)"
 if ! grep -Fq "kind: PrometheusRule" <<<"${governed_rendered}"; then

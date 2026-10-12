@@ -296,10 +296,12 @@ func (ots *objectTypeService) CreateObjectTypes(ctx context.Context, tx *sql.Tx,
 	}
 
 	// Create.
-	otIDs := []string{}
+	otIDs := make([]string, 0, len(createObjectTypes))
 	for _, objectType := range createObjectTypes {
 		otIDs = append(otIDs, objectType.OTID)
-		err = ots.ota.CreateObjectType(ctx, tx, objectType)
+	}
+	if len(createObjectTypes) == 1 {
+		err = ots.ota.CreateObjectType(ctx, tx, createObjectTypes[0])
 		if err != nil {
 			logger.Errorf("CreateObjectType error: %s", err.Error())
 			span.SetStatus(codes.Error, "创建对象类失败")
@@ -308,8 +310,7 @@ func (ots *objectTypeService) CreateObjectTypes(ctx context.Context, tx *sql.Tx,
 				berrors.BknBackend_ObjectType_InternalError).
 				WithErrorDetails(err.Error())
 		}
-
-		err = ots.ota.CreateObjectTypeStatus(ctx, tx, objectType)
+		err = ots.ota.CreateObjectTypeStatus(ctx, tx, createObjectTypes[0])
 		if err != nil {
 			logger.Errorf("CreateObjectTypeStatus error: %s", err.Error())
 			span.SetStatus(codes.Error, "创建对象类状态失败")
@@ -318,7 +319,36 @@ func (ots *objectTypeService) CreateObjectTypes(ctx context.Context, tx *sql.Tx,
 				berrors.BknBackend_ObjectType_InternalError).
 				WithErrorDetails(err.Error())
 		}
+	} else if len(createObjectTypes) > 1 {
+		err = ots.ota.CreateObjectTypes(ctx, tx, createObjectTypes)
+		if err != nil {
+			logger.Errorf("CreateObjectTypes error: %s", err.Error())
+			span.SetStatus(codes.Error, "Batch create object types failed")
+			if constraint, duplicate := common.DatabaseUniqueConstraint(err); duplicate {
+				if strings.Contains(constraint, "name") {
+					return []string{}, rest.NewHTTPError(ctx, http.StatusForbidden,
+						berrors.BknBackend_ObjectType_ObjectTypeNameExisted).
+						WithErrorDetails("One or more object type names already exist")
+				}
+				return []string{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
+					berrors.BknBackend_ObjectType_ObjectTypeIDExisted).
+					WithErrorDetails("One or more object type IDs already exist")
+			}
+			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError).
+				WithErrorDetails(err.Error())
+		}
+		err = ots.ota.CreateObjectTypeStatuses(ctx, tx, createObjectTypes)
+		if err != nil {
+			logger.Errorf("CreateObjectTypeStatuses error: %s", err.Error())
+			span.SetStatus(codes.Error, "Batch create object type statuses failed")
+			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError).
+				WithErrorDetails(err.Error())
+		}
+	}
 
+	for _, objectType := range createObjectTypes {
 		// Create object type-to-group relationships as needed.
 		if needCreateConceptGroupRelation {
 			// Create missing object type-to-group relationships after retrieving existing bindings.
@@ -340,10 +370,27 @@ func (ots *objectTypeService) CreateObjectTypes(ctx context.Context, tx *sql.Tx,
 		interfaces.RESOURCE_TYPE_KN, parentItems)
 
 	// Update.
-	for _, objectType := range updateObjectTypes {
-		err = ots.UpdateObjectType(ctx, tx, objectType, strictMode)
+	if len(updateObjectTypes) == 1 {
+		err = ots.updateObjectType(ctx, tx, updateObjectTypes[0], strictMode,
+			needCreateConceptGroupRelation)
 		if err != nil {
 			return []string{}, err
+		}
+	} else if len(updateObjectTypes) > 1 {
+		err = ots.ota.UpdateObjectTypes(ctx, tx, updateObjectTypes)
+		if err != nil {
+			logger.Errorf("UpdateObjectTypes error: %s", err.Error())
+			span.SetStatus(codes.Error, "Batch update object types failed")
+			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError).
+				WithErrorDetails(err.Error())
+		}
+		if needCreateConceptGroupRelation {
+			for _, objectType := range updateObjectTypes {
+				if err = ots.syncObjectGroups(ctx, tx, *objectType, currentTime, strictMode); err != nil {
+					return []string{}, err
+				}
+			}
 		}
 	}
 
@@ -451,8 +498,10 @@ func (ots *objectTypeService) ListObjectTypes(ctx context.Context, tx *sql.Tx,
 
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "查询对象类列表")
 	defer span.End()
-	// 0. Begin the transaction.
+	// Keep the read transaction scoped to the database operation. Permission and account
+	// lookups are remote calls and must not hold a database connection while they run.
 	var err error
+	ownedTx := tx == nil
 	if tx == nil {
 		tx, err = ots.db.Begin()
 		if err != nil {
@@ -461,24 +510,6 @@ func (ots *objectTypeService) ListObjectTypes(ctx context.Context, tx *sql.Tx,
 				berrors.BknBackend_ObjectType_InternalError_BeginTransactionFailed).
 				WithErrorDetails(err.Error())
 		}
-		// 0.1 On failure.
-		defer func() {
-			switch err {
-			case nil:
-				// Commit the transaction.
-				err = tx.Commit()
-				if err != nil {
-					otellog.LogError(ctx, "ListObjectTypes Transaction Commit Failed", err)
-					return
-				}
-				otellog.LogDebug(ctx, "ListObjectTypes Transaction Commit Success")
-			default:
-				rollbackErr := tx.Rollback()
-				if rollbackErr != nil {
-					otellog.LogError(ctx, "ListObjectTypes Transaction Rollback Error", err)
-				}
-			}
-		}()
 	}
 
 	listQuery := query
@@ -486,11 +517,24 @@ func (ots *objectTypeService) ListObjectTypes(ctx context.Context, tx *sql.Tx,
 	listQuery.Limit = -1
 	objectTypes, err := ots.ota.ListObjectTypes(ctx, tx, listQuery)
 	if err != nil {
+		if ownedTx {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				otellog.LogError(ctx, "ListObjectTypes Transaction Rollback Error", rollbackErr)
+			}
+		}
 		logger.Errorf("ListObjectTypes error: %s", err.Error())
 		span.SetStatus(codes.Error, "List object types error")
 
 		return []*interfaces.ObjectType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ObjectType_InternalError).WithErrorDetails(err.Error())
+	}
+	if ownedTx {
+		if err := tx.Commit(); err != nil {
+			otellog.LogError(ctx, "ListObjectTypes Transaction Commit Failed", err)
+			return []*interfaces.ObjectType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError).WithErrorDetails(err.Error())
+		}
+		otellog.LogDebug(ctx, "ListObjectTypes Transaction Commit Success")
 	}
 	if interfaces.IsAuthorizationResourceCatalog(ctx) {
 		total := len(objectTypes)
@@ -512,17 +556,27 @@ func (ots *objectTypeService) ListObjectTypes(ctx context.Context, tx *sql.Tx,
 		return objectTypes, total, nil
 	}
 
-	accountInfos := make([]*interfaces.AccountInfo, 0, len(objectTypes)*2)
-	for _, objectType := range objectTypes {
-		accountInfos = append(accountInfos, &objectType.Creator, &objectType.Updater)
+	if !interfaces.IsAccountNameEnrichmentDeferred(ctx) {
+		accountInfos := make([]*interfaces.AccountInfo, 0, len(objectTypes)*2)
+		for _, objectType := range objectTypes {
+			accountInfos = append(accountInfos, &objectType.Creator, &objectType.Updater)
+		}
+
+		err = ots.ums.GetAccountNames(ctx, accountInfos)
+		if err != nil {
+			span.SetStatus(codes.Error, "GetAccountNames error")
+
+			return []*interfaces.ObjectType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError).WithErrorDetails(err.Error())
+		}
 	}
 
-	err = ots.ums.GetAccountNames(ctx, accountInfos)
-	if err != nil {
-		span.SetStatus(codes.Error, "GetAccountNames error")
-
-		return []*interfaces.ObjectType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
-			berrors.BknBackend_ObjectType_InternalError).WithErrorDetails(err.Error())
+	// The object-type workspace needs the current resource index projection. Keep the lightweight
+	// authorization-resource picker free of this extra resource read.
+	if !interfaces.IsAuthorizationResourceCatalog(ctx) {
+		if err = ots.enrichObjectTypes(ctx, objectTypes); err != nil {
+			return []*interfaces.ObjectType{}, 0, err
+		}
 	}
 
 	// Object type groups are intentionally omitted from this response.
@@ -612,6 +666,7 @@ func (ots *objectTypeService) ListObjectTypeSummaries(ctx context.Context, tx *s
 			if err := ots.loadObjectTypeSummaryAccounts(ctx, page); err != nil {
 				return nil, 0, err
 			}
+			ots.enrichObjectTypeIndexStatuses(ctx, page)
 			span.SetStatus(codes.Ok, "")
 			return page, total, nil
 		}
@@ -661,6 +716,7 @@ func (ots *objectTypeService) ListObjectTypeSummaries(ctx context.Context, tx *s
 	if err := ots.loadObjectTypeSummaryAccounts(ctx, visibleItems); err != nil {
 		return nil, 0, err
 	}
+	ots.enrichObjectTypeIndexStatuses(ctx, visibleItems)
 	span.SetStatus(codes.Ok, "")
 	return visibleItems, total, nil
 }
@@ -1039,6 +1095,11 @@ func (ots *objectTypeService) GetObjectTypeSampleData(ctx context.Context,
 
 // Update object types.
 func (ots *objectTypeService) UpdateObjectType(ctx context.Context, tx *sql.Tx, objectType *interfaces.ObjectType, strictMode bool) error {
+	return ots.updateObjectType(ctx, tx, objectType, strictMode, true)
+}
+
+func (ots *objectTypeService) updateObjectType(ctx context.Context, tx *sql.Tx,
+	objectType *interfaces.ObjectType, strictMode bool, syncConceptGroupRelations bool) error {
 
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Update object type")
 	defer span.End()
@@ -1119,9 +1180,12 @@ func (ots *objectTypeService) UpdateObjectType(ctx context.Context, tx *sql.Tx, 
 			WithErrorDetails(err.Error())
 	}
 
-	// 4. Synchronize group relationships by full replacement.
-	if err := ots.syncObjectGroups(ctx, tx, *objectType, currentTime, strictMode); err != nil {
-		return err
+	// Standalone object updates retain full-replacement group semantics. Whole-network import
+	// defers relationships to its normalized additive membership plan.
+	if syncConceptGroupRelations {
+		if err := ots.syncObjectGroups(ctx, tx, *objectType, currentTime, strictMode); err != nil {
+			return err
+		}
 	}
 
 	err = ots.InsertDatasetData(ctx, []*interfaces.ObjectType{objectType})
@@ -1430,20 +1494,53 @@ func (ots *objectTypeService) handleObjectTypeImportMode(ctx context.Context, mo
 
 	creates := []*interfaces.ObjectType{}
 	updates := []*interfaces.ObjectType{}
+	var err error
+	existingNamesByID := map[string]string{}
+	existingIDsByName := map[string]string{}
+	if len(objectTypes) > 1 {
+		knID, branch := objectTypes[0].KNID, objectTypes[0].Branch
+		ids := make([]string, 0, len(objectTypes))
+		names := make([]string, 0, len(objectTypes))
+		for _, objectType := range objectTypes {
+			if objectType.KNID != knID || objectType.Branch != branch {
+				return nil, nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+					berrors.BknBackend_ObjectType_InvalidParameter)
+			}
+			ids = append(ids, objectType.OTID)
+			names = append(names, objectType.OTName)
+		}
+		existing, err := ots.ota.GetObjectTypeIdentitiesByIDsOrNames(ctx, knID, branch, ids, names)
+		if err != nil {
+			otellog.LogError(ctx, fmt.Sprintf("Batch query object type IDs in knowledge network [%s] failed", knID), err)
+			return creates, updates, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ObjectType_InternalError_CheckObjectTypeIfExistFailed).
+				WithErrorDetails(err.Error())
+		}
+		for _, objectType := range existing {
+			existingNamesByID[objectType.OTID] = objectType.OTName
+			existingIDsByName[objectType.OTName] = objectType.OTID
+		}
+	}
 
 	// 3. When the submitted model ID is not empty, validate conflicts with existing model IDs.
 	for _, objectType := range objectTypes {
 		creates = append(creates, objectType)
-		idExist := false
-		_, idExist, err := ots.CheckObjectTypeExistByID(ctx, objectType.KNID, objectType.Branch, objectType.OTID)
-		if err != nil {
-			return creates, updates, err
-		}
+		var idExist, nameExist bool
+		var existID string
+		if len(objectTypes) == 1 {
+			_, idExist, err = ots.CheckObjectTypeExistByID(ctx, objectType.KNID, objectType.Branch, objectType.OTID)
+			if err != nil {
+				return creates, updates, err
+			}
 
-		// Validate conflicts between the request and existing model names.
-		existID, nameExist, err := ots.CheckObjectTypeExistByName(ctx, objectType.KNID, objectType.Branch, objectType.OTName)
-		if err != nil {
-			return creates, updates, err
+			// Validate conflicts between the request and existing model names.
+			existID, nameExist, err = ots.CheckObjectTypeExistByName(ctx, objectType.KNID, objectType.Branch, objectType.OTName)
+			if err != nil {
+				return creates, updates, err
+			}
+		} else {
+			_, idExist = existingNamesByID[objectType.OTID]
+			existID, nameExist = existingIDsByName[objectType.OTName]
 		}
 
 		// Handle mode: ignore removes it from results, overwrite updates it, and normal returns an error.
@@ -1600,52 +1697,38 @@ func (ots *objectTypeService) InsertDatasetData(ctx context.Context, objectTypes
 		}
 	}
 
+	documents := make([]vega_backend.DatasetDocument, 0, len(objectTypes))
 	for _, objectType := range objectTypes {
 		docid := interfaces.GenerateConceptDocuemtnID(objectType.KNID, interfaces.MODULE_TYPE_OBJECT_TYPE,
 			objectType.OTID, objectType.Branch)
 		objectType.ModuleType = interfaces.MODULE_TYPE_OBJECT_TYPE
 
-		// Convert to map for dataset
-		docBytes, err := sonic.Marshal(objectType)
+		document, err := vega_backend.NewDatasetDocument(docid, objectType)
 		if err != nil {
-			logger.Errorf("Failed to marshal ObjectType: %s", err.Error())
-			span.SetStatus(codes.Error, "序列化对象类失败")
+			logger.Errorf("Failed to build object type index document: %s", err.Error())
+			span.SetStatus(codes.Error, "Serialize object type index failed")
 			return err
 		}
-
-		var doc map[string]any
-		if err := sonic.Unmarshal(docBytes, &doc); err != nil {
-			logger.Errorf("Failed to unmarshal ObjectType: %s", err.Error())
-			span.SetStatus(codes.Error, "反序列化对象类失败")
-			return err
-		}
-		// A per-response marker, never part of the indexed definition.
-		delete(doc, "data_source_metadata_unavailable")
-
-		// Serialize logic_properties[].parameters to JSON string
-		if logicProps, ok := doc["logic_properties"].([]any); ok {
-			for _, lp := range logicProps {
-				if lpMap, ok := lp.(map[string]any); ok {
-					if params, exists := lpMap["parameters"]; exists {
-						paramsBytes, err := sonic.Marshal(params)
+		delete(document.Document, "data_source_metadata_unavailable")
+		if properties, ok := document.Document["logic_properties"].([]any); ok {
+			for _, property := range properties {
+				if value, ok := property.(map[string]any); ok {
+					if parameters, exists := value["parameters"]; exists {
+						encoded, err := sonic.Marshal(parameters)
 						if err != nil {
-							logger.Errorf("Failed to marshal logic_properties parameters: %s", err.Error())
-							span.SetStatus(codes.Error, "序列化逻辑属性参数失败")
 							return err
 						}
-						lpMap["parameters"] = string(paramsBytes)
+						value["parameters"] = string(encoded)
 					}
 				}
 			}
 		}
-
-		// Set document ID
-		doc["_id"] = docid
-		if err := ots.vbs.WriteDatasetDocument(ctx, interfaces.BKN_DATASET_ID, docid, doc); err != nil {
-			logger.Errorf("WriteDatasetDocument error: %s", err.Error())
-			span.SetStatus(codes.Error, "对象类概念索引写入失败")
-			return err
-		}
+		documents = append(documents, document)
+	}
+	if err := vega_backend.WriteDatasetDocuments(ctx, ots.vbs, interfaces.BKN_DATASET_ID, documents); err != nil {
+		logger.Errorf("WriteDatasetDocument error: %s", err.Error())
+		span.SetStatus(codes.Error, "对象类概念索引写入失败")
+		return err
 	}
 
 	return nil
@@ -2165,6 +2248,49 @@ func (ots *objectTypeService) enrichObjectTypes(ctx context.Context, objectTypes
 	return nil
 }
 
+// enrichObjectTypeIndexStatuses projects only the response-time index state required by summary
+// surfaces. It deliberately avoids the schema, property capability, and logical-property work done
+// by enrichObjectTypes while retaining the same batched Vega read and managed-proxy authorization.
+func (ots *objectTypeService) enrichObjectTypeIndexStatuses(ctx context.Context,
+	objectTypes []*interfaces.ObjectType) {
+	resources := ots.fetchObjectTypeResources(ctx, objectTypes)
+	for _, objectType := range objectTypes {
+		if objectType != nil {
+			ots.projectObjectTypeIndexStatus(ctx, objectType, resources)
+		}
+	}
+}
+
+// projectObjectTypeIndexStatus applies the shared index-state semantics and returns the readable
+// resource for callers which also need detail enrichment. metadataUnavailable distinguishes a
+// failed resource read from a resource which is known not to exist.
+func (ots *objectTypeService) projectObjectTypeIndexStatus(ctx context.Context,
+	objectType *interfaces.ObjectType, resources map[string]vegaResourceLookup) (
+	resource *interfaces.VegaResource, metadataUnavailable bool) {
+	objectType.IndexStatus = &interfaces.ObjectTypeIndexStatus{State: interfaces.ObjectTypeIndexStateNotApplicable}
+	if objectType.DataSource == nil || objectType.DataSource.ID == "" ||
+		objectType.DataSource.Type != interfaces.DATA_SOURCE_TYPE_RESOURCE {
+		return nil, false
+	}
+
+	lookup, lookedUp := resources[objectType.DataSource.ID]
+	resource, err := lookup.resourceFor(objectType)
+	if err != nil {
+		otellog.LogWarn(ctx, fmt.Sprintf("Object type [%s]'s vega Resource %s not found, error: %v",
+			objectType.OTID, objectType.DataSource.ID, err))
+		setObjectTypeIndexStatus(objectType, interfaces.ObjectTypeIndexStateUnknown, "")
+		return nil, true
+	}
+	if !lookedUp || resource == nil {
+		// A successful Vega batch response which omits the id means the resource was deleted.
+		setObjectTypeIndexStatus(objectType, interfaces.ObjectTypeIndexStateResourceMissing, "")
+		return nil, false
+	}
+
+	setObjectTypeIndexStatus(objectType, indexStateForVegaResource(resource), resource.LocalIndexStatus)
+	return resource, false
+}
+
 // Extracted helper for processing object type details. resources holds the Vega resources read by
 // fetchObjectTypeResources for this batch of object types.
 func (ots *objectTypeService) processObjectTypeDetails(ctx context.Context, objectType *interfaces.ObjectType,
@@ -2172,38 +2298,39 @@ func (ots *objectTypeService) processObjectTypeDetails(ctx context.Context, obje
 
 	// The marker describes this response only; a value decoded from a stored document means nothing.
 	objectType.DataSourceMetadataUnavailable = false
+	for _, prop := range objectType.DataProperties {
+		if prop != nil {
+			// The persisted definition has no response-time index feature projection.
+			prop.IndexFeatures = nil
+		}
+	}
+	resource, metadataUnavailable := ots.projectObjectTypeIndexStatus(ctx, objectType, resources)
+	objectType.DataSourceMetadataUnavailable = metadataUnavailable
 
 	// Retrieve views or Vega resources to assemble operations. Assembly is unnecessary because they are persisted on save.
 	if objectType.DataSource != nil && objectType.DataSource.ID != "" {
-		switch objectType.DataSource.Type {
-		case interfaces.DATA_SOURCE_TYPE_RESOURCE:
-			res, err := resources[objectType.DataSource.ID].resourceFor(objectType)
-			if err != nil || res == nil {
-				otellog.LogWarn(ctx, fmt.Sprintf("Object type [%s]'s vega Resource %s not found, error: %v",
-					objectType.OTID, objectType.DataSource.ID, err))
-				// A read that failed leaves the capabilities unknown: say so, so that a consumer
-				// deciding what to search does not read the missing condition_operations as
-				// "nothing here can be searched". A resource that no longer exists is a known
-				// answer, not an unknown one -- there is nothing to search -- so it is not marked.
-				objectType.DataSourceMetadataUnavailable = err != nil
-			} else {
-				objectType.DataSource.Name = res.Name
-				propertiesMap := logics.VegaResourceSchemaToPropertiesMap(res)
-				indexCaps := logics.VegaResourceIndexCaps(res)
-				dslView := &interfaces.DataView{QueryType: interfaces.VIEW_QueryType_DSL}
-				for j, prop := range objectType.DataProperties {
-					if prop.MappedField != nil {
-						if property, exists := propertiesMap[prop.MappedField.Name]; exists {
-							objectType.DataProperties[j].MappedField.DisplayName = property.DisplayName
-							objectType.DataProperties[j].MappedField.Type = property.Type
-						}
-					}
-					ops := ots.processConditionOperations(objectType, prop, dslView)
-					if prop.MappedField != nil {
-						ops = applyIndexCapOps(ops, indexCaps[prop.MappedField.Name])
-					}
-					objectType.DataProperties[j].ConditionOperations = ops
+		if resource != nil {
+			objectType.DataSource.Name = resource.Name
+			propertiesMap := logics.VegaResourceSchemaToPropertiesMap(resource)
+			indexCaps := logics.VegaResourceIndexCaps(resource)
+			featuresByField := configuredIndexFeatures(resource, objectType.IndexStatus.State)
+			dslView := &interfaces.DataView{QueryType: interfaces.VIEW_QueryType_DSL}
+			for j, prop := range objectType.DataProperties {
+				if prop == nil {
+					continue
 				}
+				if prop.MappedField != nil {
+					if property, exists := propertiesMap[prop.MappedField.Name]; exists {
+						objectType.DataProperties[j].MappedField.DisplayName = property.DisplayName
+						objectType.DataProperties[j].MappedField.Type = property.Type
+					}
+					objectType.DataProperties[j].IndexFeatures = featuresByField[prop.MappedField.Name]
+				}
+				ops := ots.processConditionOperations(objectType, prop, dslView)
+				if prop.MappedField != nil {
+					ops = applyIndexCapOps(ops, indexCaps[prop.MappedField.Name])
+				}
+				objectType.DataProperties[j].ConditionOperations = ops
 			}
 		}
 
@@ -2222,6 +2349,73 @@ func (ots *objectTypeService) processObjectTypeDetails(ctx context.Context, obje
 	}
 
 	return nil
+}
+
+func setObjectTypeIndexStatus(objectType *interfaces.ObjectType, state, sourceStatus string) {
+	objectType.IndexStatus = &interfaces.ObjectTypeIndexStatus{State: state, SourceStatus: sourceStatus}
+}
+
+func indexStateForVegaResource(resource *interfaces.VegaResource) string {
+	switch resource.LocalIndexStatus {
+	case interfaces.ResourceLocalIndexStatusAvailable:
+		return interfaces.ObjectTypeIndexStateAvailable
+	case interfaces.ResourceLocalIndexStatusUnavailable, "stale":
+		return interfaces.ObjectTypeIndexStateUnavailable
+	default:
+		return interfaces.ObjectTypeIndexStateUnknown
+	}
+}
+
+// configuredIndexFeatures reads configuration rather than capabilities: VegaResourceIndexCaps
+// intentionally hides declared features until an index is available, while this projection needs
+// to show users what they configured even while a build is pending or stale.
+func configuredIndexFeatures(resource *interfaces.VegaResource, indexState string) map[string][]interfaces.ObjectTypeIndexFeature {
+	featuresByField := make(map[string][]interfaces.ObjectTypeIndexFeature)
+	if resource == nil {
+		return featuresByField
+	}
+
+	var available *bool
+	switch indexState {
+	case interfaces.ObjectTypeIndexStateAvailable:
+		value := true
+		available = &value
+	case interfaces.ObjectTypeIndexStateUnavailable:
+		value := false
+		available = &value
+	}
+
+	seen := make(map[string]map[string]struct{})
+	for _, property := range resource.SchemaDefinition {
+		if property == nil {
+			continue
+		}
+		for _, feature := range property.Features {
+			switch feature.FeatureType {
+			case interfaces.FieldFeatureType_Keyword, interfaces.FieldFeatureType_Fulltext, interfaces.FieldFeatureType_Vector:
+			default:
+				continue
+			}
+			field := property.Name
+			if feature.RefProperty != "" {
+				field = feature.RefProperty
+			}
+			if field == "" {
+				continue
+			}
+			if seen[field] == nil {
+				seen[field] = map[string]struct{}{}
+			}
+			if _, duplicate := seen[field][feature.FeatureType]; duplicate {
+				continue
+			}
+			seen[field][feature.FeatureType] = struct{}{}
+			featuresByField[field] = append(featuresByField[field], interfaces.ObjectTypeIndexFeature{
+				Type: feature.FeatureType, Configured: true, Available: available,
+			})
+		}
+	}
+	return featuresByField
 }
 
 func (ots *objectTypeService) GetTotal(ctx context.Context, filterCondition map[string]any) (total int64, err error) {
@@ -2331,8 +2525,14 @@ func (ots *objectTypeService) GetObjectTypeByID(ctx context.Context, tx *sql.Tx,
 	// Get basic object type information.
 	objectType, err := ots.ota.GetObjectTypeByID(ctx, tx, knID, branch, otID)
 	if err != nil {
-		logger.Errorf("GetObjectTypeByID error: %s", err.Error())
 		span.SetStatus(codes.Error, fmt.Sprintf("Get object type by id[%s] error: %v", otID, err))
+		// The access layer reports a missing row as a structured 404; keep it
+		// instead of reclassifying a caller mistake as an internal failure.
+		var httpErr *rest.HTTPError
+		if errors.As(err, &httpErr) && httpErr.HTTPCode == http.StatusNotFound {
+			return nil, httpErr
+		}
+		logger.Errorf("GetObjectTypeByID error: %s", err.Error())
 
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed).WithErrorDetails(err.Error())

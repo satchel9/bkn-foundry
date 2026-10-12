@@ -10,6 +10,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	sq "github.com/Masterminds/squirrel"
@@ -29,8 +31,13 @@ import (
 )
 
 const (
-	CONCEPT_GROUP_TABLE_NAME          = "t_concept_group"
-	CONCEPT_GROUP_RELATION_TABLE_NAME = "t_concept_group_relation"
+	CONCEPT_GROUP_TABLE_NAME            = "t_concept_group"
+	CONCEPT_GROUP_RELATION_TABLE_NAME   = "t_concept_group_relation"
+	conceptGroupIdentityQueryBatchSize  = 500
+	conceptGroupInsertBatchSize         = 200
+	conceptGroupUpdateBatchSize         = 100
+	conceptGroupRelationInsertBatchSize = 200
+	conceptGroupRelationQueryBatchSize  = 500
 )
 
 var (
@@ -136,6 +143,66 @@ func (cga *conceptGroupAccess) CheckConceptGroupExistByName(ctx context.Context,
 	return cgID, true, nil
 }
 
+// GetConceptGroupIdentitiesByIDsOrNames returns only the fields required by import conflict handling.
+func (cga *conceptGroupAccess) GetConceptGroupIdentitiesByIDsOrNames(ctx context.Context, knID string, branch string,
+	cgIDs, cgNames []string) ([]*interfaces.ConceptGroup, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "GetConceptGroupIdentitiesByIDsOrNames")
+	defer span.End()
+	span.SetAttributes(
+		attr.Int("id_count", len(cgIDs)),
+		attr.Int("name_count", len(cgNames)),
+	)
+
+	result := make([]*interfaces.ConceptGroup, 0)
+	seen := make(map[string]struct{})
+	requestCount := max(len(cgIDs), len(cgNames))
+	for start := 0; start < requestCount; start += conceptGroupIdentityQueryBatchSize {
+		idEnd := min(start+conceptGroupIdentityQueryBatchSize, len(cgIDs))
+		nameEnd := min(start+conceptGroupIdentityQueryBatchSize, len(cgNames))
+		conditions := sq.Or{}
+		if start < len(cgIDs) {
+			conditions = append(conditions, sq.Eq{"f_id": cgIDs[start:idEnd]})
+		}
+		if start < len(cgNames) {
+			conditions = append(conditions, sq.Eq{"f_name": cgNames[start:nameEnd]})
+		}
+		sqlStr, vals, err := sq.Select("f_id", "f_name").From(CONCEPT_GROUP_TABLE_NAME).
+			Where(sq.Eq{"f_kn_id": knID}).
+			Where(sq.Eq{"f_branch": branch}).
+			Where(conditions).
+			ToSql()
+		if err != nil {
+			common.LogSafeError(ctx, "Failed to build concept group identity query", err)
+			return nil, err
+		}
+		otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+		rows, err := cga.db.Query(sqlStr, vals...)
+		if err != nil {
+			common.LogSafeError(ctx, "Query concept group identities failed", err)
+			return nil, err
+		}
+		for rows.Next() {
+			conceptGroup := &interfaces.ConceptGroup{ModuleType: interfaces.MODULE_TYPE_CONCEPT_GROUP}
+			if err = rows.Scan(&conceptGroup.CGID, &conceptGroup.CGName); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			if _, duplicate := seen[conceptGroup.CGID]; duplicate {
+				continue
+			}
+			seen[conceptGroup.CGID] = struct{}{}
+			result = append(result, conceptGroup)
+		}
+		if err = rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+	span.SetStatus(codes.Ok, "")
+	return result, nil
+}
+
 // Create a concept group.
 func (cga *conceptGroupAccess) CreateConceptGroup(ctx context.Context, tx *sql.Tx, conceptGroup *interfaces.ConceptGroup) error {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "CreateConceptGroup")
@@ -202,6 +269,47 @@ func (cga *conceptGroupAccess) CreateConceptGroup(ctx context.Context, tx *sql.T
 	return nil
 }
 
+// CreateConceptGroups inserts concept-group base records in bounded batches.
+func (cga *conceptGroupAccess) CreateConceptGroups(ctx context.Context, tx *sql.Tx,
+	conceptGroups []*interfaces.ConceptGroup) error {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "CreateConceptGroups")
+	defer span.End()
+	span.SetAttributes(
+		attr.Key("db_url").String(libdb.GetDBUrl()),
+		attr.Key("db_type").String(libdb.GetDBType()),
+		attr.Int("concept_group_count", len(conceptGroups)),
+	)
+	for start := 0; start < len(conceptGroups); start += conceptGroupInsertBatchSize {
+		end := min(start+conceptGroupInsertBatchSize, len(conceptGroups))
+		builder := sq.Insert(CONCEPT_GROUP_TABLE_NAME).Columns(
+			"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_bkn_raw_content",
+			"f_kn_id", "f_branch", "f_creator", "f_creator_type", "f_create_time",
+			"f_updater", "f_updater_type", "f_update_time",
+		)
+		for _, conceptGroup := range conceptGroups[start:end] {
+			builder = builder.Values(
+				conceptGroup.CGID, conceptGroup.CGName, libCommon.TagSlice2TagString(conceptGroup.Tags),
+				conceptGroup.Comment, conceptGroup.Icon, conceptGroup.Color, conceptGroup.BKNRawContent,
+				conceptGroup.KNID, conceptGroup.Branch, conceptGroup.Creator.ID, conceptGroup.Creator.Type,
+				conceptGroup.CreateTime, conceptGroup.Updater.ID, conceptGroup.Updater.Type,
+				conceptGroup.UpdateTime,
+			)
+		}
+		sqlStr, vals, err := builder.ToSql()
+		if err != nil {
+			common.LogSafeError(ctx, "Failed to build the sql of batch insert concept groups", err)
+			return err
+		}
+		otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+		if _, err = tx.Exec(sqlStr, vals...); err != nil {
+			common.LogSafeError(ctx, "Batch insert concept groups failed", err)
+			return err
+		}
+	}
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
+
 // Query current concept groups on the main branch.
 func (cga *conceptGroupAccess) ListConceptGroups(ctx context.Context, query interfaces.ConceptGroupsQueryParams) ([]*interfaces.ConceptGroup, error) {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListConceptGroups")
@@ -238,7 +346,7 @@ func (cga *conceptGroupAccess) ListConceptGroups(ctx context.Context, query inte
 		if err != nil {
 			return nil, err
 		}
-		builder = builder.OrderBy(orderBy)
+		builder = builder.OrderBy(orderBy, "f_id ASC")
 	}
 	if query.Limit > 0 {
 		builder = builder.Limit(uint64(query.Limit))
@@ -300,6 +408,58 @@ func (cga *conceptGroupAccess) ListConceptGroups(ctx context.Context, query inte
 
 	span.SetStatus(codes.Ok, "")
 	return conceptGroups, nil
+}
+
+// ListConceptGroupTags returns the distinct tags in the requested authorization scope.
+func (cga *conceptGroupAccess) ListConceptGroupTags(ctx context.Context,
+	query interfaces.ConceptGroupsQueryParams) ([]string, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListConceptGroupTags")
+	defer span.End()
+
+	span.SetAttributes(
+		attr.Key("db_url").String(libdb.GetDBUrl()),
+		attr.Key("db_type").String(libdb.GetDBType()),
+	)
+
+	builder := processQueryCondition(query,
+		sq.Select("f_tags").From(CONCEPT_GROUP_TABLE_NAME))
+	sqlStr, vals, err := builder.ToSql()
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to build the sql of select concept group tags, error", err)
+		return nil, err
+	}
+	otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+
+	rows, err := cga.db.Query(sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "List concept group tags error", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	uniqueTags := make(map[string]struct{})
+	for rows.Next() {
+		var tagsStr string
+		if err := rows.Scan(&tagsStr); err != nil {
+			common.LogSafeError(ctx, "Row scan error", err)
+			return nil, err
+		}
+		for _, tag := range libCommon.TagString2TagSlice(tagsStr) {
+			uniqueTags[tag] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		common.LogSafeError(ctx, "Iterate concept group tags error", err)
+		return nil, err
+	}
+
+	tags := make([]string, 0, len(uniqueTags))
+	for tag := range uniqueTags {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	span.SetStatus(codes.Ok, "")
+	return tags, nil
 }
 
 // Get concept groups in bulk.
@@ -555,6 +715,107 @@ func (cga *conceptGroupAccess) UpdateConceptGroup(ctx context.Context, tx *sql.T
 	return nil
 }
 
+// UpdateConceptGroups updates concept-group base records in bounded batches. Repeated IDs are
+// split so CASE expressions retain the same input-order semantics as sequential updates.
+func (cga *conceptGroupAccess) UpdateConceptGroups(ctx context.Context, tx *sql.Tx,
+	conceptGroups []*interfaces.ConceptGroup) error {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "UpdateConceptGroups")
+	defer span.End()
+	span.SetAttributes(
+		attr.Key("db_url").String(libdb.GetDBUrl()),
+		attr.Key("db_type").String(libdb.GetDBType()),
+		attr.Int("concept_group_count", len(conceptGroups)),
+	)
+	if len(conceptGroups) == 0 {
+		return nil
+	}
+	knID, branch := conceptGroups[0].KNID, conceptGroups[0].Branch
+	for _, conceptGroup := range conceptGroups {
+		if conceptGroup.KNID != knID || conceptGroup.Branch != branch {
+			return fmt.Errorf("batch update concept groups must have one knowledge network and branch")
+		}
+	}
+	columns := []string{
+		"f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_bkn_raw_content",
+		"f_updater", "f_updater_type", "f_update_time",
+	}
+	for start := 0; start < len(conceptGroups); {
+		end := start
+		seenIDs := make(map[string]struct{}, min(conceptGroupUpdateBatchSize, len(conceptGroups)-start))
+		for end < len(conceptGroups) && end-start < conceptGroupUpdateBatchSize {
+			if _, duplicate := seenIDs[conceptGroups[end].CGID]; duplicate {
+				break
+			}
+			seenIDs[conceptGroups[end].CGID] = struct{}{}
+			end++
+		}
+		batch := conceptGroups[start:end]
+		var statement strings.Builder
+		args := make([]any, 0, len(columns)*len(batch)*2+len(batch)+2)
+		statement.WriteString("UPDATE ")
+		statement.WriteString(CONCEPT_GROUP_TABLE_NAME)
+		statement.WriteString(" SET ")
+		for columnIndex, column := range columns {
+			if columnIndex > 0 {
+				statement.WriteString(", ")
+			}
+			statement.WriteString(column)
+			statement.WriteString(" = CASE f_id")
+			for _, conceptGroup := range batch {
+				statement.WriteString(" WHEN ? THEN ?")
+				args = append(args, conceptGroup.CGID, conceptGroupUpdateValue(conceptGroup, column))
+			}
+			statement.WriteString(" ELSE ")
+			statement.WriteString(column)
+			statement.WriteString(" END")
+		}
+		statement.WriteString(" WHERE f_kn_id = ? AND f_branch = ? AND f_id IN (")
+		args = append(args, knID, branch)
+		for index, conceptGroup := range batch {
+			if index > 0 {
+				statement.WriteByte(',')
+			}
+			statement.WriteByte('?')
+			args = append(args, conceptGroup.CGID)
+		}
+		statement.WriteByte(')')
+		sqlStr := statement.String()
+		otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(args)))
+		if _, err := tx.Exec(sqlStr, args...); err != nil {
+			common.LogSafeError(ctx, "Batch update concept groups failed", err)
+			return err
+		}
+		start = end
+	}
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
+
+func conceptGroupUpdateValue(conceptGroup *interfaces.ConceptGroup, column string) any {
+	switch column {
+	case "f_name":
+		return conceptGroup.CGName
+	case "f_tags":
+		return libCommon.TagSlice2TagString(conceptGroup.Tags)
+	case "f_comment":
+		return conceptGroup.Comment
+	case "f_icon":
+		return conceptGroup.Icon
+	case "f_color":
+		return conceptGroup.Color
+	case "f_bkn_raw_content":
+		return conceptGroup.BKNRawContent
+	case "f_updater":
+		return conceptGroup.Updater.ID
+	case "f_updater_type":
+		return conceptGroup.Updater.Type
+	case "f_update_time":
+		return conceptGroup.UpdateTime
+	default:
+		panic("unsupported concept group update column: " + column)
+	}
+}
+
 func (cga *conceptGroupAccess) UpdateConceptGroupDetail(ctx context.Context, knID string, branch string, cgID string, detail string) error {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "UpdateConceptGroupDetail")
 	defer span.End()
@@ -801,6 +1062,10 @@ func processQueryCondition(query interfaces.ConceptGroupsQueryParams, subBuilder
 	if len(query.CGIDs) > 0 {
 		subBuilder = subBuilder.Where(sq.Eq{"f_id": query.CGIDs})
 	}
+	if query.ValidAuthorizationIDsOnly {
+		subBuilder = subBuilder.Where(sq.Expr(
+			"f_id <> '' AND f_id = TRIM(f_id) AND instr(f_id, '/') = 0 AND instr(f_id, '*') = 0"))
+	}
 
 	return subBuilder
 }
@@ -1003,6 +1268,38 @@ func (cga *conceptGroupAccess) CreateConceptGroupRelation(ctx context.Context, t
 	return nil
 }
 
+func (cga *conceptGroupAccess) CreateConceptGroupRelations(ctx context.Context, tx *sql.Tx,
+	relations []*interfaces.ConceptGroupRelation) error {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "CreateConceptGroupRelations")
+	defer span.End()
+	span.SetAttributes(attr.Int("relation_count", len(relations)))
+
+	for start := 0; start < len(relations); start += conceptGroupRelationInsertBatchSize {
+		end := min(start+conceptGroupRelationInsertBatchSize, len(relations))
+		builder := sq.Insert(CONCEPT_GROUP_RELATION_TABLE_NAME).Columns(
+			"f_id", "f_kn_id", "f_branch", "f_group_id", "f_concept_type", "f_concept_id", "f_create_time",
+		)
+		for _, relation := range relations[start:end] {
+			builder = builder.Values(
+				relation.ID, relation.KNID, relation.Branch, relation.CGID,
+				relation.ConceptType, relation.ConceptID, relation.CreateTime,
+			)
+		}
+		sqlStr, vals, err := builder.ToSql()
+		if err != nil {
+			common.LogSafeError(ctx, "Failed to build batch concept group relation insert", err)
+			return err
+		}
+		otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+		if _, err = tx.Exec(sqlStr, vals...); err != nil {
+			common.LogSafeError(ctx, "Batch insert concept group relations failed", err)
+			return err
+		}
+	}
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
+
 // Build SQL filter conditions.
 func processConceptGroupRelationsQueryCondition(query interfaces.ConceptGroupRelationsQueryParams, subBuilder sq.SelectBuilder, fieldPrefix string) sq.SelectBuilder {
 
@@ -1130,6 +1427,56 @@ func (cga *conceptGroupAccess) GetConceptIDsByConceptGroupIDs(ctx context.Contex
 
 	span.SetStatus(codes.Ok, "")
 	return conceptIDs, nil
+}
+
+// GetConceptIDsGroupedByConceptGroupIDs reads memberships for a page of groups in bounded queries.
+func (cga *conceptGroupAccess) GetConceptIDsGroupedByConceptGroupIDs(ctx context.Context, knID string,
+	branch string, cgIDs []string, conceptType string) (map[string][]string, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "GetConceptIDsGroupedByConceptGroupIDs")
+	defer span.End()
+
+	result := make(map[string][]string, len(cgIDs))
+	if len(cgIDs) == 0 {
+		span.SetStatus(codes.Ok, "")
+		return result, nil
+	}
+	for start := 0; start < len(cgIDs); start += conceptGroupRelationQueryBatchSize {
+		end := start + conceptGroupRelationQueryBatchSize
+		if end > len(cgIDs) {
+			end = len(cgIDs)
+		}
+		builder := sq.Select("f_group_id", "f_concept_id").From(CONCEPT_GROUP_RELATION_TABLE_NAME).
+			Where(sq.Eq{"f_kn_id": knID}).
+			Where(sq.Eq{"f_branch": branch}).
+			Where(sq.Eq{"f_concept_type": conceptType}).
+			Where(sq.Eq{"f_group_id": cgIDs[start:end]})
+		sqlStr, vals, err := builder.ToSql()
+		if err != nil {
+			return nil, err
+		}
+		otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+		rows, err := cga.db.QueryContext(ctx, sqlStr, vals...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var groupID, conceptID string
+			if err := rows.Scan(&groupID, &conceptID); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			result[groupID] = append(result[groupID], conceptID)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	span.SetStatus(codes.Ok, "")
+	return result, nil
 }
 
 // Get relation type IDs in a concept group.

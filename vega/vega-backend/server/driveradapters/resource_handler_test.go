@@ -8,6 +8,7 @@ package driveradapters
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -218,6 +219,33 @@ func Test_ResourceRestHandler_CreateResource(t *testing.T) {
 	const url = "/api/vega-backend/in/v1/resources"
 	body := `{"id":"res-1","catalog_id":"catalog-1","name":"dataset","category":"dataset","schema_definition":[{"name":"title","type":"string"}]}`
 
+	t.Run("preserves precise numbers in dynamic definitions", func(t *testing.T) {
+		engine, _, rs := setupResourceHandlerTest(t)
+		rs.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, req *interfaces.ResourceRequest) (*interfaces.Resource, error) {
+				definition := req.LogicDefinition.(map[string]any)
+				assert.Equal(t, json.Number("9007199254740993"), definition["value"])
+				return &interfaces.Resource{ID: "res-1", Name: req.Name}, nil
+			})
+		preciseBody := `{"id":"res-1","catalog_id":"catalog-1","name":"dataset","category":"dataset","schema_definition":[{"name":"title","type":"string"}],"logic_definition":{"value":9007199254740993}}`
+		req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(preciseBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, http.StatusCreated, w.Code)
+	})
+
+	t.Run("rejects manual physical table creation", func(t *testing.T) {
+		engine, _, _ := setupResourceHandlerTest(t)
+		body := `{"catalog_id":"catalog-1","name":"orders","category":"table","schema":"app","source_identifier":"app.orders"}`
+		req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, http.StatusBadRequest, w.Code)
+		assert.Contains(t, w.Body.String(), "VegaBackend.Resource.CategoryNotCreatable")
+	})
+
 	t.Run("creates dataset resource", func(t *testing.T) {
 		engine, _, rs := setupResourceHandlerTest(t)
 		rs.EXPECT().Create(gomock.Any(), gomock.Any()).
@@ -403,6 +431,22 @@ func Test_ResourceRestHandler_UpdateResource(t *testing.T) {
 	const url = "/api/vega-backend/in/v1/resources/res-1"
 	body := `{"id":"res-1","catalog_id":"catalog-1","name":"dataset-new","category":"dataset","schema_definition":[{"name":"title","type":"string"}],"expected_update_time":1}`
 
+	t.Run("preserves precise numbers in updated dynamic definitions", func(t *testing.T) {
+		engine, _, rs := setupResourceHandlerTest(t)
+		rs.EXPECT().Update(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, req *interfaces.ResourceRequest) error {
+				definition := req.LogicDefinition.(map[string]any)
+				assert.Equal(t, json.Number("9007199254740993"), definition["value"])
+				return nil
+			})
+		preciseBody := `{"id":"res-1","catalog_id":"catalog-1","name":"dataset-new","category":"dataset","schema_definition":[{"name":"title","type":"string"}],"expected_update_time":1,"logic_definition":{"value":9007199254740993}}`
+		req := httptest.NewRequest(http.MethodPut, url, strings.NewReader(preciseBody))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, http.StatusNoContent, w.Code)
+	})
+
 	t.Run("uses path id when body id is omitted", func(t *testing.T) {
 		engine, _, rs := setupResourceHandlerTest(t)
 		rs.EXPECT().Update(gomock.Any(), gomock.Any()).
@@ -542,7 +586,7 @@ func Test_ResourceRestHandler_DeleteResources(t *testing.T) {
 
 	t.Run("normalizes duplicate ids before deleting resources", func(t *testing.T) {
 		engine, _, rs := setupResourceHandlerTest(t)
-		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1", "res-2"}, false).Return(nil)
+		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1", "res-2"}, false, false).Return(nil)
 
 		req := httptest.NewRequest(http.MethodDelete, "/api/vega-backend/in/v1/resources/res-1,res-2,res-1", nil)
 		w := httptest.NewRecorder()
@@ -554,7 +598,7 @@ func Test_ResourceRestHandler_DeleteResources(t *testing.T) {
 
 	t.Run("ignores missing resources when requested", func(t *testing.T) {
 		engine, _, rs := setupResourceHandlerTest(t)
-		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1", "missing"}, true).Return(nil)
+		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1", "missing"}, true, false).Return(nil)
 
 		req := httptest.NewRequest(http.MethodDelete, "/api/vega-backend/in/v1/resources/res-1,missing?ignore_missing=true", nil)
 		w := httptest.NewRecorder()
@@ -563,4 +607,102 @@ func Test_ResourceRestHandler_DeleteResources(t *testing.T) {
 
 		require.Equal(t, http.StatusNoContent, w.Result().StatusCode)
 	})
+
+	t.Run("requires missing state for a single resource", func(t *testing.T) {
+		engine, _, rs := setupResourceHandlerTest(t)
+		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1"}, false, true).Return(nil)
+
+		req := httptest.NewRequest(http.MethodDelete, "/api/vega-backend/in/v1/resources/res-1?only_if_stale=true", nil)
+		w := httptest.NewRecorder()
+
+		engine.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusNoContent, w.Result().StatusCode)
+	})
+
+	t.Run("applies stale-state guard to a batch", func(t *testing.T) {
+		engine, _, rs := setupResourceHandlerTest(t)
+		rs.EXPECT().DeleteByIDs(gomock.Any(), []string{"res-1", "res-2"}, false, true).Return(nil)
+		req := httptest.NewRequest(http.MethodDelete, "/api/vega-backend/in/v1/resources/res-1,res-2,res-1?only_if_stale=true", nil)
+		w := httptest.NewRecorder()
+
+		engine.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusNoContent, w.Result().StatusCode)
+	})
+
+	t.Run("rejects incompatible missing-state options", func(t *testing.T) {
+		engine, _, _ := setupResourceHandlerTest(t)
+		req := httptest.NewRequest(http.MethodDelete, "/api/vega-backend/in/v1/resources/res-1?only_if_stale=true&ignore_missing=true", nil)
+		w := httptest.NewRecorder()
+
+		engine.ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusBadRequest, w.Result().StatusCode)
+	})
+}
+
+func TestReadResourceDiscoverStrategy(t *testing.T) {
+	for _, tt := range []struct {
+		body, want string
+		fail       bool
+	}{
+		{"", "full_sync", false}, {`{}`, "full_sync", false}, {`{"strategy":"count_only"}`, "count_only", false},
+		{`{"strategy":"create_only"}`, "", true}, {`{"strategy":"invalid"}`, "", true}, {`{`, "", true},
+	} {
+		t.Run(tt.body, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest("POST", "/resources/id/discover", strings.NewReader(tt.body))
+			got, err := readResourceDiscoverStrategy(c)
+			if tt.fail {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tt.want, got)
+			}
+		})
+	}
+}
+
+func TestRestHandlerDiscoverResource(t *testing.T) {
+	for _, tt := range []struct {
+		category string
+		status   int
+	}{
+		{interfaces.ResourceCategoryDataset, http.StatusBadRequest},
+		{interfaces.ResourceCategoryTable, http.StatusOK},
+	} {
+		t.Run(tt.category, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			rs := vmock.NewMockResourceService(ctrl)
+			dts := vmock.NewMockDiscoverTaskService(ctrl)
+			handler := &restHandler{rs: rs, dts: dts}
+			engine := gin.New()
+			engine.POST("/resources/:id/discover", handler.DiscoverResourceByIn)
+			rs.EXPECT().InternalGetByID(gomock.Any(), nil, "res").Return(&interfaces.Resource{
+				ID: "res", CatalogID: "cat", Category: tt.category,
+			}, nil)
+			dts.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, req *interfaces.CreateDiscoverTaskRequest) (string, error) {
+				assert.Equal(t, "res", req.ResourceID)
+				assert.Equal(t, "cat", req.CatalogID)
+				assert.Equal(t, interfaces.DiscoverStrategyCountOnly, req.Strategy)
+				if tt.status == http.StatusBadRequest {
+					return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+						WithErrorDetails("resource category dataset does not support count_only")
+				}
+				return "task", nil
+			})
+			req := httptest.NewRequest(http.MethodPost, "/resources/res/discover", strings.NewReader(`{"strategy":"count_only"}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			assert.Equal(t, tt.status, w.Code)
+			if tt.status == http.StatusBadRequest {
+				assert.Contains(t, w.Body.String(), "does not support count_only")
+				assert.NotContains(t, w.Body.String(), `"id"`)
+			} else {
+				assert.JSONEq(t, `{"id":"task"}`, w.Body.String())
+			}
+		})
+	}
 }

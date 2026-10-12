@@ -10,8 +10,10 @@ package resource
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"reflect"
 	"slices"
@@ -153,19 +155,16 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 
 	var logicType string
 	switch req.Category {
-	case interfaces.ResourceCategoryLogicView:
-		logicType, err = rs.validateLogicDefinition(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-		viewFields, err := rs.parseLogicDefinition(ctx, req.LogicDefinition)
+	case interfaces.ResourceCategoryLogicalView:
+		var viewFields []*interfaces.Property
+		req.SourceMetadata = nil
+		logicType, viewFields, err = PrepareLogicalView(ctx, req)
 		if err != nil {
 			return nil, err
 		}
 		req.SchemaDefinition = viewFields
-		if req.SourceIdentifier == "" {
-			req.SourceIdentifier = fmt.Sprintf("%s.%s", req.CatalogID, id)
-		}
+		req.SourceIdentifier = id
+		req.Schema = ""
 	}
 	if (req.Category == interfaces.ResourceCategoryTable || req.Category == interfaces.ResourceCategoryDataset) && req.SchemaDefinition != nil {
 		AddDefaultStringAndTextFeatures(req.SchemaDefinition, req.IndexConfig)
@@ -189,7 +188,7 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 			return nil, err
 		}
 	}
-	if err := rs.validateIndexConfigModels(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
+	if err := rs.validateIndexConfigModels(ctx, req.SchemaDefinition, req.IndexConfig, req.Category); err != nil {
 		return nil, err
 	}
 	if err := rs.validateIndexConfigAnalyzers(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
@@ -272,7 +271,7 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 			span.SetStatus(codes.Error, "failed to register resource parent")
 
 			cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), resourceParentCleanupTimeout)
-			if cleanupErr := rs.ra.DeleteByIDs(cleanupCtx, []string{resource.ID}); cleanupErr != nil {
+			if cleanupErr := rs.ra.DeleteByIDs(cleanupCtx, []string{resource.ID}, false); cleanupErr != nil {
 				logger.Errorf("Delete resource after parent publication failure: resource %s: %v",
 					resource.ID, cleanupErr)
 			}
@@ -477,26 +476,31 @@ func (rs *resourceService) populateResourceRowCounts(ctx context.Context, resour
 	if !includeRowCount {
 		for _, resource := range resources {
 			resource.RowCount = nil
+			resource.EstimatedRowCount = nil
+			resource.RowCountTime = nil
 		}
 		return
 	}
 	for _, resource := range resources {
+		resource.EstimatedRowCount = nil
 		if resource.Category == interfaces.ResourceCategoryDataset {
+			resource.RowCount = nil
+			resource.RowCountTime = nil
 			count, err := rs.ds.CountDocuments(ctx, resource)
 			if err != nil {
 				logger.Warnf("Failed to populate dataset row count for resource %s: %v", resource.ID, err)
-				resource.RowCount = nil
 				continue
 			}
 			resource.RowCount = &count
+			countTime := time.Now().UnixMilli()
+			resource.RowCountTime = &countTime
 			continue
 		}
-		count, ok := sourceMetadataRowCount(resource.SourceMetadata)
-		if !ok {
-			resource.RowCount = nil
-			continue
+		properties, _ := resource.SourceMetadata["properties"].(map[string]any)
+		resource.EstimatedRowCount = sourceMetadataRowCount(properties["estimated_row_count"])
+		if resource.RowCount == nil || resource.RowCountTime != nil && *resource.RowCountTime <= 0 {
+			resource.RowCountTime = nil
 		}
-		resource.RowCount = &count
 	}
 }
 
@@ -512,23 +516,12 @@ func populateResourceColumnCount(resource *interfaces.Resource) {
 	resource.ColumnCount = &count
 }
 
-func sourceMetadataRowCount(sourceMetadata map[string]any) (int64, bool) {
-	if sourceMetadata == nil {
-		return 0, false
-	}
-	properties, ok := sourceMetadata["properties"].(map[string]any)
-	if !ok {
-		return 0, false
-	}
-	value, ok := properties["row_count"]
-	if !ok {
-		return 0, false
-	}
+func sourceMetadataRowCount(value any) *int64 {
 	count, ok := common.NumberAsInt64(value)
 	if !ok || count < 0 {
-		return 0, false
+		return nil
 	}
-	return count, true
+	return &count
 }
 
 // List lists Resources with filters.
@@ -725,6 +718,12 @@ func (rs *resourceService) Update(ctx context.Context, req *interfaces.ResourceR
 		span.SetStatus(codes.Error, "Invalid resource update scope")
 		return err
 	}
+	if resource.Category == interfaces.ResourceCategoryDataset && resource.LocalIndexName != "" {
+		if field := changedDatasetFulltextAnalyzer(resource, req); field != "" {
+			return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_InvalidParameter_RequestBody).
+				WithErrorDetails(fmt.Sprintf("dataset fulltext analyzer for field %q cannot be changed on an existing index; rebuild the dataset instead", field))
+		}
+	}
 	// Older Dataset rows can have a vector feature without its persisted
 	// dimension. Completing that metadata must also pass through the index
 	// mapping update; otherwise the Resource row and physical index contract
@@ -765,18 +764,11 @@ func (rs *resourceService) Update(ctx context.Context, req *interfaces.ResourceR
 	}
 
 	switch resource.Category {
-	case interfaces.ResourceCategoryLogicView:
-		logicType, err := rs.validateLogicDefinition(ctx, req)
-		if err != nil {
-			return err
-		}
-		viewFields, err := rs.parseLogicDefinition(ctx, req.LogicDefinition)
-		if err != nil {
-			return err
-		}
-		resource.SchemaDefinition = viewFields
-		resource.LogicType = logicType
+	case interfaces.ResourceCategoryLogicalView:
+		resource.SchemaDefinition = req.SchemaDefinition
+		resource.LogicType = req.LogicType
 		resource.LogicDefinition = req.LogicDefinition
+		resource.SourceMetadata = req.SourceMetadata
 	default:
 		resource.SchemaDefinition = applyMutableSchemaFields(
 			resource.SchemaDefinition,
@@ -806,7 +798,7 @@ func (rs *resourceService) Update(ctx context.Context, req *interfaces.ResourceR
 			return err
 		}
 	}
-	if err := rs.validateIndexConfigModels(ctx, resource.SchemaDefinition, resource.IndexConfig); err != nil {
+	if err := rs.validateIndexConfigModels(ctx, resource.SchemaDefinition, resource.IndexConfig, resource.Category); err != nil {
 		return err
 	}
 	if err := rs.validateIndexConfigAnalyzers(ctx, resource.SchemaDefinition, resource.IndexConfig); err != nil {
@@ -868,6 +860,15 @@ func (rs *resourceService) Update(ctx context.Context, req *interfaces.ResourceR
 		span.SetStatus(codes.Error, "Resource update conflict")
 		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_UpdateConflict)
 	}
+	if resource.Category == interfaces.ResourceCategoryLogicalView && buildRelevantChanged {
+		resource.RowCount = nil
+		resource.RowCountTime = nil
+		if _, err := rs.ra.UpdateRowCount(ctx, tx, resource, resource.UpdateTime); err != nil {
+			otellog.LogError(ctx, "Clear changed view row count failed", err)
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+				WithErrorDetails("failed to update resource")
+		}
+	}
 	if resource.Category == interfaces.ResourceCategoryDataset && (buildRelevantChanged || legacyDatasetVectorDimensions) {
 		// Claim the resource version before changing OpenSearch. The transaction
 		// keeps concurrent updates from publishing an unpersisted mapping while
@@ -924,6 +925,48 @@ func (rs *resourceService) Update(ctx context.Context, req *interfaces.ResourceR
 	}
 	span.SetStatus(codes.Ok, "")
 	return nil
+}
+
+// jsonNumbersEqual compares JSON-backed values without treating float64 and
+// json.Number representations of the same number as a schema change.
+func jsonNumbersEqual(current, next any) bool {
+	currentValue, err := comparableJSONValue(current)
+	if err != nil {
+		return false
+	}
+	nextValue, err := comparableJSONValue(next)
+	return err == nil && reflect.DeepEqual(currentValue, nextValue)
+}
+
+func comparableJSONValue(value any) (any, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var decoded any
+	if err := common.UnmarshalPreciseJSON(encoded, &decoded); err != nil {
+		return nil, err
+	}
+	return normalizeJSONNumbers(decoded), nil
+}
+
+func normalizeJSONNumbers(value any) any {
+	switch v := value.(type) {
+	case json.Number:
+		if number, ok := new(big.Rat).SetString(string(v)); ok {
+			return struct{ Number string }{number.RatString()}
+		}
+		return v
+	case []any:
+		for i := range v {
+			v[i] = normalizeJSONNumbers(v[i])
+		}
+	case map[string]any:
+		for key := range v {
+			v[key] = normalizeJSONNumbers(v[key])
+		}
+	}
+	return value
 }
 
 func hasMissingVectorFeatureDimensions(schema []*interfaces.Property) bool {
@@ -1044,10 +1087,14 @@ func (rs *resourceService) UpdateDiscoverStatus(ctx context.Context, id string, 
 }
 
 // DeleteByIDs deletes Resources by IDs.
-func (rs *resourceService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool) error {
+func (rs *resourceService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing, onlyIfStale bool) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Delete resources")
 	defer span.End()
 
+	if ignoreMissing && onlyIfStale {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+			WithErrorDetails("only_if_stale cannot be combined with ignore_missing")
+	}
 	if len(ids) == 0 {
 		span.SetStatus(codes.Ok, "")
 		return nil
@@ -1131,6 +1178,13 @@ func (rs *resourceService) DeleteByIDs(ctx context.Context, ids []string, ignore
 		span.SetStatus(codes.Ok, "")
 		return nil
 	}
+	if onlyIfStale {
+		for _, resource := range resources {
+			if resource.Status != interfaces.ResourceStatusStale || resource.LastDiscoverStatus != interfaces.DiscoverStatusMissing {
+				return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_DeleteConflict)
+			}
+		}
+	}
 
 	for _, resource := range resources {
 		if err := rs.rejectResourceOperationWhenActiveDiscoverTask(ctx, resource.ID); err != nil {
@@ -1143,10 +1197,13 @@ func (rs *resourceService) DeleteByIDs(ctx context.Context, ids []string, ignore
 		}
 	}
 
-	if err := rs.ra.DeleteByIDs(ctx, existingIDs); err != nil {
+	if err := rs.ra.DeleteByIDs(ctx, existingIDs, onlyIfStale); err != nil {
+		if errors.Is(err, interfaces.ErrResourceDeleteConditionNotMet) {
+			return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_DeleteConflict)
+		}
 		span.SetStatus(codes.Error, "Delete resources failed")
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_DeleteFailed).
-			WithErrorDetails(err.Error())
+			WithErrorDetails("failed to delete resources")
 	}
 
 	parentIDs := make([]string, 0, len(resources))
@@ -1333,15 +1390,13 @@ func (rs *resourceService) InternalCreate(ctx context.Context, tx *sql.Tx, req *
 		logicType string
 		err       error
 	)
-	if req.Category == interfaces.ResourceCategoryLogicView {
-		logicType, err = rs.validateLogicDefinition(ctx, req)
+	if req.Category == interfaces.ResourceCategoryLogicalView {
+		logicType, req.SchemaDefinition, err = PrepareLogicalView(ctx, req)
 		if err != nil {
 			return nil, err
 		}
-		req.SchemaDefinition, err = rs.parseLogicDefinition(ctx, req.LogicDefinition)
-		if err != nil {
-			return nil, err
-		}
+		req.SourceIdentifier = id
+		req.Schema = ""
 	}
 	if (req.Category == interfaces.ResourceCategoryTable || req.Category == interfaces.ResourceCategoryDataset) && req.SchemaDefinition != nil {
 		AddDefaultStringAndTextFeatures(req.SchemaDefinition, req.IndexConfig)
@@ -1457,8 +1512,21 @@ func (rs *resourceService) validateResourceUpdateScope(ctx context.Context,
 	if req.Category != resource.Category {
 		return false, unsupportedResourceUpdateError(ctx, "category cannot be updated")
 	}
-	if resource.Category == interfaces.ResourceCategoryLogicView {
-		return req.LogicDefinition != nil && !reflect.DeepEqual(resource.LogicDefinition, req.LogicDefinition), nil
+	if resource.Category == interfaces.ResourceCategoryLogicalView {
+		if req.LogicType != resource.LogicType {
+			return false, unsupportedResourceUpdateError(ctx, "logic_type cannot be changed")
+		}
+		req.SourceMetadata = nil
+		logicType, viewFields, err := PrepareLogicalView(ctx, req)
+		if err != nil {
+			return false, err
+		}
+		if logicType != resource.LogicType {
+			return false, unsupportedResourceUpdateError(ctx, "logic_type cannot be changed")
+		}
+		req.SchemaDefinition = viewFields
+		return !jsonNumbersEqual(resource.LogicDefinition, req.LogicDefinition) ||
+			!jsonNumbersEqual(resource.SchemaDefinition, viewFields), nil
 	}
 	indexConfigChanged := req.IndexConfig != nil && !reflect.DeepEqual(resource.IndexConfig, req.IndexConfig)
 	if req.SchemaDefinition == nil {
@@ -1477,7 +1545,8 @@ func (rs *resourceService) validateResourceUpdateScope(ctx context.Context,
 	return schemaChanged || indexConfigChanged, err
 }
 
-func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema []*interfaces.Property, indexConfig *interfaces.ResourceIndexConfig) error {
+func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema []*interfaces.Property,
+	indexConfig *interfaces.ResourceIndexConfig, category string) error {
 	if err := validateIndexConfigKeyFields(ctx, schema, indexConfig); err != nil {
 		return err
 	}
@@ -1536,9 +1605,14 @@ func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema
 			feature.Config["dimension"] = model.EmbeddingDim
 		}
 	}
-	if err := ValidateVectorFeatureReferences(schema); err != nil {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
-			WithErrorDetails(err.Error())
+	// A derived view may expose only the field carrying a source Feature while
+	// its referenced vector field remains private. EE preparation validates the
+	// reference against the complete source schema before reaching this point.
+	if category != interfaces.ResourceCategoryLogicalView {
+		if err := ValidateVectorFeatureReferences(schema); err != nil {
+			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+				WithErrorDetails(err.Error())
+		}
 	}
 	return nil
 }
@@ -1584,6 +1658,45 @@ func (rs *resourceService) validateIndexConfigAnalyzers(ctx context.Context, sch
 		}
 	}
 	return nil
+}
+
+// fulltextAnalyzerConfigFor 返回 Dataset mapping 使用的字段级 analyzer 配置。
+// 缺省配置与显式 standard 必须区分；Dataset mapping 不读取资源默认 analyzer。
+func fulltextAnalyzerConfigFor(prop *interfaces.Property) (string, bool) {
+	if prop == nil {
+		return "", false
+	}
+	for _, feature := range prop.Features {
+		if feature.FeatureType == interfaces.PropertyFeatureType_Fulltext {
+			return strings.TrimSpace(fulltextAnalyzerConfigValue(feature.Config)), true
+		}
+	}
+	return "", false
+}
+
+// changedDatasetFulltextAnalyzer 检查已有全文字段的 mapping 分词器配置是否改变。
+// 空索引也不能通过更新 mapping 修改 analyzer。
+func changedDatasetFulltextAnalyzer(resource *interfaces.Resource, req *interfaces.ResourceRequest) string {
+	requestedSchema := req.SchemaDefinition
+	if requestedSchema == nil {
+		requestedSchema = resource.SchemaDefinition
+	}
+	current := make(map[string]string, len(resource.SchemaDefinition))
+	for _, prop := range resource.SchemaDefinition {
+		if analyzer, exists := fulltextAnalyzerConfigFor(prop); exists {
+			current[prop.Name] = analyzer
+		}
+	}
+	for _, prop := range requestedSchema {
+		analyzer, exists := fulltextAnalyzerConfigFor(prop)
+		if !exists {
+			continue
+		}
+		if previous, exists := current[prop.Name]; exists && previous != analyzer {
+			return prop.Name
+		}
+	}
+	return ""
 }
 
 func fulltextAnalyzerConfigValue(config map[string]any) string {
@@ -1792,7 +1905,7 @@ func validateMutableSchemaUpdate(ctx context.Context, current []*interfaces.Prop
 		requestedComparable.DisplayName = ""
 		requestedComparable.Description = ""
 		requestedComparable.Features = nil
-		if !reflect.DeepEqual(currentComparable, requestedComparable) {
+		if !jsonNumbersEqual(currentComparable, requestedComparable) {
 			return false, unsupportedResourceUpdateError(ctx, "schema_definition can only update field display_name, description, and features")
 		}
 		if !mutableFeaturesEqual(currentProp.Features, requestedProp.Features) {
@@ -1863,7 +1976,23 @@ func mutableFeaturesEqual(current, requested []interfaces.PropertyFeature) bool 
 			currentCopy[i].Config = config
 		}
 	}
-	return reflect.DeepEqual(currentCopy, requestedCopy)
+	return jsonNumbersEqual(currentCopy, requestedCopy)
+}
+
+// InitializeJSONIndexAttributes 为新建索引的 JSON 字段记录仅保存原值的策略。
+// 已有 Dataset 字段不调用此函数，避免改变不可变的 enabled 参数。
+func InitializeJSONIndexAttributes(schema []*interfaces.Property) {
+	for _, prop := range schema {
+		if prop == nil || prop.Type != interfaces.DataType_Json {
+			continue
+		}
+		attributes := make(map[string]any, len(prop.Attributes)+1)
+		for key, value := range prop.Attributes {
+			attributes[key] = value
+		}
+		attributes["enabled"] = false
+		prop.Attributes = attributes
+	}
 }
 
 func applyMutableSchemaFields(current []*interfaces.Property, requested []*interfaces.Property, allowPropertyAdditions bool) []*interfaces.Property {
@@ -1887,6 +2016,7 @@ func applyMutableSchemaFields(current []*interfaces.Property, requested []*inter
 			continue
 		}
 		if allowPropertyAdditions {
+			InitializeJSONIndexAttributes([]*interfaces.Property{requestedProp})
 			current = append(current, requestedProp)
 		}
 	}
@@ -1919,4 +2049,23 @@ func (rs *resourceService) CheckExistByCategories(ctx context.Context, catalogID
 	defer span.End()
 
 	return rs.ra.CheckExistByCategories(ctx, catalogID, categories)
+}
+
+func (rs *resourceService) InternalUpdateRowCount(ctx context.Context, tx *sql.Tx, source *interfaces.Resource, count, countTime int64) error {
+	if source == nil || count < 0 || countTime <= 0 {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody)
+	}
+	source.RowCount = &count
+	source.RowCountTime = &countTime
+	previous := source.UpdateTime
+	// 数量采集不改变资源定义版本，避免使数据游标和用户编辑失效。
+
+	updated, err := rs.ra.UpdateRowCount(ctx, tx, source, previous)
+	if err != nil {
+		return err
+	}
+	if updated != 1 {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_UpdateConflict)
+	}
+	return nil
 }

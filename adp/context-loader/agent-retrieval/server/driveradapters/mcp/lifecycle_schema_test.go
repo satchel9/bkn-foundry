@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -45,7 +46,7 @@ func TestBusinessToolSchemasRequireManagedBKNContext(t *testing.T) {
 				t.Fatalf("%s must advertise bkn_context", toolKey)
 			}
 			if !containsString(schema.Required, "bkn_context") {
-				t.Fatalf("%s must require bkn_context", toolKey)
+				t.Fatalf("%s must require managed bkn_context", toolKey)
 			}
 
 			var contextSchema struct {
@@ -92,7 +93,7 @@ func TestBusinessToolSchemasRequireManagedBKNContext(t *testing.T) {
 	}
 }
 
-func TestModuleOpenAPIRequiresManagedBKNContext(t *testing.T) {
+func TestModuleOpenAPIOffersOptionalManagedBKNContext(t *testing.T) {
 	documents := map[string]string{
 		"api_private/kn_search.yaml":                   "KnSearchCompatRequest",
 		"api_private/search_schema.yaml":               "SearchSchemaRequest",
@@ -130,8 +131,8 @@ func TestModuleOpenAPIRequiresManagedBKNContext(t *testing.T) {
 				t.Fatalf("BKNContext must document optional business_refs: %#v", contextSchema)
 			}
 			request, ok := document.Components.Schemas[requestSchema]
-			if !ok || !containsString(request.Required, "bkn_context") {
-				t.Fatalf("%s must require bkn_context: %#v", requestSchema, request)
+			if !ok || containsString(request.Required, "bkn_context") {
+				t.Fatalf("%s must offer optional bkn_context: %#v", requestSchema, request)
 			}
 			property, ok := request.Properties["bkn_context"]
 			if !ok || property["$ref"] != "#/components/schemas/BKNContext" {
@@ -187,8 +188,8 @@ func TestLifecycleToolsExposeExactCoreOutputSchemas(t *testing.T) {
 			t.Fatalf("%s output must be a closed object: %s", tool, output)
 		}
 		for _, field := range required {
-			if _, ok := schema.Properties[field]; !ok || !containsString(schema.Required, field) {
-				t.Fatalf("%s output must require Core field %s: %s", tool, field, output)
+			if _, ok := schema.Properties[field]; !ok {
+				t.Fatalf("%s output must declare healthy Core field %s: %s", tool, field, output)
 			}
 		}
 	}
@@ -445,7 +446,7 @@ func TestLifecycleSwaggerPathsRequestsAndResponsesAreStructurallyFrozen(t *testi
 func TestLifecycleMCPInputRequiredFieldsFollowAgentFacadeContract(t *testing.T) {
 	expected := map[string][]string{
 		"bkn_start_interaction":  {"question", "agent_name", "conversation_mode"},
-		"bkn_finish_interaction": {"interaction_id", "outcome"},
+		"bkn_finish_interaction": {"outcome"},
 	}
 	for tool, want := range expected {
 		input, _ := loadToolSchemas(tool)
@@ -468,11 +469,11 @@ func TestHelmEnforcesInstalledLifecycleCoreByDefault(t *testing.T) {
 	if !strings.Contains(string(values), `core_url: "http://agent-observability-internal:8081"`) {
 		t.Fatalf("Helm lifecycle default must target the internal agent-observability service: %s", values)
 	}
-	if !strings.Contains(string(values), `ingest_url: "http://agent-observability:8080/api/agent-observability/v1/evidence/events"`) {
-		t.Fatal("Helm must preserve the token-protected public evidence producer contract")
+	if !strings.Contains(string(values), `artifact_endpoint: "http://agent-observability:8080/api/agent-observability/v1/evidence/artifacts"`) {
+		t.Fatal("Helm must configure the independent Artifact endpoint")
 	}
-	if !strings.Contains(string(values), `ingest_token_secret_name: "bkn-trace-evidence-ingest"`) {
-		t.Fatal("Helm must wire the standard evidence ingest Secret by default")
+	if !strings.Contains(string(values), `artifact_secret_name: "bkn-trace-evidence-ingest"`) {
+		t.Fatal("Helm must wire the existing Core credential Secret for Artifact persistence")
 	}
 	deploymentPath := filepath.Clean("../../../helm/agent-retrieval/templates/deployment.yaml")
 	deployment, err := os.ReadFile(deploymentPath)
@@ -489,11 +490,31 @@ func TestHelmEnforcesInstalledLifecycleCoreByDefault(t *testing.T) {
 	if strings.Contains(rendering, `if .Values.observability.lifecycle.core_url`) {
 		t.Fatal("lifecycle enforcement must not have a long-lived disable switch")
 	}
+	// A completed finish cannot close without an answer artifact (#1819), so an
+	// empty endpoint must fail the install rather than every finish after it.
+	if !strings.Contains(rendering, `required "observability.evidence.artifact_endpoint is required"`) {
+		t.Fatal("Helm must reject an empty Artifact endpoint")
+	}
+	if strings.Contains(rendering, `if .Values.observability.evidence.artifact_endpoint`) {
+		t.Fatal("the Artifact endpoint must not be optional at render time")
+	}
 	if strings.Contains(rendering, `BKN_TRACE_QUERY_GATEWAY_TOKEN`) {
 		t.Fatal("Helm must not inject a shared lifecycle token into agent-retrieval")
 	}
-	if !strings.Contains(rendering, `BKN_TRACE_EVIDENCE_INGEST_TOKEN`) {
-		t.Fatal("Helm must retain the evidence ingest token for the public producer contract")
+	if !strings.Contains(rendering, `BKN_TRACE_ARTIFACT_TOKEN`) {
+		t.Fatal("Helm must inject Artifact credentials using their explicit runtime env name")
+	}
+	if strings.Contains(rendering, `BKN_TRACE_EVIDENCE_INGEST_URL`) {
+		t.Fatal("Helm must not render an HTTP Evidence event endpoint")
+	}
+	for _, env := range []string{
+		"BKN_TRACE_EVIDENCE_QUEUE_MAX_RECORDS", "BKN_TRACE_EVIDENCE_QUEUE_MAX_BYTES",
+		"BKN_TRACE_EVIDENCE_MAX_RECORD_BYTES", "BKN_TRACE_EVIDENCE_MAX_ATTEMPTS",
+		"BKN_TRACE_EVIDENCE_RETRY_BACKOFF_MS",
+	} {
+		if !strings.Contains(rendering, env) {
+			t.Fatalf("Helm must render the bounded publisher setting %s", env)
+		}
 	}
 	if !strings.Contains(rendering, `optional: true`) {
 		t.Fatal("evidence ingest Secret reference must stay optional so standalone retrieval still starts")
@@ -579,4 +600,98 @@ func sameStringSet(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+// A model reaching this server over MCP cannot set a transport header, so
+// telling it that X-Kn-ID carries the knowledge network sends it to a dead
+// end: the handler then refuses the call for a missing kn_id. This scans what
+// each entry publishes, which is what a model reads; the header fallback
+// itself stays for REST callers, and the adapter contract at GET /mcp/info
+// still describes it.
+func TestPublishedTextDoesNotOfferTheKnIDHeader(t *testing.T) {
+	for _, locale := range []string{"zh-CN", "en-US"} {
+		bundle := loadMCPLocaleBundle(locale)
+		if strings.Contains(bundle.ServerInstructions(), "X-Kn-ID") ||
+			strings.Contains(bundle.CompactServerInstructions(), "X-Kn-ID") {
+			t.Errorf("%s: the server instructions offer the X-Kn-ID header", locale)
+		}
+		full, _ := newMCPServerForLocale(nil, locale)
+		for entry, tools := range map[string]map[string]listedTool{
+			"/mcp":         listedTools(t, full),
+			"/mcp-compact": listedTools(t, compactServer(t, locale)),
+		} {
+			for name, tool := range tools {
+				if strings.Contains(string(tool.InputSchema), "X-Kn-ID") {
+					t.Errorf("%s %s %s: the published input schema offers the X-Kn-ID header",
+						locale, entry, name)
+				}
+			}
+			meta := bundle.ToolMeta(toolKeySearchInstance)
+			if strings.Contains(meta.Description, "X-Kn-ID") {
+				t.Errorf("%s: search_instance's description offers the X-Kn-ID header", locale)
+			}
+		}
+	}
+}
+
+// search_instance declared only query as required while the handler refused a
+// call without kn_id, so the first attempt of a client that cannot set
+// X-Kn-ID always failed.
+func TestSearchInstanceRequiresTheKnowledgeNetwork(t *testing.T) {
+	for _, locale := range []string{"zh-CN", "en-US"} {
+		input, _ := loadMCPLocaleBundle(locale).ToolSchemas(toolKeySearchInstance)
+		var schema struct {
+			Required []string `json:"required"`
+		}
+		if err := json.Unmarshal(input, &schema); err != nil {
+			t.Fatalf("%s: decode search_instance schema: %v", locale, err)
+		}
+		if !slices.Contains(schema.Required, "kn_id") {
+			t.Errorf("%s: search_instance required = %v, want kn_id among them", locale, schema.Required)
+		}
+	}
+}
+
+// Logic properties reach the caller through get_object_types and
+// search_schema, and their parameter definitions are what tells a caller
+// which values it has to supply. Both responses carried them only because
+// additionalProperties is open, with nothing declaring them, so a caller
+// reading the contract could not know they were there.
+func TestSchemaDeclaresLogicPropertyParameters(t *testing.T) {
+	for _, toolKey := range []string{toolKeyGetObjectTypes, toolKeySearchSchema} {
+		for _, locale := range []string{"zh-CN", "en-US"} {
+			_, output := loadMCPLocaleBundle(locale).ToolSchemas(toolKey)
+			var schema struct {
+				Properties struct {
+					ObjectTypes struct {
+						Items struct {
+							Properties struct {
+								LogicProperties struct {
+									Description string `json:"description"`
+									Items       struct {
+										Properties map[string]struct {
+											Description string `json:"description"`
+										} `json:"properties"`
+									} `json:"items"`
+								} `json:"logic_properties"`
+							} `json:"properties"`
+						} `json:"items"`
+					} `json:"object_types"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal(output, &schema); err != nil {
+				t.Fatalf("%s %s: decode output schema: %v", locale, toolKey, err)
+			}
+			declared := schema.Properties.ObjectTypes.Items.Properties.LogicProperties
+			if declared.Description == "" {
+				t.Errorf("%s %s: logic_properties is not declared", locale, toolKey)
+				continue
+			}
+			for _, field := range []string{"name", "type", "data_source", "parameters"} {
+				if declared.Items.Properties[field].Description == "" {
+					t.Errorf("%s %s: logic_properties.%s has no description", locale, toolKey, field)
+				}
+			}
+		}
+	}
 }

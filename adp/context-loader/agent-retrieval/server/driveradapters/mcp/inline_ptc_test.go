@@ -139,7 +139,7 @@ func TestInlineExecutionToolsDeclareBKNContext(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("%s 没有把 bkn_context 标为必填", tool.Name)
+			t.Fatalf("%s 必须把 bkn_context 标为业务必填", tool.Name)
 		}
 	}
 }
@@ -179,8 +179,8 @@ func TestInlineExecutionToolsAreCallable(t *testing.T) {
 		if strings.Contains(got, "not found") {
 			t.Fatalf("%s 在工具面上，但调用时是未知工具——handler 没挂上: %s", name, got)
 		}
-		if !strings.Contains(got, "conversation") {
-			t.Fatalf("%s 缺 bkn_context 时应被生命周期守卫拦下，实际: %s", name, got)
+		if !strings.Contains(got, "conversation_required") || strings.Contains(got, "caller token") {
+			t.Fatalf("%s 缺 bkn_context 时必须停止业务执行，实际: %s", name, got)
 		}
 	}
 }

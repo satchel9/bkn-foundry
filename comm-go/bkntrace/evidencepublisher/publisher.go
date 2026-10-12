@@ -21,9 +21,12 @@ type Publisher struct {
 	metrics Metrics
 
 	mu         sync.Mutex
+	drainMu    sync.Mutex
 	queue      []queuedRecord
 	queueBytes int
 	sequence   uint64
+	published  uint64
+	dropped    uint64
 	closed     bool
 	lastAck    DrainResult
 }
@@ -50,12 +53,19 @@ func (p *Publisher) SetMetrics(metrics Metrics) {
 }
 
 func (p *Publisher) TryPublish(event Event) PublishResult {
+	return p.TryPublishForPolicyRevision(event, p.config.CapturePolicyRevision)
+}
+
+// TryPublishForPolicyRevision enqueues one live Record using the already
+// validated policy revision supplied by the runtime. It remains a local,
+// non-blocking operation and preserves the revision on each queued Record.
+func (p *Publisher) TryPublishForPolicyRevision(event Event, capturePolicyRevision string) PublishResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.metrics.Eligible()
-	if p.closed {
-		p.metrics.Dropped(ReasonPublisherClosing)
-		return PublishResult{Disposition: Dropped, Reason: ReasonPublisherClosing}
+	if _, err := parseCanonicalRevision(capturePolicyRevision); err != nil {
+		p.metrics.Dropped(ReasonInvalidEvent)
+		return PublishResult{Disposition: Dropped, Reason: ReasonInvalidEvent}
 	}
 	if event.EventID == "" || event.EventType == "" || len(event.Envelope) == 0 {
 		p.metrics.Dropped(ReasonInvalidEvent)
@@ -65,6 +75,15 @@ func (p *Publisher) TryPublish(event Event) PublishResult {
 	if err != nil {
 		p.metrics.Dropped(ReasonInvalidEvent)
 		return PublishResult{EventID: event.EventID, Disposition: Dropped, Reason: ReasonInvalidEvent}
+	}
+	if prior, ok := p.previousDecision(event, payloadHash); ok {
+		// Reuse the first admission decision after validating the current payload
+		// with the existing hash pass. No new sequence or second queued Record.
+		return prior
+	}
+	if p.closed {
+		p.metrics.Dropped(ReasonPublisherClosing)
+		return PublishResult{Disposition: Dropped, Reason: ReasonPublisherClosing}
 	}
 	sequence := p.sequence + 1
 	value := map[string]any{
@@ -100,15 +119,15 @@ func (p *Publisher) TryPublish(event Event) PublishResult {
 	bytes, err := json.Marshal(value)
 	if err != nil {
 		p.metrics.Dropped(ReasonSerialization)
-		return PublishResult{EventID: event.EventID, Disposition: Dropped, Reason: ReasonSerialization}
+		return PublishResult{EventID: event.EventID, EventType: event.EventType, PayloadHash: payloadHash, ProducerID: p.config.ProducerID, Disposition: Dropped, Reason: ReasonSerialization}
 	}
 	if len(bytes) > p.config.MaxRecordBytes {
 		p.metrics.Dropped(ReasonMessageTooLarge)
-		return PublishResult{EventID: event.EventID, Disposition: Dropped, Reason: ReasonMessageTooLarge}
+		return PublishResult{EventID: event.EventID, EventType: event.EventType, PayloadHash: payloadHash, ProducerID: p.config.ProducerID, Disposition: Dropped, Reason: ReasonMessageTooLarge}
 	}
 	if len(p.queue) >= p.config.QueueMaxRecords || p.queueBytes+len(bytes) > p.config.QueueMaxBytes {
 		p.metrics.Dropped(ReasonQueueFull)
-		return PublishResult{EventID: event.EventID, Disposition: Dropped, Reason: ReasonQueueFull}
+		return PublishResult{EventID: event.EventID, EventType: event.EventType, PayloadHash: payloadHash, ProducerID: p.config.ProducerID, Disposition: Dropped, Reason: ReasonQueueFull}
 	}
 	record := Record{
 		Key:   p.config.BaseStreamID + ":" + p.config.ProcessBootID,
@@ -116,7 +135,7 @@ func (p *Publisher) TryPublish(event Event) PublishResult {
 		Headers: []Header{
 			{Key: "content-type", Value: "application/json"},
 			{Key: "bkn-trace-schema-version", Value: "3.0.0"},
-			{Key: "capture_policy_revision", Value: p.config.CapturePolicyRevision},
+			{Key: "capture_policy_revision", Value: capturePolicyRevision},
 			{Key: "producer_instance_id", Value: p.config.WorkloadIdentity + "#" + p.config.ProcessBootID},
 			{Key: "bkn-evidence-record-class", Value: "live"},
 		},
@@ -125,7 +144,27 @@ func (p *Publisher) TryPublish(event Event) PublishResult {
 	p.queueBytes += len(bytes)
 	p.sequence = sequence
 	p.metrics.Accepted()
-	return PublishResult{EventID: event.EventID, Disposition: Accepted}
+	return PublishResult{EventID: event.EventID, EventType: event.EventType, PayloadHash: payloadHash, ProducerID: p.config.ProducerID, Disposition: Accepted}
+}
+
+func (p *Publisher) previousDecision(event Event, payloadHash string) (PublishResult, bool) {
+	prior := event.PreviousResult
+	if prior != nil && prior.EventID == event.EventID && prior.EventType == event.EventType && prior.PayloadHash == payloadHash && prior.ProducerID == p.config.ProducerID && (prior.Disposition == Accepted || (prior.Disposition == Dropped && prior.Reason != "")) {
+		return *prior, true
+	}
+	return PublishResult{}, false
+}
+
+// Replay only verifies a local prior decision; it cannot admit a new Record.
+func (p *Publisher) replayAdmission(event Event) (PublishResult, bool) {
+	if event.PreviousResult == nil || event.EventID == "" || event.EventType == "" || len(event.Envelope) == 0 {
+		return PublishResult{}, false
+	}
+	payloadHash, err := canonicalPayloadHash(event.Envelope)
+	if err != nil {
+		return PublishResult{}, false
+	}
+	return p.previousDecision(event, payloadHash)
 }
 
 func (p *Publisher) SnapshotQueue() []Record {
@@ -144,7 +183,34 @@ func (p *Publisher) NextSequence() uint64 {
 	return p.sequence + 1
 }
 
+func (p *Publisher) Flush(ctx context.Context) DrainResult {
+	return p.FlushForPolicyRevision(ctx, p.config.CapturePolicyRevision)
+}
+
+// FlushForPolicyRevision accounts the queue against the validated policy
+// revision that closed its admission boundary. Queued records keep their own
+// immutable Header revisions.
+func (p *Publisher) FlushForPolicyRevision(ctx context.Context, capturePolicyRevision string) DrainResult {
+	if _, err := parseCanonicalRevision(capturePolicyRevision); err != nil {
+		return DrainResult{}
+	}
+	return p.drain(ctx, false, capturePolicyRevision)
+}
+
 func (p *Publisher) Close(ctx context.Context) DrainResult {
+	return p.CloseForPolicyRevision(ctx, p.config.CapturePolicyRevision)
+}
+
+func (p *Publisher) CloseForPolicyRevision(ctx context.Context, capturePolicyRevision string) DrainResult {
+	if _, err := parseCanonicalRevision(capturePolicyRevision); err != nil {
+		return DrainResult{}
+	}
+	return p.drain(ctx, true, capturePolicyRevision)
+}
+
+func (p *Publisher) drain(ctx context.Context, closePublisher bool, capturePolicyRevision string) DrainResult {
+	p.drainMu.Lock()
+	defer p.drainMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -159,13 +225,15 @@ func (p *Publisher) Close(ctx context.Context) DrainResult {
 		p.mu.Unlock()
 		return ack
 	}
-	p.closed = true
+	if closePublisher {
+		p.closed = true
+	}
 	items := append([]queuedRecord(nil), p.queue...)
 	p.queue = nil
 	p.queueBytes = 0
 	ack := DrainResult{
 		ProducerInstanceID:    p.config.WorkloadIdentity + "#" + p.config.ProcessBootID,
-		CapturePolicyRevision: p.config.CapturePolicyRevision,
+		CapturePolicyRevision: capturePolicyRevision,
 		LastAcceptedSequence:  p.sequence,
 		QueueEmpty:            true,
 	}
@@ -212,6 +280,10 @@ func (p *Publisher) Close(ctx context.Context) DrainResult {
 		}
 	}
 	p.mu.Lock()
+	p.published += ack.Published
+	p.dropped += ack.Dropped
+	ack.Published = p.published
+	ack.Dropped = p.dropped
 	p.lastAck = ack
 	p.mu.Unlock()
 	return ack

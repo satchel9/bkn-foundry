@@ -94,6 +94,9 @@ func TestTryPublishBuildsFrozenRecordAndUsesGoLedgerHash(t *testing.T) {
 	if value["payload_hash"] != "2a1cf0c9bbb7146106feb3d0d5139e0bf67a6700e2585d77d20d78289dfafae6" {
 		t.Fatalf("payload_hash = %v", value["payload_hash"])
 	}
+	if ack := publisher.Close(context.Background()); ack.Published != 1 || len(sender.records) != 1 {
+		t.Fatalf("sender records = %d, ack = %+v; want one delivered record", len(sender.records), ack)
+	}
 }
 
 func TestTryPublishIsFailOpenWhenQueueIsFullAndDoesNotConsumeSequence(t *testing.T) {
@@ -143,6 +146,23 @@ func TestPublisherRejectsNonCanonicalCapturePolicyRevision(t *testing.T) {
 	}
 }
 
+func TestTryPublishForPolicyRevisionPreservesPerRecordRevision(t *testing.T) {
+	publisher, err := New(publisherTestConfig(), &fakeSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close(context.Background())
+	if result := publisher.TryPublishForPolicyRevision(publisherTestEvent(), "42"); result.Disposition != Accepted {
+		t.Fatalf("TryPublishForPolicyRevision() = %+v", result)
+	}
+	if got := publisher.SnapshotQueue()[0].Header("capture_policy_revision"); got != "42" {
+		t.Fatalf("capture_policy_revision = %q; want 42", got)
+	}
+	if result := publisher.TryPublishForPolicyRevision(publisherTestEvent(), "042"); result.Disposition != Dropped || result.Reason != ReasonInvalidEvent {
+		t.Fatalf("noncanonical policy revision result = %+v", result)
+	}
+}
+
 func TestPublisherCloseHonorsShutdownTimeout(t *testing.T) {
 	cfg := publisherTestConfig()
 	cfg.ShutdownTimeout = 10 * time.Millisecond
@@ -162,5 +182,124 @@ func TestPublisherCloseHonorsShutdownTimeout(t *testing.T) {
 	}
 	if ack.Dropped != 1 || ack.QueueEmpty != true {
 		t.Fatalf("close ack = %+v", ack)
+	}
+}
+
+func TestPublisherFlushSendsWithoutClosing(t *testing.T) {
+	sender := &fakeSender{}
+	publisher, err := New(publisherTestConfig(), sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close(context.Background())
+	if publisher.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("publish rejected")
+	}
+	ack := publisher.Flush(context.Background())
+	if ack.Published != 1 || !ack.QueueEmpty || len(sender.records) != 1 {
+		t.Fatalf("flush ack=%+v records=%d", ack, len(sender.records))
+	}
+	second := publisherTestEvent()
+	second.EventID = "evt-flush-second"
+	if publisher.TryPublish(second).Disposition != Accepted {
+		t.Fatal("publisher closed after flush")
+	}
+}
+
+func TestPublisherDrainAcknowledgementIsCumulativeAcrossFlushes(t *testing.T) {
+	sender := &fakeSender{}
+	publisher, err := New(publisherTestConfig(), sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close(context.Background())
+	for _, eventID := range []string{"evt-cumulative-a", "evt-cumulative-b"} {
+		event := publisherTestEvent()
+		event.EventID = eventID
+		if result := publisher.TryPublish(event); result.Disposition != Accepted {
+			t.Fatalf("TryPublish() = %+v", result)
+		}
+	}
+	if ack := publisher.Flush(context.Background()); ack.Published != 2 || ack.Dropped != 0 || ack.LastAcceptedSequence != 2 {
+		t.Fatalf("first flush ack = %+v", ack)
+	}
+	if ack := publisher.Flush(context.Background()); ack.Published != 2 || ack.Dropped != 0 || ack.LastAcceptedSequence != 2 || !ack.QueueEmpty {
+		t.Fatalf("empty flush ack = %+v", ack)
+	}
+
+	failing := publisherTestEvent()
+	failing.EventID = "evt-cumulative-dropped"
+	sender.failures = 3
+	if result := publisher.TryPublish(failing); result.Disposition != Accepted {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+	if ack := publisher.Flush(context.Background()); ack.Published != 2 || ack.Dropped != 1 || ack.LastAcceptedSequence != 3 {
+		t.Fatalf("failed flush ack = %+v", ack)
+	}
+
+	success := publisherTestEvent()
+	success.EventID = "evt-cumulative-published"
+	if result := publisher.TryPublish(success); result.Disposition != Accepted {
+		t.Fatalf("TryPublish() = %+v", result)
+	}
+	if ack := publisher.Flush(context.Background()); ack.Published != 3 || ack.Dropped != 1 || ack.LastAcceptedSequence != 4 {
+		t.Fatalf("subsequent flush ack = %+v", ack)
+	}
+}
+
+func TestPublisherFlushHonorsContextTimeoutAndCanRetry(t *testing.T) {
+	publisher, err := New(publisherTestConfig(), blockingSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publisher.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("publish rejected")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	ack := publisher.Flush(ctx)
+	if ack.Dropped != 1 || !ack.QueueEmpty {
+		t.Fatalf("flush ack=%+v", ack)
+	}
+	if publisher.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("publisher closed after timeout flush")
+	}
+}
+
+func TestPublisherFlushConcurrentCallsAreSafe(t *testing.T) {
+	sender := &fakeSender{}
+	publisher, err := New(publisherTestConfig(), sender)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publisher.Close(context.Background())
+	if publisher.TryPublish(publisherTestEvent()).Disposition != Accepted {
+		t.Fatal("publish rejected")
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); publisher.Flush(context.Background()) }()
+	}
+	wg.Wait()
+	if len(sender.records) != 1 {
+		t.Fatalf("records=%d, want 1", len(sender.records))
+	}
+}
+
+func TestPublishResultReturnsExactFrozenIdentity(t *testing.T) {
+	cfg := publisherTestConfig()
+	cfg.ProducerID = "producer-override"
+	p, err := New(cfg, &fakeSender{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := p.TryPublish(publisherTestEvent())
+	var row map[string]any
+	if err = json.Unmarshal(p.SnapshotQueue()[0].Value, &row); err != nil {
+		t.Fatal(err)
+	}
+	if result.PayloadHash != row["payload_hash"] || result.ProducerID != row["producer_id"] {
+		t.Fatalf("result %+v disagrees with frozen record", result)
 	}
 }

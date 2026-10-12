@@ -14,7 +14,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
-	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/decisionlog"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
@@ -37,18 +36,16 @@ type resourceRef struct {
 // registerAuthz mounts bkn-safe's clean authorization API under /api/safe/v1/authz.
 // This is a redesign — it deliberately drops ISF's quirks (GET-in-body,
 // array-vs-map responses, policy-delete double form, public/private split).
-func registerAuthz(r *gin.Engine, e *authz.Enforcer, db *gorm.DB, auditStore *audit.Store, dir *directory.Service) {
+func registerAuthz(r *gin.Engine, e *authz.Enforcer, db *gorm.DB, dir *directory.Service) {
 	g := r.Group("/api/safe/v1/authz")
 	registerAuthorizationRegistry(g, db)
 	registerPropertyLevels(g, e, db)
 	registerRowFilter(g, e, dir)
-	// Policy and hierarchy writes are the authorization changes this tokenless
-	// face accepts. They are audited like the token-gated ones (#334); the
-	// actor is the service peer, see auditMiddleware.
+	// Policy and hierarchy writes are internal consequences of a caller's
+	// business operation. This tokenless face has no authenticated user actor,
+	// so it must not emit a second, anonymous audit fact. The initiating
+	// token-gated management operation owns the one business audit entry.
 	writes := g.Group("")
-	if auditStore != nil {
-		writes.Use(auditMiddleware(auditStore, dir, db))
-	}
 
 	// POST /checks evaluates one or more explicit resource-operation checks in
 	// one batched decision pass. Unlike resource-filter, this endpoint returns
@@ -453,7 +450,8 @@ func registerAuthz(r *gin.Engine, e *authz.Enforcer, db *gorm.DB, auditStore *au
 		accessorID := c.Query("accessor_id")
 		rtype := c.Query("resource_type")
 		op := c.Query("operation")
-		if accessorID == "" || rtype == "" || op == "" {
+		anyOperation := c.Query("any_operation") == "true"
+		if accessorID == "" || rtype == "" || (!anyOperation && op == "") {
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
@@ -466,7 +464,14 @@ func registerAuthz(r *gin.Engine, e *authz.Enforcer, db *gorm.DB, auditStore *au
 			c.JSON(http.StatusOK, gin.H{"ids": []string{}, "requires_candidate_filter": false})
 			return
 		}
-		ids, unrestricted, requiresCandidateFilter, err := e.AccessibleResourceScope(accessorID, rtype, op)
+		var ids []string
+		var unrestricted bool
+		var requiresCandidateFilter bool
+		if anyOperation {
+			ids, unrestricted, requiresCandidateFilter, err = e.AccessibleResourceScopeAnyOperation(accessorID, rtype)
+		} else {
+			ids, unrestricted, requiresCandidateFilter, err = e.AccessibleResourceScope(accessorID, rtype, op)
+		}
 		if err != nil {
 			serverError(c, err)
 			return
@@ -672,7 +677,7 @@ func registerRoleBindings(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB) {
 			if err := tx.AssignRole(req.AccessorID, req.RoleID); err != nil {
 				return err
 			}
-			return enqueueRoleAudit(c.Request.Context(), tx.DB(), req.AccessorID, "", http.StatusNoContent)
+			return enqueueRoleAudit(c.Request.Context(), tx.DB(), roleBindingTargetID(req.AccessorID, req.RoleID), auditBindingTargetName(c.Request.Context(), tx.DB(), req.AccessorID, req.RoleID), http.StatusNoContent)
 		})
 		markRoleAuditHandledIfCommitted(c.Request.Context(), err)
 		if err != nil {
@@ -733,7 +738,7 @@ func registerRoleBindings(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB) {
 			if err := tx.RemoveRole(req.AccessorID, req.RoleID); err != nil {
 				return err
 			}
-			return enqueueRoleAudit(c.Request.Context(), tx.DB(), req.AccessorID, "", http.StatusNoContent)
+			return enqueueRoleAudit(c.Request.Context(), tx.DB(), roleBindingTargetID(req.AccessorID, req.RoleID), auditBindingTargetName(c.Request.Context(), tx.DB(), req.AccessorID, req.RoleID), http.StatusNoContent)
 		})
 		markRoleAuditHandledIfCommitted(c.Request.Context(), err)
 		if err != nil {

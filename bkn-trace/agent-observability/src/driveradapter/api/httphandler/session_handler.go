@@ -95,18 +95,19 @@ type interactionLeaseRequest struct {
 }
 
 type finishAttemptRequest struct {
-	ReceiptID            string                       `json:"receipt_id" binding:"required"`
-	Output               sessionvo.PayloadEnvelope    `json:"output,omitempty"`
-	Error                sessionvo.PayloadEnvelope    `json:"error,omitempty"`
-	EvidenceDurability   sessionvo.EvidenceDurability `json:"evidence_durability" binding:"required"`
-	Retryable            bool                         `json:"retryable"`
-	RequestID            string                       `json:"request_id" binding:"required"`
-	TraceID              string                       `json:"trace_id" binding:"required"`
-	SpanID               string                       `json:"span_id,omitempty"`
-	ObservedEvidenceRefs []string                     `json:"observed_evidence_refs,omitempty"`
-	BusinessRefs         []sessionvo.BusinessRef      `json:"business_refs,omitempty"`
-	ArtifactRefs         []string                     `json:"artifact_refs,omitempty"`
-	PartialReasons       []string                     `json:"partial_reasons,omitempty"`
+	EvidenceExpectation  *sessionvo.EvidenceExpectation `json:"evidence_expectation,omitempty"`
+	ReceiptID            string                         `json:"receipt_id" binding:"required"`
+	Output               sessionvo.PayloadEnvelope      `json:"output,omitempty"`
+	Error                sessionvo.PayloadEnvelope      `json:"error,omitempty"`
+	EvidenceDurability   sessionvo.EvidenceDurability   `json:"evidence_durability" binding:"required"`
+	Retryable            bool                           `json:"retryable"`
+	RequestID            string                         `json:"request_id" binding:"required"`
+	TraceID              string                         `json:"trace_id" binding:"required"`
+	SpanID               string                         `json:"span_id,omitempty"`
+	ObservedEvidenceRefs []string                       `json:"observed_evidence_refs,omitempty"`
+	BusinessRefs         []sessionvo.BusinessRef        `json:"business_refs,omitempty"`
+	ArtifactRefs         []string                       `json:"artifact_refs,omitempty"`
+	PartialReasons       []string                       `json:"partial_reasons,omitempty"`
 }
 
 type terminalInteractionRequest struct {
@@ -123,6 +124,7 @@ type terminalInteractionRequest struct {
 }
 
 type managedFinishInteractionRequest struct {
+	PartialReasons    []string `json:"partial_reasons,omitempty"`
 	Outcome           string   `json:"outcome" binding:"required"`
 	IdempotencyKey    string   `json:"idempotency_key" binding:"required"`
 	AnswerArtifactRef string   `json:"answer_artifact_ref,omitempty"`
@@ -339,7 +341,7 @@ func (h *SessionHandler) handleConversationSubresource(w http.ResponseWriter, r 
 			RequestHash: request.RequestHash, AgentName: request.AgentName,
 			LeaseDuration: time.Duration(request.LeaseSeconds) * time.Second,
 		})
-		h.writeLifecycleResult(w, r, value, err, http.StatusCreated)
+		h.writeInteractionLifecycleResult(w, r, value, err, http.StatusCreated)
 	case len(parts) == 4 && parts[1] == "interactions" && parts[3] == "operations:ensure" && r.Method == http.MethodPost:
 		var request ensureOperationRequest
 		if err := decodeLifecycleBody(w, r, &request); err != nil {
@@ -448,8 +450,13 @@ func (h *SessionHandler) handleManagedFinish(
 		writeLifecycleError(w, r, http.StatusUnprocessableEntity, "interaction_required", "unsupported finish outcome")
 		return
 	}
-	if status == sessionvo.InteractionCompleted && request.AnswerArtifactRef == "" {
+	if status == sessionvo.InteractionCompleted && request.AnswerArtifactRef == "" && !h.service.CapturePolicyDisabled() {
 		writeLifecycleError(w, r, http.StatusUnprocessableEntity, "closure_manifest_invalid", "completed outcome requires an answer artifact")
+		return
+	}
+	partialReasons, err := sessionvo.NormalizeTraceCallGaps(request.PartialReasons)
+	if err != nil {
+		writeLifecycleError(w, r, http.StatusUnprocessableEntity, "closure_manifest_invalid", err.Error())
 		return
 	}
 	reason := request.Reason
@@ -461,10 +468,10 @@ func (h *SessionHandler) handleManagedFinish(
 		TerminalIdempotencyKey: request.IdempotencyKey, DeriveManifest: true,
 		Manifest: sessionvo.ClosureManifest{
 			Version: "3.0.0", AnswerArtifactRef: request.AnswerArtifactRef,
-			Claims: request.Claims, CompletionReason: reason,
+			Claims: request.Claims, CompletionReason: reason, SystemPartialReasons: partialReasons,
 		},
 	})
-	h.writeLifecycleResult(w, r, value, err, http.StatusOK)
+	h.writeInteractionLifecycleResult(w, r, value, err, http.StatusOK)
 }
 
 func managedOutcomeStatus(outcome string) (sessionvo.InteractionStatus, bool) {
@@ -613,7 +620,8 @@ func (h *SessionHandler) handleOperationSubresource(w http.ResponseWriter, r *ht
 	command := sessionsvc.FinishAttemptCommand{
 		Owner: owner, OperationID: parts[0], Attempt: uint32(attempt),
 		ReceiptID: request.ReceiptID, Output: request.Output, Error: request.Error,
-		EvidenceDurability: request.EvidenceDurability, Retryable: request.Retryable,
+		EvidenceExpectation: request.EvidenceExpectation,
+		EvidenceDurability:  request.EvidenceDurability, Retryable: request.Retryable,
 		RequestID: request.RequestID, TraceID: request.TraceID,
 		SpanID:               request.SpanID,
 		ObservedEvidenceRefs: request.ObservedEvidenceRefs,
@@ -657,6 +665,17 @@ func (h *SessionHandler) writeLifecycleResult(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, r, status, value)
+}
+
+func (h *SessionHandler) writeInteractionLifecycleResult(w http.ResponseWriter, r *http.Request, value sessionvo.Interaction, err error, status int) {
+	if err != nil {
+		writeSessionDomainError(w, r, err)
+		return
+	}
+	writeJSON(w, r, status, struct {
+		sessionvo.Interaction
+		CaptureEnabled bool `json:"capture_enabled"`
+	}{Interaction: value, CaptureEnabled: !h.service.CapturePolicyDisabled()})
 }
 
 func splitLifecyclePath(path string) []string {

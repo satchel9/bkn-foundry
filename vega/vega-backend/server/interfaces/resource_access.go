@@ -9,7 +9,10 @@ package interfaces
 import (
 	"context"
 	"database/sql"
+	"errors"
 )
+
+var ErrResourceDeleteConditionNotMet = errors.New("resource delete condition not met")
 
 // ResourceAccess defines resource data access interface.
 //
@@ -44,12 +47,14 @@ type ResourceAccess interface {
 	UpdateSemanticMetadata(ctx context.Context, tx *sql.Tx, resource *Resource, expectedUpdateTime int64) (int64, error)
 	// UpdateDiscoveryMetadata updates only Resource metadata owned by discovery.
 	UpdateDiscoveryMetadata(ctx context.Context, tx *sql.Tx, resource *Resource, expectedUpdateTime int64) (int64, error)
+	// UpdateRowCount stores only count-owned metadata with optimistic concurrency.
+	UpdateRowCount(ctx context.Context, tx *sql.Tx, resource *Resource, expectedUpdateTime int64) (int64, error)
 	// UpdateStatus updates a Resource's status, using tx when provided.
 	UpdateStatus(ctx context.Context, tx *sql.Tx, id string, status string, statusMessage string) error
 	// UpdateDiscoverStatus updates a Resource's last discover status.
 	UpdateDiscoverStatus(ctx context.Context, id string, status string) error
-	// DeleteByIDs deletes Resources by IDs.
-	DeleteByIDs(ctx context.Context, ids []string) error
+	// DeleteByIDs deletes Resources by IDs; onlyIfStale requires every row to be stale and missing.
+	DeleteByIDs(ctx context.Context, ids []string, onlyIfStale bool) error
 
 	// ListAuthResourceEntries lists resource authorization entries with filters.
 	ListAuthResourceEntries(ctx context.Context, params AuthResourceQueryParams) ([]*AuthResourceEntry, int64, error)

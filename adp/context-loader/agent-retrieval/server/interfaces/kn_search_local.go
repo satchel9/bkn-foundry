@@ -51,10 +51,8 @@ type KnSearchConceptRetrievalConfig struct {
 	TopK                   int      `json:"top_k" default:"10"`
 	IncludeSampleData      *bool    `json:"include_sample_data" default:"false"`
 	SchemaBrief            *bool    `json:"schema_brief" default:"false"`
-	EnableCoarseRecall     *bool    `json:"enable_coarse_recall" default:"true"`
 	CoarseObjectLimit      int      `json:"coarse_object_limit" default:"2000"`
 	CoarseRelationLimit    int      `json:"coarse_relation_limit" default:"300"`
-	CoarseMinRelationCount int      `json:"coarse_min_relation_count" default:"5000"`
 	EnablePropertyBrief    *bool    `json:"enable_property_brief" default:"true"`
 	PerObjectPropertyTopK  int      `json:"per_object_property_top_k" default:"8"`
 	GlobalPropertyTopK     int      `json:"global_property_top_k" default:"30"`
@@ -170,13 +168,18 @@ type KnSearchLocalResponse struct {
 
 // KnSearchObjectType object type (local response shape)
 type KnSearchObjectType struct {
-	ConceptType          string                         `json:"concept_type,omitempty"`
-	ConceptID            string                         `json:"concept_id"`
-	ConceptName          string                         `json:"concept_name"`
-	Comment              string                         `json:"comment,omitempty"`
-	Tags                 []string                       `json:"tags,omitempty"`
-	DataSource           *ResourceInfo                  `json:"data_source,omitempty"`
-	DataProperties       []*KnSearchDataProperty        `json:"data_properties,omitempty"`
+	ConceptType    string                  `json:"concept_type,omitempty"`
+	ConceptID      string                  `json:"concept_id"`
+	ConceptName    string                  `json:"concept_name"`
+	Comment        string                  `json:"comment,omitempty"`
+	Tags           []string                `json:"tags,omitempty"`
+	DataSource     *ResourceInfo           `json:"data_source,omitempty"`
+	DataProperties []*KnSearchDataProperty `json:"data_properties,omitempty"`
+	// IndexOperations is the index-derived operator list shared by this object type's indexed
+	// properties, lifted here so it is not repeated on every one of them. A property that has
+	// it carries indexed=true instead of its own condition_operations; a property whose
+	// capability differs keeps condition_operations inline. Set on the MCP surface only.
+	IndexOperations      []KnOperationType              `json:"index_operations,omitempty"`
 	LogicProperties      []*KnSearchLogicProperty       `json:"logic_properties,omitempty"`
 	PrimaryKeys          []string                       `json:"primary_keys,omitempty"`
 	SampleData           map[string]any                 `json:"sample_data,omitempty"`
@@ -205,6 +208,9 @@ type KnSearchDataProperty struct {
 	Comment             string            `json:"comment,omitempty"`
 	Type                string            `json:"type,omitempty"`
 	ConditionOperations []KnOperationType `json:"condition_operations,omitempty"`
+	// Indexed says this property supports the operators its object type publishes as
+	// index_operations. It stands in for repeating that list on every indexed property.
+	Indexed bool `json:"indexed,omitempty"`
 }
 
 // KnSearchLogicProperty logic property (local response shape)
@@ -295,6 +301,10 @@ type KnSearchConceptResult struct {
 	// object type in this knowledge network. Carried out of concept retrieval so the caller can be
 	// told "these ids do not exist" instead of being handed a bare empty result.
 	UnmatchedObjectTypes []string
+	// SchemaUnavailableObjectTypes lists the object types whose schema read gave
+	// no answer in time. They are kept with no properties, and the caller is told
+	// so instead of reading them as object types that have none.
+	SchemaUnavailableObjectTypes []string
 }
 
 // KnSearchSemanticInstanceResult semantic instance retrieval result (internal)

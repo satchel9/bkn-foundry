@@ -9,6 +9,7 @@ debug, and fatal remain unchanged.
 """
 import inspect
 import logging
+import os
 from typing import Optional
 from opentelemetry import context
 
@@ -52,6 +53,7 @@ class _StdLogger:
 
 # Global logger.
 logger: Optional[_StdLogger] = None
+_log_provider = None
 
 
 def get_caller_info() -> str:
@@ -89,9 +91,36 @@ def fatal(msg: str, ctx: Optional[context.Context] = None) -> None:
 
 
 def init_log_provider(server_info: ServerInfo, setting: LogSetting) -> None:
-    """Initialize stdlib logging after removal of the AR exporter."""
-    global logger
+    """Initialize stdlib logging and the internal batched OTLP log pipeline."""
+    global logger, _log_provider
     logger = _StdLogger(server_info.server_name or "mf-model")
+    if _log_provider is not None:
+        return
+    try:
+        from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+        from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+        from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+        from opentelemetry.sdk.resources import Resource
+
+        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otelcol-contrib:4318")
+        _log_provider = LoggerProvider(resource=Resource.create({
+            "service.name": "model-api",
+            "deployment.environment": os.getenv("ENVIRONMENT", "production"),
+        }))
+        _log_provider.add_log_record_processor(BatchLogRecordProcessor(
+            OTLPLogExporter(endpoint=f"{endpoint.rstrip('/')}/v1/logs", timeout=3),
+            max_queue_size=2048,
+            max_export_batch_size=512,
+            schedule_delay_millis=1000,
+            export_timeout_millis=3000,
+        ))
+        telemetry_logger = logging.getLogger("model-api.telemetry")
+        telemetry_logger.addHandler(LoggingHandler(level=logging.INFO, logger_provider=_log_provider))
+        telemetry_logger.setLevel(logging.INFO)
+        telemetry_logger.propagate = False
+    except Exception as exc:
+        logger.warning(message=f"OTLP logging unavailable; business continues: {exc}")
+        _log_provider = None
 
 
 def get_logger():
@@ -99,6 +128,9 @@ def get_logger():
 
 
 def shutdown_log_provider(*args, **kwargs):
-    global logger
+    global logger, _log_provider
+    if _log_provider is not None:
+        _log_provider.shutdown()
+        _log_provider = None
     if logger is not None:
         logger.shutdown()

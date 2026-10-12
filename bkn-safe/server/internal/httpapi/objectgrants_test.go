@@ -858,22 +858,13 @@ func TestObjectGrantsOwnerBatchRevokeIsAllOrNothing(t *testing.T) {
 		t.Fatalf("owner batch revoke = %d %s; want 204", w.Code, w.Body.String())
 	}
 	rows := objectGrantRevokeAuditRows(t, db, w.Header().Get("x-request-id"))
-	if len(rows) != 2 {
-		t.Fatalf("owner batch revoke audit rows = %d, want 2", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("owner batch revoke audit rows = %d, want 1", len(rows))
 	}
-	wantIDs := map[string]bool{ownerViewID: true, ownerModifyID: true}
-	for _, row := range rows {
-		outcome := objectGrantRevokeAuditOutcome(t, row)
-		if !wantIDs[row.TargetID] || outcome["grant_id"] != row.TargetID ||
-			outcome["policy_source"] != "professional_rule" ||
-			outcome["authority_source"] != "owner_delegate" ||
-			outcome["created_by"] != "u-owner" || outcome["via"] != "owner" || outcome["removed"] != true {
-			t.Fatalf("owner batch revoke audit row = %+v outcome=%v", row, outcome)
-		}
-		delete(wantIDs, row.TargetID)
-	}
-	if len(wantIDs) != 0 {
-		t.Fatalf("owner batch revoke missed audit ids: %v", wantIDs)
+	outcome := objectGrantRevokeAuditOutcome(t, rows[0])
+	grantIDsValue, _ := outcome["grant_ids"].([]any)
+	if !strings.Contains(rows[0].TargetName, "authorization for") || outcome["grant_count"] != float64(2) || outcome["removed_count"] != float64(2) || len(grantIDsValue) != 2 || outcome["grant_ids_truncated"] != false {
+		t.Fatalf("owner batch revoke audit fact = %+v outcome=%v", rows[0], outcome)
 	}
 	if ok, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); ok {
 		t.Fatal("successful batch retained view_detail")
@@ -886,7 +877,48 @@ func TestObjectGrantsOwnerBatchRevokeIsAllOrNothing(t *testing.T) {
 	}
 }
 
-func TestObjectGrantsLargeBatchRevokeKeepsEveryAuditSource(t *testing.T) {
+func TestObjectGrantsMixedBatchRevokeDoesNotMislabelFirstTarget(t *testing.T) {
+	r, e, db, users := newAdminServer(t)
+	for _, user := range []model.User{
+		{ID: "u-one", Account: "one", Name: "User One", Enabled: true},
+		{ID: "u-two", Account: "two", Name: "User Two", Enabled: true},
+	} {
+		if err := users.CreateLocalUser(t.Context(), &user, "pw-init0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedCatalogOps(t, db, "knowledge_network", "view_detail")
+	for _, accessorID := range []string{"u-one", "u-two"} {
+		if err := e.GrantProfessionalObjectPermission(accessorID, "knowledge_network", "kn-mine",
+			"view_detail", authz.EffectAllow, authz.AuthoritySourceAdminAuthz); err != nil {
+			t.Fatal(err)
+		}
+	}
+	grantIDs := make([]string, 0, 2)
+	for _, accessorID := range []string{"u-one", "u-two"} {
+		grantIDs = append(grantIDs, oneGrantID(t, e, authz.PolicyFilter{
+			AccessorID: accessorID, Object: "knowledge_network:kn-mine", Operation: "view_detail",
+			PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceAdminAuthz,
+		}))
+	}
+
+	clearAuditLog(t, db)
+	w := adminReq(t, r, http.MethodPost, "/api/safe/v1/admin/object-grants/revoke", map[string]any{
+		"grant_ids": grantIDs,
+	})
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("mixed batch revoke = %d %s; want 204", w.Code, w.Body.String())
+	}
+	rows := objectGrantRevokeAuditRows(t, db, w.Header().Get("x-request-id"))
+	if len(rows) != 1 {
+		t.Fatalf("mixed batch audit rows = %d, want 1", len(rows))
+	}
+	if rows[0].TargetName != "2 object grants across multiple subjects or resources" {
+		t.Fatalf("mixed batch target name = %q", rows[0].TargetName)
+	}
+}
+
+func TestObjectGrantsLargeBatchRevokeCreatesOneAuditFact(t *testing.T) {
 	r, e, db := ownerGrantFixtureWithDB(t)
 	operations := make([]string, 0, 20)
 	for i := 0; i < cap(operations); i++ {
@@ -905,21 +937,8 @@ func TestObjectGrantsLargeBatchRevokeKeepsEveryAuditSource(t *testing.T) {
 		t.Fatalf("batch source records = %d err=%v, want %d", len(records), err, len(operations))
 	}
 	grantIDs := make([]string, 0, len(records))
-	legacySources := make([]gin.H, 0, len(records))
 	for _, record := range records {
 		grantIDs = append(grantIDs, record.GrantID)
-		source := objectGrantRevokeAuditSource(record, authorityOwner)
-		source["removed"] = true
-		legacySources = append(legacySources, source)
-	}
-	legacyDetail, err := json.Marshal(map[string]any{
-		"grant_ids": grantIDs,
-		"_outcome": map[string]any{
-			"grant_ids": grantIDs, "grant_sources": legacySources, "removed": len(grantIDs),
-		},
-	})
-	if err != nil || len(legacyDetail) <= maxAuditDetail {
-		t.Fatalf("regression fixture detail size = %d err=%v, want over %d", len(legacyDetail), err, maxAuditDetail)
 	}
 
 	clearAuditLog(t, db)
@@ -929,26 +948,13 @@ func TestObjectGrantsLargeBatchRevokeKeepsEveryAuditSource(t *testing.T) {
 		t.Fatalf("large owner batch revoke = %d %s; want 204", w.Code, w.Body.String())
 	}
 	rows := objectGrantRevokeAuditRows(t, db, w.Header().Get("x-request-id"))
-	if len(rows) != len(grantIDs) {
-		t.Fatalf("large batch audit rows = %d, want %d", len(rows), len(grantIDs))
+	if len(rows) != 1 {
+		t.Fatalf("large batch audit rows = %d, want 1", len(rows))
 	}
-	wantIDs := make(map[string]bool, len(grantIDs))
-	for _, grantID := range grantIDs {
-		wantIDs[grantID] = true
-	}
-	for _, row := range rows {
-		outcome := objectGrantRevokeAuditOutcome(t, row)
-		if !wantIDs[row.TargetID] || outcome["grant_id"] != row.TargetID ||
-			outcome["policy_source"] != "professional_rule" ||
-			outcome["authority_source"] != "owner_delegate" ||
-			outcome["created_by"] != "u-owner" || outcome["operation"] == "" ||
-			outcome["effect"] != "allow" || outcome["via"] != "owner" || outcome["removed"] != true {
-			t.Fatalf("large batch audit row = %+v outcome=%v", row, outcome)
-		}
-		delete(wantIDs, row.TargetID)
-	}
-	if len(wantIDs) != 0 {
-		t.Fatalf("large batch audit missed ids: %v", wantIDs)
+	outcome := objectGrantRevokeAuditOutcome(t, rows[0])
+	grantIDsValue, _ := outcome["grant_ids"].([]any)
+	if !strings.Contains(rows[0].TargetName, "authorization for") || outcome["grant_count"] != float64(20) || outcome["removed_count"] != float64(20) || len(grantIDsValue) != 12 || outcome["grant_ids_truncated"] != true {
+		t.Fatalf("large batch audit fact = %+v outcome=%v", rows[0], outcome)
 	}
 	remaining, err := e.PolicyRecords(authz.PolicyFilter{
 		AccessorID: "u-mate", Object: "knowledge_network:kn-mine",
@@ -1452,10 +1458,141 @@ func TestObjectGrantsOwnerDirectoryLookups(t *testing.T) {
 	if w := tokReq(t, r, http.MethodGet, base+"/grantable-users?resource_type=knowledge_network&search=team", nil, "u-owner"); w.Code != http.StatusBadRequest {
 		t.Fatalf("picker without an object: want 400, got %d", w.Code)
 	}
-	// Holding authorize on one object is not a licence to page through the
-	// directory, so an empty search is refused rather than answered with a page.
-	if w := tokReq(t, r, http.MethodGet, base+"/grantable-users?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-owner"); w.Code != http.StatusBadRequest {
-		t.Fatalf("picker without a search term: want 400, got %d", w.Code)
+	// Opening the picker returns a bounded first page; typing narrows it through
+	// the same exact-resource-scoped endpoint.
+	if w := tokReq(t, r, http.MethodGet, base+"/grantable-users?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-owner"); w.Code != http.StatusOK {
+		t.Fatalf("picker first page: want 200, got %d", w.Code)
+	}
+}
+
+func TestObjectGrantsOwnerRolePickerAndWrite(t *testing.T) {
+	r, e, db := ownerGrantFixtureWithDB(t)
+	roles := []model.Role{
+		{ID: "role-analysts", Name: "Analysts", Description: "Reads business data", Source: model.RoleSourceCustom},
+		{ID: "role-builders", Name: "Builders", Description: "Builds networks", Source: model.RoleSourceBusiness},
+	}
+	if err := db.Create(&roles).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	const base = "/api/safe/v1/me"
+	w := tokReq(t, r, http.MethodGet, base+"/grantable-roles?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-owner")
+	if w.Code != http.StatusOK {
+		t.Fatalf("role picker first page: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+	var picker struct {
+		Roles []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Members     any    `json:"members"`
+		} `json:"roles"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &picker); err != nil {
+		t.Fatal(err)
+	}
+	if len(picker.Roles) != 1 || picker.Roles[0].Name != "Analysts" || picker.Roles[0].Members != nil {
+		t.Fatalf("role picker returned unexpected or privileged data: %+v", picker.Roles)
+	}
+
+	w = tokReq(t, r, http.MethodGet, base+"/grantable-roles?resource_type=knowledge_network&resource_id=kn-mine&search=build", nil, "u-owner")
+	if w.Code != http.StatusOK {
+		t.Fatalf("searched role picker: want 200, got %d", w.Code)
+	}
+	picker.Roles = nil
+	if err := json.Unmarshal(w.Body.Bytes(), &picker); err != nil {
+		t.Fatal(err)
+	}
+	if len(picker.Roles) != 0 {
+		t.Fatalf("search=build exposed immutable business roles: %+v", picker.Roles)
+	}
+	if w := tokReq(t, r, http.MethodGet, base+"/grantable-roles?resource_type=knowledge_network&resource_id=kn-mine", nil, "u-stranger"); w.Code != http.StatusForbidden {
+		t.Fatalf("non-owner role picker: want 403, got %d", w.Code)
+	}
+	if err := e.GrantObjectPermission("u-mate", "admin-role", "*", "view"); err != nil {
+		t.Fatal(err)
+	}
+	if w := tokReq(t, r, http.MethodGet, base+"/grantable-roles?resource_type=knowledge_network&resource_id=kn-other", nil, "u-mate"); w.Code != http.StatusOK {
+		t.Fatalf("platform role viewer picker: want 200, got %d (%s)", w.Code, w.Body.String())
+	}
+
+	w = tokReq(t, r, http.MethodPost, base+"/object-grants", map[string]any{
+		"accessor_id":   "role-analysts",
+		"accessor_type": "role",
+		"resource":      map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":    []string{"view_detail"},
+	}, "u-owner")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("owner role grant: want 204, got %d (%s)", w.Code, w.Body.String())
+	}
+	if err := e.AssignRole("u-mate", "role-analysts"); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); err != nil || !allowed {
+		t.Fatalf("role member effective permission = (%t, %v), want allowed", allowed, err)
+	}
+	if allowed, _ := e.Check("u-mate", "knowledge_network", "kn-other", "view_detail"); allowed {
+		t.Fatal("resource-scoped role grant leaked to another network")
+	}
+	roleGrants, err := e.RolePermissions("role-analysts")
+	if err != nil || len(roleGrants) != 1 {
+		t.Fatalf("role permission view = %+v, %v, want owner grant", roleGrants, err)
+	}
+	if err := (&adminWriteServices{e: e, db: db}).RevokeRolePermissions(
+		t.Context(), "role-analysts", "knowledge_network", "kn-mine", []string{"view_detail"},
+	); err != nil {
+		t.Fatalf("platform role revoke of owner grant: %v", err)
+	}
+	if allowed, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); allowed {
+		t.Fatal("platform role revoke returned successfully but owner grant remained effective")
+	}
+	// Recreate the same owner grant so the source-scoped self-service revoke is
+	// covered independently below.
+	w = tokReq(t, r, http.MethodPost, base+"/object-grants", map[string]any{
+		"accessor_id":   "role-analysts",
+		"accessor_type": "role",
+		"resource":      map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":    []string{"view_detail"},
+	}, "u-owner")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("owner role re-grant: want 204, got %d (%s)", w.Code, w.Body.String())
+	}
+	grantID := oneGrantID(t, e, authz.PolicyFilter{
+		AccessorID: "role-analysts", Object: "knowledge_network:kn-mine", Operation: "view_detail",
+		PolicySource: authz.PolicySourceProfessionalRule, AuthoritySource: authz.AuthoritySourceOwnerDelegate,
+	})
+	if w := tokReq(t, r, http.MethodDelete, base+"/object-grants", map[string]any{
+		"grant_id": grantID,
+	}, "u-owner"); w.Code != http.StatusNoContent {
+		t.Fatalf("owner role revoke: want 204, got %d (%s)", w.Code, w.Body.String())
+	}
+	if allowed, _ := e.Check("u-mate", "knowledge_network", "kn-mine", "view_detail"); allowed {
+		t.Fatal("revoked role grant remained effective")
+	}
+
+	if w := tokReq(t, r, http.MethodPost, base+"/object-grants", map[string]any{
+		"accessor_id":   "role-missing",
+		"accessor_type": "role",
+		"resource":      map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":    []string{"view_detail"},
+	}, "u-owner"); w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown role grant: want 400, got %d", w.Code)
+	}
+	if w := tokReq(t, r, http.MethodPost, base+"/object-grants", map[string]any{
+		"accessor_id":   "role-builders",
+		"accessor_type": "role",
+		"resource":      map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"operations":    []string{"view_detail"},
+	}, "u-owner"); w.Code != http.StatusBadRequest {
+		t.Fatalf("immutable business role grant: want 400, got %d", w.Code)
+	}
+	if w := adminReq(t, r, http.MethodPost, "/api/safe/v1/admin/object-grants", map[string]any{
+		"accessor_id":   "role-analysts",
+		"accessor_type": "role",
+		"resource":      map[string]any{"type": "knowledge_network", "id": "kn-mine"},
+		"bundle":        authz.ActFullBusinessAccess,
+	}); w.Code != http.StatusBadRequest {
+		t.Fatalf("role community bundle grant: want 400, got %d", w.Code)
 	}
 }
 

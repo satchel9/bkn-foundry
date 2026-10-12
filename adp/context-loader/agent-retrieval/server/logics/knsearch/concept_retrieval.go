@@ -12,12 +12,27 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/objectpermission"
 )
+
+// defaultSchemaReadTimeout bounds each selected object type's schema read when
+// the deployment sets no concept_search_config.schema_read_timeout_ms. A read
+// normally answers well inside a second; one that has not answered after five
+// is kept without properties rather than holding the whole search until the
+// caller's own deadline cancels it (#1906).
+const defaultSchemaReadTimeout = 5 * time.Second
+
+func (s *localSearchImpl) schemaReadTimeout() time.Duration {
+	if s.config != nil && s.config.ConceptSearchConfig.SchemaReadTimeoutMS > 0 {
+		return time.Duration(s.config.ConceptSearchConfig.SchemaReadTimeoutMS) * time.Millisecond
+	}
+	return defaultSchemaReadTimeout
+}
 
 // objectTypeRelationMultiplier The multiple of the number of object types relative to topK when filtering without relationship/relationship.
 const objectTypeRelationMultiplier = 2
@@ -126,6 +141,17 @@ func (s *localSearchImpl) conceptRetrievalByGroups(
 	//   - an object type the caller pinned may sit outside the concept groups and reach the pool
 	//     only through completion, so filtering first would report it as non-existent.
 	// It still runs before ranking and the TopK cut, which is the ordering the scope requires.
+	// An id the caller pinned is a decision, not a query, so it enters the pool
+	// whether or not recall surfaced it. Without this, scope.apply below reports
+	// a real object type as non-existent because this particular query did not
+	// rank it — and reports it inconsistently, since endpoint completion above
+	// pulls it in whenever some recalled relation happens to point at it (#1850).
+	objects, err = s.completePinnedObjectTypes(ctx, req.KnID, objects, config.ObjectTypes)
+	if err != nil {
+		s.logger.WithContext(ctx).Errorf("[ConceptRetrieval][Groups] complete pinned object types failed: %v", err)
+		return nil, err
+	}
+
 	scope := newObjectTypeScope(config.ObjectTypes, config.ExcludeObjectTypes)
 	objects, unmatchedObjectTypes := scope.apply(objects)
 	relations, actions = scope.applyToConcepts(objects, relations, actions)
@@ -137,10 +163,16 @@ func (s *localSearchImpl) conceptRetrievalByGroups(
 	rankedRelations := s.rankConcepts(ctx, req.Query, objects, relations,
 		config.TopK, req.EnableRerank, req.RerankModel, config.ObjectRerankCandidateLimit)
 	selectedObjects := s.selectObjectTypesForConceptRetrieval(objects, rankedRelations, config.TopK)
-	selectedObjects, err = objectpermission.FilterObjectTypes(ctx, s.schemaAccess, req.KnID, selectedObjects)
+	readTimeout := s.schemaReadTimeout()
+	selectedObjects, schemaUnavailable, err := objectpermission.FilterObjectTypesDegrading(ctx, s.schemaAccess,
+		req.KnID, selectedObjects, readTimeout)
 	if err != nil {
 		s.logger.WithContext(ctx).Errorf("[ConceptRetrieval][Groups] object property authorization failed: %v", err)
 		return nil, err
+	}
+	if len(schemaUnavailable) > 0 {
+		s.logger.WithContext(ctx).Warnf("[ConceptRetrieval][Groups] schema read gave no answer within %v, kept without properties: %v",
+			readTimeout, schemaUnavailable)
 	}
 
 	brief := boolValue(config.SchemaBrief)
@@ -155,10 +187,11 @@ func (s *localSearchImpl) conceptRetrievalByGroups(
 	}
 
 	return &interfaces.KnSearchConceptResult{
-		ObjectTypes:          objectTypesLocal,
-		RelationTypes:        relationTypesLocal,
-		ActionTypes:          actionTypesLocal,
-		UnmatchedObjectTypes: unmatchedObjectTypes,
+		ObjectTypes:                  objectTypesLocal,
+		RelationTypes:                relationTypesLocal,
+		ActionTypes:                  actionTypesLocal,
+		UnmatchedObjectTypes:         unmatchedObjectTypes,
+		SchemaUnavailableObjectTypes: schemaUnavailable,
 	}, nil
 }
 
@@ -242,62 +275,6 @@ func (s *localSearchImpl) completeReferencedObjectTypes(
 	}
 
 	return out, nil
-}
-
-// scoreObjectTypes scores object types for their relevance to query (written as obj.Score).
-//
-// The difference from coarseRecall: it only scores, does not clip the candidate set, and is not affected by CoarseMinRelationCount.
-// threshold constraints. Previously, the globally unique assignment point for obj.Score was inside coarseRecall, which required a relational type.
-// Number >= CoarseMinRelationCount (default 5000), the normal-scale knowledge network is never triggered, resulting in the object type.
-// The correlation never has a signal source and can only be passively brought out by the relationship endpoint (issue #778).
-//
-// Failure in scoring does not affect the main process: when the score is not obtained, the original relationship endpoint selection is returned, and the behavior is the same as before repair.
-//
-//nolint:unused // Retained for retrieval scoring extensions.
-func (s *localSearchImpl) scoreObjectTypes(
-	ctx context.Context,
-	knID string,
-	query string,
-	objectTypes []*interfaces.ObjectType,
-	config *interfaces.KnSearchConceptRetrievalConfig,
-) {
-	if strings.TrimSpace(query) == "" || len(objectTypes) == 0 {
-		return
-	}
-
-	limit := config.CoarseObjectLimit
-	if limit <= 0 {
-		limit = DefaultConceptRetrievalConfig().CoarseObjectLimit
-	}
-
-	resp, err := s.bknBackend.SearchObjectTypes(ctx, s.buildCoarseRecallQuery(knID, query, limit, config.ConceptGroups))
-	if err != nil {
-		s.logger.WithContext(ctx).Warnf("[ScoreObjectTypes] SearchObjectTypes failed, object relevance unavailable: %v", err)
-		return
-	}
-	if resp == nil || len(resp.Entries) == 0 {
-		return
-	}
-
-	scoreByID := make(map[string]float64, len(resp.Entries))
-	for _, entry := range resp.Entries {
-		if entry == nil || entry.ID == "" {
-			continue
-		}
-		scoreByID[entry.ID] = entry.Score
-	}
-
-	scored := 0
-	for _, obj := range objectTypes {
-		if obj == nil {
-			continue
-		}
-		if score, ok := scoreByID[obj.ID]; ok && score > 0 {
-			obj.Score = score
-			scored++
-		}
-	}
-	s.logger.WithContext(ctx).Debugf("[ScoreObjectTypes] scored %d/%d object types", scored, len(objectTypes))
 }
 
 // selectObjectTypesForConceptRetrieval selects the object types that participate in the response.
@@ -427,130 +404,6 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// coarseRecall coarse recall: first prune the candidate set in large-scale knowledge networks.
-// Business logic: construct knn+match query conditions and call the basic search interface.
-//
-//nolint:unused // Retained for retrieval recall extensions.
-func (s *localSearchImpl) coarseRecall(
-	ctx context.Context,
-	knID string,
-	query string,
-	detail *interfaces.KnowledgeNetworkDetail,
-	config *interfaces.KnSearchConceptRetrievalConfig,
-) (*interfaces.KnowledgeNetworkDetail, error) {
-	ctx, _ = oteltrace.StartInternalSpan(ctx)
-	defer oteltrace.EndSpan(ctx, nil)
-
-	// Construct a collection of object type IDs after rough recall.
-	coarseObjectIDs := make(map[string]bool)
-	coarseRelationIDs := make(map[string]bool)
-	coarseObjectScores := make(map[string]float64)
-	coarseRelationScores := make(map[string]float64)
-
-	// Rough recall object type.
-	objectReq := s.buildCoarseRecallQuery(knID, query, config.CoarseObjectLimit, config.ConceptGroups)
-	coarseObjects, objErr := s.bknBackend.SearchObjectTypes(ctx, objectReq)
-	if objErr != nil {
-		s.logger.WithContext(ctx).Warnf("[CoarseRecall] SearchObjectTypes failed: %v", objErr)
-	} else if coarseObjects != nil {
-		for _, obj := range coarseObjects.Entries {
-			coarseObjectIDs[obj.ID] = true
-			if obj.Score > 0 {
-				coarseObjectScores[obj.ID] = obj.Score
-			}
-		}
-	}
-
-	// Rough recall relationship type.
-	relationReq := s.buildCoarseRecallQuery(knID, query, config.CoarseRelationLimit, config.ConceptGroups)
-	coarseRelations, relErr := s.bknBackend.SearchRelationTypes(ctx, relationReq)
-	if relErr != nil {
-		s.logger.WithContext(ctx).Warnf("[CoarseRecall] SearchRelationTypes failed: %v", relErr)
-	} else if coarseRelations != nil {
-		for _, rel := range coarseRelations.Entries {
-			coarseRelationIDs[rel.ID] = true
-			if rel.Score > 0 {
-				coarseRelationScores[rel.ID] = rel.Score
-			}
-		}
-	}
-
-	// Filter raw data.
-	filteredDetail := &interfaces.KnowledgeNetworkDetail{
-		ID:          detail.ID,
-		ActionTypes: detail.ActionTypes, // ActionTypes does not do rough recall filtering.
-	}
-
-	// Filter object type.
-	if len(coarseObjectIDs) > 0 {
-		relationEndpointIDs := make(map[string]bool)
-		if len(coarseRelationIDs) > 0 {
-			for _, rel := range detail.RelationTypes {
-				if !coarseRelationIDs[rel.ID] {
-					continue
-				}
-				if rel.SourceObjectTypeID != "" {
-					relationEndpointIDs[rel.SourceObjectTypeID] = true
-				}
-				if rel.TargetObjectTypeID != "" {
-					relationEndpointIDs[rel.TargetObjectTypeID] = true
-				}
-			}
-		}
-
-		candidateObjectIDs := make(map[string]bool, len(coarseObjectIDs)+len(relationEndpointIDs))
-		for id := range coarseObjectIDs {
-			candidateObjectIDs[id] = true
-		}
-		for id := range relationEndpointIDs {
-			candidateObjectIDs[id] = true
-		}
-
-		var pruned []*interfaces.ObjectType
-		for _, obj := range detail.ObjectTypes {
-			if candidateObjectIDs[obj.ID] {
-				if score, ok := coarseObjectScores[obj.ID]; ok {
-					obj.Score = score
-				}
-				pruned = append(pruned, obj)
-			}
-		}
-		if len(pruned) > 0 {
-			filteredDetail.ObjectTypes = pruned
-		} else {
-			filteredDetail.ObjectTypes = detail.ObjectTypes
-		}
-	} else {
-		filteredDetail.ObjectTypes = detail.ObjectTypes
-	}
-
-	// Filter relationship types.
-	if len(coarseRelationIDs) > 0 {
-		var pruned []*interfaces.RelationType
-		for _, rel := range detail.RelationTypes {
-			if coarseRelationIDs[rel.ID] {
-				if score, ok := coarseRelationScores[rel.ID]; ok {
-					rel.Score = score
-				}
-				pruned = append(pruned, rel)
-			}
-		}
-		if len(pruned) > 0 {
-			filteredDetail.RelationTypes = pruned
-		} else {
-			filteredDetail.RelationTypes = detail.RelationTypes
-		}
-	} else {
-		filteredDetail.RelationTypes = detail.RelationTypes
-	}
-
-	s.logger.WithContext(ctx).Infof("[CoarseRecall] After coarse recall: objects=%d->%d, relations=%d->%d",
-		len(detail.ObjectTypes), len(filteredDetail.ObjectTypes),
-		len(detail.RelationTypes), len(filteredDetail.RelationTypes))
-
-	return filteredDetail, nil
 }
 
 // buildCoarseRecallQuery builds coarse recall query conditions.
@@ -1188,22 +1041,30 @@ func (s *localSearchImpl) convertObjectTypesToLocal(objects []*interfaces.Object
 	return result
 }
 
-// convertRelationTypesToLocal converts relation types to local response format, aligned with Python schema_brief:
-// - brief=true: only return concept_id, concept_name, source_object_type_id, target_object_type_id (excluding concept_type, comment)
-// - brief=false: Return the complete field (including concept_type, comment)
+// convertRelationTypesToLocal converts relation types to local response format. brief drops
+// concept_type, which the array the relation sits in already says.
+//
+// The comment stays at either level, as it does for object types and action types just above
+// and below. What a relation means is not derivable from the two object type ids it joins, and
+// this response is where a caller decides which relations to walk. It is also the only place a
+// caller meets it without paying another call: get_kn_detail's summary stopped carrying concept
+// prose in #150, on the argument that search_schema hands it back for the few concepts it
+// selects, and relation types were the one kind for which that was not true.
+//
+// The cost is bounded by how few relations one search returns — measured on the test deployment,
+// 10 relations and about 300 bytes — where get_kn_detail returns every relation of the network.
 func (s *localSearchImpl) convertRelationTypesToLocal(relations []*interfaces.RelationType, brief bool) []*interfaces.KnSearchRelationType {
 	result := make([]*interfaces.KnSearchRelationType, len(relations))
 	for i, rel := range relations {
-		var conceptType, comment string
+		var conceptType string
 		if !brief {
 			conceptType = "relation_type"
-			comment = rel.Comment
 		}
 		result[i] = &interfaces.KnSearchRelationType{
 			ConceptType:        conceptType,
 			ConceptID:          rel.ID,
 			ConceptName:        rel.Name,
-			Comment:            comment,
+			Comment:            rel.Comment,
 			SourceObjectTypeID: rel.SourceObjectTypeID,
 			TargetObjectTypeID: rel.TargetObjectTypeID,
 		}

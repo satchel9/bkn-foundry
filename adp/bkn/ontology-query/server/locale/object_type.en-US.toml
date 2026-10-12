@@ -9,8 +9,8 @@ Description = "Invalid DynamicParams"
 Solution = "Please check whether the parameter is correct."
 ErrorLink = ""
 
-[OntologyQuery.ObjectType.InvalidParameter.IgnoringStoreCache]
-Description = "Invalid Ignoring Store Cache"
+[OntologyQuery.ObjectType.InvalidParameter.IgnoreLocalIndex]
+Description = "Invalid ignore_local_index"
 Solution = "Please check whether the parameter is correct."
 ErrorLink = ""
 
@@ -27,6 +27,11 @@ ErrorLink = ""
 [OntologyQuery.ObjectType.UnsupportLogicPropertyParameterSource]
 Description = "Unsupported Logic Property Parameter Source"
 Solution = "Please check whether the parameter is correct."
+ErrorLink = ""
+
+[OntologyQuery.ObjectType.TooManyRequests]
+Description = "Too Many Requests"
+Solution = "A downstream service is at capacity. Retry later without changing the query."
 ErrorLink = ""
 
 [OntologyQuery.ObjectType.ObjectTypeNotFound]

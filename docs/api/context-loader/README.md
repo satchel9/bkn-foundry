@@ -37,7 +37,7 @@ query_object_instance    → retrieve instances and read the primary key from _i
 ```
 
 For modeled metrics, prefer the ontology contract rather than rebuilding the
-definition with `run_sql`:
+definition yourself:
 
 ```text
 search_schema / get_kn_detail  → identify an object type; related_metric_count must be positive
@@ -51,15 +51,80 @@ The Skill surface also has a knowledge-network-independent entry point:
 `get_skill_content` → `read_skill_file` → `execute_skill` flow.
 
 To bypass the ontology and access data directly, use
-`list_resources` → `describe_resource` → `run_sql`.
+`list_resources` → `describe_resource` → `run_sql`. These three are REST only:
+they return physical columns under the caller's own data-resource grants,
+outside the property-level rules the knowledge network applies, so the MCP
+surface withholds them — they appear in neither `tools/list` nor the on-demand
+gateway nor the sandbox capability surface.
 
-Multi-hop retrieval across object types: `search_schema` → `run_cypher`. Labels are object types, relationship types are relation types, and properties are logical property names, so neither `resource_id` nor physical column names are needed. Fall back to `run_sql` only for what the Cypher subset cannot express.
+Multi-hop retrieval across object types: `search_schema` → `run_cypher`. Labels are object types, relationship types are relation types, and properties are logical property names, so neither `resource_id` nor physical column names are needed.
+
+## Managed calls and ad-hoc calls
+
+Every business operation runs in one of two modes, chosen by whether the request
+names a managed interaction in `bkn_context`.
+
+| | Managed | Ad hoc |
+|---|---|---|
+| How it is chosen | `bkn_context` carries a `conversation_id` and an `interaction_id` | `bkn_context` is absent or empty |
+| What is recorded | a Conversation and Interaction; Operation, receipt and evidence only when capture is enabled | nothing |
+| What it depends on | Trace Core, in addition to the downstream the operation queries | only that downstream |
+| Where it is available | every surface | the REST routes under `/kn/` |
+
+**The MCP surface requires it.** An MCP business tool refuses a call with no
+managed interaction, so an agent starts with `bkn_start_interaction`, passes the
+two ids on every later call, and closes with `bkn_finish_interaction`. That is
+the right default there: MCP is where agents call, and an agent turn is exactly
+what an Interaction records.
+
+Disabling Trace capture does not disable the managed session. The start tool
+still returns real conversation and interaction IDs, business tools still
+require them, and the finish tool still closes the interaction. While capture
+is disabled, business tools execute without recording Operations, receipts or
+evidence. If Trace Core is unavailable, start cannot create the session and
+returns no IDs; the agent must retry start before making an MCP business call.
+
+**The REST surface admits both.** A `/kn/` request with no `bkn_context` runs ad
+hoc and never touches Trace Core. A request that names one is managed and is
+recorded like any other. This is why `bkn_context` is optional in the request
+schemas of every file indexed above. (One internal route, outside the scope of
+this documentation, keeps the managed context mandatory; see
+[TRACE.md](../../../adp/context-loader/agent-retrieval/TRACE.md) §2.1.)
+
+Note that only two shapes count as ad hoc: no `bkn_context` at all, and an empty
+one. A `bkn_context` holding one id and not the other, or only
+`parent_operation_id`, or a misspelt field, is a caller wiring the context up and
+getting it wrong, and is rejected rather than quietly downgraded.
+
+### Which one to use
+
+Use a managed call when the answer has to enter the evidence chain: an agent turn
+someone may audit afterwards, anything that executes an action, and any reading a
+later decision will be justified by. The cost is a dependency on Trace Core and
+the round trips that go with it.
+
+An ad-hoc call is the right choice for everything else, and the callers of the
+REST surface usually are everything else: Studio answering a click, an operator
+at the CLI, one service asking another for a schema. The cost is explicit — no
+Operation, no receipt, no evidence — so a question whose answer nobody will have
+to justify pays nothing for provenance it will not use.
+
+Two things follow that are worth stating, because both have been got wrong:
+
+- **Do not mint a conversation and an interaction just to satisfy the guard.**
+  Single-operation records dilute the concept rather than document anything. If
+  the call does not belong to an agent turn, make it ad hoc.
+- **Do not retry a managed call through a Trace Core outage when the answer never
+  needed provenance.** Route it to the REST equivalent instead. A statistic a
+  skill computes on the way to an answer is usually of this kind. See #1691 for
+  what the managed path costs per call.
 
 ## Conventions
 
 - **OpenAPI version:** 3.0.3.
 - **Authentication:** `Authorization: Bearer <token>` with either an OAuth access token or a self-issued AppKey with the `bak_` prefix. The service derives the account from the credential; callers do not send `x-account-id` or `x-account-type`.
 - **All operations use POST:** This includes query-like operations and operations without a request body, such as `list_knowledge_networks`.
+- **Managed execution:** While capture is enabled, `execute_action`, `execute_tool`, and `execute_skill` require a nonempty `bkn_context` with `conversation_id` and `interaction_id`. A missing or empty context returns HTTP 400 `conversation_required` with `required_action: create_conversation` before execution. When capture is disabled, the MCP start tool still creates a Conversation and Interaction and returns their IDs with `capture_enabled=false`, `trace_recorded=false` and `code=capture_disabled`. MCP business tools require those IDs but execute without recording Operations, receipts or evidence. REST calls without a context may still run ad hoc. When Trace Core is unavailable, REST execution uses a bounded, read-only probe and continues without context or Trace only after an infrastructure failure is confirmed. Read operations, including `run_sql` and `run_cypher`, may run ad hoc without a context; providing one enables managed execution when available.
 - **Response format:** Every operation accepts `?response_format=toon` and returns `application/toon`, which represents homogeneous arrays as tables to reduce token usage. The default is `json`.
 - **Error envelope:** This service does not use `comm-go/rest.BaseError`. It uses `code`, `description`, `solution`, `link`, and `details`, as defined by [`ErrorAgentRetrieval`](../_shared/errors.yaml). Downstream error bodies are passed through unchanged and commonly use `error_code` and `error_details`. Locally generated codes start with `Public.*` or `agentRetrieval.*`.
 - **Internal APIs:** Most operations have a corresponding `/api/agent-retrieval/in/v1/...` route with the same request and response structure. External routes forward the original bearer token to Execution Factory. Internal routes derive the visitor from trusted `X-Account-ID` and `X-Account-Type` headers and use Execution Factory's `/internal-v1/caller/...` face, which performs the same caller-level permission checks without substituting a service identity. A request with neither a bearer token nor a trusted caller identity returns 401. Arbitrary function-code execution is the exception: it has no caller-scoped internal equivalent and returns 403 internally. This documentation covers only external APIs; `driveradapters/rest_private_handler.go` is authoritative for internal routing.

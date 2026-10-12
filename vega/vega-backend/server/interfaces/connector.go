@@ -9,14 +9,23 @@ package interfaces
 // ConnectorConfig holds data source connection configuration.
 type ConnectorConfig map[string]any
 
+const (
+	// TableTypeTable identifies a regular table.
+	TableTypeTable string = "table"
+	// TableTypeView identifies a view.
+	TableTypeView string = "view"
+	// TableTypeMaterializedView identifies a materialized view.
+	TableTypeMaterializedView string = "materialized_view"
+)
+
 // TableMeta represents table/asset metadata.
 type TableMeta struct {
 	Name        string                `json:"name"`
 	Description string                `json:"description"`
 	Database    string                `json:"database"`   // The name of the affiliated database (used for instance-level connections)
 	Schema      string                `json:"schema"`     // The name of the schema to which it belongs (used when making instance-level connections)
-	TableType   string                `json:"table_type"` // table | view | materialized_view
-	Properties  map[string]any        `json:"properties"` // Extended attributes: charset, collation, engine, row_count, etc
+	TableType   string                `json:"table_type"` // One of the TableType* constants.
+	Properties  map[string]any        `json:"properties"` // Extended attributes: charset, collation, engine, estimated_row_count, etc
 	Columns     []TableColumnMeta     `json:"columns"`
 	PKs         []string              `json:"primary_keys"`
 	Indices     []TableIndexMeta      `json:"indices"`      // Index list
@@ -133,6 +142,8 @@ type IndexFieldMeta struct {
 	Attributes  map[string]any `json:"attributes"`
 	// SubFields (multi-fields) are arranged in alphabetical order by Name to ensure stable serialization
 	SubFields []IndexSubFieldMeta `json:"sub_fields,omitempty"`
+	// ResolvedType 保存别名目标的原生类型，仅用于当前探查，不写入源元数据。
+	ResolvedType string `json:"-"`
 }
 
 // IndexSubFieldMeta represents an OpenSearch multi-field sub-field.

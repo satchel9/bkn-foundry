@@ -106,6 +106,12 @@ config:
     # here only when this BKN deployment must explicitly override it.
     defaultSmallModelName: ""
     defaultSmallModelEnabled: false
+    proxySyncWorkerEnabled: true
+    proxySyncWorkerCount: 4
+    proxySyncPollInterval: 1
+    proxySyncLeaseSeconds: 60
+    proxySyncMaxAttempts: 12
+    proxyOutboxCleanupInterval: 3600
   log:
     logLevel: info
     developMode: false
@@ -142,6 +148,16 @@ resources:
     cpu: 2
     memory: 4Gi
 
+auditPublisher:
+  # Required for 0.2.0 release; test/production overlays must enable and supply
+  # an environment-specific Kafka principal. There is no legacy Audit fallback.
+  enabled: false
+  environment: ""
+  brokers: ""
+  credentialsSecretName: ""
+  usernameSecretKey: "username"
+  passwordSecretKey: "password"
+
 bknTrace:
   # Enables the narrow historical-projection reader. Core signs each request;
   # BKN only receives the rotating Ed25519 public-key set from this secret.
@@ -151,21 +167,23 @@ bknTrace:
     audience: ""
     publicKeysSecretName: ""
     publicKeysSecretKey: "projection-grant-public-keys"
-  evidence:
-    ingestUrl: ""
-    timeoutMs: "2000"
-    ingestTokenSecretName: ""
-    ingestTokenSecretKey: "ingest-token"
-  producerOutbox:
+  evidencePublisher:
     enabled: false
-    workerEnabled: false
-    producerStreamID: "bkn-backend"
-    applicationPrincipalID: "bkn-backend"
-    queryGatewayTokenSecretName: ""
-    queryGatewayTokenSecretKey: "query-gateway-token"
-    cleanup:
-      enabled: false
-      schedule: "0 3 * * *"
-      batchSize: 1000
-      deliveredRetentionDays: 30
-      abandonedRetentionDays: 180
+    brokers: "kafka-headless.resource.svc.cluster.local.:9097"
+    usernameSecretName: ""
+    usernameSecretKey: "username"
+    passwordSecretName: ""
+    passwordSecretKey: "password"
+    producerId: "bkn-backend"
+    workloadIdentity: "bkn-backend"
+    producerStreamId: "bkn-backend"
+    traceAdmission:
+      policyURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/policy"
+      configurationURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/configuration"
+      heartbeatURL: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/endpoints:heartbeat"
+      ackURLBase: "http://agent-observability-internal:8081/api/agent-observability/v1/internal/trace-evidence/operations"
+    queueMaxRecords: 4096
+    queueMaxBytes: 67108864
+    maxRecordBytes: 1048576
+    maxAttempts: 3
+    retryBackoffMs: 100

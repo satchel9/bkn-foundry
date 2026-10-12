@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	v034 "github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/migrations/mariadb/v034"
 )
 
 func TestTransactionRetryDelayUsesBoundedExponentialJitter(t *testing.T) {
@@ -62,7 +64,7 @@ func TestMigrationPlanUpgradesExistingCoreSchemaThroughTenantRemoval(t *testing.
 	if err != nil {
 		t.Fatalf("plan latest schema migration: %v", err)
 	}
-	if len(plan) != 10 || plan[0].Version != "017" || !strings.Contains(plan[0].SQL, "bkn_trace_ee_provenance_analyses") ||
+	if len(plan) != 14 || plan[0].Version != "017" || !strings.Contains(plan[0].SQL, "bkn_trace_ee_provenance_analyses") ||
 		plan[2].Version != "019" || !strings.Contains(plan[2].SQL, "bkn_trace_ee_historical_provenance_projections") ||
 		plan[3].Version != "020" || !strings.Contains(plan[3].SQL, "DROP COLUMN IF EXISTS business_domain_id") ||
 		plan[4].Version != "021" || !strings.Contains(plan[4].SQL, "bkn_trace_ee_historical_provenance_projections") ||
@@ -70,7 +72,11 @@ func TestMigrationPlanUpgradesExistingCoreSchemaThroughTenantRemoval(t *testing.
 		plan[6].Version != "023" || !strings.Contains(plan[6].SQL, "bkn_trace_ee_current_explanations") ||
 		plan[7].Version != "024" || !strings.Contains(plan[7].SQL, "access_profile_fingerprint") ||
 		plan[8].Version != "025" || !strings.Contains(plan[8].SQL, "capability_profile") ||
-		plan[9].Version != "031" || !strings.Contains(plan[9].SQL, "bkn_audit.audit_event_dedup") {
+		plan[9].Version != "031" || !strings.Contains(plan[9].SQL, "bkn_audit.audit_event_dedup") ||
+		plan[10].Version != "032" || !strings.Contains(plan[10].SQL, "bkn_trace_evidence_ingest_rejections") ||
+		plan[11].Version != "033" || !strings.Contains(plan[11].SQL, "bkn_trace_capture_control_state") ||
+		plan[12].Version != "034" || !strings.Contains(plan[12].SQL, "bkn_trace_evidence_migration_manifests") ||
+		plan[13].Version != "035" || !strings.Contains(plan[13].SQL, "record_integrity_version") {
 		t.Fatalf("unexpected tenant-only schema plan: %#v", plan)
 	}
 }
@@ -128,7 +134,7 @@ func TestMigrationPlanAddsLocaleToExistingProvenanceHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("plan provenance locale migration: %v", err)
 	}
-	if len(plan) != 9 || plan[0].Version != "018" ||
+	if len(plan) != 13 || plan[0].Version != "018" ||
 		!strings.Contains(plan[0].SQL, "ADD COLUMN IF NOT EXISTS locale") ||
 		!strings.Contains(plan[0].SQL, "DEFAULT 'zh-CN'") ||
 		plan[1].Version != "019" || !strings.Contains(plan[1].SQL, "bkn_trace_ee_historical_provenance_tombstones") ||
@@ -137,7 +143,11 @@ func TestMigrationPlanAddsLocaleToExistingProvenanceHistory(t *testing.T) {
 		plan[4].Version != tenantRemovalMigrationVersion || !strings.Contains(plan[4].SQL, "bkn_trace_conversations") ||
 		plan[6].Version != "024" || !strings.Contains(plan[6].SQL, "access_profile_fingerprint") ||
 		plan[7].Version != "025" || !strings.Contains(plan[7].SQL, "capability_profile") ||
-		plan[8].Version != "031" || !strings.Contains(plan[8].SQL, "bkn_audit.audit_event_dedup") {
+		plan[8].Version != "031" || !strings.Contains(plan[8].SQL, "bkn_audit.audit_event_dedup") ||
+		plan[9].Version != "032" || !strings.Contains(plan[9].SQL, "bkn_trace_evidence_ingest_rejections") ||
+		plan[10].Version != "033" || !strings.Contains(plan[10].SQL, "bkn_trace_capture_control_state") ||
+		plan[11].Version != "034" || !strings.Contains(plan[11].SQL, "bkn_trace_evidence_migration_manifests") ||
+		plan[12].Version != "035" || !strings.Contains(plan[12].SQL, "record_integrity_version") {
 		t.Fatalf("unexpected provenance locale migration plan: %#v", plan)
 	}
 }
@@ -170,6 +180,42 @@ func TestSplitSQLStatementsIgnoresSemicolonsInComments(t *testing.T) {
 	}
 	if len(statements) != 2 {
 		t.Fatalf("expected two statements, got %#v", statements)
+	}
+}
+
+func TestSplitSQLStatementsKeepsDelimitedTriggerBodyAsOneStatement(t *testing.T) {
+	statements, err := splitSQLStatements(v034.SchemaSQL())
+	if err != nil {
+		t.Fatalf("split v034 statements: %v", err)
+	}
+	triggerCount := 0
+	for _, statement := range statements {
+		if strings.HasPrefix(statement, "CREATE TRIGGER IF NOT EXISTS ") {
+			triggerCount++
+			if !strings.Contains(statement, "BEGIN") || !strings.Contains(statement, "END") {
+				t.Fatalf("trigger was split: %q", statement)
+			}
+		}
+	}
+	if triggerCount != 8 {
+		t.Fatalf("v034 trigger count = %d, want 8", triggerCount)
+	}
+}
+
+func TestMigrationPlanAppendsEvidenceMigrationAfterExistingLedger(t *testing.T) {
+	applied := make(map[string]string)
+	for _, migration := range Migrations() {
+		if migration.Version == "034" {
+			break
+		}
+		applied[migration.Version] = migration.Checksum
+	}
+	plan, err := migrationPlan(Migrations(), applied)
+	if err != nil {
+		t.Fatalf("plan evidence migration after v033: %v", err)
+	}
+	if len(plan) != 2 || plan[0].Version != "034" || plan[1].Version != "035" {
+		t.Fatalf("plan after v033 = %#v; want v034 then v035", plan)
 	}
 }
 

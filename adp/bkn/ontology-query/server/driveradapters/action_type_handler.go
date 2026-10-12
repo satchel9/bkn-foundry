@@ -68,7 +68,7 @@ func (r *restHandler) GetActionsInActionType(c *gin.Context, visitor hydra.Visit
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
 	// Record only the route; the body may contain full object-property values.
-	otellog.LogInfo(ctx, fmt.Sprintf("Action data query request: [%s]", c.Request.RequestURI))
+	otellog.LogInfo(ctx, fmt.Sprintf("Action data query request: [%s]", observabilityRoute(c)))
 
 	// Read the kn_id path parameter.
 	knID := c.Param("kn_id")
@@ -87,7 +87,7 @@ func (r *restHandler) GetActionsInActionType(c *gin.Context, visitor hydra.Visit
 	// List of system fields to exclude.
 	excludeSystemProperties := c.QueryArray("exclude_system_properties")
 	// Validate query parameters.
-	objectsQueryParas, err := validateObjectsQueryParameters(ctx, includeTypeInfo, interfaces.DEFAULT_IGNORING_STORE_CACHE,
+	objectsQueryParas, err := validateObjectsQueryParameters(ctx, includeTypeInfo, interfaces.DEFAULT_IGNORE_LOCAL_INDEX,
 		interfaces.DEFAULT_INCLUDE_LOGIC_PARAMS, excludeSystemProperties)
 	if err != nil {
 		httpErr := err.(*rest.HTTPError)

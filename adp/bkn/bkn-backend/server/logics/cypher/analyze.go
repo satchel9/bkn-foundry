@@ -56,6 +56,12 @@ func unsupportedf(ctx antlr.ParserRuleContext, feature, detail string, args ...a
 	return &Unsupported{Pos: positionOf(ctx), Feature: feature, Detail: fmt.Sprintf(detail, args...)}
 }
 
+// unsupportedAt is unsupportedf for a construct the reader already reduced to
+// its own terms, where a parse tree node is no longer at hand.
+func unsupportedAt(pos Position, feature, detail string, args ...any) error {
+	return &Unsupported{Pos: pos, Feature: feature, Detail: fmt.Sprintf(detail, args...)}
+}
+
 // Analyze reads a parse tree as a query in the supported subset.
 func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 	statement := tree.OC_Statement()
@@ -107,7 +113,11 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 			return nil, unsupported(clause, "procedure calls")
 		}
 		if match.OPTIONAL() != nil {
-			return nil, unsupported(match, "OPTIONAL MATCH")
+			if err := builder.addOptionalMatch(match); err != nil {
+				return nil, err
+			}
+			lastMatch = match
+			continue
 		}
 		if err := builder.addPattern(match.OC_Pattern()); err != nil {
 			return nil, err
@@ -127,10 +137,86 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 	// Conditions from the pattern and from WHERE mean the same thing and are
 	// joined the way Cypher joins them.
 	query.Where = combine("AND", inline, positionOf(lastMatch))
+	if err := refuseRequiredUseOfOptional(query); err != nil {
+		return nil, err
+	}
 	if err := analyzeProjectionBody(query, returning.OC_ProjectionBody()); err != nil {
 		return nil, err
 	}
 	return query, nil
+}
+
+// refuseRequiredUseOfOptional keeps what an OPTIONAL MATCH introduced out of
+// everything that would require it: a later MATCH that walks through it, or a
+// WHERE that tests it. Either one is an inner condition over an outer join, so
+// the rows the OPTIONAL MATCH set out to keep would be dropped again -- quietly,
+// and exactly where the author asked for the opposite.
+func refuseRequiredUseOfOptional(query *Query) error {
+	optional := map[string]NodeRef{}
+	for _, node := range query.Pattern.Nodes {
+		if node.Optional && node.Variable != "" {
+			optional[node.Variable] = node
+		}
+	}
+	if len(optional) == 0 {
+		return nil
+	}
+	for _, edge := range query.Pattern.Edges {
+		if edge.Optional {
+			continue
+		}
+		for _, side := range [2]int{edge.Left, edge.Right} {
+			if node := query.Pattern.Nodes[side]; node.Optional {
+				return requiredOptionalError(edge.Pos, node)
+			}
+		}
+	}
+	for _, ref := range predicateProperties(query.Where) {
+		if node, isOptional := optional[ref.Variable]; isOptional {
+			return requiredOptionalError(ref.Pos, node)
+		}
+	}
+	return nil
+}
+
+func requiredOptionalError(pos Position, node NodeRef) error {
+	name := node.Variable
+	if name == "" || node.Anonymous {
+		name = "the node " + node.Label
+	} else {
+		name = "\"" + name + "\""
+	}
+	return unsupportedAt(pos, "requiring what an OPTIONAL MATCH introduced",
+		"%s may be missing, so a MATCH or a WHERE over it would drop the rows the OPTIONAL MATCH keeps", name)
+}
+
+// predicateProperties lists every property a condition reads, which is how a
+// stage that cares about where a variable came from finds the mentions of it.
+func predicateProperties(predicate Predicate) []PropertyRef {
+	switch node := predicate.(type) {
+	case nil:
+		return nil
+	case Comparison:
+		return []PropertyRef{node.Left}
+	case NullCheck:
+		return []PropertyRef{node.Property}
+	case Membership:
+		return []PropertyRef{node.Property}
+	case StringMatch:
+		return []PropertyRef{node.Property}
+	case ExpressionComparison:
+		return append(expressionProperties(node.Left), expressionProperties(node.Right)...)
+	case Negation:
+		return predicateProperties(node.Operand)
+	case LogicalOperator:
+		var refs []PropertyRef
+		for _, operand := range node.Operands {
+			refs = append(refs, predicateProperties(operand)...)
+		}
+		return refs
+	default:
+		return nil
+	}
 }
 
 // patternBuilder collects everything the MATCH clauses describe into one
@@ -170,6 +256,97 @@ func (b *patternBuilder) addPattern(ctx parsing.IOC_PatternContext) error {
 		if err := b.addPath(element); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// addOptionalMatch reads one OPTIONAL MATCH. The subset accepts the shape a
+// left join has and no more: one relationship attaching one new node to
+// something an earlier clause already found. A wider optional pattern matches
+// as a whole or not at all -- two hops where the second fails leave the first
+// unbound too -- and a flat list of joins cannot say that, so it is refused
+// rather than approximated into something that quietly returns other rows.
+//
+// What the clause writes beside the relationship, its WHERE and any inline
+// property map, moves onto the relationship. Those conditions decide whether
+// the optional node is found, not whether the row survives: that is the
+// difference between an ON and a WHERE, and it is the whole point of the
+// clause.
+func (b *patternBuilder) addOptionalMatch(match parsing.IOC_MatchContext) error {
+	if b.clause == 0 {
+		return unsupportedf(match, "a query that starts with OPTIONAL MATCH",
+			"an OPTIONAL MATCH attaches to what an earlier clause found; write the first clause as MATCH")
+	}
+	edgesBefore, nodesBefore, inlineBefore := len(b.pattern.Edges), len(b.pattern.Nodes), len(b.inline)
+
+	if err := b.addPattern(match.OC_Pattern()); err != nil {
+		return err
+	}
+	if written := len(b.pattern.Edges) - edgesBefore; written != 1 {
+		return unsupportedf(match, "an OPTIONAL MATCH over anything but one relationship",
+			"an OPTIONAL MATCH may hold exactly one relationship, got %d", written)
+	}
+	switch introduced := len(b.pattern.Nodes) - nodesBefore; {
+	case introduced == 0:
+		return unsupportedf(match, "an OPTIONAL MATCH that introduces no node",
+			"both ends of this relationship are already matched, so there is nothing for it to leave missing")
+	case introduced > 1:
+		return unsupportedf(match, "an OPTIONAL MATCH that introduces more than one node",
+			"an OPTIONAL MATCH must attach to a node an earlier clause already found, and may introduce one node of its own")
+	}
+
+	edge := &b.pattern.Edges[edgesBefore]
+	node := nodesBefore
+	if edge.Left != node && edge.Right != node {
+		return unsupportedf(match, "an OPTIONAL MATCH whose new node is not on its relationship",
+			"the node this clause introduces has to be an end of the relationship it writes")
+	}
+	b.pattern.Nodes[node].Optional = true
+	edge.Optional, edge.OptionalNode = true, node
+	edge.Conditions = append(edge.Conditions, b.inline[inlineBefore:]...)
+	b.inline = b.inline[:inlineBefore]
+
+	if where := match.OC_Where(); where != nil {
+		written, err := analyzePredicate(where.OC_Expression())
+		if err != nil {
+			return err
+		}
+		edge.Conditions = append(edge.Conditions, written)
+	}
+	return b.refuseConditionsThatFilterNothing(match, edge, b.pattern.Nodes[node])
+}
+
+// refuseConditionsThatFilterNothing turns away a condition written inside an
+// OPTIONAL MATCH that names nothing the clause introduces.
+//
+// openCypher scopes a WHERE to the clause it is written on, so one written
+// here decides what the optional match looks for and never which rows come
+// back. An author who writes `MATCH (s)-->(t) OPTIONAL MATCH (t)<--(x) WHERE
+// s.id = $doc` reads it as a filter on s and gets every s instead -- the
+// statement runs, returns far too much, and says nothing about it. That is a
+// wrong answer rather than a slow one, and the shape is common enough that it
+// is refused with the fix in the message rather than compiled faithfully.
+func (b *patternBuilder) refuseConditionsThatFilterNothing(match parsing.IOC_MatchContext,
+	edge *EdgeRef, node NodeRef) error {
+	for _, condition := range edge.Conditions {
+		named := false
+		for _, ref := range predicateProperties(condition) {
+			if node.Variable != "" && ref.Variable == node.Variable {
+				named = true
+				break
+			}
+		}
+		if named {
+			continue
+		}
+		subject := "the node it introduces"
+		if node.Variable != "" && !node.Anonymous {
+			subject = fmt.Sprintf("%q", node.Variable)
+		}
+		return unsupportedAt(condition.predicatePosition(),
+			"a condition in an OPTIONAL MATCH that names nothing it introduces",
+			"a condition written here decides whether %s is looked for, never which rows come back; "+
+				"write it on the MATCH it is meant to filter", subject)
 	}
 	return nil
 }
@@ -474,10 +651,13 @@ func analyzeRowCount(ctx parsing.IOC_ExpressionContext, clause string) (int64, e
 	return value.literal.Integer, nil
 }
 
-// analyzeProjection reads one RETURN item: a property, or an aggregate over
-// one. The alias defaults to what was written, which is how Cypher names a
-// column nobody named.
+// analyzeProjection reads one RETURN item: a property, an aggregate over one,
+// or a value computed from those. The alias defaults to what was written,
+// which is how Cypher names a column nobody named.
 func analyzeProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
+	if computed(ctx) {
+		return analyzeComputedProjection(ctx)
+	}
 	if aggregate, ok, err := analyzeAggregate(ctx); err != nil {
 		return nil, err
 	} else if ok {
@@ -495,6 +675,25 @@ func analyzeProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
 // name of a returned column and an aggregate written out again, because with
 // aggregates in RETURN those are the only ways to say what to sort by.
 func analyzeSortKey(ctx parsing.IOC_ExpressionContext) (*SortKey, error) {
+	if computed(ctx) {
+		value, err := analyzeExpression(ctx)
+		if err != nil {
+			return nil, err
+		}
+		switch value := value.(type) {
+		case PropertyRef:
+			return &SortKey{Property: &value, Pos: value.Pos}, nil
+		case Aggregate:
+			return &SortKey{Aggregate: &value, Pos: value.Pos}, nil
+		case Arithmetic, Negative:
+		default:
+			return nil, unsupportedf(ctx, "sorting by a constant", "sort by a property, an aggregate or a returned column")
+		}
+		if len(expressionProperties(value)) == 0 && !containsAggregate(value) {
+			return nil, unsupportedf(ctx, "sorting by a constant", "sort by a property, an aggregate or a returned column")
+		}
+		return &SortKey{Expression: value, Pos: positionOf(ctx)}, nil
+	}
 	if aggregate, ok, err := analyzeAggregate(ctx); err != nil {
 		return nil, err
 	} else if ok {
@@ -553,13 +752,20 @@ func analyzeAggregate(ctx parsing.IOC_ExpressionContext) (*Aggregate, bool, erro
 	if len(term.propertyLookups) > 0 {
 		return nil, false, nil
 	}
+	return analyzeAggregateAtom(term.atom)
+}
 
+// analyzeAggregateAtom reads an atom that may be an aggregate. The argument is
+// a property, or a value computed from properties: sum(o.price * o.quantity)
+// is the usual way to total a line, and it is still one aggregate over one
+// value per row.
+func analyzeAggregateAtom(atom parsing.IOC_AtomContext) (*Aggregate, bool, error) {
 	// count(*) is its own shape in the grammar rather than a function call.
-	if count := term.atom.COUNT(); count != nil {
-		return &Aggregate{Function: "COUNT", Name: count.GetText(), Pos: positionOf(term.atom)}, true, nil
+	if count := atom.COUNT(); count != nil {
+		return &Aggregate{Function: "COUNT", Name: count.GetText(), Pos: positionOf(atom)}, true, nil
 	}
 
-	invocation := term.atom.OC_FunctionInvocation()
+	invocation := atom.OC_FunctionInvocation()
 	if invocation == nil {
 		return nil, false, nil
 	}
@@ -575,17 +781,371 @@ func analyzeAggregate(ctx parsing.IOC_ExpressionContext) (*Aggregate, bool, erro
 		return nil, false, unsupportedf(invocation, "an aggregate over "+strconv.Itoa(len(arguments))+" arguments",
 			"%s takes one property", name)
 	}
+	aggregate := &Aggregate{
+		Function: function,
+		Name:     written,
+		Distinct: invocation.DISTINCT() != nil,
+		Pos:      positionOf(invocation),
+	}
+	if computed(arguments[0]) {
+		argument, err := analyzeExpression(arguments[0])
+		if err != nil {
+			return nil, false, err
+		}
+		switch value := argument.(type) {
+		case PropertyRef:
+			aggregate.Property = &value
+			return aggregate, true, nil
+		case Arithmetic, Negative:
+		default:
+			return nil, false, unsupportedf(arguments[0], "an expression here",
+				"only variable.property references are supported")
+		}
+		if containsAggregate(argument) {
+			return nil, false, unsupportedf(arguments[0], "an aggregate inside an aggregate",
+				"aggregate a property or a value computed from properties")
+		}
+		if len(expressionProperties(argument)) == 0 {
+			return nil, false, unsupportedf(arguments[0], "an aggregate over a constant",
+				"aggregate a property or a value computed from properties")
+		}
+		aggregate.Argument, aggregate.ArgumentText = argument, sourceText(arguments[0])
+		return aggregate, true, nil
+	}
 	property, err := analyzePropertyRef(arguments[0])
 	if err != nil {
 		return nil, false, err
 	}
-	return &Aggregate{
-		Function: function,
-		Name:     written,
-		Distinct: invocation.DISTINCT() != nil,
-		Property: property,
-		Pos:      positionOf(invocation),
-	}, true, nil
+	aggregate.Property = property
+	return aggregate, true, nil
+}
+
+// computed reports whether a term is a value built from others rather than one
+// written on its own: it carries an arithmetic operator, a minus in front of
+// something other than a number, or parentheses. Anything else keeps the path
+// it had before arithmetic existed, so the messages for what is still refused
+// do not change.
+func computed(ctx parsing.IOC_ExpressionContext) bool {
+	sum, err := valueChain(ctx)
+	if err != nil {
+		return false
+	}
+	return computedSum(sum)
+}
+
+// computedSum is computed for one side of a comparison, where the grammar has
+// already split the operator off.
+func computedSum(sum parsing.IOC_AddOrSubtractExpressionContext) bool {
+	products := sum.AllOC_MultiplyDivideModuloExpression()
+	if len(products) != 1 {
+		return true
+	}
+	powers := products[0].AllOC_PowerOfExpression()
+	if len(powers) != 1 {
+		return true
+	}
+	unaries := powers[0].AllOC_UnaryAddOrSubtractExpression()
+	if len(unaries) != 1 {
+		return true
+	}
+	listOperator := unaries[0].OC_ListOperatorExpression()
+	if listOperator.GetChildCount() > 1 {
+		return false
+	}
+	atom := listOperator.OC_PropertyOrLabelsExpression().OC_Atom()
+	if atom.OC_ParenthesizedExpression() != nil {
+		return true
+	}
+	return negates(unaries[0]) && atom.OC_Literal() == nil
+}
+
+// valueChain descends an expression that is one value to the arithmetic under
+// it, refusing the boolean operators and predicates the grammar allows above.
+func valueChain(ctx parsing.IOC_ExpressionContext) (parsing.IOC_AddOrSubtractExpressionContext, error) {
+	orExpression := ctx.OC_OrExpression()
+	xorExpressions := orExpression.AllOC_XorExpression()
+	if len(xorExpressions) != 1 {
+		return nil, unsupported(orExpression, "OR")
+	}
+	andExpressions := xorExpressions[0].AllOC_AndExpression()
+	if len(andExpressions) != 1 {
+		return nil, unsupported(xorExpressions[0], "XOR")
+	}
+	notExpressions := andExpressions[0].AllOC_NotExpression()
+	if len(notExpressions) != 1 {
+		return nil, unsupported(andExpressions[0], "AND")
+	}
+	if len(notExpressions[0].AllNOT()) > 0 {
+		return nil, unsupported(notExpressions[0], "NOT")
+	}
+	comparison := notExpressions[0].OC_ComparisonExpression()
+	if len(comparison.AllOC_PartialComparisonExpression()) > 0 {
+		return nil, unsupportedf(comparison, "a comparison here", "expected a value, not a condition")
+	}
+	stringListNull := comparison.OC_StringListNullPredicateExpression()
+	if len(stringListNull.AllOC_StringPredicateExpression())+
+		len(stringListNull.AllOC_ListPredicateExpression())+
+		len(stringListNull.AllOC_NullPredicateExpression()) > 0 {
+		return nil, unsupportedf(comparison, "a condition here", "expected a value")
+	}
+	return stringListNull.OC_AddOrSubtractExpression(), nil
+}
+
+// analyzeComputedProjection reads a RETURN item that computes something. A
+// property or an aggregate that only sat inside parentheses is returned as
+// itself, so it is planned, grouped and described exactly as it would be
+// without them.
+func analyzeComputedProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
+	value, err := analyzeExpression(ctx)
+	if err != nil {
+		return nil, err
+	}
+	alias := sourceText(ctx)
+	switch value := value.(type) {
+	case PropertyRef:
+		return &Projection{Property: &value, Alias: alias, Pos: value.Pos}, nil
+	case Aggregate:
+		return &Projection{Aggregate: &value, Alias: alias, Pos: value.Pos}, nil
+	case Arithmetic, Negative:
+	default:
+		return nil, unsupportedf(ctx, "an expression here", "only variable.property references are supported")
+	}
+	if len(expressionProperties(value)) == 0 && !containsAggregate(value) {
+		// A column that is the same on every row says nothing about the rows,
+		// and grouping by one is not portable: some databases read a bare
+		// number in GROUP BY as a column position.
+		return nil, unsupportedf(ctx, "returning a constant",
+			"a computed column must use a property or an aggregate")
+	}
+	return &Projection{Expression: value, Alias: alias, Pos: positionOf(ctx)}, nil
+}
+
+// analyzeExpression reads a value RETURN computes. The arithmetic grammar is a
+// chain of one rule per precedence level, so the descent below is the grammar
+// read downwards: + and - over *, / and % over ^ over a signed term.
+func analyzeExpression(ctx parsing.IOC_ExpressionContext) (Expression, error) {
+	sum, err := valueChain(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return analyzeSum(sum)
+}
+
+func analyzeSum(ctx parsing.IOC_AddOrSubtractExpressionContext) (Expression, error) {
+	products := ctx.AllOC_MultiplyDivideModuloExpression()
+	operators := operatorTokens(ctx)
+	left, err := analyzeProduct(products[0])
+	if err != nil {
+		return nil, err
+	}
+	for i, product := range products[1:] {
+		right, err := analyzeProduct(product)
+		if err != nil {
+			return nil, err
+		}
+		if left, err = arithmetic(operators[i], left, right); err != nil {
+			return nil, err
+		}
+	}
+	return left, nil
+}
+
+func analyzeProduct(ctx parsing.IOC_MultiplyDivideModuloExpressionContext) (Expression, error) {
+	powers := ctx.AllOC_PowerOfExpression()
+	operators := operatorTokens(ctx)
+	left, err := analyzePower(powers[0])
+	if err != nil {
+		return nil, err
+	}
+	for i, power := range powers[1:] {
+		right, err := analyzePower(power)
+		if err != nil {
+			return nil, err
+		}
+		if left, err = arithmetic(operators[i], left, right); err != nil {
+			return nil, err
+		}
+	}
+	return left, nil
+}
+
+// analyzePower refuses ^. Cypher computes it in floating point, MySQL reads ^
+// as bitwise XOR, and the portable spelling is a function call; none of that
+// is worth the surprise for something this rare.
+func analyzePower(ctx parsing.IOC_PowerOfExpressionContext) (Expression, error) {
+	unaries := ctx.AllOC_UnaryAddOrSubtractExpression()
+	if len(unaries) != 1 {
+		return nil, unsupportedf(ctx, "exponentiation", "multiply the value out instead of using ^")
+	}
+	return analyzeSignedTerm(unaries[0])
+}
+
+// analyzeSignedTerm reads one term and the sign in front of it. A minus on a
+// number written in the query is folded into the number, as it is everywhere
+// else; on anything else it stays an operation.
+func analyzeSignedTerm(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (Expression, error) {
+	listOperator := ctx.OC_ListOperatorExpression()
+	if listOperator.GetChildCount() > 1 {
+		return nil, unsupported(listOperator, "list indexing and slicing")
+	}
+	propertyOrLabels := listOperator.OC_PropertyOrLabelsExpression()
+	if propertyOrLabels.OC_NodeLabels() != nil {
+		return nil, unsupported(propertyOrLabels, "label predicates")
+	}
+	atom := propertyOrLabels.OC_Atom()
+	if !negates(ctx) {
+		return analyzeTerm(propertyOrLabels, atom)
+	}
+	if atom.OC_Literal() != nil {
+		value, err := analyzeUnaryOperand(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return *value.literal, nil
+	}
+	operand, err := analyzeTerm(propertyOrLabels, atom)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseNonNumeric(operand); err != nil {
+		return nil, err
+	}
+	return Negative{Operand: operand, Pos: positionOf(ctx)}, nil
+}
+
+func analyzeTerm(ctx parsing.IOC_PropertyOrLabelsExpressionContext, atom parsing.IOC_AtomContext) (Expression, error) {
+	if len(ctx.AllOC_PropertyLookup()) == 0 {
+		if parenthesized := atom.OC_ParenthesizedExpression(); parenthesized != nil {
+			return analyzeExpression(parenthesized.OC_Expression())
+		}
+		aggregate, ok, err := analyzeAggregateAtom(atom)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			return *aggregate, nil
+		}
+	}
+	value, err := analyzeAtomOperand(ctx)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case value.property != nil:
+		return *value.property, nil
+	case value.parameter != nil:
+		return *value.parameter, nil
+	default:
+		return *value.literal, nil
+	}
+}
+
+// arithmetic combines two values under one operator. What can be known from
+// the query text alone is checked here: a string, a boolean or a null written
+// as an operand, and a literal zero on the right of / or %. Properties and
+// parameters are checked once the planner knows their types.
+func arithmetic(operator antlr.Token, left, right Expression) (Expression, error) {
+	if err := refuseNonNumeric(left); err != nil {
+		return nil, err
+	}
+	if err := refuseNonNumeric(right); err != nil {
+		return nil, err
+	}
+	written := operator.GetText()
+	if literal, ok := right.(Literal); ok && (written == "/" || written == "%") &&
+		((literal.Kind == LiteralInteger && literal.Integer == 0) ||
+			(literal.Kind == LiteralFloat && literal.Float == 0)) {
+		return nil, unsupportedAt(literal.Pos, "division by zero",
+			"Cypher and SQL databases disagree on what it gives")
+	}
+	return Arithmetic{
+		Operator: written, Left: left, Right: right,
+		Pos: Position{Line: operator.GetLine(), Column: operator.GetColumn()},
+	}, nil
+}
+
+// refuseNonNumeric turns away a literal arithmetic cannot use. Cypher would
+// concatenate strings with + and SQL would quietly convert them to numbers, so
+// a string is refused rather than given either reading.
+func refuseNonNumeric(value Expression) error {
+	literal, ok := value.(Literal)
+	if !ok || literal.Kind == LiteralInteger || literal.Kind == LiteralFloat {
+		return nil
+	}
+	if literal.Kind == LiteralNull {
+		return unsupportedAt(literal.Pos, "arithmetic on null", "the result would be null on every row")
+	}
+	return unsupportedAt(literal.Pos, "arithmetic on a non-numeric value",
+		"arithmetic takes numbers, got %s", literal.describe())
+}
+
+// operatorTokens lists the operator tokens between the operands of one
+// precedence level, in order. The whitespace tokens the grammar allows around
+// them are skipped.
+func operatorTokens(ctx antlr.ParserRuleContext) []antlr.Token {
+	var operators []antlr.Token
+	for i := 0; i < ctx.GetChildCount(); i++ {
+		terminal, ok := ctx.GetChild(i).(antlr.TerminalNode)
+		if !ok || strings.TrimSpace(terminal.GetText()) == "" {
+			continue
+		}
+		operators = append(operators, terminal.GetSymbol())
+	}
+	return operators
+}
+
+// negates reports a leading minus. The grammar allows one sign at most; a plus
+// changes nothing.
+func negates(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) bool {
+	for _, operator := range operatorTokens(ctx) {
+		if operator.GetText() == "-" {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceText is a construct exactly as it was written, whitespace included,
+// which is what Cypher names an unaliased column after.
+func sourceText(ctx antlr.ParserRuleContext) string {
+	start, stop := ctx.GetStart(), ctx.GetStop()
+	if start == nil || stop == nil || start.GetInputStream() == nil {
+		return ctx.GetText()
+	}
+	return start.GetInputStream().GetTextFromInterval(antlr.NewInterval(start.GetStart(), stop.GetStop()))
+}
+
+// expressionProperties lists every property a value reads, inside aggregates
+// or not.
+func expressionProperties(value Expression) []PropertyRef {
+	switch node := value.(type) {
+	case PropertyRef:
+		return []PropertyRef{node}
+	case Aggregate:
+		if node.Property != nil {
+			return []PropertyRef{*node.Property}
+		}
+		return expressionProperties(node.Argument)
+	case Arithmetic:
+		return append(expressionProperties(node.Left), expressionProperties(node.Right)...)
+	case Negative:
+		return expressionProperties(node.Operand)
+	default:
+		return nil
+	}
+}
+
+func containsAggregate(value Expression) bool {
+	switch node := value.(type) {
+	case Aggregate:
+		return true
+	case Arithmetic:
+		return containsAggregate(node.Left) || containsAggregate(node.Right)
+	case Negative:
+		return containsAggregate(node.Operand)
+	default:
+		return false
+	}
 }
 
 // expressionAtom is one term stripped of the precedence chain around it: the
@@ -737,6 +1297,9 @@ func analyzeNotPredicate(ctx parsing.IOC_NotExpressionContext) (Predicate, error
 }
 
 func analyzeComparison(ctx parsing.IOC_ComparisonExpressionContext) (Predicate, error) {
+	if predicate, ok, err := analyzeExpressionComparison(ctx); ok || err != nil {
+		return predicate, err
+	}
 	// The left side is read first so that a predicate written with IN or IS
 	// NULL is recognised as one: those forms carry no comparison operator, and
 	// reporting the missing operator instead would point at the wrong thing.
@@ -786,6 +1349,70 @@ func analyzeComparison(ctx parsing.IOC_ComparisonExpressionContext) (Predicate, 
 		Right:    *rightValue.operand(),
 		Pos:      positionOf(ctx),
 	}, nil
+}
+
+// analyzeExpressionComparison reads a comparison with arithmetic on either
+// side. It reports false for anything else, which keeps the path every other
+// condition takes -- and the messages it gives -- as they were.
+//
+// Parentheses on a side are part of the value here: with an operator between
+// the sides, (o.a + 1) > 3 cannot be a grouped condition.
+func analyzeExpressionComparison(ctx parsing.IOC_ComparisonExpressionContext) (Predicate, bool, error) {
+	partials := ctx.AllOC_PartialComparisonExpression()
+	if len(partials) != 1 {
+		return nil, false, nil
+	}
+	left, right := ctx.OC_StringListNullPredicateExpression(), partials[0].OC_StringListNullPredicateExpression()
+	for _, side := range []parsing.IOC_StringListNullPredicateExpressionContext{left, right} {
+		if len(side.AllOC_StringPredicateExpression())+len(side.AllOC_ListPredicateExpression())+
+			len(side.AllOC_NullPredicateExpression()) > 0 {
+			return nil, false, nil
+		}
+	}
+	if !computedSum(left.OC_AddOrSubtractExpression()) && !computedSum(right.OC_AddOrSubtractExpression()) {
+		return nil, false, nil
+	}
+	for _, side := range []parsing.IOC_StringListNullPredicateExpressionContext{left, right} {
+		// A parenthesised condition compared with another is not a value; the
+		// ordinary path names it as what it is.
+		if inner, ok := parenthesizedExpression(side.OC_AddOrSubtractExpression()); ok {
+			if _, err := valueChain(inner); err != nil {
+				return nil, false, nil
+			}
+		}
+	}
+
+	values := make([]Expression, 2)
+	for i, side := range []parsing.IOC_StringListNullPredicateExpressionContext{left, right} {
+		value, err := analyzeSum(side.OC_AddOrSubtractExpression())
+		if err != nil {
+			return nil, true, err
+		}
+		if containsAggregate(value) {
+			return nil, true, unsupportedf(side, "an aggregate in a condition",
+				"a condition is tested on each row before anything is aggregated; aggregates belong in RETURN")
+		}
+		if literal, ok := value.(Literal); ok && literal.Kind == LiteralNull {
+			return nil, true, unsupportedf(ctx, "comparing against null", "write IS NULL or IS NOT NULL instead")
+		}
+		values[i] = value
+	}
+	operator := comparisonOperator(partials[0])
+	// A property that only sat in parentheses against a value is the plain
+	// comparison it always was.
+	if property, ok := values[0].(PropertyRef); ok {
+		switch value := values[1].(type) {
+		case Literal:
+			return Comparison{Left: property, Operator: operator, Right: Operand{Literal: &value}, Pos: positionOf(ctx)}, true, nil
+		case ParameterRef:
+			return Comparison{Left: property, Operator: operator, Right: Operand{Parameter: &value}, Pos: positionOf(ctx)}, true, nil
+		}
+	}
+	if len(expressionProperties(values[0]))+len(expressionProperties(values[1])) == 0 {
+		return nil, true, unsupportedf(ctx, "a condition over constants",
+			"a condition has to read a property to say anything about the rows")
+	}
+	return ExpressionComparison{Left: values[0], Operator: operator, Right: values[1], Pos: positionOf(ctx)}, true, nil
 }
 
 // analyzeStringListNullPredicate reads one side of a comparison. A side that
@@ -1067,17 +1694,24 @@ func analyzeOperand(ctx parsing.IOC_ExpressionContext) (operand, error) {
 func analyzeAddOrSubtractOperand(ctx parsing.IOC_AddOrSubtractExpressionContext) (operand, error) {
 	multiplications := ctx.AllOC_MultiplyDivideModuloExpression()
 	if len(multiplications) != 1 {
-		return operand{}, unsupported(ctx, "arithmetic")
+		return operand{}, arithmeticOutsideReturn(ctx)
 	}
 	powers := multiplications[0].AllOC_PowerOfExpression()
 	if len(powers) != 1 {
-		return operand{}, unsupported(multiplications[0], "arithmetic")
+		return operand{}, arithmeticOutsideReturn(multiplications[0])
 	}
 	unaries := powers[0].AllOC_UnaryAddOrSubtractExpression()
 	if len(unaries) != 1 {
-		return operand{}, unsupported(powers[0], "arithmetic")
+		return operand{}, arithmeticOutsideReturn(powers[0])
 	}
 	return analyzeUnaryOperand(unaries[0])
+}
+
+// arithmeticOutsideReturn refuses arithmetic where a plain value is expected:
+// an inline property map, an IN list, a string predicate, SKIP or LIMIT.
+func arithmeticOutsideReturn(ctx antlr.ParserRuleContext) error {
+	return unsupportedf(ctx, "arithmetic here",
+		"values are computed in RETURN, ORDER BY and the two sides of a comparison")
 }
 
 func analyzeUnaryOperand(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (operand, error) {
@@ -1115,7 +1749,7 @@ func analyzeUnaryOperand(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (o
 	// A leading minus only means anything on a number; on anything else it is
 	// arithmetic the subset does not generate.
 	if value.literal == nil {
-		return operand{}, unsupported(ctx, "arithmetic")
+		return operand{}, arithmeticOutsideReturn(ctx)
 	}
 	switch value.literal.Kind {
 	case LiteralInteger:

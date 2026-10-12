@@ -297,14 +297,35 @@ func (ats *actionTypeService) CreateActionTypes(ctx context.Context, tx *sql.Tx,
 	}
 
 	// Create.
-	atIDs := []string{}
+	atIDs := make([]string, 0, len(createActionTypes))
 	for _, actionType := range createActionTypes {
 		atIDs = append(atIDs, actionType.ATID)
-		err = ats.ata.CreateActionType(ctx, tx, actionType)
+	}
+	if len(createActionTypes) == 1 {
+		err = ats.ata.CreateActionType(ctx, tx, createActionTypes[0])
 		if err != nil {
 			logger.Errorf("CreateActionType error: %s", err.Error())
 			span.SetStatus(codes.Error, "创建行动类失败")
 			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionType_InternalError).
+				WithErrorDetails(err.Error())
+		}
+	} else if len(createActionTypes) > 1 {
+		err = ats.ata.CreateActionTypes(ctx, tx, createActionTypes)
+		if err != nil {
+			logger.Errorf("CreateActionTypes error: %s", err.Error())
+			span.SetStatus(codes.Error, "Batch create action types failed")
+			if constraint, duplicate := common.DatabaseUniqueConstraint(err); duplicate {
+				if strings.Contains(constraint, "name") {
+					return []string{}, rest.NewHTTPError(ctx, http.StatusForbidden,
+						berrors.BknBackend_ActionType_ActionTypeNameExisted).
+						WithErrorDetails("One or more action type names already exist")
+				}
+				return []string{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
+					berrors.BknBackend_ActionType_ActionTypeIDExisted).
+					WithErrorDetails("One or more action type IDs already exist")
+			}
+			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ActionType_InternalError).
 				WithErrorDetails(err.Error())
 		}
 	}
@@ -317,11 +338,19 @@ func (ats *actionTypeService) CreateActionTypes(ctx context.Context, tx *sql.Tx,
 		interfaces.RESOURCE_TYPE_KN, parentItems)
 
 	// Update.
-	for _, actionType := range updateActionTypes {
-		// Update an existing submitted item.
-		err = ats.UpdateActionType(ctx, tx, actionType, strictMode)
+	if len(updateActionTypes) == 1 {
+		err = ats.UpdateActionType(ctx, tx, updateActionTypes[0], strictMode)
 		if err != nil {
 			return []string{}, err
+		}
+	} else if len(updateActionTypes) > 1 {
+		err = ats.ata.UpdateActionTypes(ctx, tx, updateActionTypes)
+		if err != nil {
+			logger.Errorf("UpdateActionTypes error: %s", err.Error())
+			span.SetStatus(codes.Error, "Batch update action types failed")
+			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ActionType_InternalError).
+				WithErrorDetails(err.Error())
 		}
 	}
 
@@ -460,39 +489,43 @@ func (ats *actionTypeService) ListActionTypes(ctx context.Context, query interfa
 		return actionTypes, total, nil
 	}
 
-	objectTypeIDs := make([]string, 0, len(actionTypes))
-	for _, actionType := range actionTypes {
-		objectTypeIDs = append(objectTypeIDs, actionType.ObjectTypeID)
-	}
+	if !interfaces.IsObjectReferenceEnrichmentDeferred(ctx) {
+		objectTypeIDs := make([]string, 0, len(actionTypes))
+		for _, actionType := range actionTypes {
+			objectTypeIDs = append(objectTypeIDs, actionType.ObjectTypeID)
+		}
 
-	objectTypeMap, err := ats.ots.GetObjectTypesMapByIDs(ctx, query.KNID,
-		query.Branch, common.DuplicateSlice(objectTypeIDs), false)
-	if err != nil {
-		return []*interfaces.ActionType{}, 0, err
-	}
+		objectTypeMap, err := ats.ots.GetObjectTypesMapByIDs(ctx, query.KNID,
+			query.Branch, common.DuplicateSlice(objectTypeIDs), false)
+		if err != nil {
+			return []*interfaces.ActionType{}, 0, err
+		}
 
-	// Populate bound object type names for the current action type page.
-	for _, actionType := range actionTypes {
-		if objectTypeMap[actionType.ObjectTypeID] != nil {
-			actionType.ObjectType = interfaces.SimpleObjectType{
-				OTID:   objectTypeMap[actionType.ObjectTypeID].OTID,
-				OTName: objectTypeMap[actionType.ObjectTypeID].OTName,
-				Icon:   objectTypeMap[actionType.ObjectTypeID].Icon,
-				Color:  objectTypeMap[actionType.ObjectTypeID].Color,
+		// Populate bound object type names for the current action type page.
+		for _, actionType := range actionTypes {
+			if objectTypeMap[actionType.ObjectTypeID] != nil {
+				actionType.ObjectType = interfaces.SimpleObjectType{
+					OTID:   objectTypeMap[actionType.ObjectTypeID].OTID,
+					OTName: objectTypeMap[actionType.ObjectTypeID].OTName,
+					Icon:   objectTypeMap[actionType.ObjectTypeID].Icon,
+					Color:  objectTypeMap[actionType.ObjectTypeID].Color,
+				}
 			}
 		}
 	}
 
-	accountInfos := make([]*interfaces.AccountInfo, 0, len(actionTypes)*2)
-	for _, at := range actionTypes {
-		accountInfos = append(accountInfos, &at.Creator, &at.Updater)
-	}
+	if !interfaces.IsAccountNameEnrichmentDeferred(ctx) {
+		accountInfos := make([]*interfaces.AccountInfo, 0, len(actionTypes)*2)
+		for _, at := range actionTypes {
+			accountInfos = append(accountInfos, &at.Creator, &at.Updater)
+		}
 
-	err = ats.ums.GetAccountNames(ctx, accountInfos)
-	if err != nil {
-		span.SetStatus(codes.Error, "GetAccountNames error")
-		return []*interfaces.ActionType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
-			berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
+		err = ats.ums.GetAccountNames(ctx, accountInfos)
+		if err != nil {
+			span.SetStatus(codes.Error, "GetAccountNames error")
+			return []*interfaces.ActionType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
+		}
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -832,20 +865,53 @@ func (ats *actionTypeService) handleActionTypeImportMode(ctx context.Context, mo
 
 	creates := []*interfaces.ActionType{}
 	updates := []*interfaces.ActionType{}
+	var err error
+	existingNamesByID := map[string]string{}
+	existingIDsByName := map[string]string{}
+	if len(actionTypes) > 1 {
+		knID, branch := actionTypes[0].KNID, actionTypes[0].Branch
+		ids := make([]string, 0, len(actionTypes))
+		names := make([]string, 0, len(actionTypes))
+		for _, actionType := range actionTypes {
+			if actionType.KNID != knID || actionType.Branch != branch {
+				return nil, nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+					berrors.BknBackend_ActionType_InvalidParameter)
+			}
+			ids = append(ids, actionType.ATID)
+			names = append(names, actionType.ATName)
+		}
+		existing, err := ats.ata.GetActionTypeIdentitiesByIDsOrNames(ctx, knID, branch, ids, names)
+		if err != nil {
+			otellog.LogError(ctx, fmt.Sprintf("Batch query action type IDs in knowledge network [%s] failed", knID), err)
+			return creates, updates, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_ActionType_InternalError_CheckActionTypeIfExistFailed).
+				WithErrorDetails(err.Error())
+		}
+		for _, actionType := range existing {
+			existingNamesByID[actionType.ATID] = actionType.ATName
+			existingIDsByName[actionType.ATName] = actionType.ATID
+		}
+	}
 
 	// 3. When the submitted model ID is not empty, validate conflicts with existing model IDs.
 	for _, actionType := range actionTypes {
 		creates = append(creates, actionType)
-		idExist := false
-		_, idExist, err := ats.CheckActionTypeExistByID(ctx, actionType.KNID, actionType.Branch, actionType.ATID)
-		if err != nil {
-			return creates, updates, err
-		}
+		var idExist, nameExist bool
+		var existID string
+		if len(actionTypes) == 1 {
+			_, idExist, err = ats.CheckActionTypeExistByID(ctx, actionType.KNID, actionType.Branch, actionType.ATID)
+			if err != nil {
+				return creates, updates, err
+			}
 
-		// Validate conflicts between the request and existing model names.
-		existID, nameExist, err := ats.CheckActionTypeExistByName(ctx, actionType.KNID, actionType.Branch, actionType.ATName)
-		if err != nil {
-			return creates, updates, err
+			// Validate conflicts between the request and existing model names.
+			existID, nameExist, err = ats.CheckActionTypeExistByName(ctx, actionType.KNID, actionType.Branch, actionType.ATName)
+			if err != nil {
+				return creates, updates, err
+			}
+		} else {
+			_, idExist = existingNamesByID[actionType.ATID]
+			existID, nameExist = existingIDsByName[actionType.ATName]
 		}
 
 		// Handle mode: ignore removes it from results, overwrite updates it, and normal returns an error.
@@ -964,55 +1030,38 @@ func (ats *actionTypeService) InsertDatasetData(ctx context.Context, actionTypes
 		}
 	}
 
+	documents := make([]vega_backend.DatasetDocument, 0, len(actionTypes))
 	for _, actionType := range actionTypes {
 		docid := interfaces.GenerateConceptDocuemtnID(actionType.KNID, interfaces.MODULE_TYPE_ACTION_TYPE,
 			actionType.ATID, actionType.Branch)
 		actionType.ModuleType = interfaces.MODULE_TYPE_ACTION_TYPE
 
-		// Convert to map for dataset
-		docBytes, err := sonic.Marshal(actionType)
+		document, err := vega_backend.NewDatasetDocument(docid, actionType)
 		if err != nil {
-			logger.Errorf("Failed to marshal ActionType: %s", err.Error())
-			span.SetStatus(codes.Error, "序列化行动类失败")
+			logger.Errorf("Failed to build action type index document: %s", err.Error())
+			span.SetStatus(codes.Error, "Serialize action type index failed")
 			return err
 		}
-
-		var doc map[string]any
-		if err := sonic.Unmarshal(docBytes, &doc); err != nil {
-			logger.Errorf("Failed to unmarshal ActionType: %s", err.Error())
-			span.SetStatus(codes.Error, "反序列化行动类失败")
-			return err
-		}
-
-		// Serialize parameters to JSON string
-		if params, exists := doc["parameters"]; exists {
-			paramsBytes, err := sonic.Marshal(params)
+		if parameters, exists := document.Document["parameters"]; exists {
+			encoded, err := sonic.Marshal(parameters)
 			if err != nil {
-				logger.Errorf("Failed to marshal action_type parameters: %s", err.Error())
-				span.SetStatus(codes.Error, "序列化行动类参数失败")
 				return err
 			}
-			doc["parameters"] = string(paramsBytes)
+			document.Document["parameters"] = string(encoded)
 		}
-
-		// Serialize condition to JSON string
-		if cond, exists := doc["condition"]; exists && cond != nil {
-			condBytes, err := sonic.Marshal(cond)
+		if condition, exists := document.Document["condition"]; exists && condition != nil {
+			encoded, err := sonic.Marshal(condition)
 			if err != nil {
-				logger.Errorf("Failed to marshal action_type condition: %s", err.Error())
-				span.SetStatus(codes.Error, "序列化行动类条件失败")
 				return err
 			}
-			doc["condition"] = string(condBytes)
+			document.Document["condition"] = string(encoded)
 		}
-
-		// Set document ID
-		doc["_id"] = docid
-		if err := ats.vbs.WriteDatasetDocument(ctx, interfaces.BKN_DATASET_ID, docid, doc); err != nil {
-			logger.Errorf("WriteDatasetDocument error: %s", err.Error())
-			span.SetStatus(codes.Error, "行动类概念索引写入失败")
-			return err
-		}
+		documents = append(documents, document)
+	}
+	if err := vega_backend.WriteDatasetDocuments(ctx, ats.vbs, interfaces.BKN_DATASET_ID, documents); err != nil {
+		logger.Errorf("WriteDatasetDocument error: %s", err.Error())
+		span.SetStatus(codes.Error, "行动类概念索引写入失败")
+		return err
 	}
 
 	return nil

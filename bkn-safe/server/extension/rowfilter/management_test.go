@@ -19,16 +19,22 @@ import (
 
 type managementServicesStub struct{}
 
-func (managementServicesStub) AuthorizeUserRead(context.Context, string) (bool, error) {
+func (managementServicesStub) AuthorizeUserRead(context.Context, string, string) (bool, error) {
 	return true, nil
 }
-func (managementServicesStub) AuthorizeUserWrite(context.Context, string) (bool, error) {
+func (managementServicesStub) AuthorizeUserWrite(context.Context, string, string) (bool, error) {
 	return true, nil
 }
-func (managementServicesStub) AuthorizeRoleRead(context.Context, string) (bool, error) {
+func (managementServicesStub) AuthorizeRoleRead(context.Context, string, string) (bool, error) {
 	return true, nil
 }
-func (managementServicesStub) AuthorizeRoleWrite(context.Context, string) (bool, error) {
+func (managementServicesStub) AuthorizeRoleWrite(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+func (managementServicesStub) CanInspectRoleMembership(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (managementServicesStub) GrantSubjectExists(context.Context, string, string) (bool, error) {
 	return true, nil
 }
 func (managementServicesStub) ResolveCaller(context.Context, string) (Caller, error) {
@@ -44,7 +50,7 @@ func managementTestRouter(t *testing.T, enterprise bool) *gin.Engine {
 	ResetForTest()
 	if enterprise {
 		Register(licverify.EditionEnterprise, &fakeResolver{})
-		RegisterManagementHandler(licverify.EditionEnterprise, func(ManagementServices, OperatorIDResolver) http.Handler {
+		RegisterManagementHandler(licverify.EditionEnterprise, func(ManagementServices, OperatorIDResolver, ManagementAuditReporter) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				operator, ok := operatorIDFromRequest(r)
 				if !ok || operator != "operator-1" {
@@ -62,7 +68,7 @@ func managementTestRouter(t *testing.T, enterprise bool) *gin.Engine {
 	}
 	router := gin.New()
 	group := router.Group("/api/safe/v1/admin", ManagementGate())
-	MountManagement(group, managementServicesStub{}, func(*gin.Context) (string, bool) { return "operator-1", true })
+	MountManagement(group, managementServicesStub{}, func(*gin.Context) (string, bool) { return "operator-1", true }, func(*gin.Context, ManagementAuditResult) {})
 	return router
 }
 

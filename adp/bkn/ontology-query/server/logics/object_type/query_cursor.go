@@ -42,7 +42,10 @@ type queryCursorPayload struct {
 	ModelVersion             string                      `json:"model_version"`
 	SearchAfter              interfaces.SearchAfterArray `json:"search_after"`
 	ResourceCursor           string                      `json:"resource_cursor,omitempty"`
-	ExpiresAt                time.Time                   `json:"expires_at"`
+	// ResourceOffset is the next row offset of a resource query whose first
+	// page was read without a Vega cursor session.
+	ResourceOffset int       `json:"resource_offset,omitempty"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 func newQueryCursorCodec() *queryCursorCodec {
@@ -70,7 +73,7 @@ func (codec *queryCursorCodec) encode(ctx context.Context, query *interfaces.Obj
 	if len(searchAfter) == 0 {
 		return "", nil
 	}
-	return codec.encodePayload(ctx, query, modelVersion, interfaces.SearchAfterArray(searchAfter), "", nil)
+	return codec.encodePayload(ctx, query, modelVersion, interfaces.SearchAfterArray(searchAfter), "", 0, nil)
 }
 
 func (codec *queryCursorCodec) encodeResource(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
@@ -82,7 +85,17 @@ func (codec *queryCursorCodec) encodeResource(ctx context.Context, query *interf
 	if err != nil {
 		return "", err
 	}
-	return codec.encodePayload(ctx, query, modelVersion, nil, resourceCursor, &expiresAt)
+	return codec.encodePayload(ctx, query, modelVersion, nil, resourceCursor, 0, &expiresAt)
+}
+
+// encodeResourceOffset encodes a stateless resource continuation. It holds no
+// Vega state, so a caller that never continues leaves nothing to reclaim.
+func (codec *queryCursorCodec) encodeResourceOffset(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
+	modelVersion string, resourceOffset int) (string, error) {
+	if resourceOffset <= 0 {
+		return "", nil
+	}
+	return codec.encodePayload(ctx, query, modelVersion, nil, "", resourceOffset, nil)
 }
 
 func (codec *queryCursorCodec) cursorExpiresAt(resourceCursorExpiry *int64) (time.Time, error) {
@@ -91,7 +104,7 @@ func (codec *queryCursorCodec) cursorExpiresAt(resourceCursorExpiry *int64) (tim
 	if resourceCursorExpiry != nil {
 		vegaExpiresAt := time.Unix(*resourceCursorExpiry, 0)
 		if !vegaExpiresAt.After(now) {
-			return time.Time{}, fmt.Errorf("Vega resource cursor is already expired")
+			return time.Time{}, fmt.Errorf("vega resource cursor is already expired")
 		}
 		if vegaExpiresAt.Before(expiresAt) {
 			expiresAt = vegaExpiresAt
@@ -101,7 +114,8 @@ func (codec *queryCursorCodec) cursorExpiresAt(resourceCursorExpiry *int64) (tim
 }
 
 func (codec *queryCursorCodec) encodePayload(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
-	modelVersion string, searchAfter interfaces.SearchAfterArray, resourceCursor string, expiresAtOverride *time.Time) (string, error) {
+	modelVersion string, searchAfter interfaces.SearchAfterArray, resourceCursor string, resourceOffset int,
+	expiresAtOverride *time.Time) (string, error) {
 	account, ok := queryCursorAccount(ctx)
 	if !ok || codec == nil || codec.aead == nil {
 		return "", fmt.Errorf("query cursor is unavailable")
@@ -121,7 +135,7 @@ func (codec *queryCursorCodec) encodePayload(ctx context.Context, query *interfa
 		Version: queryCursorVersion, CallerID: account.ID, CallerType: account.Type,
 		KNID: query.KNID, ObjectTypeID: query.ObjectTypeID,
 		QueryDigest: digest, EffectiveRowFilterDigest: query.EffectiveRowFilterDigest, ModelVersion: modelVersion,
-		SearchAfter: searchAfter, ResourceCursor: resourceCursor,
+		SearchAfter: searchAfter, ResourceCursor: resourceCursor, ResourceOffset: resourceOffset,
 		ExpiresAt: expiresAt,
 	}
 	plaintext, err := json.Marshal(payload)
@@ -146,13 +160,15 @@ func (codec *queryCursorCodec) decode(ctx context.Context, query *interfaces.Obj
 	return payload.SearchAfter, nil
 }
 
+// decodeResource returns exactly one of a Vega cursor or a stateless next-row
+// offset.
 func (codec *queryCursorCodec) decodeResource(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
-	modelVersion, token string) (string, error) {
+	modelVersion, token string) (string, int, error) {
 	payload, err := codec.decodePayload(ctx, query, modelVersion, token)
-	if err != nil || payload.ResourceCursor == "" {
-		return "", fmt.Errorf("query cursor is invalid")
+	if err != nil || (payload.ResourceCursor == "") == (payload.ResourceOffset <= 0) {
+		return "", 0, fmt.Errorf("query cursor is invalid")
 	}
-	return payload.ResourceCursor, nil
+	return payload.ResourceCursor, payload.ResourceOffset, nil
 }
 
 func (codec *queryCursorCodec) decodePayload(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
@@ -182,7 +198,7 @@ func (codec *queryCursorCodec) decodePayload(ctx context.Context, query *interfa
 		payload.KNID != query.KNID || payload.ObjectTypeID != query.ObjectTypeID || payload.QueryDigest != digest ||
 		payload.EffectiveRowFilterDigest != query.EffectiveRowFilterDigest ||
 		payload.ModelVersion != modelVersion || !codec.now().Before(payload.ExpiresAt) ||
-		(len(payload.SearchAfter) == 0 && payload.ResourceCursor == "") {
+		(len(payload.SearchAfter) == 0 && payload.ResourceCursor == "" && payload.ResourceOffset <= 0) {
 		return nil, fmt.Errorf("query cursor is invalid")
 	}
 	return &payload, nil
@@ -203,15 +219,23 @@ func objectQueryDigest(query *interfaces.ObjectQueryBaseOnObjectType) (string, e
 		Sort                    []*interfaces.SortParams    `json:"sort,omitempty"`
 		IncludeTypeInfo         bool                        `json:"include_type_info"`
 		IncludeLogicParams      bool                        `json:"include_logic_params"`
-		IgnoringStore           bool                        `json:"ignoring_store"`
+		IgnoreLocalIndex        bool                        `json:"ignoring_store"`
 		ExcludeSystemProperties []string                    `json:"exclude_system_properties,omitempty"`
 	}
+	// Keep the internal digest key stable across the public parameter rename.
 	body, err := json.Marshal(digestInput{
-		Branch: query.Branch, Condition: query.Condition, Properties: query.Properties,
-		ObjectQueryInfo: query.ObjectQueryInfo,
-		NeedTotal:       query.NeedTotal, Limit: query.Limit, Offset: query.Offset, Sort: query.Sort,
-		IncludeTypeInfo: query.IncludeTypeInfo, IncludeLogicParams: query.IncludeLogicParams,
-		IgnoringStore: query.IgnoringStore, ExcludeSystemProperties: query.ExcludeSystemProperties,
+		Branch:                  query.Branch,
+		Condition:               query.Condition,
+		Properties:              query.Properties,
+		ObjectQueryInfo:         query.ObjectQueryInfo,
+		NeedTotal:               query.NeedTotal,
+		Limit:                   query.Limit,
+		Offset:                  query.Offset,
+		Sort:                    query.Sort,
+		IncludeTypeInfo:         query.IncludeTypeInfo,
+		IncludeLogicParams:      query.IncludeLogicParams,
+		IgnoreLocalIndex:        query.IgnoreLocalIndex,
+		ExcludeSystemProperties: query.ExcludeSystemProperties,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode query digest: %w", err)

@@ -42,6 +42,52 @@ func constCfg(name, op string, value any) *interfaces.FilterCondCfg {
 	}
 }
 
+func TestNormalizeValueFrom(t *testing.T) {
+	require.NoError(t, NormalizeValueFrom(nil))
+	require.NoError(t, NormalizeValueFrom(&interfaces.FilterCondCfg{}))
+	condition := &interfaces.FilterCondCfg{Operation: OperationAnd, SubConds: []*interfaces.FilterCondCfg{
+		{Name: "age", Operation: OperationGt, ValueOptCfg: interfaces.ValueOptCfg{Value: 0}},
+		{Operation: OperationOr, SubConds: []*interfaces.FilterCondCfg{
+			{Name: "age", Operation: OperationEqual, ValueOptCfg: interfaces.ValueOptCfg{Value: 1}},
+			{Name: "age", Operation: OperationEqual, ValueOptCfg: interfaces.ValueOptCfg{Value: 2}},
+		}},
+	}}
+	require.NoError(t, NormalizeValueFrom(condition))
+	assert.Equal(t, interfaces.ValueFrom_Const, condition.SubConds[0].ValueFrom)
+	for _, child := range condition.SubConds[1].SubConds {
+		assert.Equal(t, interfaces.ValueFrom_Const, child.ValueFrom)
+	}
+
+	field := constCfg("age", OperationGt, "score")
+	field.ValueFrom = interfaces.ValueFrom_Field
+	require.NoError(t, NormalizeValueFrom(field))
+	assert.Equal(t, interfaces.ValueFrom_Field, field.ValueFrom)
+
+	invalid := constCfg("age", OperationEqual, 1)
+	invalid.ValueFrom = "unknown"
+	require.ErrorContains(t, NormalizeValueFrom(invalid), "value_from")
+
+	constOnly := constCfg("name", OperationLike, "a")
+	constOnly.ValueFrom = interfaces.ValueFrom_Field
+	require.ErrorContains(t, NormalizeValueFrom(constOnly), "value_from")
+
+	for _, tc := range []struct {
+		name      string
+		operation string
+		want      error
+	}{
+		{"missing operation", "", ErrMissingOperation},
+		{"unsupported operation", "unknown", ErrUnsupportedOperation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := constCfg("age", tc.operation, 1)
+			require.ErrorIs(t, NormalizeValueFrom(child), tc.want)
+			nested := &interfaces.FilterCondCfg{Operation: OperationAnd, SubConds: []*interfaces.FilterCondCfg{child}}
+			require.ErrorIs(t, NormalizeValueFrom(nested), tc.want)
+		})
+	}
+}
+
 func TestFilterConditionFactory(t *testing.T) {
 	t.Run("returns nil for nil config", func(t *testing.T) {
 		cond, err := NewFilterCondition(context.Background(), nil, testFieldsMap())
@@ -644,6 +690,37 @@ func TestNullCondValid(t *testing.T) {
 			t.Error("null condition should not need value")
 		}
 	})
+}
+
+func TestBooleanPredicateFieldTypes(t *testing.T) {
+	fields := map[string]*interfaces.Property{
+		"native_boolean":     {Name: "native_boolean", Type: interfaces.DataType_Boolean},
+		"oracle_flag":        {Name: "oracle_flag", Type: interfaces.DataType_Decimal, OriginalType: "number"},
+		"mariadb_flag":       {Name: "mariadb_flag", Type: interfaces.DataType_Integer, OriginalType: "tinyint(1)"},
+		"number_two":         {Name: "number_two", Type: interfaces.DataType_Decimal, OriginalType: "number"},
+		"fractional_number":  {Name: "fractional_number", Type: interfaces.DataType_Decimal, OriginalType: "number"},
+		"unqualified_number": {Name: "unqualified_number", Type: interfaces.DataType_Decimal, OriginalType: "number"},
+		"integer":            {Name: "integer", Type: interfaces.DataType_Integer, OriginalType: "int"},
+		"tinyint_two":        {Name: "tinyint_two", Type: interfaces.DataType_Integer, OriginalType: "tinyint(2)"},
+		"unsigned_integer":   {Name: "unsigned_integer", Type: interfaces.DataType_UnsignedInteger},
+		"float":              {Name: "float", Type: interfaces.DataType_Float},
+		"name":               {Name: "name", Type: interfaces.DataType_String},
+	}
+
+	for _, operation := range []string{OperationTrue, OperationFalse} {
+		t.Run(operation, func(t *testing.T) {
+			for _, field := range []string{"native_boolean", "oracle_flag", "mariadb_flag", "number_two", "fractional_number", "unqualified_number", "integer", "tinyint_two", "unsigned_integer"} {
+				condition, err := NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Name: field, Operation: operation}, fields)
+				require.NoError(t, err)
+				require.NotNil(t, condition)
+			}
+			for _, field := range []string{"float", "name"} {
+				condition, err := NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Name: field, Operation: operation}, fields)
+				require.ErrorContains(t, err, "not a boolean or supported numeric field")
+				assert.Nil(t, condition)
+			}
+		})
+	}
 }
 
 func TestConditionMetadata(t *testing.T) {

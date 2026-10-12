@@ -8,17 +8,20 @@ package postgresql
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
+	"github.com/lib/pq"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
 )
 
+// convertRawValue converts driver byte values to strings unless binary output is requested.
 func convertRawValue(v any, preserveBinary bool) any {
 	if b, ok := v.([]byte); ok {
 		if preserveBinary {
@@ -81,7 +84,7 @@ func (c *PostgresqlConnector) ExecuteRawSQL(ctx context.Context, sql string) (*i
 
 	rows, err := c.db.QueryContext(ctx, sql)
 	if err != nil {
-		return nil, fmt.Errorf("execute query failed: %w", err)
+		return nil, fmt.Errorf("execute query failed: %w", classifyQueryError(err))
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -127,7 +130,7 @@ func (c *PostgresqlConnector) ExecuteRawSQL(ctx context.Context, sql string) (*i
 		response.Entries = append(response.Entries, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate rows failed: %w", err)
+		return nil, fmt.Errorf("iterate rows failed: %w", classifyQueryError(err))
 	}
 
 	totalCount := int64(len(response.Entries))
@@ -170,7 +173,7 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 	var condition sq.Sqlizer
 	var err error
 	if params.ActualFilterCond != nil {
-		condition, err = c.ConvertFilterCondition(ctx, params.ActualFilterCond, fieldMap)
+		condition, err = c.ConvertFilterCondition(params.ActualFilterCond)
 		if err != nil {
 			return nil, err
 		}
@@ -180,26 +183,24 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 		Entries: make([]map[string]any, 0),
 	}
 
-	tableRef := qualTable(resource)
-
 	// Construct the SELECT clause
 	selectFields := []string{}
 
 	// Add the GROUP BY field (when aggregating queries)
 	for _, groupByItem := range params.GroupBy {
-		column := quoteColumnName(originalName(groupByItem.Property))
+		column := pgQuoteColumnName(originalName(groupByItem.Property))
 		if groupByItem.CalendarInterval != "" {
 			selectFields = append(selectFields,
-				c.buildDateFormat(column, groupByItem.CalendarInterval)+" AS "+quoteColumnName(groupByItem.Property))
+				c.buildDateFormat(column, groupByItem.CalendarInterval)+" AS "+pgQuoteColumnName(groupByItem.Property))
 		} else {
-			selectFields = append(selectFields, column+" AS "+quoteColumnName(groupByItem.Property))
+			selectFields = append(selectFields, column+" AS "+pgQuoteColumnName(groupByItem.Property))
 		}
 	}
 
 	// Add aggregated fields (when performing aggregated queries)
 	var aggAlias string
 	if params.Aggregation != nil {
-		aggField := quoteColumnName(originalName(params.Aggregation.Property))
+		aggField := pgQuoteColumnName(originalName(params.Aggregation.Property))
 
 		// Determine the aggregation function
 		aggFunc := params.Aggregation.Aggr
@@ -217,26 +218,26 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 			aggAlias = "__value"
 		}
 
-		selectFields = append(selectFields, aggFunc+" AS "+quoteColumnName(aggAlias))
+		selectFields = append(selectFields, aggFunc+" AS "+pgQuoteColumnName(aggAlias))
 	}
 
 	// If it is not an aggregated query and GROUP BY is not specified, add all fields
 	selectField := func(name string) string {
-		column := quoteColumnName(originalName(name))
+		column := pgQuoteColumnName(originalName(name))
 		if prop := fieldMap[name]; prop != nil && prop.Type == interfaces.DataType_Binary {
 			if params.BinaryMode == nil {
-				return "NULL AS " + quoteColumnName(name)
+				return "NULL AS " + pgQuoteColumnName(name)
 			}
 			switch *params.BinaryMode {
 			case interfaces.BinaryModeMetadata:
-				return "octet_length(" + column + ") AS " + quoteColumnName(name)
+				return "octet_length(" + column + ") AS " + pgQuoteColumnName(name)
 			case interfaces.BinaryModeContent:
-				return column + " AS " + quoteColumnName(name)
+				return column + " AS " + pgQuoteColumnName(name)
 			default:
-				return "NULL AS " + quoteColumnName(name)
+				return "NULL AS " + pgQuoteColumnName(name)
 			}
 		}
-		return column + " AS " + quoteColumnName(name)
+		return column + " AS " + pgQuoteColumnName(name)
 	}
 	if len(params.GroupBy) == 0 && params.Aggregation == nil {
 		if len(params.OutputFields) > 0 {
@@ -252,7 +253,8 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 	}
 
 	// Build query
-	builder := pgSq.Select(selectFields...).From(tableRef)
+	builder := stmtBuilder.Select(selectFields...).
+		From(resource.SourceIdentifier)
 
 	// Add the WHERE condition
 	if condition != nil {
@@ -263,7 +265,7 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 	if len(params.GroupBy) > 0 {
 		groupByFields := []string{}
 		for _, groupByItem := range params.GroupBy {
-			column := quoteColumnName(originalName(groupByItem.Property))
+			column := pgQuoteColumnName(originalName(groupByItem.Property))
 			if groupByItem.CalendarInterval != "" {
 				groupByFields = append(groupByFields, c.buildDateFormat(column, groupByItem.CalendarInterval))
 			} else {
@@ -291,13 +293,13 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 			if sortItem.Direction == interfaces.DESC_DIRECTION {
 				dir = "DESC"
 			}
-			sortField := quoteColumnName(originalName(sortItem.Field))
+			sortField := pgQuoteColumnName(originalName(sortItem.Field))
 			if aggAlias != "" && sortItem.Field == aggAlias {
-				sortField = quoteColumnName(aggAlias)
+				sortField = pgQuoteColumnName(aggAlias)
 			}
 			for _, groupByItem := range params.GroupBy {
 				if groupByItem.Property == sortItem.Field && groupByItem.CalendarInterval != "" {
-					sortField = c.buildDateFormat(quoteColumnName(originalName(groupByItem.Property)), groupByItem.CalendarInterval)
+					sortField = c.buildDateFormat(pgQuoteColumnName(originalName(groupByItem.Property)), groupByItem.CalendarInterval)
 					break
 				}
 			}
@@ -326,7 +328,7 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 
 	rows, err := c.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
+		return nil, fmt.Errorf("failed to execute query: %w", classifyQueryError(err))
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -362,12 +364,13 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 		result.Entries = append(result.Entries, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, classifyQueryError(err)
 	}
 
 	// Total number of processed items (for detailed inquiries only)
 	if params.NeedTotal && !isAggregate {
-		countBuilder := pgSq.Select("COUNT(1)").From(tableRef)
+		countBuilder := stmtBuilder.Select("COUNT(1)").
+			From(resource.SourceIdentifier)
 		if condition != nil {
 			countBuilder = countBuilder.Where(condition)
 		}
@@ -379,7 +382,7 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 		var total int64
 		row := c.db.QueryRowContext(ctx, countQuery, countArgs...)
 		if err := row.Scan(&total); err != nil {
-			return nil, fmt.Errorf("failed to scan total: %w", err)
+			return nil, fmt.Errorf("failed to scan total: %w", classifyQueryError(err))
 		}
 		result.Total = total
 	}
@@ -387,6 +390,15 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 	return result, nil
 }
 
+func classifyQueryError(err error) error {
+	var driverErr *pq.Error
+	if errors.As(err, &driverErr) && string(driverErr.Code) == "42703" {
+		return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterUnknownColumn, err)
+	}
+	return err
+}
+
+// buildDateFormat formats a date field for the requested calendar grouping.
 func (c *PostgresqlConnector) buildDateFormat(dateField, calendarInterval string) string {
 	switch calendarInterval {
 	case interfaces.CALENDAR_UNIT_MINUTE:

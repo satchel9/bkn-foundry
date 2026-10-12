@@ -8,17 +8,47 @@ package driveradapters
 
 import (
 	"context"
-	"os"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 
+	"ontology-query/common"
+	"ontology-query/common/bkntrace"
 	"ontology-query/interfaces"
 )
 
+func TestOntologyTraceRequestContextUsesVerifiedOwnerAndRegisteredParentOperation(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/api/ontology-query/in/v1/knowledge-networks/kn/object-types/ot", nil)
+	c.Request.Header.Set("x-bkn-delegation-id", "spoofed")
+	traceCtx := common.TraceContext{RequestID: "req_ontology_owner_001", ConversationID: "conv-1", InteractionID: "int-1", OperationID: "op-local"}
+	ctx := common.SetTraceContextToCtx(context.Background(), traceCtx)
+	visitor := hydra.Visitor{ID: "real-user", ClientID: "openbkn-sdk", Type: hydra.VisitorType_User}
+	got := ontologyTraceRequestContext(c, ctx, visitor)
+	if got.ApplicationPrincipalID != "openbkn-sdk" || got.EffectiveSubjectID != "real-user" || got.EffectiveSubjectType != "user" || got.DelegationID != "" || got.OperationScopePresent {
+		t.Fatalf("owner and local operation = %+v, want verified owner without asserted Core operation", got)
+	}
+	c.Request.Header.Set(common.HeaderBKNOperationID, "op-local")
+	got = ontologyTraceRequestContext(c, ctx, visitor)
+	if got.OperationScopePresent || got.CoreOperationID != "" {
+		t.Fatalf("unregistered child operation claimed Core scope: %+v", got)
+	}
+	c.Request.Header.Set(common.HeaderBKNParentOperationID, "op-core")
+	got = ontologyTraceRequestContext(c, ctx, visitor)
+	if !got.OperationScopePresent || got.CoreOperationID != "op-core" || got.OperationID != "op-local" {
+		t.Fatalf("derived child and Core parent operation = %+v", got)
+	}
+	c.Request.URL.Path = "/api/ontology-query/v1/knowledge-networks/kn/object-types/ot"
+	got = ontologyTraceRequestContext(c, ctx, visitor)
+	if got.OperationScopePresent || got.CoreOperationID != "" {
+		t.Fatalf("public route claimed Core operation from caller header: %+v", got)
+	}
+}
+
 func TestOntologyEvidenceEmittersReturnBeforeWorkWhenDisabled(t *testing.T) {
-	t.Setenv("BKN_TRACE_EVIDENCE_INGEST_URL", "")
-	_ = os.Unsetenv("BKN_TRACE_EVIDENCE_INGEST_URL")
+	bkntrace.SetEvidencePublisher(nil)
 
 	visitor := hydra.Visitor{ID: "acct_demo", Type: hydra.VisitorType_User}
 

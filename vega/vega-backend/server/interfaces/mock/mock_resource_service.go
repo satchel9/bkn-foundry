@@ -87,17 +87,17 @@ func (mr *MockResourceServiceMockRecorder) Create(ctx, req any) *gomock.Call {
 }
 
 // DeleteByIDs mocks base method.
-func (m *MockResourceService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool) error {
+func (m *MockResourceService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing, onlyIfStale bool) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DeleteByIDs", ctx, ids, ignoreMissing)
+	ret := m.ctrl.Call(m, "DeleteByIDs", ctx, ids, ignoreMissing, onlyIfStale)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // DeleteByIDs indicates an expected call of DeleteByIDs.
-func (mr *MockResourceServiceMockRecorder) DeleteByIDs(ctx, ids, ignoreMissing any) *gomock.Call {
+func (mr *MockResourceServiceMockRecorder) DeleteByIDs(ctx, ids, ignoreMissing, onlyIfStale any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteByIDs", reflect.TypeOf((*MockResourceService)(nil).DeleteByIDs), ctx, ids, ignoreMissing)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteByIDs", reflect.TypeOf((*MockResourceService)(nil).DeleteByIDs), ctx, ids, ignoreMissing, onlyIfStale)
 }
 
 // GetByID mocks base method.
@@ -246,6 +246,20 @@ func (m *MockResourceService) InternalUpdateLocalIndexState(ctx context.Context,
 func (mr *MockResourceServiceMockRecorder) InternalUpdateLocalIndexState(ctx, tx, id, localIndexStatus, localIndexName, syncMark any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InternalUpdateLocalIndexState", reflect.TypeOf((*MockResourceService)(nil).InternalUpdateLocalIndexState), ctx, tx, id, localIndexStatus, localIndexName, syncMark)
+}
+
+// InternalUpdateRowCount mocks base method.
+func (m *MockResourceService) InternalUpdateRowCount(ctx context.Context, tx *sql.Tx, resource *interfaces.Resource, count, countTime int64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "InternalUpdateRowCount", ctx, tx, resource, count, countTime)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// InternalUpdateRowCount indicates an expected call of InternalUpdateRowCount.
+func (mr *MockResourceServiceMockRecorder) InternalUpdateRowCount(ctx, tx, resource, count, countTime any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InternalUpdateRowCount", reflect.TypeOf((*MockResourceService)(nil).InternalUpdateRowCount), ctx, tx, resource, count, countTime)
 }
 
 // InternalUpdateSemanticMetadata mocks base method.

@@ -25,6 +25,8 @@ spec:
       labels:
         app: {{ .Release.Name }}
     spec:
+      serviceAccountName: {{ .Release.Name }}
+      automountServiceAccountToken: false
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -77,17 +79,70 @@ spec:
               - name: DB_TYPE
                 value: {{ .Values.depServices.rds.type | quote }}
             {{- end}}
-            {{- if .Values.observability.evidence.ingest_url }}
-              - name: BKN_TRACE_EVIDENCE_INGEST_URL
-                value: {{ .Values.observability.evidence.ingest_url | quote }}
-            {{- end}}
-            {{- if .Values.observability.evidence.ingest_token_secret_name }}
-              - name: BKN_TRACE_EVIDENCE_INGEST_TOKEN
+            {{- with .Values.observability.evidence.publisher }}
+            {{- if .brokers }}
+              - name: BKN_TRACE_KAFKA_BROKERS
+                value: {{ .brokers | quote }}
+              - name: BKN_TRACE_KAFKA_SASL_MECHANISM
+                value: PLAIN
+              - name: BKN_TRACE_PRODUCER_ID
+                value: {{ .producer_id | quote }}
+              - name: BKN_TRACE_PRODUCER_STREAM_ID
+                value: {{ .producer_stream_id | quote }}
+              - name: BKN_TRACE_WORKLOAD_IDENTITY
+                value: {{ .workload_identity | quote }}
+              - name: TRACE_ADMISSION_POLICY_URL
+                value: {{ .trace_admission.policy_url | quote }}
+              - name: TRACE_ADMISSION_CONFIGURATION_URL
+                value: {{ .trace_admission.configuration_url | quote }}
+              - name: TRACE_ADMISSION_HEARTBEAT_URL
+                value: {{ .trace_admission.heartbeat_url | quote }}
+              - name: TRACE_ADMISSION_ACK_URL_BASE
+                value: {{ .trace_admission.ack_url_base | quote }}
+              - name: BKN_TRACE_EVIDENCE_QUEUE_MAX_RECORDS
+                value: {{ .queue_max_records | quote }}
+              - name: BKN_TRACE_EVIDENCE_QUEUE_MAX_BYTES
+                value: {{ .queue_max_bytes | int64 | quote }}
+              - name: BKN_TRACE_EVIDENCE_MAX_RECORD_BYTES
+                value: {{ .max_record_bytes | int64 | quote }}
+              - name: BKN_TRACE_EVIDENCE_MAX_ATTEMPTS
+                value: {{ .max_attempts | quote }}
+              - name: BKN_TRACE_EVIDENCE_RETRY_BACKOFF_MS
+                value: {{ .retry_backoff_ms | quote }}
+              {{- if .credentials_secret_name }}
+              - name: BKN_TRACE_KAFKA_USERNAME
                 valueFrom:
                   secretKeyRef:
-                    name: {{ .Values.observability.evidence.ingest_token_secret_name | quote }}
-                    key: {{ .Values.observability.evidence.ingest_token_secret_key | quote }}
-            {{- end}}
+                    name: {{ .credentials_secret_name | quote }}
+                    key: {{ .username_secret_key | quote }}
+              - name: BKN_TRACE_KAFKA_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: {{ .credentials_secret_name | quote }}
+                    key: {{ .password_secret_key | quote }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.observability.audit.publisher }}
+              - name: BKN_AUDIT_KAFKA_BROKERS
+                value: {{ .brokers | quote }}
+              - name: BKN_AUDIT_KAFKA_SASL_MECHANISM
+                value: PLAIN
+              - name: BKN_AUDIT_ENVIRONMENT
+                value: {{ $.Values.observability.environment | quote }}
+              {{- if .credentials_secret_name }}
+              - name: BKN_AUDIT_KAFKA_USERNAME
+                valueFrom:
+                  secretKeyRef:
+                    name: {{ .credentials_secret_name | quote }}
+                    key: {{ .username_secret_key | quote }}
+              - name: BKN_AUDIT_KAFKA_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: {{ .credentials_secret_name | quote }}
+                    key: {{ .password_secret_key | quote }}
+              {{- end }}
+            {{- end }}
 
           ports:
             - name: public-port

@@ -3,6 +3,7 @@ package dataset
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -62,6 +63,7 @@ func (ds *datasetService) Create(ctx context.Context, res *interfaces.Resource) 
 			WithErrorDetails("generate dataset index UUIDv7 failed")
 	}
 	indexName := fmt.Sprintf("%s-%s", interfaces.DatasetIndexPrefix, indexID)
+	resourcelogic.InitializeJSONIndexAttributes(res.SchemaDefinition)
 	err = ds.lim.CreateIndex(ctx, indexName, res.SchemaDefinition, map[string]string{"resource_id": res.ID})
 	if err != nil {
 		otellog.LogError(ctx, "Create dataset index failed", err)
@@ -124,7 +126,7 @@ func (ds *datasetService) ListDocuments(ctx context.Context, res *interfaces.Res
 	documents, total, err := ds.lim.ListDocuments(ctx, res.LocalIndexName, res, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List dataset documents failed")
-		if reason, ok := filter_condition.RequestSideQueryError(err); ok {
+		if reason, ok := interfaces.RequestSideQueryError(err); ok {
 			return nil, 0, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
 				WithErrorDetails(reason)
 		}
@@ -296,6 +298,18 @@ func (ds *datasetService) DeleteDocumentsByQuery(ctx context.Context, res *inter
 		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
 			WithErrorDetails("delete-by-query requires a filter condition")
 	}
+	if err := filter_condition.NormalizeValueFrom(params.FilterCondCfg); err != nil {
+		span.SetStatus(codes.Error, "Validate dataset delete condition failed")
+		errorCode := verrors.VegaBackend_InvalidParameter_FilterConditionValueFrom
+		switch {
+		case errors.Is(err, filter_condition.ErrMissingOperation):
+			errorCode = verrors.VegaBackend_NullParameter_FilterConditionOperation
+		case errors.Is(err, filter_condition.ErrUnsupportedOperation):
+			errorCode = verrors.VegaBackend_UnsupportFilterConditionOperation
+		}
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, errorCode).
+			WithErrorDetails(err.Error())
+	}
 	querySchema := local_index.SchemaForQuery(res.SchemaDefinition)
 	fieldMap := make(map[string]*interfaces.Property, len(querySchema))
 	for _, prop := range querySchema {
@@ -326,7 +340,7 @@ func (ds *datasetService) DeleteDocumentsByQuery(ctx context.Context, res *inter
 	// Call the local index store to batch delete documents
 	if err := ds.lim.DeleteDocumentsByQuery(ctx, res.LocalIndexName, res, params); err != nil {
 		span.SetStatus(codes.Error, "Delete dataset documents failed")
-		if reason, ok := filter_condition.RequestSideQueryError(err); ok {
+		if reason, ok := interfaces.RequestSideQueryError(err); ok {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
 				WithErrorDetails(reason)
 		}

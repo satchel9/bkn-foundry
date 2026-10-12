@@ -9,6 +9,8 @@ env:
 # bkn-safe authorization endpoint. The service requires this URL at startup.
 bknSafe:
   url: "http://bkn-safe:3000"
+  # Idle connections kept to bkn-safe (BKN_SAFE_MAX_IDLE_CONNS). Empty uses the built-in 128.
+  maxIdleConns: ""
 
 # 节点选择器
 nodeSelector: {}
@@ -20,6 +22,19 @@ image:
   repository: vega-backend
   tag: "__VERSION__"
   pullPolicy: IfNotPresent
+
+# Management Audit is independent of the Trace/Evidence capture switch.
+auditPublisher:
+  enabled: false
+  environment: ""
+  brokers: ""
+  credentialsSecretName: ""
+  usernameSecretKey: username
+  passwordSecretKey: password
+
+serviceAccount:
+  create: true
+  name: vega
 
 service:
   vegaBackend:
@@ -86,6 +101,9 @@ depServices:
     protocol: http
 
 config:
+  query:
+    cursorMaxSessions: 1000
+    cursorMaxSessionsPerAccount: 100
   server:
     runMode: release
     httpPort: 13014
@@ -151,11 +169,3 @@ resources:
   limits:
     cpu: 2
     memory: 4Gi
-
-bknTrace:
-  evidence:
-    ingestUrl: ""
-    artifactIngestUrl: ""
-    timeoutMs: "2000"
-    ingestTokenSecretName: ""
-    ingestTokenSecretKey: "ingest-token"

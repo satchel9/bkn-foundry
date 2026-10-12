@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	neturl "net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,7 +116,7 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 		}))
 		oteltrace.EndSpan(ctx, err)
 	}()
-	action, actionEnabled := bkntrace.ParseAction(req.Headers, req.BoxID, req.ToolID, req.UserID)
+	action, actionEnabled := bkntrace.ParseAction(req.Headers, req.BoxID, req.ToolID, req.UserID, req.BKNConversationID)
 	actionEvents := []bkntrace.Event{}
 	actionApproved := false
 	actionClaimed := false
@@ -136,11 +137,7 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 			}
 			actionEvents = append(actionEvents, action.AfterExecution(result, err)...)
 			if emitErr := emitAction(); emitErr != nil {
-				if err == nil {
-					err = emitErr
-				} else {
-					s.Logger.WithContext(ctx).Errorf("bkn trace terminal evidence emit failed: %T", emitErr)
-				}
+				s.Logger.WithContext(ctx).Errorf("bkn trace terminal evidence emit failed: %v", emitErr)
 			}
 		}
 	}()
@@ -185,9 +182,7 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 		actionEvents = append(actionEvents, decision...)
 		actionApproved = true
 		if emitErr := emitAction(); emitErr != nil {
-			err = emitErr
-			actionFinished = true
-			return
+			s.Logger.WithContext(ctx).Errorf("bkn trace approval evidence emit failed: %v", emitErr)
 		}
 		actionEvents = nil
 		if s.ActionExecutions == nil {
@@ -209,8 +204,7 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 			}
 			actionEvents = append(actionEvents, action.AfterExecution(state.Result, replayErr)...)
 			if emitErr := emitAction(); emitErr != nil {
-				err = emitErr
-				return
+				s.Logger.WithContext(ctx).Errorf("bkn trace replay evidence emit failed: %v", emitErr)
 			}
 			if len(state.Result) > 0 {
 				_ = json.Unmarshal(state.Result, &resp)
@@ -268,8 +262,8 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 		}
 		actionEvents = append(actionEvents, action.AfterExecution(result, err)...)
 		actionFinished = true
-		if emitErr := emitAction(); emitErr != nil && err == nil {
-			err = emitErr
+		if emitErr := emitAction(); emitErr != nil {
+			s.Logger.WithContext(ctx).Errorf("bkn trace terminal evidence emit failed: %v", emitErr)
 		}
 	}
 	if err != nil {
@@ -392,6 +386,37 @@ func (s *ToolServiceImpl) executeTool(ctx context.Context, req *interfaces.Execu
 		},
 		HTTPRequestParams: req.HTTPRequestParams,
 		Timeout:           time.Duration(req.Timeout) * time.Second,
+	}
+	if tool.SourceType == model.SourceTypeFunction && isPlatformFunctionTarget(url) {
+		proxyReq.ClientTimeoutGrace = 5 * time.Second
+		// The HTTP client timeout alone does not control sandbox execution. The internal
+		// Function endpoint accepts milliseconds through its timeout query parameter.
+		// Do not allow an existing URL query or a user-supplied query.timeout to
+		// bypass the configured limit.
+		parsedURL, parseErr := neturl.Parse(proxyReq.URL)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		existingQuery := parsedURL.Query()
+		existingQuery.Del("timeout")
+		parsedURL.RawQuery = existingQuery.Encode()
+		proxyReq.URL = parsedURL.String()
+		query := make(map[string]any, len(proxyReq.QueryParams)+1)
+		for key, value := range proxyReq.QueryParams {
+			if key != "timeout" {
+				query[key] = value
+			}
+		}
+		if req.Timeout > 0 {
+			seconds := int64(req.Timeout)
+			if s.ProxyMaxTimeout > 0 && seconds > int64(s.ProxyMaxTimeout/time.Second) {
+				seconds = int64(s.ProxyMaxTimeout / time.Second)
+			}
+			timeout := time.Duration(seconds) * time.Second
+			proxyReq.Timeout = timeout
+			query["timeout"] = strconv.FormatInt(timeout.Milliseconds(), 10)
+		}
+		proxyReq.QueryParams = query
 	}
 	proxyReq.Headers = utils.SanitizeThirdPartyHeaders(proxyReq.Headers)
 	// After sanitizing, never before: the sanitizer strips exactly this header

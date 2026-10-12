@@ -8,242 +8,152 @@ package driveradapters
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
 )
 
-func TestValidateLogicViewRequest(t *testing.T) {
-	ctx := context.Background()
+type validatingViewService struct{ err error }
 
-	t.Run("accepts valid logic view", func(t *testing.T) {
-		req := &interfaces.ResourceRequest{
-			Name:     "view",
-			Category: interfaces.ResourceCategoryLogicView,
-			LogicDefinition: []*interfaces.LogicDefinitionNode{
-				{
-					ID:   "out",
-					Type: interfaces.LogicDefinitionNodeType_Output,
-					OutputFields: []*interfaces.ViewProperty{
-						{
-							Property: interfaces.Property{
-								Name: "title",
-								Type: interfaces.DataType_Text,
-								Features: []interfaces.PropertyFeature{
-									{FeatureName: "title_fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext, RefProperty: "title"},
-								},
-							},
-						},
-					},
-				},
-			},
-		}
+func (service *validatingViewService) ValidateRequest(context.Context, *interfaces.ResourceRequest) error {
+	return service.err
+}
 
-		require.NoError(t, ValidateResourceRequest(ctx, req))
-	})
+func (*validatingViewService) Prepare(context.Context, *interfaces.ResourceRequest) (string, []*interfaces.Property, error) {
+	return "", nil, nil
+}
 
-	t.Run("accepts a ref-only vector feature", func(t *testing.T) {
-		req := &interfaces.ResourceRequest{
-			Name:     "view",
-			Category: interfaces.ResourceCategoryLogicView,
-			LogicDefinition: []*interfaces.LogicDefinitionNode{{
-				ID:   "out",
-				Type: interfaces.LogicDefinitionNodeType_Output,
-				OutputFields: []*interfaces.ViewProperty{
-					{Property: interfaces.Property{
-						Name: "content",
-						Type: interfaces.DataType_Text,
-						Features: []interfaces.PropertyFeature{{
-							FeatureType: interfaces.PropertyFeatureType_Vector,
-							RefProperty: "embedding",
-						}},
-					}},
-					{Property: interfaces.Property{Name: "embedding", Type: interfaces.DataType_Vector}},
-				},
-			}},
-		}
+func (*validatingViewService) QueryWithPaging(context.Context, *interfaces.Resource, *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
+	return nil, errors.New("query is not expected")
+}
 
-		require.NoError(t, ValidateResourceRequest(ctx, req))
-	})
+func TestValidateResourceRequestLogicalViewService(t *testing.T) {
+	previous := resourcelogic.GetLogicalViewService()
+	t.Cleanup(func() { resourcelogic.SetLogicalViewService(previous) })
+	req := &interfaces.ResourceRequest{Name: "view", Category: interfaces.ResourceCategoryLogicalView}
+	want := errors.New("invalid view")
+	resourcelogic.SetLogicalViewService(&validatingViewService{err: want})
+	require.ErrorIs(t, ValidateResourceRequest(context.Background(), req), want)
 
-	t.Run("returns logic definition error", func(t *testing.T) {
-		req := &interfaces.ResourceRequest{
-			Name:     "view",
-			Category: interfaces.ResourceCategoryLogicView,
-			LogicDefinition: []*interfaces.LogicDefinitionNode{
-				{ID: "bad", Type: "bad"},
-			},
-		}
-
-		require.Error(t, validateLogicViewRequest(ctx, req))
-	})
-
-	t.Run("rejects a qualified feature name", func(t *testing.T) {
-		req := &interfaces.ResourceRequest{
-			Name:     "view",
-			Category: interfaces.ResourceCategoryLogicView,
-			LogicDefinition: []*interfaces.LogicDefinitionNode{{
-				ID:   "out",
-				Type: interfaces.LogicDefinitionNodeType_Output,
-				OutputFields: []*interfaces.ViewProperty{{Property: interfaces.Property{
-					Name: "title",
-					Type: interfaces.DataType_Text,
-					Features: []interfaces.PropertyFeature{{
-						FeatureName: "title.keyword",
-						FeatureType: interfaces.PropertyFeatureType_Keyword,
-						RefProperty: "title",
-					}},
-				}}},
-			}},
-		}
-
-		err := ValidateResourceRequest(ctx, req)
-
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "must be relative to property")
-	})
+	resourcelogic.SetLogicalViewService(nil)
+	var httpErr *rest.HTTPError
+	require.ErrorAs(t, ValidateResourceRequest(context.Background(), req), &httpErr)
+	require.Equal(t, http.StatusNotImplemented, httpErr.HTTPCode)
 }
 
 func TestValidateResourceRequestIgnoresExpectedUpdateTime(t *testing.T) {
 	err := ValidateResourceRequest(context.Background(), &interfaces.ResourceRequest{
 		Name:               "resource",
-		Category:           interfaces.ResourceCategoryLogicView,
+		Category:           interfaces.ResourceCategoryTable,
 		ExpectedUpdateTime: -1,
 	})
 	require.NoError(t, err)
 }
 
-func TestValidateLogicDefinition(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("accepts nil definition", func(t *testing.T) {
-		fields, err := validateLogicDefinition(ctx, nil)
-
-		require.NoError(t, err)
-		assert.Nil(t, fields)
-	})
-
-	t.Run("returns output fields", func(t *testing.T) {
-		want := []*interfaces.ViewProperty{{Property: interfaces.Property{Name: "id", Type: interfaces.DataType_Integer}}}
-
-		fields, err := validateLogicDefinition(ctx, []*interfaces.LogicDefinitionNode{
-			{ID: "resource", Type: interfaces.LogicDefinitionNodeType_Resource},
-			{ID: "out", Type: interfaces.LogicDefinitionNodeType_Output, OutputFields: want},
-		})
-
-		require.NoError(t, err)
-		assert.Equal(t, want, fields)
-	})
-
-	t.Run("rejects too many nodes", func(t *testing.T) {
-		nodes := make([]*interfaces.LogicDefinitionNode, 21)
-		for i := range nodes {
-			nodes[i] = &interfaces.LogicDefinitionNode{ID: "n", Type: interfaces.LogicDefinitionNodeType_Resource}
+func TestValidateResourceRequestDatasetDisplayName(t *testing.T) {
+	newRequest := func(props ...*interfaces.Property) *interfaces.ResourceRequest {
+		return &interfaces.ResourceRequest{
+			Name: "dataset", Category: interfaces.ResourceCategoryDataset, SchemaDefinition: props,
 		}
-
-		_, err := validateLogicDefinition(ctx, nodes)
-
-		require.Error(t, err)
-	})
-
-	t.Run("rejects invalid node type", func(t *testing.T) {
-		_, err := validateLogicDefinition(ctx, []*interfaces.LogicDefinitionNode{{ID: "bad", Type: "bad"}})
-
-		require.Error(t, err)
-	})
-}
-
-func TestValidateViewFields(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("accepts valid fields and sets display name", func(t *testing.T) {
-		fields := []*interfaces.ViewProperty{
-			{Property: interfaces.Property{Name: "title", Type: interfaces.DataType_Text}},
-		}
-
-		err := validateViewFields(ctx, fields)
-
-		require.NoError(t, err)
-		assert.Equal(t, "title", fields[0].DisplayName)
-	})
-
-	t.Run("rejects invalid fields", func(t *testing.T) {
-		tests := []struct {
-			name   string
-			fields []*interfaces.ViewProperty
-		}{
-			{name: "empty name", fields: []*interfaces.ViewProperty{{Property: interfaces.Property{Type: interfaces.DataType_String}}}},
-			{name: "name too long", fields: []*interfaces.ViewProperty{{Property: interfaces.Property{Name: strings.Repeat("a", interfaces.MaxLength_PropertyName+1), Type: interfaces.DataType_String}}}},
-			{name: "display name too long", fields: []*interfaces.ViewProperty{{Property: interfaces.Property{Name: "f1", DisplayName: strings.Repeat("a", interfaces.MaxLength_PropertyDisplayName+1), Type: interfaces.DataType_String}}}},
-			{name: "description too long", fields: []*interfaces.ViewProperty{{Property: interfaces.Property{Name: "f1", Description: strings.Repeat("a", interfaces.MaxLength_PropertyDescription+1), Type: interfaces.DataType_String}}}},
-			{name: "duplicate name", fields: []*interfaces.ViewProperty{
-				{Property: interfaces.Property{Name: "f1", Type: interfaces.DataType_String}},
-				{Property: interfaces.Property{Name: "f1", Type: interfaces.DataType_Integer}},
-			}},
-			{name: "duplicate display name", fields: []*interfaces.ViewProperty{
-				{Property: interfaces.Property{Name: "f1", DisplayName: "same", Type: interfaces.DataType_String}},
-				{Property: interfaces.Property{Name: "f2", DisplayName: "same", Type: interfaces.DataType_Integer}},
-			}},
-			{name: "invalid feature", fields: []*interfaces.ViewProperty{
-				{Property: interfaces.Property{Name: "f1", Type: interfaces.DataType_String, Features: []interfaces.PropertyFeature{{FeatureName: "", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "f1"}}}},
-			}},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				require.Error(t, validateViewFields(ctx, tt.fields))
-			})
-		}
-	})
-}
-
-func TestValidateFeatures(t *testing.T) {
-	ctx := context.Background()
-	fieldsMap := map[string]*interfaces.ViewProperty{
-		"title":     {Property: interfaces.Property{Name: "title", Type: interfaces.DataType_Text}},
-		"name":      {Property: interfaces.Property{Name: "name", Type: interfaces.DataType_String}},
-		"embedding": {Property: interfaces.Property{Name: "embedding", Type: interfaces.DataType_Vector}},
 	}
 
-	t.Run("accepts valid native and referenced features", func(t *testing.T) {
-		features := []interfaces.PropertyFeature{
-			{FeatureName: "title_fulltext", FeatureType: interfaces.PropertyFeatureType_Fulltext, RefProperty: "title"},
-			{FeatureName: "native_keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "not_in_map", IsNative: true},
-		}
-
-		require.NoError(t, validateFeatures(ctx, fieldsMap, features))
+	t.Run("trims display name before saving", func(t *testing.T) {
+		req := newRequest(&interfaces.Property{Name: "field", Type: interfaces.DataType_String, DisplayName: "  Title \t"})
+		require.NoError(t, ValidateResourceRequest(context.Background(), req))
+		assert.Equal(t, "Title", req.SchemaDefinition[0].DisplayName)
 	})
 
-	t.Run("rejects invalid features", func(t *testing.T) {
-		tests := []struct {
-			name     string
-			features []interfaces.PropertyFeature
-		}{
-			{name: "empty feature name", features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name"}}},
-			{name: "feature name too long", features: []interfaces.PropertyFeature{{FeatureName: strings.Repeat("a", interfaces.MaxLength_PropertyFeatureName+1), FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name"}}},
-			{name: "duplicate feature name", features: []interfaces.PropertyFeature{
-				{FeatureName: "kw", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name"},
-				{FeatureName: "kw", FeatureType: interfaces.PropertyFeatureType_Fulltext, RefProperty: "title"},
-			}},
-			{name: "invalid feature type", features: []interfaces.PropertyFeature{{FeatureName: "bad", FeatureType: "bad", RefProperty: "name"}}},
-			{name: "description too long", features: []interfaces.PropertyFeature{{FeatureName: "kw", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name", Description: strings.Repeat("a", interfaces.MaxLength_PropertyFeatureDescription+1)}}},
-			{name: "empty ref property", features: []interfaces.PropertyFeature{{FeatureName: "kw", FeatureType: interfaces.PropertyFeatureType_Keyword}}},
-			{name: "missing ref property", features: []interfaces.PropertyFeature{{FeatureName: "kw", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "missing"}}},
-			{name: "unsupported ref type", features: []interfaces.PropertyFeature{{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "embedding"}}},
-			{name: "duplicate default per type", features: []interfaces.PropertyFeature{
-				{FeatureName: "kw1", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name", IsDefault: true},
-				{FeatureName: "kw2", FeatureType: interfaces.PropertyFeatureType_Keyword, RefProperty: "name", IsDefault: true},
-			}},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				require.Error(t, validateFeatures(ctx, fieldsMap, tt.features))
-			})
-		}
+	t.Run("blank display name falls back to field name", func(t *testing.T) {
+		req := newRequest(&interfaces.Property{Name: "field", Type: interfaces.DataType_String, DisplayName: " \t "})
+		require.NoError(t, ValidateResourceRequest(context.Background(), req))
+		assert.Equal(t, "field", req.SchemaDefinition[0].DisplayName)
 	})
+
+	t.Run("checks length after trimming", func(t *testing.T) {
+		req := newRequest(&interfaces.Property{
+			Name: "field", Type: interfaces.DataType_String,
+			DisplayName: " " + strings.Repeat("a", interfaces.MaxLength_PropertyDisplayName) + " ",
+		})
+		require.NoError(t, ValidateResourceRequest(context.Background(), req))
+		assert.Equal(t, strings.Repeat("a", interfaces.MaxLength_PropertyDisplayName), req.SchemaDefinition[0].DisplayName)
+	})
+
+	t.Run("rejects duplicates after trimming", func(t *testing.T) {
+		req := newRequest(
+			&interfaces.Property{Name: "first", Type: interfaces.DataType_String, DisplayName: "Title"},
+			&interfaces.Property{Name: "second", Type: interfaces.DataType_String, DisplayName: " Title "},
+		)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, ValidateResourceRequest(context.Background(), req), &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Dataset_Duplicated_FieldDisplayName, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, "Title", req.SchemaDefinition[1].DisplayName)
+	})
+
+	t.Run("rejects blank fallback duplicate", func(t *testing.T) {
+		req := newRequest(
+			&interfaces.Property{Name: "first", Type: interfaces.DataType_String, DisplayName: "second"},
+			&interfaces.Property{Name: "second", Type: interfaces.DataType_String, DisplayName: "  "},
+		)
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, ValidateResourceRequest(context.Background(), req), &httpErr)
+		assert.Equal(t, verrors.VegaBackend_Dataset_Duplicated_FieldDisplayName, httpErr.BaseError.ErrorCode)
+	})
+}
+
+func TestValidateResourceRequestRawDisplayNameUnchanged(t *testing.T) {
+	req := &interfaces.ResourceRequest{
+		Name: "table", Category: interfaces.ResourceCategoryTable,
+		SchemaDefinition: []*interfaces.Property{{Name: "field", Type: interfaces.DataType_String, DisplayName: " Title "}},
+	}
+	require.NoError(t, ValidateResourceRequest(context.Background(), req))
+	assert.Equal(t, " Title ", req.SchemaDefinition[0].DisplayName)
+}
+
+func TestValidateResourceRequestRejectsDuplicateFeatureTypes(t *testing.T) {
+	for _, category := range []string{interfaces.ResourceCategoryTable, interfaces.ResourceCategoryDataset} {
+		t.Run(category, func(t *testing.T) {
+			for _, tc := range []struct {
+				name         string
+				firstDefault bool
+				lastDefault  bool
+			}{
+				{name: "neither default"},
+				{name: "first default", firstDefault: true},
+				{name: "both default", firstDefault: true, lastDefault: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					req := &interfaces.ResourceRequest{
+						Name:     "resource",
+						Category: category,
+						SchemaDefinition: []*interfaces.Property{{
+							Name: "title",
+							Type: interfaces.DataType_Text,
+							Features: []interfaces.PropertyFeature{
+								{FeatureName: "standard", FeatureType: interfaces.PropertyFeatureType_Fulltext, IsDefault: tc.firstDefault},
+								{FeatureName: "english", FeatureType: interfaces.PropertyFeatureType_Fulltext, IsDefault: tc.lastDefault},
+							},
+						}},
+					}
+
+					var httpErr *rest.HTTPError
+					require.ErrorAs(t, ValidateResourceRequest(rest.WithLanguage(context.Background(), rest.AmericanEnglish), req), &httpErr)
+					require.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+					require.Equal(t, verrors.VegaBackend_Resource_Duplicated_FieldFeatureType, httpErr.BaseError.ErrorCode)
+					require.Equal(t, map[string]any{"FieldName": "title", "FieldFeatureType": interfaces.PropertyFeatureType_Fulltext}, httpErr.BaseError.DescriptionTemplateData)
+					require.Equal(t, "Field title already has a fulltext feature", httpErr.BaseError.Description)
+					require.Contains(t, httpErr.BaseError.ErrorDetails, `property "title" has more than one "fulltext" feature`)
+				})
+			}
+		})
+	}
 }

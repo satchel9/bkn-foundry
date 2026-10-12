@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/captureadmission"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/sessionsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/evidencevo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/sessionvo"
@@ -1427,6 +1428,28 @@ func TestRetryAttemptRequiresRetryableFailure(t *testing.T) {
 	}
 }
 
+func TestRetryAttemptIsRejectedAfterCaptureStops(t *testing.T) {
+	view := captureadmission.New(1, "enabled")
+	service := sessionsvc.New(sessionstore.New(), sessionsvc.Options{CaptureAdmission: view})
+	owner := testOwner()
+	conversation := mustEnsureConversation(t, service, owner, "retry-off")
+	interaction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{Owner: owner, ConversationID: conversation.ID, IdempotencyKey: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, receipt, err := service.EnsureOperation(context.Background(), sessionsvc.EnsureOperationCommand{Owner: owner, ConversationID: conversation.ID, InteractionID: interaction.ID, OperationKey: "op", ToolName: "query", Input: operationInput("query"), LeaseToken: interaction.LeaseToken, LeaseEpoch: interaction.LeaseEpoch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = service.FailOperationAttempt(context.Background(), sessionsvc.FinishAttemptCommand{Owner: owner, OperationID: operation.ID, Attempt: 1, ReceiptID: receipt.ID, Error: operationError("failed"), Retryable: true, RequestID: "req-fail", TraceID: validTraceIDOne}); err != nil {
+		t.Fatal(err)
+	}
+	view.Update(2, "disabled")
+	if _, _, err = service.StartOperationAttempt(context.Background(), sessionsvc.StartAttemptCommand{Owner: owner, OperationID: operation.ID, LeaseToken: interaction.LeaseToken, LeaseEpoch: interaction.LeaseEpoch}); !sessionsvc.IsCode(err, sessionsvc.CodeCaptureDisabled) {
+		t.Fatalf("retry after off error = %v", err)
+	}
+}
+
 func TestCompleteOperationAttemptDefaultsEvidenceDurabilityToPending(t *testing.T) {
 	t.Parallel()
 
@@ -2111,6 +2134,141 @@ func TestLicenseLossStillTerminatesAndRecordsEvidenceOmission(t *testing.T) {
 		len(revisions[0].PartialReasons) != 1 ||
 		revisions[0].PartialReasons[0] != "not_collected_due_to_license" {
 		t.Fatalf("license omission was not preserved: %#v, %v", revisions, err)
+	}
+}
+
+func TestCaptureDisabledKeepsManagedLifecycleAndClosesInteraction(t *testing.T) {
+	t.Parallel()
+	view := captureadmission.New(7, "enabled")
+	store := sessionstore.New()
+	service := sessionsvc.New(store, sessionsvc.Options{CaptureAdmission: view})
+	owner := testOwner()
+	conversation := mustEnsureConversation(t, service, owner, "capture-policy-boundary")
+	interaction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{
+		Owner: owner, ConversationID: conversation.ID, IdempotencyKey: "accepted-before-off",
+	})
+	if err != nil {
+		t.Fatalf("start interaction: %v", err)
+	}
+	view.Update(8, "disabled")
+	newConversation, err := service.EnsureCurrentConversation(context.Background(), sessionsvc.EnsureConversationCommand{
+		Owner: owner, ExternalConversationKey: "new-after-off", IdempotencyKey: "new-conversation",
+	})
+	if err != nil {
+		t.Fatalf("new conversation under disabled capture: %v", err)
+	}
+	newInteraction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{
+		Owner: owner, ConversationID: newConversation.ID, IdempotencyKey: "new-interaction-after-off",
+	})
+	if err != nil || newInteraction.ID == "" {
+		t.Fatalf("new interaction under disabled capture: %#v %v", newInteraction, err)
+	}
+	_, _, err = service.EnsureOperation(context.Background(), sessionsvc.EnsureOperationCommand{
+		Owner: owner, ConversationID: newConversation.ID, InteractionID: newInteraction.ID,
+		OperationKey: "managed-off", ToolName: "query", Input: operationInput("query"),
+		LeaseToken: newInteraction.LeaseToken, LeaseEpoch: newInteraction.LeaseEpoch,
+	})
+	if !sessionsvc.IsCode(err, sessionsvc.CodeCaptureDisabled) {
+		t.Fatalf("new operation after capture off error = %v", err)
+	}
+	completed, err := service.TerminateInteraction(context.Background(), sessionsvc.TerminateInteractionCommand{
+		Owner: owner, InteractionID: interaction.ID, Status: sessionvo.InteractionCompleted,
+		TerminalIdempotencyKey: "accepted-finish", DeriveManifest: true,
+		Manifest: sessionvo.ClosureManifest{Version: "3.0.0", CompletionReason: "answer_returned"},
+	})
+	if err != nil {
+		t.Fatalf("accepted interaction finish: %v", err)
+	}
+	if completed.ClosureManifest == nil || !slices.Contains(completed.ClosureManifest.SystemPartialReasons, "not_collected_due_to_policy") {
+		t.Fatalf("trusted policy reason missing: %#v", completed.ClosureManifest)
+	}
+	if completed.EvidenceStatus != sessionvo.EvidencePartial {
+		t.Fatalf("evidence status = %q, want partial", completed.EvidenceStatus)
+	}
+	revisions, err := service.ListAssemblyRevisions(context.Background(), owner, interaction.ID)
+	if err != nil {
+		t.Fatalf("list assembly revisions: %v", err)
+	}
+	if len(revisions) != 0 {
+		t.Fatalf("policy closure created %d assembly revisions", len(revisions))
+	}
+}
+
+func TestCaptureDisabledClosesOneShotManagedConversation(t *testing.T) {
+	view := captureadmission.New(1, "disabled")
+	store := sessionstore.New()
+	service := sessionsvc.New(store, sessionsvc.Options{CaptureAdmission: view})
+	owner := testOwner()
+	conversation, err := service.EnsureCurrentConversation(context.Background(), sessionsvc.EnsureConversationCommand{
+		Owner: owner, ExternalConversationKey: "one-shot-under-disabled-capture", OneShot: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	interaction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{
+		Owner: owner, ConversationID: conversation.ID, IdempotencyKey: "start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.TerminateInteraction(context.Background(), sessionsvc.TerminateInteractionCommand{
+		Owner: owner, InteractionID: interaction.ID, Status: sessionvo.InteractionCompleted,
+		TerminalIdempotencyKey: "finish", DeriveManifest: true,
+		Manifest: sessionvo.ClosureManifest{Version: "3.0.0", CompletionReason: "answer_returned"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closed, err := service.GetConversation(context.Background(), owner, conversation.ID)
+	if err != nil || closed.Status != sessionvo.ConversationClosed {
+		t.Fatalf("one-shot conversation did not close: %#v %v", closed, err)
+	}
+	items, err := store.Lease(context.Background(), 100, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var interactionClosed, conversationClosed bool
+	for _, item := range items {
+		interactionClosed = interactionClosed || item.EventType == "interaction.completed" && item.AggregateID == interaction.ID
+		conversationClosed = conversationClosed || item.EventType == "conversation.closed" && item.AggregateID == conversation.ID
+	}
+	if !interactionClosed || !conversationClosed {
+		t.Fatalf("managed terminal projections missing under disabled capture: interaction=%v conversation=%v", interactionClosed, conversationClosed)
+	}
+}
+
+func TestPolicyClosureTerminalReplaySurvivesRecovery(t *testing.T) {
+	view := captureadmission.New(1, "enabled")
+	service := sessionsvc.New(sessionstore.New(), sessionsvc.Options{CaptureAdmission: view})
+	owner := testOwner()
+	conversation := mustEnsureConversation(t, service, owner, "policy-replay")
+	interaction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{Owner: owner, ConversationID: conversation.ID, IdempotencyKey: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Update(2, "disabled")
+	first, err := service.TerminateInteraction(context.Background(), sessionsvc.TerminateInteractionCommand{Owner: owner, InteractionID: interaction.ID, Status: sessionvo.InteractionCompleted, TerminalIdempotencyKey: "finish", DeriveManifest: true, Manifest: sessionvo.ClosureManifest{Version: "3.0.0", CompletionReason: "answer_returned"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view.Update(3, "enabled")
+	replay, err := service.TerminateInteraction(context.Background(), sessionsvc.TerminateInteractionCommand{Owner: owner, InteractionID: interaction.ID, Status: sessionvo.InteractionCompleted, TerminalIdempotencyKey: "finish", DeriveManifest: true, Manifest: sessionvo.ClosureManifest{Version: "3.0.0", CompletionReason: "answer_returned"}})
+	if err != nil || replay.ID != first.ID || !slices.Contains(replay.ClosureManifest.SystemPartialReasons, "not_collected_due_to_policy") {
+		t.Fatalf("recovery replay = %#v, %v", replay, err)
+	}
+}
+
+func TestEnabledClientCannotForgePolicyPartialReason(t *testing.T) {
+	view := captureadmission.New(1, "enabled")
+	service := sessionsvc.New(sessionstore.New(), sessionsvc.Options{CaptureAdmission: view})
+	owner := testOwner()
+	conversation := mustEnsureConversation(t, service, owner, "forged-policy-reason")
+	interaction, err := service.StartInteraction(context.Background(), sessionsvc.StartInteractionCommand{Owner: owner, ConversationID: conversation.ID, IdempotencyKey: "start"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.TerminateInteraction(context.Background(), sessionsvc.TerminateInteractionCommand{Owner: owner, InteractionID: interaction.ID, Status: sessionvo.InteractionCompleted, TerminalIdempotencyKey: "finish", DeriveManifest: true, Manifest: sessionvo.ClosureManifest{Version: "3.0.0", CompletionReason: "answer_returned", SystemPartialReasons: []string{"not_collected_due_to_policy"}}})
+	if !sessionsvc.IsCode(err, sessionsvc.CodeClosureManifestInvalid) {
+		t.Fatalf("forged reason error = %v", err)
 	}
 }
 

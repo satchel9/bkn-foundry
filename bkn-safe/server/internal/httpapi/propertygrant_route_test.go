@@ -52,6 +52,7 @@ func propertyGrantRouter(t *testing.T, register bool) *gin.Engine {
 		permdata.RegisterManagementHandler(licverify.EditionEnterprise, func(
 			_ permdata.ManagementServices,
 			operatorID permdata.OperatorIDResolver,
+			_ permdata.ManagementAuditReporter,
 		) http.Handler {
 			return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 				operator, ok := operatorID(request)
@@ -98,6 +99,9 @@ func TestPropertyGrantGateRunsBeforeAuthentication(t *testing.T) {
 		}
 		header := response.Header.Clone()
 		header.Del("Date")
+		// Request correlation is deliberately per-request, so it cannot be
+		// part of the indistinguishability check between the two gate paths.
+		header.Del("X-Request-Id")
 		return wireResponse{status: response.StatusCode, header: header, body: string(body)}
 	}
 	community := probe(propertyGrantRouter(t, false))

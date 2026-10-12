@@ -48,13 +48,14 @@ const (
 )
 
 type KnBaseError struct {
-	ErrorCode               string         `json:"error_code"`    // Error code
-	Description             string         `json:"description"`   // Error description
-	Solution                string         `json:"solution"`      // Solution
-	ErrorLink               string         `json:"error_link"`    // Error link
-	ErrorDetails            interface{}    `json:"error_details"` // Detail content
-	DescriptionTemplateData map[string]any `json:"-"`             // Description parameters
-	SolutionTemplateData    map[string]any `json:"-"`             // Solution parameters
+	ErrorCode               string         `json:"error_code"`         // Error code
+	Description             string         `json:"description"`        // Error description
+	Solution                string         `json:"solution"`           // Solution
+	ErrorLink               string         `json:"error_link"`         // Error link
+	ErrorDetails            interface{}    `json:"error_details"`      // Detail content
+	Metadata                map[string]any `json:"metadata,omitempty"` // Machine-readable error metadata
+	DescriptionTemplateData map[string]any `json:"-"`                  // Description parameters
+	SolutionTemplateData    map[string]any `json:"-"`                  // Solution parameters
 }
 
 type ResourceInfo struct {
@@ -104,12 +105,12 @@ type PropertyParameter struct {
 
 // ObjectType Object type structure definition
 type ObjectType struct {
-	ModuleType           string                         `json:"module_type"` // Module type
-	ID                   string                         `json:"id"`          // Object ID
-	Name                 string                         `json:"name"`        // Object name
-	Tags                 []string                       `json:"tags"`        // Tags
-	Comment              string                         `json:"comment"`     // Comment
-	Score                float64                        `json:"_score"`      // Score
+	ModuleType           string                         `json:"module_type,omitempty"` // Module type
+	ID                   string                         `json:"id"`                    // Object ID
+	Name                 string                         `json:"name"`                  // Object name
+	Tags                 []string                       `json:"tags,omitempty"`        // Tags
+	Comment              string                         `json:"comment,omitempty"`     // Comment
+	Score                float64                        `json:"_score,omitempty"`      // Score
 	DataSource           *ResourceInfo                  `json:"data_source"`
 	DataProperties       []*DataProperty                `json:"data_properties,omitempty"`  // Data properties
 	LogicProperties      []*LogicPropertyDef            `json:"logic_properties,omitempty"` // Logic properties
@@ -154,12 +155,12 @@ type RelatedMetric struct {
 
 // RelationType Relation type structure definition
 type RelationType struct {
-	ModuleType string   `json:"module_type"` // Module type
-	ID         string   `json:"id"`          // Relation type ID
-	Name       string   `json:"name"`        // Relation type name
-	Tags       []string `json:"tags"`        // Tags
-	Comment    string   `json:"comment"`     // Comment
-	Score      float64  `json:"_score"`      // Score
+	ModuleType string   `json:"module_type,omitempty"` // Module type
+	ID         string   `json:"id"`                    // Relation type ID
+	Name       string   `json:"name"`                  // Relation type name
+	Tags       []string `json:"tags,omitempty"`        // Tags
+	Comment    string   `json:"comment,omitempty"`     // Comment
+	Score      float64  `json:"_score,omitempty"`      // Score
 
 	SourceObjectTypeID string `json:"source_object_type_id"`        // Source object type ID
 	TargetObjectTypeID string `json:"target_object_type_id"`        // Target object type ID
@@ -171,12 +172,12 @@ type RelationType struct {
 
 // ActionType Action type structure definition
 type ActionType struct {
-	ModuleType string   `json:"module_type"` // Module type
-	ID         string   `json:"id"`          // Action type ID
-	Name       string   `json:"name"`        // Action type name
-	Tags       []string `json:"tags"`        // Tags
-	Comment    string   `json:"comment"`     // Comment
-	Score      float64  `json:"_score"`      // Score
+	ModuleType string   `json:"module_type,omitempty"` // Module type
+	ID         string   `json:"id"`                    // Action type ID
+	Name       string   `json:"name"`                  // Action type name
+	Tags       []string `json:"tags,omitempty"`        // Tags
+	Comment    string   `json:"comment,omitempty"`     // Comment
+	Score      float64  `json:"_score,omitempty"`      // Score
 
 	ObjectTypeID string `json:"object_type_id"` // Object type ID bound to action type
 }
@@ -307,6 +308,14 @@ type KnowledgeNetworkDetail struct {
 	// layer is there and worth a call to search_capabilities, without carrying an input schema per
 	// tool into every "describe this network" answer.
 	MountedCapabilities *MountedCapabilityCounts `json:"mounted_capabilities,omitempty"`
+
+	// The three counts and the notice below appear together, and only when the network
+	// was too large to answer with its concept model -- see ReduceToNavigationShell.
+	// On every other answer the arrays are the count, so repeating it would be noise.
+	ObjectTypeCount   int    `json:"object_type_count,omitempty"`
+	RelationTypeCount int    `json:"relation_type_count,omitempty"`
+	ActionTypeCount   int    `json:"action_type_count,omitempty"`
+	Notice            string `json:"notice,omitempty"`
 }
 
 // MountedCapabilityCounts is how many capabilities of each kind a network has mounted.
@@ -358,6 +367,74 @@ func CountMountedCapabilities(refs []*CapabilityRef) *MountedCapabilityCounts {
 	return counts
 }
 
+// MaxSummaryObjectTypes is the size past which get_kn_detail answers with the
+// network's navigation shell instead of its concept arrays.
+//
+// A summary object type costs about 1.1KB rendered, so the 1000-object network of
+// #1877 came to 1.09MB -- past any caller's context, and a thousand authorization
+// reads to produce something nobody could read. Two hundred is where the answer
+// stops being one: it is already 218KB, and every network that works today is well
+// under it.
+const MaxSummaryObjectTypes = 200
+
+// MaxSummaryRelationTypes is the same limit for the relation types.
+//
+// A relation entry is smaller than an object type and costs no downstream call, so
+// it is not what made #1877 time out -- but it is a quarter of that network's 4.5MB
+// and would carry a network past what a caller can read on its own. The reported
+// network holds 2925 relation types over 1000 object types, so three per object type
+// is what this model shape produces: 600 is the relation-side equivalent of the 200
+// above, and at roughly 430 bytes an entry it lands in the same quarter-megabyte.
+const MaxSummaryRelationTypes = 600
+
+// NeedsNavigationShell reports whether this network is too large to answer with its
+// concept arrays at any detail level. full is strictly larger than summary, so the
+// size that rules out one rules out the other.
+func (d *KnowledgeNetworkDetail) NeedsNavigationShell() bool {
+	if d == nil {
+		return false
+	}
+	return len(d.ObjectTypes) > MaxSummaryObjectTypes || len(d.RelationTypes) > MaxSummaryRelationTypes
+}
+
+// ReduceToNavigationShell keeps what a caller navigates by -- the network's own
+// record and its concept groups -- and replaces the three concept arrays with their
+// counts.
+//
+// This is the drill-down the tool description already prescribes at any size: pick
+// concept groups here, then call search_schema with them as its scope. Callers who
+// paged such a list would be scanning a knowledge model in name order, which is why
+// the answer narrows instead of paginating.
+//
+// It runs before the per-object-type authorization reads and the metric counts, not
+// after: those cost one downstream call per object type of a list this answer is not
+// going to carry.
+func (d *KnowledgeNetworkDetail) ReduceToNavigationShell() {
+	if d == nil {
+		return
+	}
+	d.ObjectTypeCount = len(d.ObjectTypes)
+	d.RelationTypeCount = len(d.RelationTypes)
+	d.ActionTypeCount = len(d.ActionTypes)
+	d.ObjectTypes = nil
+	d.RelationTypes = nil
+	d.ActionTypes = nil
+}
+
+// NavigationShellNoticeKey names the localized notice that fits this shell.
+//
+// The shell tells a caller to narrow by concept groups, because that is the
+// drill-down the tool prescribes. A network that defines none -- the 1000-object
+// network of #1877 is one -- would be told to pick from an empty field, so it is
+// pointed straight at search_schema instead, which recalls by meaning and needs
+// no scope.
+func (d *KnowledgeNetworkDetail) NavigationShellNoticeKey() string {
+	if d != nil && len(d.ConceptGroups) > 0 {
+		return "KnDetailNavigationShell"
+	}
+	return "KnDetailNavigationShellNoGroups"
+}
+
 // Detail levels for get_kn_detail progressive disclosure.
 const (
 	DetailLevelSummary = "summary" // skeleton + property name/type/comment (default)
@@ -371,11 +448,28 @@ const (
 // consumer reads) and nested inside each ConceptGroup. The nested copies are unused,
 // so we drop them and keep only object_type_ids as the group boundary.
 //
+// It always drops _score, which this response has no notion of: get_kn_detail is not a
+// search, and every concept comes back scored 0.
+//
 // Unless level is DetailLevelFull, it also strips the heavy per-property detail —
 // data-property field mappings and query operators, logic-property data sources and
-// parameters, relation mapping rules — while keeping property name/type/comment so an
-// agent still sees the schema shape. Callers fetch the stripped detail on demand via
+// parameters, relation mapping rules — while keeping property name/type so an agent
+// still sees the schema shape. Callers fetch the stripped detail on demand via
 // get_object_types / get_relation_types.
+//
+// Summary drops two more things from the object and relation entries themselves:
+//
+//   - module_type, which repeats for every entry of an array that already says which
+//     kind it holds;
+//   - comment, the long prose describing what a concept means. It is the single largest
+//     part of a summary — measured on the test deployment, 18.7KB of one 53.8KB network,
+//     35% — and get_object_types / get_relation_types / get_action_info return it for the
+//     few concepts a caller actually drills into. The tool schema has described comment as
+//     full-only since the progressive disclosure work; this is the behaviour catching up.
+//
+// Concept group comments stay: choosing 1-3 relevant groups is what the summary is for,
+// and their names alone do not carry enough to choose by. Tags stay everywhere, because a
+// tag such as requires_confirmation changes how a caller may use the concept.
 func (d *KnowledgeNetworkDetail) Slim(level string) {
 	if d == nil {
 		return
@@ -389,13 +483,37 @@ func (d *KnowledgeNetworkDetail) Slim(level string) {
 		g.RelationTypes = nil
 		g.ActionTypes = nil
 	}
+	for _, o := range d.ObjectTypes {
+		if o != nil {
+			o.Score = 0
+		}
+	}
+	for _, r := range d.RelationTypes {
+		if r != nil {
+			r.Score = 0
+		}
+	}
+	for _, a := range d.ActionTypes {
+		if a != nil {
+			a.Score = 0
+		}
+	}
 	if level == DetailLevelFull {
 		return
+	}
+	for _, a := range d.ActionTypes {
+		if a == nil {
+			continue
+		}
+		a.ModuleType = ""
+		a.Comment = ""
 	}
 	for _, o := range d.ObjectTypes {
 		if o == nil {
 			continue
 		}
+		o.ModuleType = ""
+		o.Comment = ""
 		// summary keeps only name+type per property so the array is flat and uniform
 		// (TOON then renders it as a compact table); drop display_name/comment and the
 		// heavy mapped_field/operators/logic sources. Full detail via get_object_types.
@@ -422,6 +540,8 @@ func (d *KnowledgeNetworkDetail) Slim(level string) {
 		if r == nil {
 			continue
 		}
+		r.ModuleType = ""
+		r.Comment = ""
 		r.MappingRules = nil
 		r.SourceObjectType = nil
 		r.TargetObjectType = nil
@@ -434,6 +554,81 @@ type ObjectTypesResp struct {
 	KnID        string        `json:"kn_id"`
 	ObjectTypes []*ObjectType `json:"object_types"`
 	Missing     []string      `json:"missing,omitempty"`
+
+	// The two below appear only when the caller listed instead of naming ids.
+	// TotalCount is how many object types the caller may see in this network, so a
+	// page can be read as "20 of 1000" rather than "20, and who knows".
+	TotalCount int64 `json:"total_count,omitempty"`
+	// NextOffset is the offset that continues the walk, absent on the last page.
+	// The caller should not compute it: what it means is this service's business,
+	// and a caller that derives it will be wrong the day the walk changes.
+	NextOffset *int `json:"next_offset,omitempty"`
+	// Notice says when the request was not honoured as asked -- today, only when a
+	// limit past the maximum was answered with the maximum. Quietly returning fewer
+	// rows than were asked for is how a caller concludes the network is small.
+	Notice string `json:"notice,omitempty"`
+}
+
+// Object type index bounds for get_object_types without ids.
+//
+// A listed entry is an index entry -- id, name, comment, tags, data source -- at
+// a few hundred bytes, because what a caller without ids needs is something to
+// choose by and then name. Two hundred of those is about the size of a small
+// network's whole summary, and fifty walks a 1000-object network in twenty
+// calls. Definitions come from naming the ids, which is the same progressive
+// disclosure get_kn_detail's summary and this tool's by-id path already are.
+const (
+	DefaultObjectTypePageSize = 50
+	MaxObjectTypePageSize     = 200
+)
+
+// ResolveObjectTypePage clamps a caller's paging inputs to the bounds above.
+// A negative offset is a typo, not a request to walk backwards; a limit past the
+// maximum is answered with the maximum rather than refused, because the caller
+// asked for more of a thing they can simply ask for again.
+// It reports whether the limit was cut down, because a page shorter than the one
+// asked for, with nothing said about it, reads as a network that ran out.
+func ResolveObjectTypePage(offset, limit int) (resolvedOffset, resolvedLimit int, clamped bool) {
+	if offset < 0 {
+		offset = 0
+	}
+	switch {
+	case limit <= 0:
+		limit = DefaultObjectTypePageSize
+	case limit > MaxObjectTypePageSize:
+		limit, clamped = MaxObjectTypePageSize, true
+	}
+	return offset, limit, clamped
+}
+
+// NextObjectTypeOffset is the offset that continues a walk, or nil on the last
+// page. It takes what the listing scanned, not what the page carries.
+//
+// A window that scanned nothing ends the walk even when the total says otherwise:
+// the total can move under a walk, and trusting it over what was actually read is
+// how a caller ends up looping on an empty page.
+func NextObjectTypeOffset(offset, scanned int, total int64) *int {
+	if scanned == 0 {
+		return nil
+	}
+	next := offset + scanned
+	if int64(next) >= total {
+		return nil
+	}
+	return &next
+}
+
+// ObjectTypePage is one page of a knowledge network's object types, with the
+// total the caller may see. bkn-backend applies the caller's authorization
+// before paging, so the total and the offsets are over what they can read.
+type ObjectTypePage struct {
+	Entries    []*ObjectType
+	TotalCount int64
+	// Scanned is how many object types the listing covered for this window, which
+	// is what a walk advances by. Entries can be shorter -- reading one of them in
+	// full can turn up nothing the caller may see -- and advancing by the entries
+	// would then re-read the window it just consumed, or stop while rows remain.
+	Scanned int
 }
 
 // RelationTypesResp is the get_relation_types response: the requested relation
@@ -573,9 +768,19 @@ type CypherQueryColumn struct {
 // is deliberately absent: it names physical tables and columns, which a caller
 // is not entitled to just because they may read the data.
 type CypherQueryResp struct {
-	Columns         []CypherQueryColumn `json:"columns"`
-	Entries         []map[string]any    `json:"entries"`
-	TraceDescriptor json.RawMessage     `json:"-"`
+	Columns            []CypherQueryColumn      `json:"columns"`
+	Entries            []map[string]any         `json:"entries"`
+	TraceDescriptor    json.RawMessage          `json:"-"`
+	PermissionImpacts  []ObjectPermissionImpact `json:"-"`
+	PermissionGuidance []*PermissionGuidance    `json:"permission_guidance,omitempty"`
+}
+
+// ObjectPermissionImpact is a structured signal that an object type's
+// property or row policy affected a tool result.
+type ObjectPermissionImpact struct {
+	ObjectTypeID     string   `json:"object_type_id"`
+	Properties       []string `json:"properties,omitempty"`
+	RowFilterApplied bool     `json:"row_filter_applied,omitempty"`
 }
 
 type BknBackendAccess interface {
@@ -596,6 +801,11 @@ type BknBackendAccess interface {
 	SearchObjectTypes(ctx context.Context, query *QueryConceptsReq) (objectTypes *ObjectTypeConcepts, err error)
 	// GetObjectTypeDetail Get object type details
 	GetObjectTypeDetail(ctx context.Context, knID string, otIds []string, includeDetail bool) ([]*ObjectType, error)
+	// ListObjectTypes reads one page of the network's object types in name order,
+	// for a caller that has no ids yet. Name order because a walk has to be
+	// repeatable: the export read had no order at all, and a page of an unordered
+	// list is not a page of anything.
+	ListObjectTypes(ctx context.Context, knID string, offset, limit int) (*ObjectTypePage, error)
 
 	// SearchRelationTypes Search relation types
 	SearchRelationTypes(ctx context.Context, query *QueryConceptsReq) (releationTypes *RelationTypeConcepts, err error)
@@ -664,9 +874,13 @@ const (
 	// server its action source names. Context Loader uses it only to read that
 	// target's invocation contract; running the action stays with ontology-query.
 	KNProxyChildTypeActionType = "action_type"
-	KNProxyTargetTypeToolBox   = "tool_box"
-	KNProxyTargetTypeFunction  = "function"
-	KNProxyTargetTypeMCP       = "mcp"
+	// KNProxyChildTypeLogicProperty binds an object type's logic property to the
+	// Tool box its tool data source names. Context Loader uses it only to read
+	// that tool's definition; running it stays with ontology-query.
+	KNProxyChildTypeLogicProperty = "logic_property"
+	KNProxyTargetTypeToolBox      = "tool_box"
+	KNProxyTargetTypeFunction     = "function"
+	KNProxyTargetTypeMCP          = "mcp"
 	// KNProxyTargetTypeSkill is a Skill mounted on the network. The proxy only
 	// reads it, relying on its execute grant; running a Skill stays caller-scoped.
 	KNProxyTargetTypeSkill  = "skill"
