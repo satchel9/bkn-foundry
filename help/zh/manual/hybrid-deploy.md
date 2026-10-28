@@ -487,6 +487,50 @@ done
 
 > **为什么不改控制器**：给 `nginx-hw-public` 的 DaemonSet 加 `--default-ssl-certificate=rdm/changhong.com` 也能让 catch-all 用上真证书（零改平台资源、升级无感），但该 DaemonSet 由 matrix 平台管理、是全集群公共入口（`nodeSelector: matrix.ingress=hw-public`），影响面覆盖所有「未声明 host」的 HTTPS 请求。除非 matrix 侧有官方入口，否则用上面的命名空间内做法。
 
+### 4.5 默认 OSS 存储注册
+
+> **2026-10-28 已实施并实测**（本部署 0.1.5）。
+
+**症状**：页面「上传技能」报 `desc.OSSGatewayDefaultStorageNotFound`。
+
+**根因**：技能上传会先向 oss-gateway 查默认存储（`GET /api/v1/storages?enabled=true&is_default=true`），返回 200 但 `data` 为空就抛该错误（`adp/execution-factory/operator-integration/server/drivenadapters/oss_gateway_backend.go:310-312`）。安装脚本 `deploy/scripts/lib/onboard_oss_storage.sh` 只会用**集群内置 MinIO**（按 `component=minio` 找 Pod）自动注册；本部署 `minio.enabled: false` + 外置 MinIO，脚本从 0.1.4 首装起就只打一条 warn 跳过，升级也不会补。
+
+**修法**（`/storages` 不在 ingress 上，先端口转发）：
+
+```bash
+kubectl -n openbkn port-forward svc/oss-gateway-backend 18080:8080 &
+
+# 1) 核验确实是空表
+curl -s 'http://127.0.0.1:18080/api/v1/storages' | python3 -m json.tool
+
+# 2) 复用沙箱的外置 MinIO 与凭据，注册默认存储
+ENDPOINT=$(kubectl -n openbkn get secret sandbox-secrets -o jsonpath='{.data.S3_ENDPOINT_URL}' | base64 -d)
+CRED=$(kubectl -n openbkn get secret s3fs-passwd -o jsonpath='{.data.s3fs-passwd}' | base64 -d)
+AK=${CRED%%:*}; SK=${CRED#*:}
+body="$(MUSER="$AK" MPASS="$SK" EP="$ENDPOINT" python3 -c '
+import json, os
+print(json.dumps({
+  "storage_name": "minio-default", "vendor_type": "ECEPH",
+  "endpoint": os.environ["EP"], "bucket_name": "open-bkn",
+  "access_key_id": os.environ["MUSER"], "access_key_secret": os.environ["MPASS"],
+  "region": "us-east-1", "is_default": True}))')"
+curl -sS -X POST 'http://127.0.0.1:18080/api/v1/storages' \
+  -H 'Content-Type: application/json' -d "$body" | python3 -m json.tool
+
+# 3) 连通性检查（只验证 BucketExists，不验证写权限）
+SID=$(curl -s 'http://127.0.0.1:18080/api/v1/storages?enabled=true&is_default=true' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["storage_id"])')
+curl -sS -X POST "http://127.0.0.1:18080/api/v1/storages/$SID/check" | python3 -m json.tool
+```
+
+**易错点**：
+
+- bucket 必须用**已存在且该凭据有权访问**的 `open-bkn`，不能照抄官方脚本的 `bkn-oss`。本部署的 `s3fs-passwd` 是按 bucket 授权的受限用户，对不存在的 bucket 返回 `Access Denied`（不是 `bucket not exist`）。
+- 技能对象键前缀是 `execution-factory/skill/...`，沙箱只挂载 `open-bkn:/sessions/{session_id}`，两者按前缀隔离，共用 bucket 不冲突。
+- `/check` 通过 ≠ 可写；最终以页面上传一个技能成功为准。若 PUT 阶段 403，是 MinIO policy 缺写权限。
+- 注册后无需重启 operator-integration（其默认存储缓存为空时会逐次重查；本部署实测注册后直接上传成功）。
+- 回滚：`curl -X DELETE .../storages/$SID`；若进程已缓存 ID，再 `kubectl -n openbkn rollout restart deploy/agent-operator-integration`。
+
 ---
 
 ## 05 验证
@@ -656,6 +700,12 @@ CONFIG_YAML_PATH=/opt/bkn-foundry/my-config.yaml \
 - **根因**：Docker 20.10.8 的默认 seccomp profile 缺 `clone3`（20.10.10 才修）。Kafka chart 设了 `seccompProfile: RuntimeDefault`，现代 glibc 的 JVM 因此起不来。
 - **修法**：改用外置 Kafka。其余 6 个 chart 都不设 seccompProfile，不受影响。
 
+### 对象存储
+
+**`desc.OSSGatewayDefaultStorageNotFound`** — 页面「上传技能」
+- **根因**：oss-gateway 的 `t_storage_config` 没有 `enabled + is_default` 记录。`onboard_oss_storage.sh` 只认集群内置 MinIO（`component=minio` Pod），关了内置 minio 的部署从首装起就被静默跳过，升级也不补。
+- **修法**：手工注册一条指向外置 MinIO `open-bkn` bucket 的默认存储，见 §4.5。注意凭据是 bucket 级受限用户，bucket 名不能照抄官方脚本的 `bkn-oss`。
+
 ---
 
 ## 附：本文涉及的关键源码位置
@@ -665,6 +715,7 @@ CONFIG_YAML_PATH=/opt/bkn-foundry/my-config.yaml \
 | 位置 | 说明 |
 | --- | --- |
 | `deploy/scripts/lib/common.sh:1407` | `INGRESS_NGINX_CLASS` 默认 `class-443`——标准安装自建控制器时才存在 |
+| `deploy/scripts/lib/onboard_oss_storage.sh:38` | 默认 OSS 存储自动注册只认内置 MinIO（`component=minio`）；外置 S3 部署静默跳过 → 首次上传技能才报错（§4.5） |
 | `deploy/scripts/services/config.sh:510` | 配置生成器会写 `authzProvider: bkn-safe`；手写配置时容易漏 |
 | `deploy/scripts/services/openbkn.sh:1455` | 需要两个 `OPENBKN_SKIP_*` 的原因 |
 | `deploy/onboard.sh:273` | `--config=` 只设 `INTERACTIVE=false`，不设 `CONFIG_YAML_PATH` |
