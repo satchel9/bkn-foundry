@@ -706,6 +706,35 @@ CONFIG_YAML_PATH=/opt/bkn-foundry/my-config.yaml \
 - **根因**：oss-gateway 的 `t_storage_config` 没有 `enabled + is_default` 记录。`onboard_oss_storage.sh` 只认集群内置 MinIO（`component=minio` Pod），关了内置 minio 的部署从首装起就被静默跳过，升级也不补。
 - **修法**：手工注册一条指向外置 MinIO `open-bkn` bucket 的默认存储，见 §4.5。注意凭据是 bucket 级受限用户，bucket 名不能照抄官方脚本的 `bkn-oss`。
 
+### 模型 / DNS
+
+**模型工厂测试连接失败：`ModelFactory.ModelController.TestModel.Error`** — `ucs.changhong.com`
+
+- **症状**：在模型工厂添加 `https://ucs.changhong.com/api/v1/chat/completions` 的 LLM 时，「测试连接」失败，响应里的 `detail` 只有通用文案（v0.1.5 的 locale 中间件会用 i18n 目录覆盖上游错误，看不到真实状态码）。Pod 内执行 `python -c "import socket;print(socket.gethostbyname('ucs.changhong.com'))"` 报 `socket.gaierror: [Errno -2] Name or service not known`。
+- **根因**：`100.125.1.250 / 100.125.129.250` 私有 DNS 中没有该域名的记录（所有节点 `getent -s dns hosts ucs.changhong.com` 返回 `rc=2`）；节点能解析是因为 `/etc/hosts` 手工写了 `202.98.157.177 ucs.changhong.com`，而 **Pod 不继承节点 hosts**。Pod 的 DNS 指向 `169.254.25.10`（`kube-system/nodelocaldns`），其 `.:53` 块是 `forward . /etc/resolv.conf`（外部域名不经过 CoreDNS）；该镜像 `k8s-dns-node-cache:1.15.12` 未编译 `hosts` 插件（`cmd/node-cache/main.go` 的插件导入列表无 `hosts`），**不能在 nodelocaldns 的 Corefile 里加 hosts 覆盖**，否则 node-cache 会启动失败、全集群 DNS 中断。
+- **修法**：给实际发起调用的两个 Deployment 加 `hostAliases`（`mf-model-manager` 负责「测试连接」，`mf-model-api` 负责真实对话）：
+
+```bash
+for d in mf-model-manager mf-model-api; do
+  kubectl -n openbkn patch deploy "$d" --type=merge -p \
+    '{"spec":{"template":{"spec":{"hostAliases":[{"ip":"202.98.157.177","hostnames":["ucs.changhong.com"]}]}}}}'
+done
+kubectl -n openbkn rollout status deploy/mf-model-manager --timeout=180s
+kubectl -n openbkn rollout status deploy/mf-model-api --timeout=180s
+```
+
+验证：
+
+```bash
+kubectl -n openbkn exec deploy/mf-model-manager -- \
+  python -c "import socket;print(socket.gethostbyname('ucs.changhong.com'))"
+# 期望输出 202.98.157.177
+```
+
+- **注意**：chart 不支持 `hostAliases` 字段，**Helm 升级会覆盖，需在升级后重新打补丁**；长期应让 DNS/网络团队把 `ucs.changhong.com → 202.98.157.177` 正式加入 `100.125.x` 私有 DNS，之后即可撤掉补丁。
+- **DNS 通后仍需满足**：`model_series` 选 `others`（`openai` 是 Azure 专用，会强制拼 Azure 路径）；`api_url` 用完整的 `https://ucs.changhong.com/api/v1/chat/completions`；`api_key` 必须是 UCS 网关认可的 JWT（普通 key 会返回 401）。
+- **验证记录**：2026-11-12 已按此修复，模型工厂「测试连接」通过。
+
 ---
 
 ## 附：本文涉及的关键源码位置

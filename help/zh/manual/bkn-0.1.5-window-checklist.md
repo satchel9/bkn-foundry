@@ -589,6 +589,29 @@ kubectl -n openbkn logs -l app=sandbox-executor -c executor --tail=20 | grep con
 
 ---
 
+**④ 模型域名 `ucs.changhong.com` 的 hostAliases（Helm 升级会覆盖，必须重打）**
+
+`ucs.changhong.com` 不在 `100.125.x` 私有 DNS 中，Pod 解析只能靠 Deployment 的 `hostAliases`。
+本次（2026-11-12）已在 `mf-model-manager` / `mf-model-api` 上配置；**任何 `helm upgrade` 之后都要检查，
+为空则重新应用**：
+
+```bash
+for d in mf-model-manager mf-model-api; do
+  echo "== $d =="
+  kubectl -n openbkn get deploy "$d" -o jsonpath='{.spec.template.spec.hostAliases}'; echo
+done
+
+# 为空则重打：
+for d in mf-model-manager mf-model-api; do
+  kubectl -n openbkn patch deploy "$d" --type=merge -p \
+    '{"spec":{"template":{"spec":{"hostAliases":[{"ip":"202.98.157.177","hostnames":["ucs.changhong.com"]}]}}}}'
+done
+```
+
+根因、验证方法与长期修复（把记录加进私有 DNS）见 `hybrid-deploy.md` 故障速查「模型 / DNS」。
+
+---
+
 ## 回滚速查（对应 runbook §6）
 
 > **★ P2.3 一跑，回 0.1.4 就必须恢复数据库。**
