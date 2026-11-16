@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"io/fs"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -20,7 +21,7 @@ func TestMCPLocaleBundle(t *testing.T) {
 		convey.So(meta.Name, convey.ShouldEqual, "search_schema")
 		convey.So(meta.Description, convey.ShouldContainSubstring, "Explore schema")
 		convey.So(meta.Title, convey.ShouldEqual, "Explore Schema")
-		convey.So(meta.GroupTitle, convey.ShouldEqual, "Networks & Schema")
+		convey.So(meta.GroupTitle, convey.ShouldEqual, "Knowledge network concept search")
 		// Group and order belong only to the baseline file. Locales can translate
 		// presentation text, but must not alter grouping or ordering.
 		convey.So(meta.Group, convey.ShouldEqual, "discovery")
@@ -38,7 +39,7 @@ func TestMCPLocaleBundle(t *testing.T) {
 		bundle := loadMCPLocaleBundle("fr-FR")
 
 		convey.So(bundle.ServerInstructions(), convey.ShouldEqual, mustReadMCPInstructions(schemasFS, defaultMCPLocale))
-		convey.So(bundle.ToolMeta(toolKeyRunSQL).Name, convey.ShouldEqual, toolKeyRunSQL)
+		convey.So(bundle.ToolMeta(toolKeyRunCypher).Name, convey.ShouldEqual, toolKeyRunCypher)
 	})
 
 	convey.Convey("localized schema description overlays should match existing schema paths", t, func() {
@@ -60,29 +61,10 @@ func TestMCPLocaleBundle(t *testing.T) {
 	})
 }
 
-func TestMCPLocaleBundleFallsBackWhenOverlayResourcesAreUnavailable(t *testing.T) {
-	resources := fstest.MapFS{
-		"schemas/locales/zh-CN/instructions.txt":         &fstest.MapFile{Data: []byte("Chinese baseline instructions")},
-		"schemas/locales/zh-CN/instructions_compact.txt": &fstest.MapFile{Data: []byte("Chinese baseline compact instructions")},
-		"schemas/locales/zh-CN/ptc_instructions.txt":     &fstest.MapFile{Data: []byte("Chinese baseline PTC instructions")},
-	}
-
-	bundle := buildMCPLocaleBundleFromFS(resources, "en-US")
-
-	if got := bundle.ServerInstructions(); got != "Chinese baseline instructions" {
-		t.Fatalf("instructions = %q, want baseline instructions", got)
-	}
-	if got := bundle.CompactServerInstructions(); got != "Chinese baseline compact instructions" {
-		t.Fatalf("compact instructions = %q, want baseline instructions", got)
-	}
-	if got := bundle.PTCServerInstructions(); got != "Chinese baseline PTC instructions" {
-		t.Fatalf("PTC instructions = %q, want baseline instructions", got)
-	}
-	if bundle.toolMeta != nil {
-		t.Fatalf("tool metadata = %#v, want no overlay", bundle.toolMeta)
-	}
-	if bundle.schemaDescriptions != nil {
-		t.Fatalf("schema descriptions = %#v, want no overlay", bundle.schemaDescriptions)
+func TestMCPLocaleResourcesRejectMissingLanguage(t *testing.T) {
+	resources := fstest.MapFS{"schemas/locales/zh-CN/instructions.txt": &fstest.MapFile{Data: []byte("baseline")}}
+	if _, err := loadMCPMessages(resources); err == nil {
+		t.Fatal("expected missing language to fail startup")
 	}
 }
 
@@ -98,37 +80,6 @@ PTC instructions`)},
 
 	if got := mustReadMCPResource(resources, defaultMCPLocale, "ptc_instructions.txt"); got != "PTC instructions" {
 		t.Fatalf("resource = %q, want license header stripped", got)
-	}
-}
-
-func TestMCPLocaleBundleFallsBackWhenOverlayResourcesAreMalformed(t *testing.T) {
-	resources := fstest.MapFS{
-		"schemas/locales/zh-CN/instructions.txt":         &fstest.MapFile{Data: []byte("Chinese baseline instructions")},
-		"schemas/locales/zh-CN/instructions_compact.txt": &fstest.MapFile{Data: []byte("Chinese baseline compact instructions")},
-		"schemas/locales/zh-CN/ptc_instructions.txt":     &fstest.MapFile{Data: []byte("Chinese baseline PTC instructions")},
-		"schemas/locales/en-US/instructions.txt":         &fstest.MapFile{Data: []byte("English instructions")},
-		"schemas/locales/en-US/instructions_compact.txt": &fstest.MapFile{Data: []byte("English compact instructions")},
-		"schemas/locales/en-US/ptc_instructions.txt":     &fstest.MapFile{Data: []byte("English PTC instructions")},
-		"schemas/locales/en-US/tools_meta.json":          &fstest.MapFile{Data: []byte(`{`)},
-		"schemas/locales/en-US/schema_descriptions.json": &fstest.MapFile{Data: []byte(`{`)},
-	}
-
-	bundle := buildMCPLocaleBundleFromFS(resources, "en-US")
-
-	if got := bundle.ServerInstructions(); got != "English instructions" {
-		t.Fatalf("instructions = %q, want localized instructions", got)
-	}
-	if got := bundle.CompactServerInstructions(); got != "English compact instructions" {
-		t.Fatalf("compact instructions = %q, want localized instructions", got)
-	}
-	if got := bundle.PTCServerInstructions(); got != "English PTC instructions" {
-		t.Fatalf("PTC instructions = %q, want localized instructions", got)
-	}
-	if bundle.toolMeta != nil {
-		t.Fatalf("tool metadata = %#v, want no overlay", bundle.toolMeta)
-	}
-	if bundle.schemaDescriptions != nil {
-		t.Fatalf("schema descriptions = %#v, want no overlay", bundle.schemaDescriptions)
 	}
 }
 
@@ -183,15 +134,16 @@ func TestServerInstructionsLeadWithManagedInteractionLifecycle(t *testing.T) {
 	}
 }
 
-// retiredToolNames is what no model-facing text may name any more.
-var retiredToolNames = []string{"run_sql", "list_resources", "describe_resource"}
+// removedToolNames is what no model-facing text may name any more: the
+// physical query tools, which the server no longer has.
+var removedToolNames = []string{"run_sql", "list_resources", "describe_resource"}
 
 // #1545 routed model-expressible aggregation to run_cypher and left run_sql as
-// the fallback; retiredTools has since withdrawn run_sql and the two resource
-// tools from the MCP surface, so run_cypher is the whole routing. Both locales,
-// in the server instructions and in the PTC digest, must say that — and must
-// name none of the withheld tools, because an instruction pointing at one
-// spends a turn on a call that answers "no such tool".
+// the fallback; run_sql and the two resource tools have since been removed, so
+// run_cypher is the whole routing. Both locales, in the server instructions
+// and in the PTC digest, must say that — and must name none of the removed
+// tools, because an instruction pointing at one spends a turn on a call that
+// answers "no such tool".
 func TestServerInstructionsRouteModelAggregationToCypher(t *testing.T) {
 	tests := []struct {
 		locale       string
@@ -206,12 +158,12 @@ func TestServerInstructionsRouteModelAggregationToCypher(t *testing.T) {
 				"跨表 join）→ run_cypher",
 				"聚合类问题（如「每个 X 的 Y 总数/排名」）用 run_cypher",
 			},
-			forbidden: retiredToolNames,
+			forbidden: removedToolNames,
 			ptcExpected: []string{
 				"**优先写一条 `run_cypher`**",
 				`print("答案:", run_cypher(`,
 			},
-			ptcForbidden: retiredToolNames,
+			ptcForbidden: removedToolNames,
 		},
 		{
 			locale: "en-US",
@@ -219,11 +171,11 @@ func TestServerInstructionsRouteModelAggregationToCypher(t *testing.T) {
 				"use run_cypher whenever the question can be stated in object types, relation types and logical properties",
 				"write them on the model with run_cypher",
 			},
-			forbidden: retiredToolNames,
+			forbidden: removedToolNames,
 			ptcExpected: []string{
 				"prefer run_cypher whenever the question can be stated in object types, relation types and logical properties",
 			},
-			ptcForbidden: retiredToolNames,
+			ptcForbidden: removedToolNames,
 		},
 	}
 	for _, test := range tests {
@@ -266,6 +218,69 @@ func TestServerInstructionsRequireRecomputableMembershipThresholdAndDetail(t *te
 			for _, want := range test.want {
 				if !strings.Contains(instructions, want) {
 					t.Fatalf("instructions for %s omit %q", test.locale, want)
+				}
+			}
+		})
+	}
+}
+
+// #2515: a caller found the right published function through
+// search_capabilities, skipped it because the question (a product's full
+// sales detail) was not on a domain list of business calculations, read one
+// unfiltered object page and reported its in-page matches as the product
+// total. Both profiles must route any matching mounted function regardless of
+// domain, and say that a total only comes from a result under the same filter.
+func TestServerInstructionsFollowDiscoveredFunctionAndScopedTotals(t *testing.T) {
+	tests := []struct {
+		locale  string
+		full    []string
+		compact []string
+	}{
+		{
+			locale: "zh-CN",
+			full: []string{
+				"不知道 kn_id 时先 list_knowledge_networks",
+				"网络挂载了函数时，先用 search_capabilities 查有没有与问题相符的已发布函数",
+				"有就按它的 call 调 execute_tool",
+				"不要改用 query_object_instance、run_cypher 或 run_code 取原始数据代替",
+				"回答中的总数只能来自带同一过滤条件的 total_count、聚合结果或函数结果",
+				"不带 condition 的 query_object_instance 返回的 total_count 是整个对象类的数量",
+			},
+			compact: []string{
+				"查与问题相符的已发布函数",
+				"有就按其 call 调 execute_tool",
+				"总数只取同一过滤条件的 total_count 或聚合结果",
+			},
+		},
+		{
+			locale: "en-US",
+			full: []string{
+				"Without a kn_id, call list_knowledge_networks",
+				"When the network mounts functions, first ask search_capabilities whether a published function matches the question",
+				"call execute_tool with its call template, fill the arguments from input_schema",
+				"do not fetch raw rows through query_object_instance, run_cypher or run_code instead",
+				"A total in the answer must come from a total_count, aggregate or function result computed under the same filter",
+				"the total_count of a query_object_instance call without a condition counts the whole object type",
+			},
+			compact: []string{
+				"for a published function matching the question",
+				"run it with execute_tool from its call template",
+				"A total must come from a total_count or aggregate under the same filter",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.locale, func(t *testing.T) {
+			bundle := loadMCPLocaleBundle(test.locale)
+			full, compact := bundle.ServerInstructions(), bundle.CompactServerInstructions()
+			for _, want := range test.full {
+				if !strings.Contains(full, want) {
+					t.Errorf("full instructions for %s omit %q", test.locale, want)
+				}
+			}
+			for _, want := range test.compact {
+				if !strings.Contains(compact, want) {
+					t.Errorf("compact instructions for %s omit %q", test.locale, want)
 				}
 			}
 		})
@@ -374,5 +389,59 @@ func TestOverlayKeepsAnAbsentOutputSchemaAbsent(t *testing.T) {
 	}
 	if strings.Contains(string(translated), "行动类") {
 		t.Fatalf("input schema was not translated: %s", translated)
+	}
+}
+
+func TestPTCMessageParametersRemainLiteral(t *testing.T) {
+	bundle := loadMCPLocaleBundle("en-US")
+	got := bundle.PTCError("unsupported_tool_wrap", "{{ literal }}")
+	if got != "Unsupported PTC tool wrapper: {{ literal }}." {
+		t.Fatalf("rendered PTC error = %q", got)
+	}
+}
+
+func mustReadMCPInstructions(resources fs.FS, locale string) string {
+	return mustReadMCPResource(resources, locale, "instructions.txt")
+}
+
+func mustReadMCPResource(resources fs.FS, locale, resource string) string {
+	content, err := readMCPResource(resources, locale, resource)
+	if err != nil {
+		panic("cannot load MCP baseline resource: " + err.Error())
+	}
+	instructions := strings.TrimSpace(content)
+	if instructions == "" {
+		panic("MCP baseline resource must not be empty")
+	}
+	return instructions
+}
+
+func TestMCPMessagesRejectMalformedAndInvalidStructuredResources(t *testing.T) {
+	resources := fstest.MapFS{}
+	err := fs.WalkDir(schemasFS, "schemas", func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		data, readErr := fs.ReadFile(schemasFS, path)
+		if readErr != nil {
+			return readErr
+		}
+		resources[path] = &fstest.MapFile{Data: data}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{`{`, `[]`} {
+		t.Run(invalid, func(t *testing.T) {
+			resources["schemas/locales/en-US/tools_meta.json"] = &fstest.MapFile{Data: []byte(invalid)}
+			_, err := loadMCPMessages(resources)
+			if err == nil || !strings.Contains(err.Error(), "tools_meta.json") {
+				t.Fatalf("invalid metadata must fail startup: %v", err)
+			}
+		})
 	}
 }

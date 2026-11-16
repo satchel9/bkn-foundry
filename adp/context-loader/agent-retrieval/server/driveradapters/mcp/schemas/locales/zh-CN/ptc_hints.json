@@ -7,15 +7,9 @@
 {
   "run_cypher": [
     "标签写对象类 id/名称，关系写关系类 id/名称，属性写逻辑属性名，都不是物理列名。",
-    "无 WITH / UNION / 变长路径；OPTIONAL MATCH 只能一条关系、挂一个新节点，用 count(可选侧属性) 数 0 度。",
+    "WITH 在所有 MATCH 之后做聚合后过滤，可连写多个（只有第一个能聚合），RETURN count(*) 可对分组再统计；或 WITH DISTINCT x.p AS v 再接 MATCH … WHERE y.q = v；可用 UNION / UNION ALL 合并返回相同列的几段；无变长路径；不等于写 <>；OPTIONAL MATCH 只能一条关系、挂一个新节点，用 count(可选侧属性) 数 0 度。",
     "不写 LIMIT 默认 1000 行。",
     "run_cypher(kn_id=\"<kn_id>\", query=\"MATCH (p:player)-[:rel_goal_player]->(g:goal) RETURN p.name AS name, count(*) AS goals ORDER BY goals DESC LIMIT 10\")"
-  ],
-  "run_sql": [
-    "表名必须写成 {{.<resource_id>}} 占位符，id 取自 search_schema 的 data_source.id",
-    "或 list_resources 的 resource_id；不可原样写 'resource_id' 字面量。",
-    "列名用物理列名。仅单条 SELECT，无 CTE/UNION。",
-    "run_sql(sql=\"SELECT team_name, COUNT(*) c FROM {{.<resource_id>}} GROUP BY team_name\")"
   ],
   "get_kn_detail": [
     "先读 concept_groups：每组带 name/tags/comment，是收敛检索范围的入口。",

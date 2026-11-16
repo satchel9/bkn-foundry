@@ -2,7 +2,7 @@
 # Knowledge-network capability binding: which Skills and ToolBox tools belong to a knowledge network.
 openapi: 3.0.2
 info:
-  title: BKN Capabilities
+  title: BKN 知识网络 · 能力绑定 API
   version: 0.1.0
   description: |
     A capability binding records that a Skill or a ToolBox tool belongs to a knowledge network.
@@ -17,10 +17,18 @@ info:
     |---|---|---|
     | `skill` | empty | `skill_id` |
     | `function` | `box_id` | `tool_id` |
+    | `knowledge_base` | empty | knowledge base id |
 
     `box_id` is required for a function because a tool id is scoped to its box in the execution
     factory, and it is the same name the execution factory, Context Loader and Studio already
-    use. A skill has no container and omits it.
+    use. A skill has no container and omits it, and so does a knowledge base.
+
+    A `knowledge_base` is an Enterprise knowledge base served by kb-api. Mounting one checks
+    with kb-api that it exists (400 `KnowledgeBaseNotSupported` where kb-api is not deployed)
+    and that the editor holds `query_data` on it. Publishing then lets the network's managed
+    proxy read the whole knowledge base through kb-api's read API. Like a Skill, the grant is
+    best effort: if the editor later loses access, only that knowledge base becomes unreadable
+    through the proxy.
 
     The stored column behind it is type-neutral (`f_owner_id`) so a later capability type can
     bring a different kind of container without a migration; that name does not appear on the
@@ -33,6 +41,11 @@ info:
     A binding answers "which capabilities does this knowledge network have", not "which
     capability is relevant to this question". Listing does not replace retrieval: a network
     with dozens of Skills and tools needs the execution factory's search endpoints.
+
+    The public list includes model-referenced tools by default, including tools with no stored
+    binding. Set `mounted_only=true` for mount-management views: it returns only stored bindings,
+    pages them directly in the database, and does not scan object or action types. The default
+    remains unchanged for callers inspecting model dependencies.
 
     ## Scope and branch
 
@@ -120,13 +133,16 @@ info:
     box is omitted from `boxes` and `metadata_available` turns false, rather than published with
     a number that would send the caller after tools that are already bound.
 
-    ## When the execution factory is down
+    ## When a metadata service is unavailable
 
     Listing degrades rather than fails: the bindings come back in full with empty metadata and
     `metadata_available: false`. Listing memberships is the point of the endpoint and the names
     are decoration — failing the request would take the mount UI down with the factory. The flag
     exists so an empty name is not read as a deleted capability; an outage and a deletion must
-    not look alike.
+    not look alike. For knowledge bases, this also covers an unset `KB_API_URL`: without
+    a configured kb-api the backend cannot establish whether the target exists. Only a confirmed
+    not-found response marks a knowledge base `missing`. Export fails with metadata unavailable
+    until the configuration or service recovers, rather than silently dropping these mounts.
 
     ## Navigation-only knowledge networks
 
@@ -161,12 +177,12 @@ info:
     network `execute` (execution scope resolution); public discovery and execution endpoints each
     enforce their own operation before calling it.
 
-    **Prefix aliases**: every path below is also served under `/api/ontology-manager/v1`, and
-    the internal face under `/api/bkn-backend/in/v1` and `/api/ontology-manager/in/v1`.
+    Public paths use `/api/bkn-backend/v1`; the internal face uses
+    `/api/bkn-backend/in/v1`.
 paths:
   /api/bkn-backend/v1/knowledge-networks/{kn_id}/capabilities:
     get:
-      summary: List the capabilities bound to a knowledge network
+      summary: List mounted and model-referenced capabilities of a knowledge network
       parameters:
         - name: kn_id
           description: Business knowledge network ID
@@ -186,6 +202,7 @@ paths:
               - skill
               - function
               - mcp_tool
+              - knowledge_base
             type: string
           in: query
         - name: box_id
@@ -222,6 +239,17 @@ paths:
             type: boolean
             default: false
           in: query
+        - name: mounted_only
+          description: >-
+            Return stored capability bindings only. Excludes tools referenced solely by object
+            or action types; `total_count` and pagination cover stored bindings. This mode skips
+            model provenance reads, so `sources` contains only the direct mount kind and
+            `sources_available` is false. Defaults to false to preserve the existing dependency
+            inspection response.
+          schema:
+            type: boolean
+            default: false
+          in: query
         - name: offset
           description: Offset. Defaults to 0.
           schema:
@@ -248,8 +276,17 @@ paths:
               - desc
             type: string
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         '200':
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: >-
             Capability bindings of this branch for a knowledge-network detail reader. A
             navigation-only caller who reaches the network through a visible child receives a
@@ -266,6 +303,10 @@ paths:
             this network.
         '404':
           description: Knowledge network or branch not found
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       operationId: listCapabilities
       tags:
         - Capabilities
@@ -294,6 +335,9 @@ paths:
               $ref: '#/components/schemas/AttachCapabilitiesRequest'
       responses:
         '200':
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: >-
             The bindings of the requested capabilities. This reuses the list schema but fills
             only `entries` and `total_count`: `boxes` is empty and `metadata_available` /
@@ -306,7 +350,7 @@ paths:
         '400':
           description: >-
             Empty capability list, unsupported capability_type, missing capability_id, a
-            function without box_id, or a value longer than its column: box_id and
+            function without box_id, a knowledge_base on a deployment without kb-api, or a value longer than its column: box_id and
             capability_id are limited to 64 characters and comment to 255. Over-long values are
             rejected here rather than reaching the database, where they would surface as a 500
             under strict SQL mode or be silently truncated into a binding pointing at a
@@ -316,8 +360,9 @@ paths:
             names a box with no tool to mount (`BknBackend.CapabilityBinding.EmptyToolBox`).
         '502':
           description: >-
-            The execution factory is unreachable, so the targets could not be validated
-            (`BknBackend.CapabilityBinding.ExecutionFactoryUnavailable`). Nothing is written —
+            The execution factory or, for a knowledge_base, kb-api is unreachable, so the
+            targets could not be validated (`BknBackend.CapabilityBinding.ExecutionFactoryUnavailable`
+            or `BknBackend.CapabilityBinding.KnowledgeBaseServiceUnavailable`). Nothing is written —
             a retry is safe.
         '403':
           description: The caller cannot modify this knowledge network
@@ -352,18 +397,27 @@ paths:
           schema:
             type: string
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       responses:
         '204':
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: >-
             Released. Releasing a binding that is already gone is also a 204: the request states
             that the capability is not mounted, and that is true either way. This matches
-            DELETE .../metrics.
+            deleting an already-absent binding.
         '400':
           description: Empty binding_ids
         '403':
           description: The caller cannot modify this knowledge network
         '404':
           description: Knowledge network or branch not found
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       operationId: detachCapabilities
       tags:
         - Capabilities
@@ -399,6 +453,7 @@ paths:
               - skill
               - function
               - mcp_tool
+              - knowledge_base
             type: string
           in: query
       responses:
@@ -448,6 +503,7 @@ components:
             - skill
             - function
             - mcp_tool
+            - knowledge_base
           type: string
         box_id:
           description: Owning tool box ID. Present for functions, absent for skills.
@@ -562,7 +618,9 @@ components:
           items:
             $ref: '#/components/schemas/CapabilityBinding'
         total_count:
-          description: Total matching bindings, ignoring pagination
+          description: >-
+            Total matching entries, ignoring pagination. With `mounted_only=true`, counts stored
+            bindings only; the default list also counts model-referenced tools without a mount.
           type: integer
         boxes:
           description: The tool boxes behind the whole-box mounts on this page
@@ -571,7 +629,8 @@ components:
             $ref: '#/components/schemas/CapabilityBoxSummary'
         metadata_available:
           description: >-
-            False when the execution factory could not be reached. The bindings are still
+            False when a metadata service (execution factory or kb-api) is unconfigured or
+            could not be reached. The bindings are still
             complete; only their names, descriptions and statuses are missing.
 
             Meaningful on the list response only. The mount response reuses this schema without
@@ -579,7 +638,8 @@ components:
           type: boolean
         sources_available:
           description: >-
-            False when the branch's object types or action types could not be read. The mounted
+            False when `mounted_only=true` skips provenance or when the branch's object types or
+            action types could not be read. The mounted
             capabilities are still listed, but the ones only the model uses are missing and the
             `sources` on the rest are incomplete — an empty sources list would otherwise read as
             "nothing uses this", which is the opposite of unknown.
@@ -614,14 +674,15 @@ components:
             - skill
             - function
             - mcp_tool
+            - knowledge_base
           type: string
         box_id:
           description: >-
             Tool box ID for a function reference, or MCP Server ID for an mcp_tool. Absent for a
-            skill.
+            skill or a knowledge_base.
           type: string
         capability_id:
-          description: skill_id for a skill, tool_id for a function, or tool name for an mcp_tool
+          description: skill_id for a skill, tool_id for a function, tool name for an mcp_tool, or the knowledge base id for a knowledge_base
           type: string
     AttachCapabilitiesRequest:
       description: Mount request
@@ -646,13 +707,14 @@ components:
             - skill
             - function
             - mcp_tool
+            - knowledge_base
           type: string
         box_id:
-          description: Tool box ID for a function, or MCP Server ID for an mcp_tool. Ignored for a skill.
+          description: Tool box ID for a function, or MCP Server ID for an mcp_tool. Ignored for a skill or a knowledge_base.
           type: string
         capability_id:
           description: >-
-            skill_id for a skill, tool_id for a function, or tool name for an mcp_tool. Omitted when all_tools is set.
+            skill_id for a skill, tool_id for a function, tool name for an mcp_tool, or the knowledge base id for a knowledge_base. Omitted when all_tools is set.
           type: string
         all_tools:
           description: >-

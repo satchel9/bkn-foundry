@@ -5,7 +5,7 @@
 // Package authz is bkn-safe's authorization engine: a Casbin RBAC model with
 // resource instances, backed by a GORM adapter (policies live in the shared DB).
 //
-// This is a clean redesign, NOT the ISF authorization contract. Casbin stores
+// This is a clean redesign, NOT the legacy authorization contract. Casbin stores
 // policies and resolves transitive roles; the shared grant index performs the
 // actual local/hierarchical/effective decision so logical bundles and wildcard
 // fallback cannot drift across endpoints. A deny wins within one resource,
@@ -25,13 +25,13 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/casbin/casbin/v2"
 	"github.com/casbin/casbin/v2/model"
 	gormadapter "github.com/casbin/gorm-adapter/v3"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/authzresource"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/permobject"
 	safemodel "github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
@@ -42,7 +42,7 @@ import (
 //	p = sub, obj, act, eft, policy_source, authority_source
 //	g = _, _            user/app -> role (UUID-preserved)
 //
-// The matcher also accepts policies whose subject is PublicAccessorID: ISF's
+// The matcher also accepts policies whose subject is PublicAccessorID: the legacy service's
 // "grant to the root department = everyone" convention. bkn-safe keeps no
 // user→department g rules (membership lives in relational tables only), so a
 // root-department grant would otherwise never match any requester; instead the
@@ -65,7 +65,7 @@ m = (g(r.sub, p.sub) || p.sub == "` + PublicAccessorID + `") && keyMatch(r.obj, 
 `
 
 // PublicAccessorID is the root-department accessor: a policy granted to this
-// subject applies to every requester (see modelConf). The UUID is the ISF root
+// subject applies to every requester (see modelConf). The UUID is the legacy root
 // department id, written by e.g. execution-factory's CreateIntCompPolicyForAllUsers
 // (interfaces.AccessorRootDepartmentID) for built-in toolbox public access.
 const PublicAccessorID = permobject.PublicAccessorID
@@ -114,17 +114,30 @@ type Enforcer struct {
 	// of a reload. It is a channel rather than a mutex so a caller whose context
 	// ends while queued leaves without doing any work (#1511).
 	writeSlot chan struct{}
-	// The authorization registry is static after startup reconciliation. Cache
-	// child-to-parent derivation metadata so ordinary authorization checks do
-	// not add registry queries.
-	derivedRulesMu    sync.Mutex
-	derivedRulesReady bool
-	derivedRules      map[string][]derivedRule
+	registry  *Registry
 }
+
+// casbinRule keeps the adapter projection aligned with the domain limits.
+// V1 stores "<resource_type>:<resource_id>": a 64-character resource type,
+// one separator, and a 257-character knowledge-network child reference.
+// The bounded fields also keep the adapter's composite unique index below
+// MariaDB's index-byte limit under utf8mb4.
+type casbinRule struct {
+	ID    uint   `gorm:"primaryKey;autoIncrement"`
+	Ptype string `gorm:"size:16"`
+	V0    string `gorm:"size:64"`
+	V1    string `gorm:"size:322"`
+	V2    string `gorm:"size:64"`
+	V3    string `gorm:"size:16"`
+	V4    string `gorm:"size:32"`
+	V5    string `gorm:"size:64"`
+}
+
+func (casbinRule) TableName() string { return "casbin_rule" }
 
 // New builds an Enforcer using a GORM-backed policy store on the given db.
 func New(db *gorm.DB) (*Enforcer, error) {
-	adapter, err := gormadapter.NewAdapterByDB(db)
+	adapter, err := gormadapter.NewAdapterByDBWithCustomTable(db, &casbinRule{})
 	if err != nil {
 		return nil, fmt.Errorf("new gorm adapter: %w", err)
 	}
@@ -155,7 +168,7 @@ func New(db *gorm.DB) (*Enforcer, error) {
 	if err := e.LoadPolicy(); err != nil {
 		return nil, fmt.Errorf("load policy: %w", err)
 	}
-	return &Enforcer{e: e, db: db, writeSlot: make(chan struct{}, 1)}, nil
+	return &Enforcer{e: e, db: db, writeSlot: make(chan struct{}, 1), registry: newRegistry(db)}, nil
 }
 
 // obj builds the "type:id" object key.
@@ -222,13 +235,12 @@ func (en *Enforcer) hasCurrentProxySource(ctx context.Context, proxyID, resource
 		case safemodel.ProxyGrantSourceTypeManual, safemodel.ProxyGrantSourceTypeAdmin:
 			return true, nil
 		case safemodel.ProxyGrantSourceTypeKNBinding:
-			var registered int64
-			if err := en.db.WithContext(ctx).Model(&safemodel.Operation{}).
-				Where("resource_type_id = ? AND id = ?", resourceType, op).Count(&registered).Error; err != nil {
-				return false, err
-			}
-			if registered == 0 {
+			_, err := en.Registry().Operation(ctx, resourceType, op)
+			if errors.Is(err, gorm.ErrRecordNotFound) {
 				continue
+			}
+			if err != nil {
+				return false, err
 			}
 			var active int64
 			if err := en.db.WithContext(ctx).Model(&safemodel.User{}).
@@ -417,7 +429,7 @@ func (en *Enforcer) RemoveRoleContext(ctx context.Context, accessorID, roleID st
 }
 
 // RolesForAccessor lists the role ids directly bound to an accessor (the
-// grouping g-lines with sub=accessor). Mirrors ISF accessor_roles.
+// grouping g-lines with sub=accessor). Mirrors legacy accessor_roles.
 func (en *Enforcer) RolesForAccessor(accessorID string) ([]string, error) {
 	return en.e.GetRolesForUser(accessorID)
 }
@@ -487,7 +499,7 @@ func rowFilterImplicitRoles(reader groupingPolicyReader, accessorID string) ([]s
 }
 
 // RoleMembers lists the accessor ids bound to a role (the grouping g-lines with
-// role=roleID). Mirrors ISF role-members.
+// role=roleID). Mirrors legacy role-members.
 func (en *Enforcer) RoleMembers(roleID string) ([]string, error) {
 	return en.e.GetUsersForRole(roleID)
 }
@@ -594,11 +606,24 @@ type PermQuery struct {
 // Object/op order follows GetImplicitPermissionsForUser; callers treat the
 // result as sets.
 func (en *Enforcer) EffectivePermissions(accessorID string, q PermQuery) (hasWildcard bool, grants []RoleGrant, err error) {
+	// A paid type below its edition reads as granted to nobody (#2512). The
+	// unscoped "*:*" row cannot name it; callers render those types from the
+	// licence's capabilities, which leave them out.
+	if q.ResourceType != "" && !authzresource.Entitled(q.ResourceType) {
+		return false, []RoleGrant{}, nil
+	}
 	rows, err := en.implicitPermissions(accessorID)
 	if err != nil {
 		return false, nil, err
 	}
 	rows = activePolicyRows(rows)
+	rows = slices.DeleteFunc(rows, func(row []string) bool {
+		if len(row) < 2 {
+			return false
+		}
+		rtype, _ := splitObjectKey(row[1])
+		return !authzresource.Entitled(rtype)
+	})
 	rows = projectCommunityBundleRows(rows, true)
 	grouped := groupGrantsByObject(rows)
 	superAdmin, err := en.hasSuperAdminRole(accessorID)
@@ -960,11 +985,7 @@ func (en *Enforcer) RemoveRolePermissions(roleID string) error {
 // no orphaned grants linger. Idempotent.
 func (en *Enforcer) RemoveAccessor(accessorID string) error {
 	return en.Transaction(context.Background(), func(tx *PolicyTransaction) error {
-		if _, err := tx.enforcer.e.RemoveFilteredGroupingPolicy(0, accessorID); err != nil {
-			return err
-		}
-		_, err := tx.enforcer.removePolicyGrants(PolicyFilter{AccessorID: accessorID})
-		return err
+		return tx.RemoveAccessor(accessorID)
 	})
 }
 
@@ -972,8 +993,8 @@ func (en *Enforcer) RemoveAccessor(accessorID string) error {
 // after ensuring no managed proxy policy remains. Proxy policies belong
 // exclusively to proxy-grant sources, and the KN deletion flow must remove
 // those sources before generic resource policy cleanup.
-func (en *Enforcer) RemoveResourcePolicies(resourceType, resourceID string) error {
-	return en.Transaction(context.Background(), func(tx *PolicyTransaction) error {
+func (en *Enforcer) RemoveResourcePolicies(ctx context.Context, resourceType, resourceID string) error {
+	return en.Transaction(ctx, func(tx *PolicyTransaction) error {
 		var activeSources int64
 		if err := tx.db.Model(&safemodel.ProxyGrantSource{}).
 			Where("resource_type = ? AND resource_id = ? AND lifecycle_status = ?", resourceType, resourceID, "active").
@@ -983,8 +1004,11 @@ func (en *Enforcer) RemoveResourcePolicies(resourceType, resourceID string) erro
 		if activeSources > 0 {
 			return ErrManagedProxyPolicies
 		}
-		_, err := tx.enforcer.removePolicyGrants(PolicyFilter{Object: obj(resourceType, resourceID)})
-		return err
+		if _, err := tx.enforcer.removePolicyGrants(PolicyFilter{Object: obj(resourceType, resourceID)}); err != nil {
+			return err
+		}
+		return tx.db.Where("resource_type_id = ? AND resource_id = ?", resourceType, resourceID).
+			Delete(&safemodel.ResourceParent{}).Error
 	})
 }
 
@@ -995,7 +1019,7 @@ func (en *Enforcer) RemoveResourcePolicies(resourceType, resourceID string) erro
 // type-wide case separately (an "is-admin" short-circuit).
 //
 // IDs are returned verbatim (bkn-safe is opaque to any caller-side id encoding,
-// e.g. "dagID:subtype"), de-duplicated, in first-appearance order. Mirrors ISF
+// e.g. "dagID:subtype"), de-duplicated, in first-appearance order. Mirrors the legacy
 // resource-list for one (accessor, type, op).
 //
 // Instances reached only through an ancestor are included too (#800). Without
@@ -1032,6 +1056,11 @@ func (en *Enforcer) AccessibleResources(accessorID, resourceType, op string) ([]
 // represented by concrete IDs without losing its deny exceptions, so the
 // third result asks callers to filter their storage candidates through Safe.
 func (en *Enforcer) AccessibleResourceScope(accessorID, resourceType, op string) ([]string, bool, bool, error) {
+	// Super administrators short-circuit to "unrestricted" below without a
+	// decision; a paid type below its edition must still come back empty (#2512).
+	if !authzresource.Entitled(resourceType) {
+		return []string{}, false, false, nil
+	}
 	idx, err := en.grantIndex(accessorID)
 	if err != nil {
 		return nil, false, false, err
@@ -1048,6 +1077,9 @@ func (en *Enforcer) AccessibleResourceScope(accessorID, resourceType, op string)
 // effective registered operation on it.
 func (en *Enforcer) AccessibleResourceScopeAnyOperation(accessorID,
 	resourceType string) ([]string, bool, bool, error) {
+	if !authzresource.Entitled(resourceType) {
+		return []string{}, false, false, nil
+	}
 	idx, err := en.grantIndex(accessorID)
 	if err != nil {
 		return nil, false, false, err
@@ -1055,8 +1087,8 @@ func (en *Enforcer) AccessibleResourceScopeAnyOperation(accessorID,
 	if idx.superAdmin {
 		return []string{}, true, false, nil
 	}
-	var operations []safemodel.Operation
-	if err := en.db.Where("resource_type_id = ?", resourceType).Order("id ASC").Find(&operations).Error; err != nil {
+	operations, err := en.Registry().Operations(context.Background(), resourceType)
+	if err != nil {
 		return nil, false, false, err
 	}
 	operationIDs := make([]string, 0, len(operations))
@@ -1224,7 +1256,7 @@ type ResourcePolicy struct {
 // ResourcePolicies lists the per-accessor grants on a concrete resource
 // instance, grouping the raw (sub, obj, act) rows by accessor. Order of
 // accessors follows first appearance; ops within an accessor follow row order.
-// Mirrors ISF list-policy for one resource (bkn-safe has no expiry/condition).
+// Mirrors the legacy list-policy for one resource (bkn-safe has no expiry/condition).
 // Allows retain the legacy Operations field; deny exceptions are additive.
 func (en *Enforcer) ResourcePolicies(resourceType, resourceID string) ([]ResourcePolicy, error) {
 	rows, err := en.e.GetFilteredPolicy(1, obj(resourceType, resourceID))

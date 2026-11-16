@@ -235,6 +235,7 @@ type integritySnapshotStore struct {
 	readErr   error
 	snapshots map[string]sessionvo.EvidenceSnapshot
 	reads     int
+	clock     func() time.Time
 }
 
 func (s *integritySnapshotStore) ReadEvidenceSnapshot(_ context.Context, id string) (sessionvo.EvidenceSnapshot, bool, error) {
@@ -326,6 +327,39 @@ func TestRecordIntegrityTargetIsSpecificAndRejectedInputHasNoInventedTarget(t *t
 		t.Fatalf("rejected input has no known valid target: %+v %v", r, err)
 	}
 }
+
+func TestRecordIntegrityAcceptsVersionedMetricTarget(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input string
+		refID string
+		want  string
+	}{
+		{"matching metric with network", `{"kn_id":"supply","metric_id":"revenue","version":2}`, "metric:supply:revenue:v2", "complete"},
+		{"matching metric with header network", `{"metric_id":"revenue","version":2}`, "metric:supply:revenue:v2", "complete"},
+		{"other metric", `{"kn_id":"supply","metric_id":"revenue","version":2}`, "metric:supply:cost:v2", "missing"},
+		{"other network", `{"kn_id":"supply","metric_id":"revenue","version":2}`, "metric:other:revenue:v2", "missing"},
+		{"other version", `{"kn_id":"supply","metric_id":"revenue","version":2}`, "metric:supply:revenue:v3", "missing"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, owner, now := integrityFixture()
+			fact := &snapshot.CallFacts[0]
+			fact.ToolName = "query_metric"
+			fact.Input, _ = sessionvo.InlineJSONPayload(json.RawMessage(test.input))
+			fact.CapabilityProfile = &sessionvo.CapabilityProfile{Resolution: "matched", EvidenceContract: "ontology_metric_result/v1", RequiredTraceFields: []string{"business_refs"}}
+			snapshot.Receipts[0].BusinessRefs = []sessionvo.BusinessRef{{RefType: sessionvo.BusinessRefMetric, RefID: test.refID, Version: "v2"}}
+
+			report, err := evaluateRecordIntegrity(snapshot, owner, now, nil)
+			if err != nil || report == nil || report.Status != test.want {
+				t.Fatalf("versioned metric target %q: report=%+v err=%v", test.refID, report, err)
+			}
+			if test.want == "missing" && (len(report.Missing) != 1 || report.Missing[0].Reason != "business_target_missing") {
+				t.Fatalf("only the unmatched target is missing: %+v", report.Missing)
+			}
+		})
+	}
+}
+
 func TestRecordIntegrityManagedFunctionUsesRecordedExecution(t *testing.T) {
 	s, o, n := integrityFixture()
 	s.CallFacts[0].ToolName = "function"
@@ -594,7 +628,7 @@ func TestRecordIntegrityArtifactBudgetIsSharedAcrossRounds(t *testing.T) {
 		t.Fatalf("last permitted content read must succeed: %+v %v", first, err)
 	}
 	second, err := service.inspectLiveRecordIntegrity(ctx, "int", scope)
-	if err == nil || second != nil {
+	if !errors.Is(err, errRecordIntegrityInspectionBudget) || second != nil {
 		t.Fatalf("exhausted request budget must retain facts without verdict: %+v %v", second, err)
 	}
 	if reads := ctx.Value(recordIntegrityBudgetKey{}).(*recordIntegrityReadBudget).reads; reads != 128 {
@@ -704,7 +738,8 @@ func integrityArtifactWithContent(t *testing.T, id string, content any) (evidenc
 func integrityServiceForSnapshot(t *testing.T, snapshot sessionvo.EvidenceSnapshot) *Service {
 	t.Helper()
 	_, owner, now := integrityFixture()
-	store := &integritySnapshotStore{Store: memorystore.New(), snapshot: snapshot}
+	store := &integritySnapshotStore{snapshot: snapshot, clock: time.Now}
+	store.Store = memorystore.NewWithClock(func() time.Time { return store.clock() })
 	if err := store.WithinTransaction(context.Background(), func(tx isessionstore.Transaction) error {
 		tx.SaveConversation(sessionvo.Conversation{ID: "conv", Owner: owner})
 		tx.SaveInteraction(sessionvo.Interaction{ID: "int", ConversationID: "conv", ExecutionStatus: sessionvo.InteractionCompleted, CreatedAt: now})

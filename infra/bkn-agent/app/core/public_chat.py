@@ -1,0 +1,555 @@
+# Copyright openbkn.ai
+#
+# Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
+"""Public protocol projection and network guard around the existing chat loop."""
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import StructuredTool, ToolException
+
+from app.commons.i18n import build_error_content
+from app.core.context_budget import budget_messages
+from app.models import AgentLimits
+
+# Appended to the system prompt for the closing call when the tool loop ran
+# out of steps or ended without an answer.
+_FINALIZE_INSTRUCTION = (
+    "The tool-step limit was reached or no final answer was produced. Using only "
+    "the information already obtained, answer the user now in the conversation's "
+    "language without calling tools. State plainly what remains unknown."
+)
+
+# These dispatch arbitrary code or nested calls; an outer kn_id cannot bind the
+# operations they perform. The public surface does not offer them to the model
+# until they can be taken over with an enforced network scope; offering them
+# only produced calls that were refused, wasting steps.
+_INDIRECT_TOOLS = {
+    "run_code",
+    "run_shell",
+    "execute_tool",
+    "execute_skill",
+    "execute_native_tool",
+}
+
+def _declared_types(prop: Any) -> set[str]:
+    """JSON Schema types a property allows, including those in anyOf/oneOf."""
+    if not isinstance(prop, dict):
+        return set()
+    found = prop.get("type")
+    types = set(found) if isinstance(found, list) else {found} if found else set()
+    for key in ("anyOf", "oneOf"):
+        for branch in prop.get(key) or ():
+            types |= _declared_types(branch)
+    return types - {"null"}
+
+
+REASONING_FLUSH_CHARS = 200
+REASONING_FLUSH_S = 0.3
+
+
+@dataclass
+class PublicChat:
+    run_id: str
+    kn_id: str
+    # The network version the run reads, pinned into scoped calls like kn_id.
+    # None leaves the tool's own argument and default untouched.
+    kn_version: str | None = None
+    draft_revision: int | None = None
+    sequence: int = 0
+    prompt_version: int | None = None
+    # Only a lifecycle-issued Context Loader Interaction may be returned as a
+    # managed Trace reference. A local evidence ID is not an equivalent proof.
+    interaction_id: str | None = None
+    answer: list[str] = field(default_factory=list)
+    # The last assistant message without tool calls. Text spoken before a tool
+    # call is progress narration and streams as tokens, but is not the answer.
+    final: str | None = None
+    # Network and user layers: appended instructions and the narrowed tool set
+    # (None keeps every tool the shared definition loads).
+    instructions: list[tuple[str, str]] = field(default_factory=list)
+    allowed_tools: set[str] | None = None
+    # Built-in tools as the network and user layers narrow them; None keeps all.
+    allowed_builtin_tools: set[str] | None = None
+    usage: dict = field(default_factory=dict)
+    # The run's built-in provider state, when the Agent mounts one.
+    builtin_run: Any = None
+    tool_starts: dict[str, float] = field(default_factory=dict)
+    # Reasoning arrives a token or two per chunk; it is sent in pieces instead.
+    reasoning_parts: list[str] = field(default_factory=list)
+    reasoning_since: float = 0.0
+
+    def event(self, name: str, data: dict) -> str:
+        # Any other event first sends the reasoning held so far, so order holds.
+        pending = self._flush_reasoning()
+        self.sequence += 1
+        payload = {**data, "run_id": self.run_id, "sequence": self.sequence}
+        return pending + f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def reasoning(self, text: str) -> str:
+        """Buffer reasoning; return an event once enough text or time has gathered."""
+        if not self.reasoning_parts:
+            self.reasoning_since = time.monotonic()
+        self.reasoning_parts.append(text)
+        if (
+            sum(map(len, self.reasoning_parts)) < REASONING_FLUSH_CHARS
+            and time.monotonic() - self.reasoning_since < REASONING_FLUSH_S
+        ):
+            return ""
+        return self._flush_reasoning()
+
+    def _flush_reasoning(self) -> str:
+        if not self.reasoning_parts:
+            return ""
+        content = "".join(self.reasoning_parts)
+        self.reasoning_parts.clear()
+        self.sequence += 1
+        payload = {"content": content, "run_id": self.run_id, "sequence": self.sequence}
+        return f"event: reasoning\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    @staticmethod
+    def text(content) -> str:
+        if isinstance(content, str):
+            return content
+        return "".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type", "text") == "text"
+        )
+
+    @staticmethod
+    def interrupted_messages(messages: list) -> list[ToolMessage]:
+        # A cancelled tools node may have saved assistant calls without their
+        # results. Complete the protocol history, never replay those calls.
+        pending = {}
+        for message in messages:
+            if isinstance(message, AIMessage):
+                pending.update({call["id"]: call for call in message.tool_calls})
+            elif isinstance(message, ToolMessage):
+                pending.pop(message.tool_call_id, None)
+        return [
+            ToolMessage(
+                content="The previous execution was interrupted. This tool's outcome is unavailable; do not treat it as a successful result.",
+                tool_call_id=call["id"],
+                name=call["name"],
+                status="error",
+            )
+            for call in pending.values()
+        ]
+
+    async def finalize(
+        self, graph, cfg: dict, model, system_prompt: str, limits: AgentLimits
+    ):
+        """Close a turn that has no answer with one tool-free model call.
+
+        The browser loop this replaces did the same when steps ran out. The
+        answer is saved to the thread so the next turn sees it. The saved thread
+        holds every raw result of the question, so the call gets the same
+        budgeted copy the tool loop's model calls get.
+        """
+        state = await graph.aget_state(cfg)
+        messages = state.values.get("messages", [])
+        # A step limit can stop right after the model asked for tools.
+        fills = self.interrupted_messages(messages)
+        # Only real results count against the budget; the fills for interrupted
+        # calls would otherwise take kept slots from them.
+        sent = [
+            *budget_messages(
+                messages,
+                limits.data_result_chars,
+                limits.schema_result_chars,
+                limits.keep_tool_results,
+            ),
+            *fills,
+        ]
+        final = None
+        async for chunk in model.astream(
+            [
+                SystemMessage(content=f"{system_prompt}\n\n{_FINALIZE_INSTRUCTION}"),
+                *sent,
+            ]
+        ):
+            final = chunk if final is None else final + chunk
+            content = self.text(chunk.content)
+            if content:
+                yield content
+        if final is not None:
+            if final.usage_metadata:
+                for key in ("input_tokens", "output_tokens", "total_tokens"):
+                    value = final.usage_metadata.get(key)
+                    if isinstance(value, int):
+                        self.usage[key] = self.usage.get(key, 0) + value
+            answer = self.text(final.content)
+            self.final = answer
+            await graph.aupdate_state(
+                cfg, {"messages": [*fills, AIMessage(content=answer)]}
+            )
+
+    def updates(self, update: dict):
+        for state in update.values():
+            if not isinstance(state, dict):
+                continue
+            for message in state.get("messages", []):
+                if isinstance(message, AIMessage):
+                    if message.usage_metadata:
+                        for key in ("input_tokens", "output_tokens", "total_tokens"):
+                            value = message.usage_metadata.get(key)
+                            if isinstance(value, int):
+                                self.usage[key] = self.usage.get(key, 0) + value
+                    self.final = (
+                        None if message.tool_calls else self.text(message.content)
+                    )
+                    for call in message.tool_calls:
+                        self.tool_starts[call["id"]] = time.monotonic()
+                        yield self.event(
+                            "tool_started",
+                            {
+                                "tool_call_id": call["id"],
+                                "name": call["name"],
+                                "input": project(call["args"]),
+                            },
+                        )
+                elif isinstance(message, ToolMessage):
+                    progress = self.builtin_progress(message.name)
+                    yield self.event(
+                        "tool_finished",
+                        {
+                            "tool_call_id": message.tool_call_id,
+                            "name": message.name,
+                            "status": "failed"
+                            if message.status == "error"
+                            else "succeeded",
+                            "output": project(message.content),
+                            "duration_ms": round(
+                                (
+                                    time.monotonic()
+                                    - self.tool_starts.pop(
+                                        message.tool_call_id, time.monotonic()
+                                    )
+                                )
+                                * 1000
+                            ),
+                            **(
+                                {
+                                    "error": project(message.content),
+                                    # unavailable: the call did not go through;
+                                    # error: the tool ran and returned an error.
+                                    "error_kind": "unavailable"
+                                    if _TOOL_UNAVAILABLE in _text_of(message.content)
+                                    else "error",
+                                }
+                                if message.status == "error"
+                                else {}
+                            ),
+                            **({"progress": progress} if progress else {}),
+                        },
+                    )
+
+    def builtin_progress(self, tool_name: str | None) -> dict | None:
+        """What a built-in tool's provider planned since the last tool result,
+        under its result key (canvas_result), for the page to show early. The
+        final result stays authoritative."""
+        run = self.builtin_run
+        provider = run.provider if run else None
+        if not provider or not provider.progress or tool_name not in provider.tool_names:
+            return None
+        delta = provider.progress(run)
+        return {provider.result_key: delta} if delta else None
+
+    def _pinned_scope(self, properties: dict) -> dict:
+        """The scope values a tool's call must carry: always kn_id, and the
+        network version when the tool takes it. A value is passed in the type
+        the tool declares; None means the call carries none."""
+        pinned: dict = {"kn_id": self.kn_id}
+        if self.kn_version is None:
+            # A run without a version reads what the network runs. The model
+            # cannot pick the draft, with its unpublished edits, or an older
+            # version the caller did not ask for.
+            for name in ("kn_version", "draft_revision"):
+                if name in properties:
+                    pinned[name] = None
+            return pinned
+        # With a version set, the run also decides the draft revision: a run
+        # without one sends none, so the model cannot add one the entry point
+        # would have refused (draft_revision=5 on kn_version=running).
+        for name, value in (
+            ("kn_version", self.kn_version),
+            ("draft_revision", self.draft_revision),
+        ):
+            if name not in properties:
+                continue
+            if value is None:
+                pinned[name] = None
+                continue
+            declared = _declared_types(properties[name])
+            if "integer" in declared and str(value).isdigit():
+                pinned[name] = int(value)
+            elif "string" in declared or not declared:
+                pinned[name] = str(value)
+            else:
+                pinned[name] = value
+        return pinned
+
+    def guard_tools(self, tools: list) -> list:
+        from app.core import builtin_tools
+
+        guarded = []
+        for tool in tools:
+            if builtin_tools.is_builtin(tool):
+                # Built here for this run and already bound to its network;
+                # network and user layers can still narrow them by name.
+                if (
+                    self.allowed_builtin_tools is None
+                    or tool.name in self.allowed_builtin_tools
+                ):
+                    tool.handle_tool_error = True
+                    guarded.append(tool)
+                continue
+            # Only the Context Loader wrapper carries this unforgeable local
+            # receipt marker; an arbitrary MCP/toolbox schema is not a boundary.
+            from app.core.context_loader import _MCP_RECEIPT_TRUST_TOKEN
+
+            metadata = tool.metadata or {}
+            schema = (
+                tool.args_schema
+                if isinstance(tool.args_schema, dict)
+                else tool.args_schema.model_json_schema()
+            )
+            scoped = (
+                tool.name.lower() not in _INDIRECT_TOOLS
+                and metadata.get("bkn_context_loader_trust_token")
+                is _MCP_RECEIPT_TRUST_TOKEN
+                and "kn_id" in schema.get("properties", {})
+            )
+            if not scoped:
+                continue
+            if self.allowed_tools is not None and tool.name not in self.allowed_tools:
+                continue
+
+            properties = schema.get("properties", {})
+            pinned = self._pinned_scope(properties)
+            # Context Loader checks branch against the version only when the run
+            # sends one, and bkn-backend reads branch=draft of a versioned network
+            # as its draft, so a run without a version refuses that branch too.
+            refuse_draft_branch = self.kn_version is None and "branch" in properties
+
+            # Bind closure state outside model-controlled keyword arguments.
+            def bind(inner, pinned, refuse_draft_branch):
+                async def call(**kwargs):
+                    branch = kwargs.get("branch")
+                    if refuse_draft_branch and str(branch or "").strip().lower() == "draft":
+                        raise ToolException(
+                            json.dumps(
+                                build_error_content("BknAgent.Execution.ToolScopeMismatch"),
+                                ensure_ascii=False,
+                            )
+                        )
+                    for name, value in pinned.items():
+                        if name == "kn_id":
+                            same = kwargs.get(name, value) == value
+                        else:
+                            # A version may come as "3" or 3; an explicit
+                            # null is replaced by the pinned value. Without a
+                            # pinned version, "running" names the same read.
+                            given = kwargs.get(name)
+                            same = (
+                                given is None
+                                or (value is None and name == "kn_version" and given == "running")
+                                or (value is not None and str(given) == str(value))
+                            )
+                        if not same:
+                            raise ToolException(
+                                json.dumps(
+                                    build_error_content(
+                                        "BknAgent.Execution.ToolScopeMismatch"
+                                    ),
+                                    ensure_ascii=False,
+                                )
+                            )
+                        if value is None:
+                            kwargs.pop(name, None)
+                        else:
+                            kwargs[name] = value
+                    try:
+                        return await inner(**kwargs)
+                    except ToolException:
+                        raise
+                    except Exception as exc:
+                        # The call itself did not go through (unreachable, timed
+                        # out, or a result that fails its own schema). The model
+                        # can work around it, so the turn goes on, but the event
+                        # reports it apart from errors the tool itself returned.
+                        raise ToolException(
+                            json.dumps(
+                                {
+                                    **build_error_content("BknAgent.Tool.Unavailable"),
+                                    "cause": _redact(f"{type(exc).__name__}: {exc}")[
+                                        :500
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            )
+                        ) from exc
+
+                return call
+
+            call = bind(tool.coroutine, pinned, refuse_draft_branch)
+            guarded.append(
+                StructuredTool.from_function(
+                    coroutine=call,
+                    name=tool.name,
+                    description=tool.description,
+                    args_schema=tool.args_schema,
+                    response_format=tool.response_format,
+                    metadata=metadata,
+                    handle_tool_error=True,
+                )
+            )
+        return guarded
+
+
+def classify_failure(exc: BaseException) -> tuple[str, dict | None]:
+    """A stable code for a failed public turn, plus the upstream's own error.
+
+    Model Factory already returns user-facing error codes and messages; passing
+    them on tells the caller what actually failed. Credentials are removed and
+    the text is bounded; stack traces and addresses are never included.
+    """
+    import openai
+
+    if isinstance(exc, openai.APIConnectionError):
+        return "BknAgent.Model.Unavailable", None
+    if isinstance(exc, openai.APIStatusError):
+        body = exc.body if isinstance(exc.body, dict) else {}
+        error = body.get("error") if isinstance(body.get("error"), dict) else body
+        upstream = {
+            key: _redact(str(error[key]))[:500]
+            for key in ("code", "message")
+            if isinstance(error, dict) and error.get(key)
+        } or None
+        retryable = exc.status_code >= 500 or exc.status_code == 429
+        return (
+            "BknAgent.Model.Unavailable" if retryable else "BknAgent.Model.Rejected",
+            upstream,
+        )
+    if isinstance(exc, openai.APIError):
+        # An error frame inside an accepted stream carries no HTTP status: Model
+        # Factory's stream is always 200, so a busy, rate-limited or unreachable
+        # provider arrives this way too. Its OpenAI error type tells a passing
+        # failure from a refusal (an exhausted balance, a content filter).
+        body = exc.body if isinstance(exc.body, dict) else {}
+        code = body.get("code") or getattr(exc, "code", None)
+        kind = body.get("type") or getattr(exc, "type", None)
+        upstream = {
+            key: _redact(str(value))[:500]
+            for key, value in (("code", code), ("message", exc.message))
+            if value
+        } or None
+        # OpenAI's own 429 carries rate_limit_exceeded as the code, not the type.
+        if kind in _TRANSIENT_ERROR_TYPES or code in _TRANSIENT_ERROR_TYPES:
+            return "BknAgent.Model.Unavailable", upstream
+        return "BknAgent.Model.Rejected", upstream
+    return "BknAgent.Chat.Failed", None
+
+
+# Error types worth retrying, unlike the rest: what Model Factory
+# (openai_error.error_type_for_status) gives provider 429/5xx/timeouts and lost
+# connections, plus the types it passes through unchanged when a provider names
+# its own (OpenAI rate limiting; Anthropic overload and server errors).
+_TRANSIENT_ERROR_TYPES = frozenset(
+    {
+        "server_error",
+        "service_unavailable_error",
+        "timeout_error",
+        "rate_limit_exceeded",
+        "rate_limit_error",
+        "api_connection_error",
+        "overloaded_error",
+        "api_error",
+    }
+)
+
+
+def _redact(text: str) -> str:
+    return re.sub(
+        r"(?i)bearer\s+[^\s\"']+|bak_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+",
+        "[redacted]",
+        text,
+    )
+
+
+_TOOL_UNAVAILABLE = '"code": "BknAgent.Tool.Unavailable"'
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    return "".join(
+        block.get("text", "") if isinstance(block, dict) else str(block)
+        for block in content or []
+    )
+
+
+_SENSITIVE = {
+    "authorization",
+    "token",
+    "access_token",
+    "api_key",
+    "password",
+    "secret",
+    "bkn_context",
+}
+
+
+_PROJECTION_LIMIT = 16000
+
+
+def project(value: Any) -> Any:
+    """Bound the complete display projection; never alter the tool's real result."""
+    result = _project(value)
+    text = json.dumps(result, ensure_ascii=False)
+    if len(text) <= _PROJECTION_LIMIT:
+        return result
+    # Keep a readable prefix: a bare marker left the client nothing to show
+    # for any sizeable query result.
+    return text[:_PROJECTION_LIMIT] + "…[truncated]"
+
+
+def _project(value: Any, depth: int = 0) -> Any:
+    if depth > 6:
+        return {"truncated": True}
+    if isinstance(value, dict):
+        result = {
+            str(k): "[redacted]"
+            if str(k).lower() in _SENSITIVE
+            else _project(v, depth + 1)
+            for k, v in list(value.items())[:100]
+        }
+        if len(value) > 100:
+            result["truncated"] = True
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_project(item, depth + 1) for item in value[:100]] + (
+            [{"truncated": True}] if len(value) > 100 else []
+        )
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            # Unstructured text can contain credentials; report only bounded
+            # content after removing common token forms.
+            value = re.sub(
+                r"(?i)bearer\s+[^\s\"']+|bak_[A-Za-z0-9_-]+", "[redacted]", value
+            )
+            return value[:8000] + ("…[truncated]" if len(value) > 8000 else "")
+        return _project(parsed, depth + 1)
+    return (
+        value
+        if value is None or isinstance(value, (int, float, bool))
+        else str(value)[:1000]
+    )

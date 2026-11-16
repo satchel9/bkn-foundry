@@ -1,11 +1,11 @@
 # Copyright openbkn.ai
 # Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 #
-# Production image for bkn-safe (ISF replacement auth service). The dev image
+# Production image for bkn-safe (replacement identity service). The dev image
 # (dev/Dockerfile) wraps a host-cross-compiled binary; this one builds in-image.
 
 ########################### Stage 0 — build ########################
-ARG BUILD_IMAGE=golang:1.25.14
+ARG BUILD_IMAGE=golang:1.26.9
 ARG BASE_IMAGE=alpine:3.20
 
 FROM ${BUILD_IMAGE} AS builder
@@ -31,7 +31,6 @@ RUN apk add --no-cache ca-certificates curl \
     && addgroup -g $GID -S bkn && adduser -u $UID -S bkn -G bkn
 
 COPY --from=builder --chown=$UID:$GID /go/src/bin/bkn-safe /opt/bkn-safe/bkn-safe
-COPY --from=builder --chown=$UID:$GID /go/src/locale /opt/bkn-safe/locale
 
 WORKDIR /opt/bkn-safe
 USER $UID

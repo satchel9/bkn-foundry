@@ -15,7 +15,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -74,7 +74,7 @@ func (a *outboxAccess) ListPlannedSources(ctx context.Context, knID string,
 	return result, nil
 }
 
-func (a *outboxAccess) ListPlannedSnapshot(ctx context.Context, knID string) ([]interfaces.ProxyGrantSourceSpec, error) {
+func (a *outboxAccess) ListPlannedSnapshot(ctx context.Context, knID string) (result []interfaces.ProxyGrantSourceSpec, err error) {
 	query, args, err := sq.Select(
 		"f_resource_type", "f_resource_id", "f_operation", "f_source_type", "f_source_id",
 		"f_kn_id", "f_binding_type", "f_binding_id",
@@ -87,8 +87,12 @@ func (a *outboxAccess) ListPlannedSnapshot(ctx context.Context, knID string) ([]
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	result := make([]interfaces.ProxyGrantSourceSpec, 0)
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+	result = make([]interfaces.ProxyGrantSourceSpec, 0)
 	for rows.Next() {
 		var source interfaces.ProxyGrantSourceSpec
 		if err := rows.Scan(&source.ResourceType, &source.ResourceID, &source.Operation,
@@ -313,6 +317,16 @@ func validateOutboxPayload(event *interfaces.KNProxyOutboxEvent) error {
 		strings.TrimSpace(event.TargetVersion) == "" {
 		return errors.New("proxy outbox payload has no grantor or target version")
 	}
+	for _, cleanup := range event.AuthorizationCleanups {
+		if !isKNChildAuthorizationResourceType(cleanup.ResourceType) || len(cleanup.ResourceIDs) == 0 {
+			return errors.New("proxy outbox payload contains an invalid authorization cleanup")
+		}
+		for _, resourceID := range cleanup.ResourceIDs {
+			if !interfaces.IsValidKNChildResourceID(resourceID) {
+				return errors.New("proxy outbox payload contains an invalid authorization cleanup resource")
+			}
+		}
+	}
 	bindings := make(map[string]struct{}, len(event.Bindings))
 	for _, binding := range event.Bindings {
 		if strings.TrimSpace(binding.BindingType) == "" || strings.TrimSpace(binding.BindingID) == "" {
@@ -371,6 +385,20 @@ func validateOutboxPayload(event *interfaces.KNProxyOutboxEvent) error {
 		}
 	}
 	return nil
+}
+
+func isKNChildAuthorizationResourceType(resourceType string) bool {
+	switch resourceType {
+	case interfaces.RESOURCE_TYPE_METRIC,
+		interfaces.RESOURCE_TYPE_ACTION_TYPE,
+		interfaces.RESOURCE_TYPE_RELATION_TYPE,
+		interfaces.RESOURCE_TYPE_RISK_TYPE,
+		interfaces.RESOURCE_TYPE_CONCEPT_GROUP,
+		interfaces.RESOURCE_TYPE_OBJECT_TYPE:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *outboxAccess) RenewLease(ctx context.Context, eventID, owner string, now, leaseUntil int64) (bool, error) {
@@ -545,7 +573,7 @@ WHERE f_id = ? AND f_status IN ('processing', 'completing') AND f_lease_owner = 
 	return tx.Commit()
 }
 
-func (a *outboxAccess) CleanupTerminal(ctx context.Context, updatedBefore int64, limit int) (int64, error) {
+func (a *outboxAccess) CleanupTerminal(ctx context.Context, updatedBefore int64, limit int) (deleted int64, err error) {
 	if limit <= 0 {
 		return 0, nil
 	}
@@ -553,7 +581,11 @@ func (a *outboxAccess) CleanupTerminal(ctx context.Context, updatedBefore int64,
 	if err != nil {
 		return 0, err
 	}
-	defer conn.Close()
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	var acquired int
 	const acquireCleanupLock = "SELECT GET_LOCK(CONCAT(DATABASE(), ':', ?), 0)"
 	const releaseCleanupLock = "SELECT RELEASE_LOCK(CONCAT(DATABASE(), ':', ?))"

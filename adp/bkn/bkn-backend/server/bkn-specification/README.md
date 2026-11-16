@@ -2,13 +2,28 @@
 
 Go SDK for parsing, serializing, loading, and diffing BKN networks.
 
+The BKN format itself is specified in [SPECIFICATION.md](SPECIFICATION.md). That document and
+this package change together: when they disagree, decide which one is intended and fix the other.
+
+## Object metrics in BKN archives
+
+Object metrics V1 are stored as `object_metrics/<id>@<version>.json`. Each file
+contains the complete versioned object-metric record, including its definition,
+lifecycle status, and persistence metadata. Exports include every version so
+pinned dependencies remain resolvable after import. The `CHECKSUM` file covers
+these JSON files; a mismatch prevents V1 import.
+
+The old `metrics/*.bkn` format is not imported or exported. Archives containing
+it fail with an explicit error. Historical database metrics are migrated through
+the separate deployment upgrade script, not through BKN archive compatibility.
+
 ## Requirements
 
-- **Go 1.25+**
+- **Go 1.26.0+**
 
 ## Structure
 
-```
+``` bash
 ├── bkn/
 │   ├── models.go        # Data structures
 │   ├── parser.go        # Parse .bkn files (per type)
@@ -108,7 +123,7 @@ if !result.OK() {
 ### Parser
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `ParseFrontmatter(text)` | Parses YAML frontmatter and returns `map[string]any` |
 | `ParseNetworkFile(text, sourcePath)` | Parses a network file |
 | `ParseObjectTypeFile(text, sourcePath)` | Parses an object_type file |
@@ -120,7 +135,7 @@ if !result.OK() {
 ### Loader
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `LoadNetwork(rootPath)` | Loads a complete network from a directory, automatically discovering network.bkn |
 | `LoadNetworkWithFS(fsys, rootPath)` | Loads a network with a custom FileSystem |
 | `LoadNetworkFromTar(r)` | Loads a network from a tar stream |
@@ -129,7 +144,7 @@ if !result.OK() {
 ### Serializer
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `SerializeBknNetwork(doc)` | Serializes network frontmatter |
 | `SerializeObjectType(ot)` | Serializes object_type |
 | `SerializeRelationType(rt)` | Serializes relation_type |
@@ -139,10 +154,10 @@ if !result.OK() {
 | `WriteNetworkToTar(doc, w)` | Writes a complete network to a tar stream |
 | `PackDirToTar(sourceDir, outputPath, gzip)` | Packs a directory into a tar file; on macOS, sets `COPYFILE_DISABLE=1` automatically |
 
-### Checksum & Diff
+### Checksum & Diff API
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `GenerateChecksumFile(root)` | Generates and writes a CHECKSUM file |
 | `VerifyChecksumFile(root)` | Verifies the directory CHECKSUM and returns `(ok, errors)` |
 | `ComputeChecksumFromTar(r)` | Computes checksums for tar entries |
@@ -155,13 +170,13 @@ if !result.OK() {
 ### Validator
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `ValidateNetwork(doc)` | Validates the network structure and returns `*ValidationResult` |
 
 ### FileSystem
 
 | Function | Description |
-|------|------|
+| ------ | ------ |
 | `NewOSFileSystem()` | OS-backed file system implementation |
 | `NewMemoryFileSystem()` | In-memory file system for tests or tar extraction |
 

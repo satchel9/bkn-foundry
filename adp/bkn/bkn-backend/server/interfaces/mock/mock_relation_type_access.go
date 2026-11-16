@@ -10,11 +10,11 @@
 package mock_interfaces
 
 import (
-	interfaces "bkn-backend/interfaces"
 	context "context"
 	sql "database/sql"
 	reflect "reflect"
 
+	interfaces "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -146,6 +146,21 @@ func (mr *MockRelationTypeAccessMockRecorder) GetRelationTypeByID(ctx, knID, bra
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRelationTypeByID", reflect.TypeOf((*MockRelationTypeAccess)(nil).GetRelationTypeByID), ctx, knID, branch, rtID)
 }
 
+// GetRelationTypeByIDInTx mocks base method.
+func (m *MockRelationTypeAccess) GetRelationTypeByIDInTx(ctx context.Context, tx *sql.Tx, knID, branch, rtID string) (*interfaces.RelationType, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetRelationTypeByIDInTx", ctx, tx, knID, branch, rtID)
+	ret0, _ := ret[0].(*interfaces.RelationType)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetRelationTypeByIDInTx indicates an expected call of GetRelationTypeByIDInTx.
+func (mr *MockRelationTypeAccessMockRecorder) GetRelationTypeByIDInTx(ctx, tx, knID, branch, rtID any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRelationTypeByIDInTx", reflect.TypeOf((*MockRelationTypeAccess)(nil).GetRelationTypeByIDInTx), ctx, tx, knID, branch, rtID)
+}
+
 // GetRelationTypeIDsByIDs mocks base method.
 func (m *MockRelationTypeAccess) GetRelationTypeIDsByIDs(ctx context.Context, knID, branch string, rtIDs []string) ([]string, error) {
 	m.ctrl.T.Helper()
@@ -204,6 +219,21 @@ func (m *MockRelationTypeAccess) GetRelationTypesTotal(ctx context.Context, quer
 func (mr *MockRelationTypeAccessMockRecorder) GetRelationTypesTotal(ctx, query any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetRelationTypesTotal", reflect.TypeOf((*MockRelationTypeAccess)(nil).GetRelationTypesTotal), ctx, query)
+}
+
+// ListDeprecatedOrFallbackRelationTypeIDs mocks base method.
+func (m *MockRelationTypeAccess) ListDeprecatedOrFallbackRelationTypeIDs(ctx context.Context, knID, branch string) ([]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListDeprecatedOrFallbackRelationTypeIDs", ctx, knID, branch)
+	ret0, _ := ret[0].([]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListDeprecatedOrFallbackRelationTypeIDs indicates an expected call of ListDeprecatedOrFallbackRelationTypeIDs.
+func (mr *MockRelationTypeAccessMockRecorder) ListDeprecatedOrFallbackRelationTypeIDs(ctx, knID, branch any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListDeprecatedOrFallbackRelationTypeIDs", reflect.TypeOf((*MockRelationTypeAccess)(nil).ListDeprecatedOrFallbackRelationTypeIDs), ctx, knID, branch)
 }
 
 // ListRelationTypeSummaries mocks base method.

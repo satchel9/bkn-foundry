@@ -45,6 +45,10 @@ func (c *MultiMatchCond) RequiredValueLen() int      { return -1 }
 func (c *MultiMatchCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	fieldsMap map[string]*interfaces.Property) (interfaces.FilterCondition, error) {
 
+	if cfg.ValueFrom != interfaces.ValueFrom_Const {
+		return nil, fmt.Errorf("condition [multi_match] does not support value_from type '%s'", cfg.ValueFrom)
+	}
+
 	// Obtain the fields from the ReaminCfg of the cfg. This is the fields field belonging to multi_match, which is an array of strings.
 	// If you want all fields to match, you can either leave it blank or fill in ["*"]. String * is not supported. An array is required
 	var mFields []*interfaces.Property
@@ -53,11 +57,8 @@ func (c *MultiMatchCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 		return nil, fmt.Errorf("condition [multi_match] 'fields' value should be an array")
 	}
 
-	if len(cfgFields) == 1 && cfgFields[0].(string) == interfaces.AllField {
-		mFields = make([]*interfaces.Property, 0, len(fieldsMap))
-		for _, field := range fieldsMap {
-			mFields = append(mFields, field)
-		}
+	if len(cfgFields) == 1 && cfgFields[0] == interfaces.AllField {
+		mFields = wildcardFields(fieldsMap)
 	} else {
 		// The field array needs to be a string array
 		for _, cfgField := range cfgFields {

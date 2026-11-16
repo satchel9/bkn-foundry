@@ -1,0 +1,683 @@
+openapi: 3.1.0
+info:
+  title: OpenBKN Object Metrics API
+  version: 1.0.0
+  description: |
+    Versioned, object-centered metric authoring API. Published versions are immutable.
+
+    ## Knowledge-network versioning
+
+    A knowledge network can be versioned (see the knowledge-network versions API). Metric versions
+    here are the versions of one metric and are unrelated to the versions of the network, except
+    in the ways below.
+
+    On a versioned network every write goes to the draft of the network and moves its draft
+    revision, returned as the `X-Kn-Draft-Revision` response header. Writes send no `kn_version`
+    (400 `BknBackend.KNVersion.InvalidVersion`); `branch` may be `main` or `draft` and means the
+    draft. Updating a metric version (`PUT`) needs the `If-Match` header with the `revision` of the
+    version, also returned as the `ETag` of a single `GET`: without it the request is 428
+    `BknBackend.KNVersion.PreconditionRequired`, with a stale one 409
+    `BknBackend.KNVersion.DefinitionModified` (details `current_etag`). Deleting a version
+    needs `If-Match` or `expected_draft_revision`. Creating metrics, creating the next version,
+    validating, publishing and deprecating a metric version need no precondition. A stale
+    `expected_draft_revision` is 409 `BknBackend.KNVersion.DraftRevisionMismatch`. A network
+    without versioning accepts the same header and parameter and never requires them.
+
+    Reads accept `kn_version` (`running`, `draft` or a network version number) and, for the draft,
+    `draft_revision`, and answer with `X-Kn-Version`, `X-Kn-Draft-Revision` and
+    `X-Kn-Running-Version` like the other knowledge-network reads. Do not combine `kn_version` with
+    `branch`. The metrics of a network version are the ones published with it.
+
+    Publishing the draft as a network version also publishes the validated metrics of the draft
+    (Enterprise edition). A metric that stays unpublished is reported in the `warnings` of the
+    network publish response.
+servers:
+  - url: /api/bkn-backend
+security:
+  - bearerAuth: []
+paths:
+  /v1/object-metrics/capabilities:
+    get:
+      operationId: getObjectMetricCapabilities
+      responses:
+        "200":
+          description: Supported registries and domain capabilities.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricCapabilities" }
+  /v1/knowledge-networks/{kn_id}/object-metrics:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/Branch"
+    get:
+      operationId: listObjectMetrics
+      parameters:
+        - { name: owner_object_type_id, in: query, schema: { type: string } }
+        - { name: metric_type, in: query, schema: { $ref: "#/components/schemas/ObjectMetricType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/LifecycleStatus" } }
+        - { name: keyword, in: query, schema: { type: string } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500, default: 20 } }
+        - $ref: "#/components/parameters/KnVersion"
+        - $ref: "#/components/parameters/DraftRevision"
+      responses:
+        "200":
+          description: Latest metric versions matching the filters.
+          headers:
+            X-Kn-Version: { $ref: "#/components/headers/XKnVersion" }
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+            X-Kn-Running-Version: { $ref: "#/components/headers/XKnRunningVersion" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricList" }
+        "400": { description: "`kn_version` is not `running`, `draft` or a version number, or is combined with `branch` (`BknBackend.KNVersion.InvalidVersion`); a version other than `running` on a network without versioning (`BknBackend.KNVersion.NotVersioned`)." }
+        "404": { description: "The requested network version was never published (`BknBackend.KNVersion.VersionNotFound`)." }
+        "409": { description: "Draft changed while it was read (`BknBackend.KNVersion.DraftRevisionMismatch`)." }
+        "410": { description: "The requested network version was purged (`BknBackend.KNVersion.VersionPurged`)." }
+    post:
+      operationId: createObjectMetricDraft
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectMetricDefinition" }
+      responses:
+        "201":
+          description: Draft created. On a versioned network it is created in the draft of the network.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "400": { description: "Invalid definition, or `kn_version` sent on a write (`BknBackend.KNVersion.InvalidVersion`)." }
+  /v1/knowledge-networks/{kn_id}/object-metrics/validate:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/Branch"
+    post:
+      operationId: validateObjectMetric
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectMetricDefinition" }
+      responses:
+        "200":
+          description: Stable validation issues and inferred output shape.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ValidationResult" }
+  /v1/knowledge-networks/{kn_id}/object-metrics/preview:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/Branch"
+    post:
+      operationId: previewObjectMetricContract
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectMetricDefinition" }
+      responses:
+        "200":
+          description: Validation plus inferred result contract. This endpoint does not execute business data.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricPreview" }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+      - $ref: "#/components/parameters/Version"
+    get:
+      operationId: getObjectMetric
+      parameters:
+        - $ref: "#/components/parameters/KnVersion"
+        - $ref: "#/components/parameters/DraftRevision"
+      responses:
+        "200":
+          description: Requested version, or the latest version when omitted. The `ETag` header carries its `revision`.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+            X-Kn-Version: { $ref: "#/components/headers/XKnVersion" }
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+            X-Kn-Running-Version: { $ref: "#/components/headers/XKnRunningVersion" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "400": { description: "`kn_version` is not `running`, `draft` or a version number, or is combined with `branch` (`BknBackend.KNVersion.InvalidVersion`); a version other than `running` on a network without versioning (`BknBackend.KNVersion.NotVersioned`)." }
+        "404": { description: "The metric or its requested version does not exist, or the requested network version was never published (`BknBackend.KNVersion.VersionNotFound`)." }
+        "409": { description: "Draft changed while it was read (`BknBackend.KNVersion.DraftRevisionMismatch`)." }
+        "410": { description: "The requested network version was purged (`BknBackend.KNVersion.VersionPurged`)." }
+    put:
+      operationId: updateObjectMetricDraft
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectMetricDefinition" }
+      responses:
+        "200":
+          description: Draft updated. Identity, owner, code, type and version are server protected.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "400": { description: "Invalid definition, or `kn_version` sent on a write (`BknBackend.KNVersion.InvalidVersion`)." }
+        "409": { description: "`BknBackend.KNVersion.DefinitionModified` (details `current_etag`) or `BknBackend.KNVersion.DraftRevisionMismatch` on a versioned network." }
+        "428": { description: "`If-Match` is missing on a versioned network (`BknBackend.KNVersion.PreconditionRequired`)." }
+    delete:
+      operationId: deleteObjectMetricVersion
+      parameters:
+        - $ref: "#/components/parameters/RequiredVersion"
+        - $ref: "#/components/parameters/IfMatch"
+        - $ref: "#/components/parameters/ExpectedDraftRevision"
+      description: >-
+        Deletes exactly one version in the requested knowledge-network branch. Metric references are
+        branch-local because a metric reference does not carry a branch. Published versions and versions
+        referenced by any retained metric version cannot be deleted.
+      responses:
+        "204":
+          description: Draft, validated, or unreferenced deprecated version removed.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+        "404": { description: The requested metric version does not exist (including a repeated delete). }
+        "409": { description: "Published version or a version retained by metric references; on a versioned network also `BknBackend.KNVersion.DefinitionModified` or `BknBackend.KNVersion.DraftRevisionMismatch`." }
+        "428": { description: "Neither `If-Match` nor `expected_draft_revision` was sent on a versioned network (`BknBackend.KNVersion.PreconditionRequired`)." }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/deletion-check:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+      - $ref: "#/components/parameters/RequiredVersion"
+    get:
+      operationId: checkObjectMetricVersionDeletion
+      description: >-
+        Checks the same branch-local constraints enforced atomically by DELETE. Blocker details are filtered
+        by view permission; hidden blockers are reported only as a count.
+      responses:
+        "200":
+          description: Permission-filtered deletion eligibility and blockers.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricVersionDeletionCheck" }
+        "404": { description: The requested metric version does not exist. }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/versions:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+    post:
+      operationId: createNextObjectMetricDraftVersion
+      responses:
+        "201":
+          description: A draft copied from the latest published version. On a versioned network it is created in the draft of the network.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+    get:
+      operationId: listObjectMetricVersions
+      parameters:
+        - $ref: "#/components/parameters/KnVersion"
+        - $ref: "#/components/parameters/DraftRevision"
+      responses:
+        "200":
+          description: All immutable and draft versions, newest first.
+          headers:
+            X-Kn-Version: { $ref: "#/components/headers/XKnVersion" }
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+            X-Kn-Running-Version: { $ref: "#/components/headers/XKnRunningVersion" }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "400": { description: "`kn_version` is not `running`, `draft` or a version number, or is combined with `branch` (`BknBackend.KNVersion.InvalidVersion`); a version other than `running` on a network without versioning (`BknBackend.KNVersion.NotVersioned`)." }
+        "404": { description: "The metric does not exist in the requested network version, or that version was never published (`BknBackend.KNVersion.VersionNotFound`)." }
+        "409": { description: "Draft changed while it was read (`BknBackend.KNVersion.DraftRevisionMismatch`)." }
+        "410": { description: "The requested network version was purged (`BknBackend.KNVersion.VersionPurged`)." }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/publish:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+      - $ref: "#/components/parameters/RequiredVersion"
+    post:
+      operationId: publishObjectMetricVersion
+      responses:
+        "200":
+          description: Immutable published metric version. The saved version must already be in validated status. On a versioned network the draft of the network changes.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "422": { description: Definition or referenced ontology is invalid. }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/validate:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+      - $ref: "#/components/parameters/RequiredVersion"
+    post:
+      operationId: validateSavedObjectMetricVersion
+      description: Runs authoritative validation for a saved draft and persists its lifecycle status as validated. Any later edit returns it to draft.
+      responses:
+        "200":
+          description: Saved metric version marked as validated. On a versioned network the draft of the network changes.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+        "422": { description: Definition or referenced ontology is invalid. }
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/deprecate:
+    parameters:
+      - $ref: "#/components/parameters/KnowledgeNetworkId"
+      - $ref: "#/components/parameters/MetricId"
+      - $ref: "#/components/parameters/Branch"
+      - $ref: "#/components/parameters/RequiredVersion"
+    post:
+      operationId: deprecateObjectMetricVersion
+      responses:
+        "200":
+          description: Published version marked as deprecated. On a versioned network the draft of the network changes.
+          headers:
+            X-Kn-Draft-Revision: { $ref: "#/components/headers/XKnDraftRevision" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectMetricRecord" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    KnowledgeNetworkId: { name: kn_id, in: path, required: true, schema: { type: string } }
+    MetricId: { name: metric_id, in: path, required: true, schema: { type: string, format: uuid } }
+    Branch: { name: branch, in: query, schema: { type: string, default: main } }
+    Version: { name: version, in: query, schema: { type: integer, minimum: 1 } }
+    KnVersion:
+      name: kn_version
+      in: query
+      description: >-
+        Which version of a versioned knowledge network to read: `running` (default), `draft` or a version
+        number. Do not combine it with `branch`. Refused on writes.
+      schema: { type: string, example: draft }
+    DraftRevision:
+      name: draft_revision
+      in: query
+      description: With `kn_version=draft`, the draft revision the caller expects to read; a different current revision is 409 `BknBackend.KNVersion.DraftRevisionMismatch`.
+      schema: { type: integer, format: int64, minimum: 0 }
+    ExpectedDraftRevision:
+      name: expected_draft_revision
+      in: query
+      description: >-
+        The draft revision a write is based on. On a versioned network a delete of a metric version needs
+        it unless `If-Match` is sent; a stale value is 409 `BknBackend.KNVersion.DraftRevisionMismatch`.
+      schema: { type: integer, format: int64, minimum: 0 }
+    IfMatch:
+      name: If-Match
+      in: header
+      description: >-
+        The `revision` of the metric version being changed (quotes optional). Required on a versioned network to
+        update a version and, unless `expected_draft_revision` is sent, to delete one: 428
+        `BknBackend.KNVersion.PreconditionRequired` without it, 409 `BknBackend.KNVersion.DefinitionModified`
+        (details `current_etag`) when stale.
+      schema: { type: string }
+    RequiredVersion: { name: version, in: query, required: true, schema: { type: integer, minimum: 1 } }
+  headers:
+    XKnVersion:
+      description: The network version the response was read from, a number or `draft`. Sent for reads of a versioned network.
+      schema: { type: string }
+    XKnDraftRevision:
+      description: The draft revision, sent for reads of the draft and by a write to the draft of a versioned network that succeeded (the revision it produced).
+      schema: { type: integer, format: int64 }
+    XKnRunningVersion:
+      description: The running version of the versioned network when the read was resolved.
+      schema: { type: integer }
+    ETag:
+      description: Quoted `revision` of the single metric version returned; send it back as `If-Match`.
+      schema: { type: string }
+  schemas:
+    ObjectMetricType: { type: string, enum: [atomic, derived, composite] }
+    LifecycleStatus: { type: string, enum: [draft, validated, published, deprecated] }
+    OutputShape: { type: string, enum: [summary, grouped, time_series] }
+    ObjectMetricDefinition:
+      type: object
+      required: [code, name, description, owner_object_type_id, metric_type, result_semantics, specification, query_capabilities, lifecycle]
+      properties:
+        id: { type: string, description: Ignored on create; protected on update. }
+        version: { type: integer, minimum: 1 }
+        code: { type: string, pattern: "^[a-z][a-z0-9_]*$" }
+        name: { type: string, minLength: 1 }
+        description: { type: string, minLength: 1 }
+        owner_object_type_id: { type: string }
+        metric_type: { $ref: "#/components/schemas/ObjectMetricType" }
+        result_semantics: { type: object, additionalProperties: true }
+        specification:
+          oneOf:
+            - { $ref: "#/components/schemas/AtomicSpecification" }
+            - { $ref: "#/components/schemas/DerivedSpecification" }
+            - { $ref: "#/components/schemas/CompositeSpecification" }
+        query_capabilities: { type: object, additionalProperties: true }
+        lifecycle: { type: object, additionalProperties: true }
+    AtomicSpecification:
+      type: object
+      required: [kind, measure]
+      properties:
+        kind: { const: atomic }
+        measure:
+          type: object
+          required: [aggregation]
+          properties:
+            aggregation: { type: string, enum: [count_rows, count, count_distinct, sum, avg, min, max] }
+            allow_approximate:
+              type: boolean
+              default: true
+              description: Only valid for count_distinct. False requires exact computation; omitted or true allows estimates. Fixed with the metric version and inherited by derived metrics.
+            expression: { $ref: "#/components/schemas/Expression" }
+    DerivedSpecification:
+      type: object
+      required: [kind, base_metric, business_qualifiers]
+      properties:
+        kind: { const: derived }
+        base_metric: { $ref: "#/components/schemas/MetricRef" }
+        business_qualifiers: { $ref: "#/components/schemas/ObjectMetricBusinessQualifiers" }
+    ObjectMetricBusinessQualifiers:
+      type: object
+      additionalProperties: false
+      properties:
+        filters:
+          $ref: "#/components/schemas/ObjectMetricCondition"
+        relation_path:
+          $ref: "#/components/schemas/ObjectMetricRelationPath"
+        event_time: { $ref: "#/components/schemas/PropertyRef" }
+        time_window: { $ref: "#/components/schemas/ObjectMetricTimeWindow" }
+    ObjectMetricTimeWindow:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [mode]
+          properties:
+            mode: { const: unbounded }
+        - type: object
+          additionalProperties: false
+          required: [mode, length, unit]
+          properties:
+            mode: { const: rolling }
+            length: { type: integer, minimum: 1 }
+            unit: { type: string, enum: [minute, hour, day, week, month, quarter, year] }
+            timezone: { type: string, description: IANA timezone name. }
+        - type: object
+          additionalProperties: false
+          required: [mode, period, timezone]
+          properties:
+            mode: { type: string, enum: [calendar_period, period_to_date] }
+            period: { type: string, enum: [day, week, month, quarter, year] }
+            timezone: { type: string, description: IANA timezone name. }
+            week_start: { type: string, enum: [monday, sunday] }
+        - type: object
+          additionalProperties: false
+          required: [mode, start_at, end_at, timezone]
+          properties:
+            mode: { const: fixed_range }
+            start_at: { type: integer, format: int64, description: Inclusive Unix time in milliseconds. }
+            end_at: { type: integer, format: int64, description: Inclusive Unix time in milliseconds and greater than start_at. }
+            timezone: { type: string, description: IANA timezone used to interpret the authored range. }
+    CompositeSpecification:
+      type: object
+      required: [kind, dependencies, expression, alignment, null_policy, zero_division_policy]
+      properties:
+        kind: { const: composite }
+        dependencies:
+          type: array
+          minItems: 2
+          items: { $ref: "#/components/schemas/ObjectMetricDependency" }
+        expression: { $ref: "#/components/schemas/Expression" }
+        alignment: { type: object, additionalProperties: true }
+        null_policy: { type: string, enum: [propagate, coalesce_zero] }
+        zero_division_policy: { type: string, enum: [unavailable, "null", zero] }
+    Expression:
+      type: object
+      description: Typed expression AST. node_type selects property, dependency, literal, call, unary or binary payload.
+      required: [node_type]
+      additionalProperties: true
+      properties:
+        node_type:
+          type: string
+          enum: [property, dependency, literal, call, unary, binary]
+    MetricRef:
+      type: object
+      required: [metric_id, version]
+      properties:
+        metric_id: { type: string }
+        version: { type: integer, minimum: 1 }
+    PropertyRef:
+      type: object
+      additionalProperties: false
+      required: [object_type_id, property_name]
+      properties:
+        object_type_id: { type: string, minLength: 1 }
+        property_name: { type: string, minLength: 1 }
+        relation_path_alias: { type: string, minLength: 1 }
+    ObjectMetricPropertyOperand:
+      type: object
+      additionalProperties: false
+      required: [source, property_ref]
+      properties:
+        source: { const: property }
+        property_ref: { $ref: "#/components/schemas/PropertyRef" }
+    ObjectMetricLiteralOperand:
+      type: object
+      additionalProperties: false
+      required: [source, value_type, value]
+      properties:
+        source: { const: literal }
+        value_type:
+          type: string
+          enum: [int64, decimal, boolean, string, date, datetime, duration]
+          description: date uses YYYY-MM-DD, datetime uses RFC 3339, and duration is numeric.
+        value: { description: Must match value_type; int64 values must be integers. }
+    ObjectMetricOperand:
+      oneOf:
+        - { $ref: "#/components/schemas/ObjectMetricPropertyOperand" }
+        - { $ref: "#/components/schemas/ObjectMetricLiteralOperand" }
+    ObjectMetricScalarPredicate:
+      type: object
+      additionalProperties: false
+      required: [node_type, left, comparison_operator, right]
+      properties:
+        node_type: { const: predicate }
+        left: { $ref: "#/components/schemas/ObjectMetricOperand" }
+        comparison_operator:
+          type: string
+          enum: [eq, neq, gt, gte, lt, lte, contains, not_contains, starts_with, ends_with, before, before_or_equal, after, after_or_equal]
+        right: { type: array, minItems: 1, maxItems: 1, items: { $ref: "#/components/schemas/ObjectMetricOperand" } }
+    ObjectMetricMembershipPredicate:
+      type: object
+      additionalProperties: false
+      required: [node_type, left, comparison_operator, right]
+      properties:
+        node_type: { const: predicate }
+        left: { $ref: "#/components/schemas/ObjectMetricOperand" }
+        comparison_operator: { type: string, enum: [in, not_in] }
+        right: { type: array, minItems: 1, items: { $ref: "#/components/schemas/ObjectMetricOperand" } }
+    ObjectMetricRangePredicate:
+      type: object
+      additionalProperties: false
+      required: [node_type, left, comparison_operator, right]
+      properties:
+        node_type: { const: predicate }
+        left: { $ref: "#/components/schemas/ObjectMetricOperand" }
+        comparison_operator: { type: string, enum: [between, not_between] }
+        right:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: Inclusive lower and upper bounds, in that order.
+          items: { $ref: "#/components/schemas/ObjectMetricOperand" }
+    ObjectMetricUnaryPredicate:
+      type: object
+      additionalProperties: false
+      required: [node_type, left, comparison_operator]
+      properties:
+        node_type: { const: predicate }
+        left: { $ref: "#/components/schemas/ObjectMetricOperand" }
+        comparison_operator: { type: string, enum: [is_empty, is_not_empty, is_null, is_not_null, is_true, is_false] }
+        right: { type: array, maxItems: 0, description: Must be omitted or empty for a unary comparison. }
+    ObjectMetricPredicate:
+      oneOf:
+        - { $ref: "#/components/schemas/ObjectMetricScalarPredicate" }
+        - { $ref: "#/components/schemas/ObjectMetricMembershipPredicate" }
+        - { $ref: "#/components/schemas/ObjectMetricRangePredicate" }
+        - { $ref: "#/components/schemas/ObjectMetricUnaryPredicate" }
+    ObjectMetricBooleanGroup:
+      type: object
+      additionalProperties: false
+      required: [node_type, boolean_operator, children]
+      properties:
+        node_type: { const: group }
+        boolean_operator: { type: string, enum: [and, or] }
+        children: { type: array, minItems: 2, items: { $ref: "#/components/schemas/ObjectMetricCondition" } }
+    ObjectMetricNotGroup:
+      type: object
+      additionalProperties: false
+      required: [node_type, boolean_operator, children]
+      properties:
+        node_type: { const: group }
+        boolean_operator: { const: not }
+        children: { type: array, minItems: 1, maxItems: 1, items: { $ref: "#/components/schemas/ObjectMetricCondition" } }
+    ObjectMetricCondition:
+      description: >-
+        Recursive Object Metric V1 condition AST. Property and literal operand types must be
+        compatible. Text operators require string properties, is_true/is_false require boolean
+        properties, and before/after operators require date or datetime properties.
+      oneOf:
+        - { $ref: "#/components/schemas/ObjectMetricPredicate" }
+        - { $ref: "#/components/schemas/ObjectMetricBooleanGroup" }
+        - { $ref: "#/components/schemas/ObjectMetricNotGroup" }
+    ObjectMetricRelationStep:
+      type: object
+      additionalProperties: false
+      required: [relation_type_id, direction, target_object_type_id]
+      properties:
+        relation_type_id: { type: string, minLength: 1 }
+        direction:
+          type: string
+          enum: [forward, backward, outgoing, incoming]
+          description: >-
+            Traversal direction relative to the relationship definition. forward walks from its
+            source object type to its target object type; backward walks in reverse. outgoing and
+            incoming are deprecated aliases accepted only for backward compatibility. They are
+            normalized to forward and backward when a draft is saved.
+        target_object_type_id: { type: string, minLength: 1 }
+    ObjectMetricRelationPath:
+      type: object
+      additionalProperties: false
+      required: [alias, steps, purpose, quantifier, cardinality_policy]
+      properties:
+        alias: { type: string, minLength: 1 }
+        steps:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ObjectMetricRelationStep" }
+        purpose: { const: qualify_root }
+        quantifier: { type: string, enum: [exists, not_exists, all, all_nonempty, count_compare] }
+        related_filters: { $ref: "#/components/schemas/ObjectMetricCondition" }
+        cardinality_policy: { type: string, enum: [preserve_root, distinct_root, allow_multiplication] }
+        count_comparison: { type: string, enum: [eq, neq, gt, gte, lt, lte] }
+        count_threshold: { type: integer, minimum: 0 }
+    ObjectMetricDependency:
+      type: object
+      required: [alias, metric_ref, object_alignment, evaluation_context]
+      properties:
+        alias: { type: string }
+        metric_ref: { $ref: "#/components/schemas/MetricRef" }
+        object_alignment: { type: object, additionalProperties: true }
+        evaluation_context: { type: object, additionalProperties: true }
+        rollup_aggregation:
+          type: string
+          enum: [sum, avg, min, max, count, count_distinct]
+          description: Required when this dependency is rolled up across object instances or statistical grain.
+    ObjectMetricRecord:
+      type: object
+      required: [definition, kn_id, branch, creator, updater, create_time, update_time]
+      properties:
+        definition: { $ref: "#/components/schemas/ObjectMetricDefinition" }
+        owner_object_type_name:
+          type: string
+          description: Name-only projection of the owning object type for callers authorized to view the metric. This does not grant object-type detail access.
+        kn_id: { type: string }
+        branch: { type: string }
+        creator: { type: object, additionalProperties: true }
+        updater: { type: object, additionalProperties: true }
+        create_time: { type: integer, format: int64 }
+        update_time: { type: integer, format: int64 }
+        revision:
+          type: string
+          description: Changes on every write of this metric version. Send it back as `If-Match` when updating or deleting the version on a versioned network.
+    ObjectMetricList:
+      type: object
+      required: [entries, total_count]
+      properties:
+        entries: { type: array, items: { $ref: "#/components/schemas/ObjectMetricRecord" } }
+        total_count: { type: integer, minimum: 0 }
+    ObjectMetricDeletionBlocker:
+      type: object
+      required: [resource_type, resource_id, field]
+      properties:
+        resource_type: { type: string, enum: [metric_version] }
+        resource_id: { type: string }
+        version: { type: integer, minimum: 1 }
+        name: { type: string }
+        field: { type: string }
+    ObjectMetricVersionDeletionCheck:
+      type: object
+      required: [metric_id, metric_name, version, status, deletable, blockers, hidden_blocker_count]
+      properties:
+        metric_id: { type: string }
+        metric_name: { type: string }
+        version: { type: integer, minimum: 1 }
+        status: { $ref: "#/components/schemas/LifecycleStatus" }
+        deletable: { type: boolean }
+        blockers:
+          type: array
+          items: { $ref: "#/components/schemas/ObjectMetricDeletionBlocker" }
+        hidden_blocker_count: { type: integer, minimum: 0 }
+    ValidationIssue:
+      type: object
+      required: [code, field, message]
+      properties:
+        code: { type: string }
+        field: { type: string }
+        message: { type: string }
+    ValidationResult:
+      type: object
+      required: [valid, issues, output_shape]
+      properties:
+        valid: { type: boolean }
+        issues: { type: array, items: { $ref: "#/components/schemas/ValidationIssue" } }
+        output_shape: { $ref: "#/components/schemas/OutputShape" }
+    ObjectMetricPreview:
+      type: object
+      required: [validation, output_schema]
+      properties:
+        validation: { $ref: "#/components/schemas/ValidationResult" }
+        output_schema: { type: object, additionalProperties: true }
+    ObjectMetricCapabilities:
+      type: object
+      properties:
+        time_window_modes:
+          type: array
+          items: { type: string, enum: [unbounded, rolling, calendar_period, period_to_date, fixed_range] }
+      additionalProperties:
+        oneOf:
+          - { type: array, items: { type: string } }
+          - { type: object, additionalProperties: { type: string } }

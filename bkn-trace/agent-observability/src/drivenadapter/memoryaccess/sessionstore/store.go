@@ -19,18 +19,19 @@ import (
 )
 
 type Store struct {
-	evidenceReader func([]string) ([]ledgervo.Event, error)
-	mu             sync.Mutex
-	now            func() time.Time
-	conversations  map[string]sessionvo.Conversation
-	interactions   map[string]sessionvo.Interaction
-	operations     map[string]sessionvo.Operation
-	operationCalls map[string]sessionvo.OperationCallFact
-	receipts       map[string]sessionvo.Receipt
-	idempotencies  map[string]sessionvo.IdempotencyRecord
-	projections    map[uint64]sessionvo.ProjectionMutation
-	nextProjection uint64
-	revisions      map[string]sessionvo.AssemblyRevision
+	integrityRetries map[integrityRetryKey]isessionstore.RecordIntegrityRetry
+	evidenceReader   func([]string) ([]ledgervo.Event, error)
+	mu               sync.Mutex
+	now              func() time.Time
+	conversations    map[string]sessionvo.Conversation
+	interactions     map[string]sessionvo.Interaction
+	operations       map[string]sessionvo.Operation
+	operationCalls   map[string]sessionvo.OperationCallFact
+	receipts         map[string]sessionvo.Receipt
+	idempotencies    map[string]sessionvo.IdempotencyRecord
+	projections      map[uint64]sessionvo.ProjectionMutation
+	nextProjection   uint64
+	revisions        map[string]sessionvo.AssemblyRevision
 }
 
 func New() *Store {
@@ -321,6 +322,23 @@ func (tx memoryTransaction) ListOperationCallFacts(interactionID string) []sessi
 		}
 		return result[i].StartedAt.Before(result[j].StartedAt)
 	})
+	return result
+}
+
+func (tx memoryTransaction) ListOperationCallSummaries(interactionID string) []sessionvo.OperationCallSummary {
+	facts := tx.ListOperationCallFacts(interactionID)
+	result := make([]sessionvo.OperationCallSummary, 0, len(facts))
+	for _, fact := range facts {
+		result = append(result, sessionvo.OperationCallSummary{
+			OperationID: fact.OperationID, Attempt: fact.Attempt,
+			ConversationID: fact.ConversationID, InteractionID: fact.InteractionID,
+			ReceiptID: fact.ReceiptID, ToolName: fact.ToolName, Protocol: fact.Protocol,
+			SourceModule: fact.SourceModule, ParentOperationID: fact.ParentOperationID,
+			RequestID: fact.RequestID, TraceID: fact.TraceID, SpanID: fact.SpanID,
+			StartedAt: fact.StartedAt, FinishedAt: fact.FinishedAt,
+			Status: fact.Status, Retryable: fact.Retryable,
+		})
+	}
 	return result
 }
 

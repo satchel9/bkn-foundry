@@ -17,8 +17,23 @@
 [![License](https://img.shields.io/badge/license-multi--licensed-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/openbkn-ai/bkn-foundry)](https://github.com/openbkn-ai/bkn-foundry/releases/latest)
 
 <a href="https://trendshift.io/repositories/109706?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-109706" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/109706" alt="openbkn-ai%2Fbkn-foundry | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/109706?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-109706" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/109706/daily?language=Go" alt="openbkn-ai%2Fbkn-foundry | Trendshift" width="250" height="55"/></a>
 
 </div>
+
+---
+
+<div align="center">
+
+<a href="https://youtu.be/xarWAhN5cQg?si=Z28Uug7__WDknbiO">
+  <img src="help/openbkn-in-3-minutes-preview.webp" alt="OpenBKN video preview; click to watch the full 3-minute video on YouTube" width="640" height="360">
+</a>
+
+**[▶ Watch the full 3-minute OpenBKN video on YouTube](https://youtu.be/xarWAhN5cQg?si=Z28Uug7__WDknbiO)**
+
+</div>
+
+---
 
 OpenBKN is an ontology-driven business knowledge network platform. Through ontology modeling, it turns the data and logic scattered across documents, systems, processes, rules, and expert experience into a business knowledge network that agents can understand, execute, and verify — so agents land accurately, safely, and reliably in real business environments, not just generating answers but continuously creating executable, traceable, and verifiable business value.
 
@@ -103,7 +118,7 @@ sudo bash ./onboard.sh --help # all flags (--config=models.yaml, --enable-bkn-se
 
    > **Why `sudo`?** `onboard.sh` reads `$HOME/.openbkn-ai/config.yaml` (written by `sudo deploy.sh` into `/root/.openbkn-ai/`) and writes the `openbkn` auth token to `$HOME/.bkn`. Running it without `sudo` falls back to the in-repo template `conf/config.yaml` and may resolve a different access URL. **macOS dev path** (`bash dev/mac.sh onboard`) does **not** need `sudo`.
 
-   Re-runs are safe: existing models / BKN defaults are detected and skipped. For the full sequence, the Mermaid flow, and the `openbkn` authentication notes (full ISF), see [help/en/install.md — Post-install: `onboard.sh`](help/en/install.md#post-install-onboardsh).
+   Re-runs are safe: existing models / BKN defaults are detected and skipped. For the full sequence, the Mermaid flow, and the `openbkn` authentication notes (full identity deployment), see [help/en/install.md — Post-install: `onboard.sh`](help/en/install.md#post-install-onboardsh).
 
 6. **Verify API access**
 
@@ -152,7 +167,7 @@ In long-running agent scenarios, context inevitably faces explosion, decay, poll
 Beyond "seeing more", Agents must "do it right". BKN Foundry provides constraint engineering capabilities for enterprise-grade safe execution:
 
 - **Explainable decisions** — Uses "Object → Action → Rule → Constraint" knowledge structures to express business intent graphs, grounding tool invocation and parameter selection to explicit semantic boundaries and rule dependencies, making it clear "why this action was taken".
-- **Traceable evidence chain** — From action intent → knowledge node → data source → mapping/operator → final invocation, full-chain tracing is supported. Entities and relationships can be traced back to source data and active rules, enabling audit and review.
+- **Traceable evidence chain** — From action intent → knowledge node → data source → mapping/tool → final invocation, full-chain tracing is supported. Entities and relationships can be traced back to source data and active rules, enabling audit and review.
 - **Controllable execution loop** — Unifies identity and access control down to knowledge network object/action permissions, with pre-execution validation, mid-execution policy interception, and post-execution audit logging, achieving "authorizable, approvable, revocable" security loops.
 - **Risk prevention mechanism** — Models risks as "Risk Types" linked to Action Types; performs risk assessment and simulation before execution, with automatic downgrade/blocking/secondary confirmation when thresholds are hit, blocking high-risk actions before they execute.
 
@@ -167,7 +182,7 @@ Beyond "seeing more", Agents must "do it right". BKN Foundry provides constraint
 | **VEGA** | Data virtualization — hides differences between underlying multi-source & multi-modal data |
 | **Exec Factory** | Execution factory — orchestrates tools, MCP, and Skills |
 | **BKN Safe** | Access control — unified identity, permissions, and policy entry point; security controls and auditing per business object / action |
-| **BKN Trace** | Evidence chain — traces BKN call chains (intent → knowledge node → data source → mapping / operator); traceable and explainable |
+| **BKN Trace** | Evidence chain — traces BKN call chains (intent → knowledge node → data source → mapping / tool); traceable and explainable |
 
 See the full write-up in [BKN Reference Architecture](docs/bkn-architecture.md).
 

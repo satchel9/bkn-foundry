@@ -7,11 +7,14 @@
 package interfaces
 
 import (
+	"context"
 	"fmt"
+	"slices"
+	"sync"
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/audit"
 
-	"bkn-backend/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 type contextKey string // Private context key type.
@@ -27,6 +30,19 @@ const (
 
 	ACCOUNT_INFO_KEY contextKey = "x-account-info" // Avoid using a raw string directly.
 
+	// CONFIRM_CLEAR_DECLARATIONS_KEY marks a request that confirmed, with the query parameter
+	// QueryParam_ConfirmClearDeclarations, that an overwrite may clear stored property
+	// declarations.
+	CONFIRM_CLEAR_DECLARATIONS_KEY contextKey = "x-confirm-clear-declarations"
+
+	// CLEARED_DECLARATIONS_COLLECTOR_KEY carries a ClearedDeclarationCollector.
+	CLEARED_DECLARATIONS_COLLECTOR_KEY contextKey = "x-cleared-declarations-collector"
+
+	// RESOURCE_NAME_MAX_LENGTH is the maximum number of Unicode characters in a BKN resource name.
+	RESOURCE_NAME_MAX_LENGTH = 128
+	// PROPERTY_DISPLAY_NAME_MAX_LENGTH is the maximum number of Unicode characters in a property display name.
+	PROPERTY_DISPLAY_NAME_MAX_LENGTH = 128
+	// OBJECT_NAME_MAX_LENGTH remains the limit for tags.
 	OBJECT_NAME_MAX_LENGTH = 40
 	DEFAULT_NAME_PATTERN   = ""
 	DEFAULT_OFFEST         = "0"
@@ -67,6 +83,9 @@ const (
 	ImportMode_Normal    = "normal"
 	ImportMode_Ignore    = "ignore"
 	ImportMode_Overwrite = "overwrite"
+	// ImportMode_Replace is overwrite that also deletes what the package leaves out, capability
+	// bindings included. Only BKN package uploads accept it.
+	ImportMode_Replace = "replace"
 
 	Mode_Export = "export"
 
@@ -74,8 +93,9 @@ const (
 	DATA_SOURCE_TYPE_RESOURCE = "resource"
 
 	// Object ID validation.
-	RegexPattern_Builtin_ID    = "^[a-z0-9_][a-z0-9_-]{0,39}$"
-	RegexPattern_NonBuiltin_ID = "^[a-z0-9][a-z0-9_-]{0,39}$"
+	RESOURCE_ID_MAX_LENGTH     = 128
+	RegexPattern_Builtin_ID    = "^[a-z0-9_][a-z0-9_-]{0,127}$"
+	RegexPattern_NonBuiltin_ID = "^[a-z0-9][a-z0-9_-]{0,127}$"
 
 	// Property name constraints.
 	RegexPattern_Property_Name = "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$"
@@ -89,9 +109,6 @@ const (
 	VALUE_FROM_PROPERTY = "property"
 	VALUE_FROM_CONST    = "const"
 	VALUE_FROM_PARAM    = "param" // RiskFunction parameter value comes from a RiskType parameter named by ParamDef.name.
-
-	// Property types.
-	PROPERTY_TYPE_METRIC = "metric"
 
 	// Maximum page size when concept search does not specify limit.
 	ConceptQueryLimit = 10000
@@ -127,6 +144,7 @@ const (
 	MODULE_TYPE_CONCEPT_GROUP_RELATION = "concept_group_relation"
 	MODULE_TYPE_ACTION_SCHEDULE        = "action_schedule"
 	MODULE_TYPE_RISK_TYPE              = "risk_type"
+	MODULE_TYPE_VALUE_TYPE             = "value_type"
 	MODULE_TYPE_METRIC                 = "metric"
 )
 
@@ -445,6 +463,24 @@ func GetBKNConceptSchemaDefinition(vectorDim int, defaultSmallModelEnabled bool)
 					DisplayName: "keyword_branch",
 					FeatureType: FieldFeatureType_Keyword,
 					Description: "BKN分支名称的关键词特征",
+					IsDefault:   true,
+					IsNative:    false,
+					Config:      map[string]any{FIELD_KEYWORD_PROPERTY_IGNORE_ABOVE: FIELD_KEYWORD_PROPERTY_IGNORE_ABOVE_VALUE},
+				},
+			},
+		},
+		{
+			Name:         CONCEPT_FIELD_LIFECYCLE_STATUS,
+			Type:         data_type.DATATYPE_STRING,
+			DisplayName:  CONCEPT_FIELD_LIFECYCLE_STATUS,
+			OriginalName: CONCEPT_FIELD_LIFECYCLE_STATUS,
+			Description:  "Lifecycle status of an object type, relation type or action type; set only for deprecated concepts",
+			Features: []PropertyFeature{
+				{
+					FeatureName: "keyword_lifecycle_status",
+					DisplayName: "keyword_lifecycle_status",
+					FeatureType: FieldFeatureType_Keyword,
+					Description: "Keyword feature of the lifecycle status",
 					IsDefault:   true,
 					IsNative:    false,
 					Config:      map[string]any{FIELD_KEYWORD_PROPERTY_IGNORE_ABOVE: FIELD_KEYWORD_PROPERTY_IGNORE_ABOVE_VALUE},
@@ -1090,4 +1126,66 @@ func GetBKNConceptSchemaDefinition(vectorDim int, defaultSmallModelEnabled bool)
 	}
 
 	return datasetProp
+}
+
+// QueryParam_ConfirmClearDeclarations=true lets an overwrite clear stored property declarations.
+const QueryParam_ConfirmClearDeclarations = "confirm_clear_declarations"
+
+// WithClearDeclarationsConfirmed marks ctx as confirming that an overwrite may clear stored property
+// declarations.
+func WithClearDeclarationsConfirmed(ctx context.Context) context.Context {
+	return context.WithValue(ctx, CONFIRM_CLEAR_DECLARATIONS_KEY, true)
+}
+
+// ClearDeclarationsConfirmed reports whether ctx confirms that an overwrite may clear stored
+// property declarations.
+func ClearDeclarationsConfirmed(ctx context.Context) bool {
+	confirmed, _ := ctx.Value(CONFIRM_CLEAR_DECLARATIONS_KEY).(bool)
+	return confirmed
+}
+
+// ClearedDeclarationCollector gathers the declarations an overwrite of several kinds of definition
+// would clear, so that the refusal lists them all at once instead of the first kind's alone.
+type ClearedDeclarationCollector struct {
+	mu      sync.Mutex
+	cleared []ClearedDeclaration
+}
+
+// WithClearedDeclarationCollector makes the overwrite checks under ctx record what they would clear
+// in the returned collector instead of refusing at the first definition kind that has any. Its
+// owner refuses once every kind is checked.
+func WithClearedDeclarationCollector(ctx context.Context) (context.Context, *ClearedDeclarationCollector) {
+	collector := &ClearedDeclarationCollector{}
+	return context.WithValue(ctx, CLEARED_DECLARATIONS_COLLECTOR_KEY, collector), collector
+}
+
+// CollectClearedDeclarations records cleared in the collector of ctx and reports whether there is
+// one; without it the caller refuses on its own.
+func CollectClearedDeclarations(ctx context.Context, cleared []ClearedDeclaration) bool {
+	collector, ok := ctx.Value(CLEARED_DECLARATIONS_COLLECTOR_KEY).(*ClearedDeclarationCollector)
+	if !ok {
+		return false
+	}
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.cleared = append(collector.cleared, cleared...)
+	return true
+}
+
+// Cleared lists what was collected: object types first, then relation types, then action types.
+func (c *ClearedDeclarationCollector) Cleared() []ClearedDeclaration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cleared := slices.Clone(c.cleared)
+	rank := func(d ClearedDeclaration) int {
+		switch {
+		case d.ObjectTypeID != "":
+			return 0
+		case d.RelationTypeID != "":
+			return 1
+		}
+		return 2
+	}
+	slices.SortStableFunc(cleared, func(a, b ClearedDeclaration) int { return rank(a) - rank(b) })
+	return cleared
 }

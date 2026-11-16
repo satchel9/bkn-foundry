@@ -10,11 +10,12 @@ import (
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/go-python/gpython/ast"
 	"github.com/go-python/gpython/parser"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces/model"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/utils"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 )
 
 const (
@@ -221,6 +222,9 @@ func (p *pythonFunctionParser) Parse(ctx context.Context, inputValue any) (metad
 	// Record the operation span.
 	ctx, _ = oteltrace.StartInternalSpan(ctx)
 	defer oteltrace.EndSpan(ctx, err)
+	if input, ok := cypherFunctionInput(inputValue); ok {
+		return p.parseCypherFunction(ctx, input)
+	}
 	input, err := p.validate(ctx, inputValue)
 	if err != nil {
 		return nil, err
@@ -253,6 +257,12 @@ func (p *pythonFunctionParser) Parse(ctx context.Context, inputValue any) (metad
 
 // GetAllContent returns the complete generated API contract.
 func (p *pythonFunctionParser) GetAllContent(ctx context.Context, inputValue any) (content any, err error) {
+	if input, ok := cypherFunctionInput(inputValue); ok {
+		if err = p.validateCypherFunction(ctx, input); err != nil {
+			return nil, err
+		}
+		return convertCypherToPathItemContent(input), nil
+	}
 	input, err := p.validate(ctx, inputValue)
 	if err != nil {
 		return nil, err
@@ -373,7 +383,7 @@ func createResponseBody(outputs []*interfaces.ParameterDef) []*interfaces.Respon
 		Description: "Failure details",
 		Properties:  map[string]*openapi3.SchemaRef{},
 	}
-	errSchema.Properties["code"] = openapi3.NewSchemaRef("", &openapi3.Schema{
+	errSchema.Properties["error_code"] = openapi3.NewSchemaRef("", &openapi3.Schema{
 		Type:        &openapi3.Types{openapi3.TypeString},
 		Description: "Error code",
 	})
@@ -381,18 +391,14 @@ func createResponseBody(outputs []*interfaces.ParameterDef) []*interfaces.Respon
 		Type:        &openapi3.Types{openapi3.TypeString},
 		Description: "Error description",
 	})
-	errSchema.Properties["detail"] = openapi3.NewSchemaRef("", &openapi3.Schema{
-		Type:        &openapi3.Types{openapi3.TypeObject},
+	errSchema.Properties["error_details"] = openapi3.NewSchemaRef("", &openapi3.Schema{
 		Description: "Error details",
 	})
-	errSchema.Properties["solution"] = openapi3.NewSchemaRef("", &openapi3.Schema{
-		Type:        &openapi3.Types{openapi3.TypeString},
-		Description: "Error solution",
+	errSchema.Properties["metadata"] = openapi3.NewSchemaRef("", &openapi3.Schema{
+		Type:        &openapi3.Types{openapi3.TypeObject},
+		Description: "Public rendering parameters",
 	})
-	errSchema.Properties["link"] = openapi3.NewSchemaRef("", &openapi3.Schema{
-		Type:        &openapi3.Types{openapi3.TypeString},
-		Description: "Error link",
-	})
+	errSchema.Required = []string{"error_code", "description", "error_details"}
 	// Build the response list.
 	responseBody := []*interfaces.Response{
 		{
@@ -512,7 +518,7 @@ func createParameterSchema(param *interfaces.ParameterDef) *openapi3.Schema {
 //
 // Outputs are left alone deliberately. A missing output description costs a
 // reader some guessing; a missing input description costs a failed call. The
-// function's own description is left to ValidateOperatorDesc, which already
+// function's own description is left to ValidatorToolDesc, which already
 // refuses it with a localised code of its own.
 func validateParameterDescriptions(ctx context.Context, input *interfaces.FunctionInput) error {
 	for _, missing := range undescribedParameters(input.Inputs, "", "") {

@@ -18,8 +18,13 @@ const (
 	// the page ceiling of vega-backend's raw query interface, which would
 	// otherwise cut the result down without saying so.
 	CYPHER_MAX_LIMIT = 10000
-	// CYPHER_DEFAULT_TIMEOUT_SEC bounds one statement at the connector.
-	CYPHER_DEFAULT_TIMEOUT_SEC = 30
+	// CYPHER_DEFAULT_TIMEOUT_SEC bounds one statement at the connector when
+	// the service is not configured otherwise; see
+	// common.ServerSetting.CypherQueryTimeoutSec.
+	CYPHER_DEFAULT_TIMEOUT_SEC = 55
+	// CYPHER_MAX_TIMEOUT_SEC is the most vega-backend accepts for one
+	// statement; a configured timeout past it is held to it.
+	CYPHER_MAX_TIMEOUT_SEC = 3600
 	// CYPHER_MAX_PATH_LENGTH bounds how many relationships one pattern may
 	// hold. Each is a join, and the row limit bounds what comes back rather
 	// than what it costs to produce, so the number of joins is bounded here.
@@ -37,11 +42,26 @@ const (
 type CypherQuery struct {
 	KNID   string
 	Branch string
-	Query  string
+	// RunningVersion marks Branch as the running version of a versioned network, whose content
+	// main mirrors, so a refused statement may fall back to the proxy as on main.
+	RunningVersion bool
+	Query          string
 	// Parameters supply the values the query refers to as $name. They are
 	// values only: a parameter can change which rows come back, never which
 	// resource or column is read.
 	Parameters map[string]any
+	// ObjectProperties names, per node variable, the properties a returned
+	// node carries besides its identity. Each one is authorized like any
+	// property the query names.
+	ObjectProperties map[string][]string
+	// Explain asks for the query's plan instead of its rows. The query is
+	// read, authorized and compiled exactly as it would be to run, so it is
+	// refused in exactly the same cases, but nothing is read from the data.
+	Explain bool
+	// TimeoutSec asks for a shorter statement timeout than the service's
+	// configured one; zero means the configured one. More than that is
+	// refused.
+	TimeoutSec int
 }
 
 // CypherQueryResult carries the rows a query produced. The generated SQL is
@@ -50,12 +70,21 @@ type CypherQuery struct {
 type CypherQueryResult struct {
 	Columns []RawQueryColumn `json:"columns"`
 	Entries []map[string]any `json:"entries"`
+	// ValueTypes and Execution are set when the query returns graph values:
+	// what each column holds, and how complete the answer is.
+	ValueTypes map[string]*CypherValueType `json:"value_types,omitempty"`
+	Execution  *CypherExecution            `json:"execution,omitempty"`
 	// PermissionImpacts is returned only on the internal HTTP face. It lets an
 	// agent explain which object-type access rules narrowed or refused a query.
 	PermissionImpacts []CypherPermissionImpact `json:"-"`
 	// TraceDescriptor is returned only on the internal HTTP face. The public
 	// REST response keeps its existing shape.
 	TraceDescriptor json.RawMessage `json:"-"`
+	// Plan is set, instead of any rows, when the query asked to be explained.
+	Plan *CypherPlan `json:"plan,omitempty"`
+	// Limited says the query wrote no LIMIT and returned as many rows as the
+	// default allows, so more may match.
+	Limited bool `json:"limited,omitempty"`
 }
 
 // CypherPermissionImpact identifies one object type whose row or property

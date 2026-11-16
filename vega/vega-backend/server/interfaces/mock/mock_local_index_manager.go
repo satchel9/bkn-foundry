@@ -114,11 +114,12 @@ func (mr *MockLocalIndexManagerMockRecorder) DeleteDocuments(ctx, indexName, doc
 }
 
 // DeleteDocumentsByQuery mocks base method.
-func (m *MockLocalIndexManager) DeleteDocumentsByQuery(ctx context.Context, indexName string, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) error {
+func (m *MockLocalIndexManager) DeleteDocumentsByQuery(ctx context.Context, indexName string, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "DeleteDocumentsByQuery", ctx, indexName, res, params)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret0, _ := ret[0].(*interfaces.DeleteByQueryResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // DeleteDocumentsByQuery indicates an expected call of DeleteDocumentsByQuery.
@@ -139,6 +140,21 @@ func (m *MockLocalIndexManager) DeleteIndex(ctx context.Context, indexName strin
 func (mr *MockLocalIndexManagerMockRecorder) DeleteIndex(ctx, indexName any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteIndex", reflect.TypeOf((*MockLocalIndexManager)(nil).DeleteIndex), ctx, indexName)
+}
+
+// GeneratedFields mocks base method.
+func (m *MockLocalIndexManager) GeneratedFields(schema []*interfaces.Property) (map[string]*interfaces.Property, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GeneratedFields", schema)
+	ret0, _ := ret[0].(map[string]*interfaces.Property)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GeneratedFields indicates an expected call of GeneratedFields.
+func (mr *MockLocalIndexManagerMockRecorder) GeneratedFields(schema any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GeneratedFields", reflect.TypeOf((*MockLocalIndexManager)(nil).GeneratedFields), schema)
 }
 
 // GetDocument mocks base method.
@@ -201,10 +217,10 @@ func (mr *MockLocalIndexManagerMockRecorder) GetIndexMeta(ctx, index any) *gomoc
 }
 
 // IndexDocuments mocks base method.
-func (m *MockLocalIndexManager) IndexDocuments(ctx context.Context, indexName string, documents map[string]map[string]any) ([]string, error) {
+func (m *MockLocalIndexManager) IndexDocuments(ctx context.Context, indexName string, documents []interfaces.DocumentWrite) ([]interfaces.DocumentWriteResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "IndexDocuments", ctx, indexName, documents)
-	ret0, _ := ret[0].([]string)
+	ret0, _ := ret[0].([]interfaces.DocumentWriteResult)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -216,13 +232,12 @@ func (mr *MockLocalIndexManagerMockRecorder) IndexDocuments(ctx, indexName, docu
 }
 
 // ListDocuments mocks base method.
-func (m *MockLocalIndexManager) ListDocuments(ctx context.Context, indexName string, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+func (m *MockLocalIndexManager) ListDocuments(ctx context.Context, indexName string, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ListDocuments", ctx, indexName, res, params)
-	ret0, _ := ret[0].([]map[string]any)
-	ret1, _ := ret[1].(int64)
-	ret2, _ := ret[2].(error)
-	return ret0, ret1, ret2
+	ret0, _ := ret[0].(*interfaces.ResourceDataQueryResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // ListDocuments indicates an expected call of ListDocuments.
@@ -244,6 +259,21 @@ func (m *MockLocalIndexManager) ListIndexes(ctx context.Context) ([]*interfaces.
 func (mr *MockLocalIndexManagerMockRecorder) ListIndexes(ctx any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListIndexes", reflect.TypeOf((*MockLocalIndexManager)(nil).ListIndexes), ctx)
+}
+
+// SchemaForQuery mocks base method.
+func (m *MockLocalIndexManager) SchemaForQuery(schema []*interfaces.Property) ([]*interfaces.Property, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SchemaForQuery", schema)
+	ret0, _ := ret[0].([]*interfaces.Property)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SchemaForQuery indicates an expected call of SchemaForQuery.
+func (mr *MockLocalIndexManagerMockRecorder) SchemaForQuery(schema any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SchemaForQuery", reflect.TypeOf((*MockLocalIndexManager)(nil).SchemaForQuery), schema)
 }
 
 // UpdateIndex mocks base method.
@@ -288,4 +318,32 @@ func (m *MockLocalIndexManager) ValidateAnalyzer(ctx context.Context, analyzer s
 func (mr *MockLocalIndexManagerMockRecorder) ValidateAnalyzer(ctx, analyzer any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateAnalyzer", reflect.TypeOf((*MockLocalIndexManager)(nil).ValidateAnalyzer), ctx, analyzer)
+}
+
+// ValidateFilterCondition mocks base method.
+func (m *MockLocalIndexManager) ValidateFilterCondition(condition interfaces.FilterCondition, properties []*interfaces.Property) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ValidateFilterCondition", condition, properties)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ValidateFilterCondition indicates an expected call of ValidateFilterCondition.
+func (mr *MockLocalIndexManagerMockRecorder) ValidateFilterCondition(condition, properties any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateFilterCondition", reflect.TypeOf((*MockLocalIndexManager)(nil).ValidateFilterCondition), condition, properties)
+}
+
+// ValidateFilterability mocks base method.
+func (m *MockLocalIndexManager) ValidateFilterability(schema []*interfaces.Property) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ValidateFilterability", schema)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ValidateFilterability indicates an expected call of ValidateFilterability.
+func (mr *MockLocalIndexManagerMockRecorder) ValidateFilterability(schema any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateFilterability", reflect.TypeOf((*MockLocalIndexManager)(nil).ValidateFilterability), schema)
 }

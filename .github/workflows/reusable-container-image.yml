@@ -75,7 +75,7 @@ jobs:
   # Turns the `platforms` input into the build matrix and settles the SWR
   # decision once, so the legs and the manifest job agree on both.
   setup:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # Surfaced so a step can test credential presence — secrets aren't
       # allowed in `if:` directly. Empty when the SWR secrets aren't set.
@@ -100,7 +100,7 @@ jobs:
           for platform in "${platforms[@]}"; do
             platform="$(echo "${platform}" | xargs)"
             case "${platform}" in
-              linux/amd64) arch=amd64; runner=ubuntu-latest ;;
+              linux/amd64) arch=amd64; runner=ubuntu-24.04 ;;
               linux/arm64) arch=arm64; runner=ubuntu-24.04-arm ;;
               *)
                 echo "::error::No native runner mapped for platform '${platform}' (supported: linux/amd64, linux/arm64)"
@@ -167,14 +167,17 @@ jobs:
           SWR_REPO: ${{ inputs.swr-registry }}/${{ inputs.swr-namespace }}
           VERSION: ${{ inputs.version }}
         run: |
-          # Arch-suffixed tags are the manifest list's children and are left in
-          # the registry on purpose: deleting them breaks the list that
-          # references their digests.
+          # Keep each run's children reachable while other runs overwrite the
+          # compatibility tags. SWR may discard manifests once their last tag
+          # moves; a digest artifact alone does not retain the registry object.
+          retention_tag="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH}"
           {
             echo "tags<<EOF"
             echo "ghcr.io/${{ github.repository_owner }}/${IMAGE}:${VERSION}-${ARCH}"
+            echo "ghcr.io/${{ github.repository_owner }}/${IMAGE}:${retention_tag}"
             if [ "${{ needs.setup.outputs.swr }}" = "true" ]; then
               echo "${SWR_REPO}/${IMAGE}:${VERSION}-${ARCH}"
+              echo "${SWR_REPO}/${IMAGE}:${retention_tag}"
             fi
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -238,7 +241,7 @@ jobs:
   manifest:
     needs: [setup, build]
     if: ${{ inputs.publish }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # No merge-multiple: each artifact unpacks into its own directory named
       # after the artifact, and the union step reads the exact
@@ -283,6 +286,26 @@ jobs:
           digest_for() {
             cat "${DIGEST_DIR}/digest__${IMAGE}__${1}/${1}"
           }
+          wait_for_manifest() {
+            local ref="$1"
+            local attempt
+            local delay
+            local max_attempts=6
+            for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+              if docker manifest inspect "${ref}" >/dev/null 2>&1; then
+                return 0
+              fi
+              if [ "${attempt}" -lt "${max_attempts}" ]; then
+                delay=$((attempt * 5))
+                echo "Waiting ${delay}s for ${ref} to become visible (attempt ${attempt}/${max_attempts})"
+                sleep "${delay}"
+              fi
+            done
+            echo "::error::manifest did not become visible after ${max_attempts} attempts: ${ref}"
+            # Run once without suppressing stderr so the registry error is
+            # preserved in the job log.
+            docker manifest inspect "${ref}"
+          }
           for arch in "${archs[@]}"; do
             file="${DIGEST_DIR}/digest__${IMAGE}__${arch}/${arch}"
             if [ ! -f "${file}" ]; then
@@ -308,8 +331,28 @@ jobs:
             for arch in "${archs[@]}"; do
               children+=("${repo}@$(digest_for "${arch}")")
             done
+            # SWR can acknowledge a push before the manifest is readable by
+            # digest. Wait for every child before asking `docker manifest
+            # create` to resolve it; GHCR normally succeeds on the first try.
+            for child in "${children[@]}"; do
+              wait_for_manifest "${child}"
+            done
             docker manifest create "${repo}:${tag}" "${children[@]}"
-            docker manifest push "${repo}:${tag}"
+            local push_attempt
+            local push_delay
+            local max_push_attempts=6
+            for ((push_attempt = 1; push_attempt <= max_push_attempts; push_attempt++)); do
+              if docker manifest push "${repo}:${tag}"; then
+                break
+              fi
+              if [ "${push_attempt}" -eq "${max_push_attempts}" ]; then
+                echo "::error::failed to push ${repo}:${tag} after ${max_push_attempts} attempts"
+                return 1
+              fi
+              push_delay=$((push_attempt * 5))
+              echo "Waiting ${push_delay}s before retrying manifest push for ${repo}:${tag} (attempt ${push_attempt}/${max_push_attempts})"
+              sleep "${push_delay}"
+            done
             echo "Pushed multi-arch ${repo}:${tag}"
             docker manifest inspect "${repo}:${tag}" | head -30
           }

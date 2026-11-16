@@ -8,28 +8,44 @@ package bkn
 
 import (
 	"fmt"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
-func testExamplesDir(t *testing.T) string {
-	t.Helper()
-	_, file, _, ok := runtime.Caller(0)
-	require.True(t, ok)
-	return filepath.Join(filepath.Dir(file), "..", "examples")
-}
+func TestResourceIdentityBoundaries(t *testing.T) {
+	t.Run("resource id", func(t *testing.T) {
+		assert.Empty(t, validateIDString(strings.Repeat("a", 128)))
+		assert.Contains(t, validateIDString(strings.Repeat("a", 129)), "must match")
+		assert.Contains(t, validateIDString("_resource"), "must match")
+		assert.Contains(t, validateIDString("resource@id"), "must match")
+	})
 
-func TestValidateNetwork_ValidK8s(t *testing.T) {
-	dir := filepath.Join(testExamplesDir(t), "k8s-network")
-	net, err := LoadNetwork(dir)
-	require.NoError(t, err)
-	res := ValidateNetwork(net)
-	assert.True(t, res.OK(), "errors: %+v", res.Errors)
+	t.Run("resource name counts Unicode characters", func(t *testing.T) {
+		assert.Empty(t, validateResourceName(strings.Repeat("名", 128)))
+		assert.Contains(t, validateResourceName(strings.Repeat("名", 129)), "exceeds 128")
+	})
+
+	t.Run("property display names count Unicode characters", func(t *testing.T) {
+		for _, name := range []string{
+			strings.Repeat("a", 40),
+			strings.Repeat("a", 41),
+			strings.Repeat("名", 127),
+			strings.Repeat("a名", 63) + "😀b",
+		} {
+			assert.Empty(t, validatePropertyDisplayName(name))
+		}
+		assert.Contains(t, validatePropertyDisplayName(strings.Repeat("😀", 129)), "exceeds 128")
+		assert.Contains(t, validatePropertyDisplayName(""), "must not be empty")
+	})
+
+	t.Run("short non-property fields keep their existing limit", func(t *testing.T) {
+		assert.Empty(t, validateFieldDisplayName(strings.Repeat("名", 40)))
+		assert.Contains(t, validateFieldDisplayName(strings.Repeat("名", 41)), "exceeds 40")
+		assert.NoError(t, validateTags([]string{strings.Repeat("名", 40)}))
+		assert.Error(t, validateTags([]string{strings.Repeat("名", 41)}))
+	})
 }
 
 func TestValidateNetwork_MissingID(t *testing.T) {
@@ -204,7 +220,7 @@ func TestValidateNetwork_InvalidBoundObjectRef(t *testing.T) {
 	assert.True(t, found, "expected invalid_bound_object_ref, got %+v", res.Errors)
 }
 
-func TestValidateNetwork_LogicPropertyMetricOK(t *testing.T) {
+func TestValidateNetwork_RejectsRemovedMetricLogicProperty(t *testing.T) {
 	net := &BknNetwork{
 		BknNetworkFrontmatter: BknNetworkFrontmatter{
 			Type: "knowledge_network",
@@ -235,146 +251,9 @@ func TestValidateNetwork_LogicPropertyMetricOK(t *testing.T) {
 		},
 	}
 	res := ValidateNetwork(net)
-	assert.True(t, res.OK(), "expected valid logic metric property, errors: %+v", res.Errors)
-}
-
-func testNetworkWithMetric(scopeType, scopeRef string) *BknNetwork {
-	return &BknNetwork{
-		BknNetworkFrontmatter: BknNetworkFrontmatter{
-			Type: "knowledge_network",
-			ID:   "net",
-			Name: "Net",
-		},
-		ObjectTypes: []*BknObjectType{
-			{
-				BknObjectTypeFrontmatter: BknObjectTypeFrontmatter{
-					Type: "object_type",
-					ID:   "ot1",
-					Name: "O",
-				},
-				HasDataPropertiesSection: true,
-				HasKeysSection:           true,
-				DataProperties:           []*DataProperty{{Name: "k", DisplayName: "K", Type: "string"}},
-				PrimaryKeys:              []string{"k"},
-				DisplayKey:               "k",
-			},
-		},
-		Metrics: []*BknMetric{
-			{
-				BknMetricFrontmatter: BknMetricFrontmatter{
-					Type: "metric",
-					ID:   "m1",
-					Name: "M",
-				},
-				HasScopeSection:              true,
-				HasCalculationFormulaSection: true,
-				ScopeType:                    scopeType,
-				ScopeRef:                     scopeRef,
-				Formula: &MetricFormula{
-					Kind: "atomic",
-					Atomic: &MetricAtomic{
-						Aggregation: &MetricAggregation{Property: "k", Aggr: "count"},
-					},
-				},
-			},
-		},
-	}
-}
-
-func TestValidateNetwork_MetricScopeOnlyObjectType(t *testing.T) {
-	res := ValidateNetwork(testNetworkWithMetric("object_type", "ot1"))
-	assert.True(t, res.OK(), "errors: %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricSubgraphScopeRejected(t *testing.T) {
-	res := ValidateNetwork(testNetworkWithMetric("subgraph", "sg1"))
 	assert.False(t, res.OK())
-	var found bool
-	for _, e := range res.Errors {
-		if e.Code == "unsupported_metric_scope" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected unsupported_metric_scope, got %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricOtherScopeRejected(t *testing.T) {
-	res := ValidateNetwork(testNetworkWithMetric("custom_scope", "ref"))
-	assert.False(t, res.OK())
-	var found bool
-	for _, e := range res.Errors {
-		if e.Code == "unsupported_metric_scope" && strings.Contains(e.Message, "only object_type") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected unsupported_metric_scope, got %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricEmptyScopeTypeRejected(t *testing.T) {
-	res := ValidateNetwork(testNetworkWithMetric("", "ot1"))
-	assert.False(t, res.OK())
-	var found bool
-	for _, e := range res.Errors {
-		if e.Code == "invalid_metric_scope_type" {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected invalid_metric_scope_type, got %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricObjectTypeMissingScopeRefRejected(t *testing.T) {
-	res := ValidateNetwork(testNetworkWithMetric("object_type", ""))
-	assert.False(t, res.OK())
-	var found bool
-	for _, e := range res.Errors {
-		if e.Code == "invalid_metric_scope_ref" && strings.Contains(e.Message, "required") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected invalid_metric_scope_ref (required), got %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricCompositeConditionOK(t *testing.T) {
-	net := testNetworkWithMetric("object_type", "ot1")
-	net.Metrics[0].Formula.Atomic.Condition = &MetricCondition{
-		Operation: "and",
-		SubConds: []*MetricCondition{
-			{Field: "k", Operation: "eq", Value: "v"},
-			{Field: "status", Operation: "in", Value: []any{"a"}},
-		},
-	}
-	res := ValidateNetwork(net)
-	assert.True(t, res.OK(), "errors: %+v", res.Errors)
-}
-
-func TestValidateNetwork_MetricEmptySubCondsRejected(t *testing.T) {
-	net := testNetworkWithMetric("object_type", "ot1")
-	net.Metrics[0].Formula.Atomic.Condition = &MetricCondition{
-		Operation: "and",
-		SubConds:  []*MetricCondition{},
-	}
-	res := ValidateNetwork(net)
-	assert.False(t, res.OK())
-	var found bool
-	for _, e := range res.Errors {
-		if e.Code == "invalid_metric_condition" && strings.Contains(e.Message, "sub_cond") {
-			found = true
-			break
-		}
-	}
-	assert.True(t, found, "expected invalid_metric_condition for empty sub_conds, got %+v", res.Errors)
-}
-
-func TestValidateNetwork_MockSystem(t *testing.T) {
-	dir := filepath.Join(testExamplesDir(t), "mock_system")
-	net, err := LoadNetwork(dir)
-	require.NoError(t, err)
-	res := ValidateNetwork(net)
-	assert.True(t, res.OK(), "errors: %+v", res.Errors)
+	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "type must be tool")
+	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "data_source.type must be tool")
 }
 
 // networkWithLogicSource builds a minimal valid network whose only logic property carries src.
@@ -420,24 +299,19 @@ func TestValidateNetwork_LogicPropertyToolSourceMissingIDs(t *testing.T) {
 	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "requires both box_id and tool_id")
 }
 
-func TestValidateNetwork_LogicPropertyMetricSourceMissingID(t *testing.T) {
-	res := ValidateNetwork(networkWithLogicSource("metric", &ResourceInfo{Type: "metric", Name: "m"}))
-	assert.False(t, res.OK())
-	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "requires source id")
-}
-
-func TestValidateNetwork_LogicPropertyResultPathNeedsTool(t *testing.T) {
-	res := ValidateNetwork(networkWithLogicSource("metric", &ResourceInfo{
-		Type: "metric", ID: "1", Name: "m", ResultPath: "$.result",
-	}))
-	assert.False(t, res.OK())
-	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "result_path is only valid")
-}
-
 func TestValidateNetwork_LogicPropertyResultPathMustParse(t *testing.T) {
 	res := ValidateNetwork(networkWithLogicSource("tool", &ResourceInfo{
 		Type: "tool", Name: "coupon_stats", BoxID: "box-1", ToolID: "tool-1", ResultPath: "$..[",
 	}))
 	assert.False(t, res.OK())
 	assert.Contains(t, fmt.Sprintf("%+v", res.Errors), "not a valid jsonpath")
+}
+
+// The backend rejects the curly quotes ‘’“” in a tag; offline validation has to reject them too,
+// or a network passes validate and then fails on push.
+func TestValidateTags_RejectsCurlyQuotes(t *testing.T) {
+	for _, tag := range []string{"“核心”", "‘核心’"} {
+		assert.Error(t, validateTags([]string{tag}), tag)
+	}
+	assert.NoError(t, validateTags([]string{"核心", "主数据"}))
 }

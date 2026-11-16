@@ -8,51 +8,59 @@ import (
 	"context"
 	"sort"
 	"strings"
-
-	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
-	"gorm.io/gorm"
 )
 
-// DirectRequirements returns the catalog-declared, same-resource prerequisites
-// for each requested operation. Requirements are one layer only; seed rejects
-// a requirement that itself declares requirements.
+// DirectRequirements returns the catalog-declared, same-resource prerequisites.
+// Use Requirements when validating or normalizing a complete dependency chain.
 func (en *Enforcer) DirectRequirements(ctx context.Context, resourceType string,
 	operations []string) (map[string][]string, error) {
 	if en.db == nil || len(operations) == 0 {
 		return make(map[string][]string, len(operations)), nil
 	}
-	return directRequirements(en.db.WithContext(ctx), resourceType, operations)
+	return en.Registry().requirements(ctx, resourceType, operations, false, false)
 }
 
-// DirectRequirements reads prerequisites through the transaction connection.
-// Mutation workflows use this form so the catalog snapshot and policy changes
-// belong to the same database transaction.
+// DirectRequirements uses the same immutable registry as the live enforcer.
 func (tx *PolicyTransaction) DirectRequirements(ctx context.Context, resourceType string,
 	operations []string) (map[string][]string, error) {
-	return directRequirements(tx.db.WithContext(ctx), resourceType, operations)
+	return tx.Registry().requirements(ctx, resourceType, operations, false, false)
 }
 
-func directRequirements(db *gorm.DB, resourceType string,
-	operations []string) (map[string][]string, error) {
-	result := make(map[string][]string, len(operations))
-	var rows []model.Operation
-	if err := db.
-		Where("resource_type_id = ? AND id IN ?", resourceType, distinctOperations(operations)).
-		Find(&rows).Error; err != nil {
-		return nil, err
+// ExpandRequirements follows the requested operation's dependencies in a registry
+// already validated by seed. Seen operations are processed once, including shared dependencies.
+func ExpandRequirements(requirements map[string][]string, operation string) []string {
+	seen := map[string]bool{operation: true}
+	queue := []string{operation}
+	for i := 0; i < len(queue); i++ {
+		for _, required := range requirements[queue[i]] {
+			if !seen[required] {
+				seen[required] = true
+				queue = append(queue, required)
+			}
+		}
 	}
-	for _, row := range rows {
-		result[row.ID] = splitOperationIDs(row.RequiredOperationIDs)
-	}
-	return result, nil
+	return queue[1:]
 }
 
-// NormalizeOperations adds every direct requirement while preserving the
+// Requirements returns all prerequisites for each requested operation, including
+// transitive dependencies. Startup precomputes the closure once.
+func (en *Enforcer) Requirements(ctx context.Context, resourceType string, operations []string) (map[string][]string, error) {
+	if en.db == nil || len(operations) == 0 {
+		return make(map[string][]string), nil
+	}
+	return en.Registry().requirements(ctx, resourceType, operations, true, false)
+}
+
+func (tx *PolicyTransaction) Requirements(ctx context.Context, resourceType string, operations []string) (map[string][]string, error) {
+	return tx.Registry().requirements(ctx, resourceType, operations, true, false)
+}
+
+// NormalizeOperations adds every transitive requirement while preserving the
 // caller's first-seen order. Callers use the result to persist an authorization
 // set that satisfies the declared write-time constraint.
 func (en *Enforcer) NormalizeOperations(ctx context.Context, resourceType string,
 	operations []string) ([]string, error) {
-	requires, err := en.DirectRequirements(ctx, resourceType, operations)
+	requires, err := en.Requirements(ctx, resourceType, operations)
 	if err != nil {
 		return nil, err
 	}
@@ -78,7 +86,7 @@ func (en *Enforcer) NormalizeOperations(ctx context.Context, resourceType string
 }
 
 // RequiringOperations returns the requested operations plus every operation
-// that directly requires one of them. Role revocation uses this reverse view to
+// that transitively requires one of them. Role revocation uses this reverse view to
 // keep a retained operation and its prerequisite together.
 func (en *Enforcer) RequiringOperations(ctx context.Context, resourceType string,
 	operations []string) ([]string, error) {
@@ -102,40 +110,14 @@ func (en *Enforcer) RequiringOperations(ctx context.Context, resourceType string
 	return out, nil
 }
 
-// RequiringOperationsByRequirement returns the direct reverse dependency list
-// for every requested prerequisite. It loads the catalog once so callers that
-// revoke a set do not repeat the same resource-type query per operation.
+// RequiringOperationsByRequirement returns the transitive reverse dependency list
+// for every requested prerequisite from the shared registry snapshot.
 func (en *Enforcer) RequiringOperationsByRequirement(ctx context.Context, resourceType string,
 	operations []string) (map[string][]string, error) {
 	if en.db == nil || len(operations) == 0 {
 		return make(map[string][]string, len(operations)), nil
 	}
-	return requiringOperationsByRequirement(en.db.WithContext(ctx), resourceType, operations)
-}
-
-func requiringOperationsByRequirement(db *gorm.DB, resourceType string,
-	operations []string) (map[string][]string, error) {
-	result := make(map[string][]string, len(operations))
-	var rows []model.Operation
-	if err := db.
-		Where("resource_type_id = ? AND implied_operation_ids <> ''", resourceType).
-		Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	wanted := make(map[string]bool, len(operations))
-	for _, operation := range operations {
-		wanted[operation] = true
-	}
-	// Seed rejects multi-level declarations, so one pass is the complete reverse
-	// set and intentionally does not turn this into a recursive dependency graph.
-	for _, row := range rows {
-		for _, required := range splitOperationIDs(row.RequiredOperationIDs) {
-			if wanted[required] {
-				result[required] = append(result[required], row.ID)
-			}
-		}
-	}
-	return result, nil
+	return en.Registry().requirements(ctx, resourceType, operations, true, true)
 }
 
 func splitOperationIDs(value string) []string {

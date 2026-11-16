@@ -6,7 +6,9 @@
 package httphandler
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,13 +17,15 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/evidencesvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/evidencevo"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/driveradapter/api/rdto"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/infra/opensearch"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/iprojectionsource"
 )
 
 // ListTraceExecutions returns the Community technical Trace list. Business
 // provenance is resolved by the mounted EE route, never by this Core handler.
 //
 // @Summary List technical trace executions
-// @Description Returns stable trace summaries with reverse request links, generated from authorized trace evidence.
+// @Description Returns authorized technical Trace summaries. Ordinary pages batch-read missing projection IDs from canonical SQL metadata; unavailable Span counts are explicit. Content/root-filtered pages and dependency failures retain their existing behavior.
 // @Tags traces
 // @Produce json
 // @Param limit query int false "Page size, 1..200"
@@ -29,17 +33,19 @@ import (
 // @Param trace_id query string false "Exact trace ID; bypasses list projection scan"
 // @Param conversation_id query string false "Caller-owned conversation ID"
 // @Param interaction_id query string false "One user interaction ID"
-// @Param from query string false "Started at or after this RFC3339 timestamp"
-// @Param to query string false "Started at or before this RFC3339 timestamp"
+// @Param from query string false "Started at or after this RFC3339 timestamp; omitted means no lower time bound"
+// @Param to query string false "Started at or before this RFC3339 timestamp; omitted means no upper time bound"
 // @Param status query string false "Execution status"
 // @Param agent_or_app query string false "Agent or application"
 // @Param service query string false "Root service name"
 // @Param tool query string false "Root operation name"
 // @Param error_keyword query string false "Substring matched against the recorded error summary"
-// @Param keyword query string false "Trace, request, operation, or error keyword"
+// @Param keyword query string false "Case-insensitive substring of trace/request/conversation/interaction IDs, agent/app, root service/operation, or recorded error summary; incomplete searches return a resource error"
 // @Success 200 {object} evidencevo.TraceSummaryPage
 // @Failure 400 {object} rdto.ErrorResponse
 // @Failure 401 {object} rdto.ErrorResponse
+// @Failure 422 {object} rdto.ErrorResponse
+// @Failure 503 {object} rdto.ErrorResponse "SUMMARY_QUERY_TIMEOUT, PROJECTION_LAG, or SUMMARY_DEPENDENCY_UNAVAILABLE"
 // @Failure 500 {object} rdto.ErrorResponse
 // @Router /traces [get]
 func (h *EvidenceHandler) ListTraceExecutions(w http.ResponseWriter, r *http.Request) {
@@ -133,6 +139,29 @@ func (h *EvidenceHandler) summaryQueryOptionsFromRequest(w http.ResponseWriter, 
 }
 
 func writeSummaryQueryError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, evidencesvc.ErrSummaryFallbackUnavailable) {
+		reason := "read_failed"
+		if errors.Is(err, context.DeadlineExceeded) {
+			reason = "timeout"
+		}
+		slog.WarnContext(r.Context(), "summary page metadata unavailable", "trace_id", ensureResponseTraceID(w, r), "dependency", "mariadb", "reason", reason)
+		writeJSON(w, r, http.StatusServiceUnavailable, rdto.ErrorResponse{Code: "SUMMARY_DEPENDENCY_UNAVAILABLE", Message: "trace storage is temporarily unavailable; retry the query later"})
+		return
+	}
+	var storageError *opensearch.StatusError
+	if errors.As(err, &storageError) && (storageError.StatusCode == http.StatusTooManyRequests || storageError.StatusCode >= http.StatusInternalServerError) {
+		slog.WarnContext(r.Context(), "summary query storage dependency unavailable", "trace_id", ensureResponseTraceID(w, r), "dependency", "opensearch", "status", storageError.StatusCode, "error_type", storageError.Type)
+		writeJSON(w, r, http.StatusServiceUnavailable, rdto.ErrorResponse{Code: "SUMMARY_DEPENDENCY_UNAVAILABLE", Message: "trace storage is temporarily unavailable; retry the query later"})
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeJSON(w, r, http.StatusServiceUnavailable, rdto.ErrorResponse{Code: "SUMMARY_QUERY_TIMEOUT", Message: "trace query exceeded its time budget; narrow the time range or filters before retrying"})
+		return
+	}
+	if errors.Is(err, iprojectionsource.ErrSummaryScanBudgetExceeded) {
+		writeJSON(w, r, http.StatusUnprocessableEntity, rdto.ErrorResponse{Code: "SUMMARY_QUERY_BUDGET_EXCEEDED", Message: "trace query exceeds its resource budget; narrow the time range or filters, or use cursor pagination instead of a deep page"})
+		return
+	}
 	if errors.Is(err, evidencesvc.ErrSummaryCursorInvalid) {
 		writeJSON(w, r, http.StatusBadRequest, rdto.ErrorResponse{Code: "INVALID_ARGUMENT", Message: "cursor is invalid"})
 		return

@@ -10,6 +10,59 @@ from app.config import config
 
 
 _thinking_mode: ContextVar[str] = ContextVar("bkn_agent_thinking_mode", default="")
+_task_usage: ContextVar[Optional[dict]] = ContextVar("bkn_agent_task_usage", default=None)
+
+
+def set_task_usage(usage: dict) -> Token:
+    return _task_usage.set(usage)
+
+
+def reset_task_usage(token: Token) -> None:
+    _task_usage.reset(token)
+
+
+def record_task_prompt(version: Optional[int]) -> None:
+    usage = _task_usage.get()
+    if usage is not None:
+        usage["prompt_version"] = version
+
+
+def _record_task_model(model: str, metadata: dict) -> None:
+    usage = _task_usage.get()
+    if usage is not None and usage.get("model") == model:
+        # LangChain exposes the provider's response.model as model_name.
+        usage["model_id"] = metadata.get("model_name") or metadata.get("model") or None
+
+
+def _usage_counts(usage: Any) -> Optional[tuple[int, int]]:
+    """Input and output tokens of one model reply, from LangChain's
+    usage_metadata or the OpenAI-compatible token_usage; None when the
+    provider reported neither."""
+    if not isinstance(usage, dict):
+        return None
+    pairs = (("input_tokens", "output_tokens"), ("prompt_tokens", "completion_tokens"))
+    for input_key, output_key in pairs:
+        prompt, completion = usage.get(input_key), usage.get(output_key)
+        if isinstance(prompt, int) and isinstance(completion, int) and prompt >= 0 and completion >= 0:
+            return prompt, completion
+    return None
+
+
+def _record_task_tokens(*candidates: Any) -> None:
+    """Add one model reply's tokens to the task, from the first candidate that
+    carries them. A reply with no usage leaves the totals as they are and is
+    counted apart, so a total is never mistaken for complete."""
+    usage = _task_usage.get()
+    if usage is None:
+        return
+    for candidate in candidates:
+        counts = _usage_counts(candidate)
+        if counts is not None:
+            usage["input_tokens"] = usage.get("input_tokens", 0) + counts[0]
+            usage["output_tokens"] = usage.get("output_tokens", 0) + counts[1]
+            usage["model_calls"] = usage.get("model_calls", 0) + 1
+            return
+    usage["unmetered_calls"] = usage.get("unmetered_calls", 0) + 1
 
 
 def set_thinking_mode(value: str) -> Token:
@@ -72,8 +125,7 @@ def _record_model_response(message: Any, operation_id: str) -> None:
         event_id=event_id,
         operation_id=operation_id,
         adopted_source_event_ids=[
-            value for value in adopted_source_event_ids
-            if isinstance(value, str)
+            value for value in adopted_source_event_ids if isinstance(value, str)
         ],
         evidence_refs=evidence_refs if isinstance(evidence_refs, list) else [],
         business_refs=business_refs if isinstance(business_refs, list) else [],
@@ -83,8 +135,32 @@ def _record_model_response(message: Any, operation_id: str) -> None:
 class TraceChatOpenAI(ChatOpenAI):
     """Bind each real mf-model-api request to one operation and consume its fact receipt."""
 
-    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+    def _convert_chunk_to_generation_chunk(
+        self, chunk, default_chunk_class, base_generation_info
+    ):
+        generation = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        # OpenAI-compatible reasoning models stream their thinking as
+        # delta.reasoning_content, which langchain_openai drops. Keep it beside
+        # the content so callers can show it; it is never sent back to the model.
+        choices = chunk.get("choices") or []
+        delta = (choices[0].get("delta") or {}) if choices else {}
+        reasoning = delta.get("reasoning_content")
+        if generation is not None and isinstance(reasoning, str) and reasoning:
+            generation.message.additional_kwargs["reasoning_content"] = reasoning
+        return generation
+
+    async def _agenerate(
+        self, messages, stop=None, run_manager=None, **kwargs
+    ) -> ChatResult:
         operation_id, parent_event_id = evidence.new_operation()
+        # Execution identity is required even when Evidence is disabled or its
+        # start event was not admitted. Only causal fact headers are conditional.
+        kwargs["extra_headers"] = {
+            **(kwargs.get("extra_headers") or {}),
+            **observability.outbound_headers(),
+        }
         if operation_id and parent_event_id:
             kwargs["extra_headers"] = {
                 **(kwargs.get("extra_headers") or {}),
@@ -93,13 +169,30 @@ class TraceChatOpenAI(ChatOpenAI):
                 **evidence.model_context_headers(messages, operation_id),
             }
         result = await super()._agenerate(messages, stop, run_manager, **kwargs)
+        if result.generations:
+            _record_task_model(self.model_name, {
+                **(result.llm_output or {}),
+                **result.generations[0].message.response_metadata,
+            })
+            _record_task_tokens(
+                getattr(result.generations[0].message, "usage_metadata", None),
+                (result.llm_output or {}).get("token_usage"),
+            )
         if operation_id and result.generations:
             _record_model_response(result.generations[0].message, operation_id)
         return result
 
-    async def _astream(self, *args: Any, **kwargs: Any) -> AsyncIterator[ChatGenerationChunk]:
+    async def _astream(
+        self, *args: Any, **kwargs: Any
+    ) -> AsyncIterator[ChatGenerationChunk]:
         operation_id, parent_event_id = evidence.new_operation()
         messages = args[0] if args else kwargs.get("messages", [])
+        # Execution identity is required even when Evidence is disabled or its
+        # start event was not admitted. Only causal fact headers are conditional.
+        kwargs["extra_headers"] = {
+            **(kwargs.get("extra_headers") or {}),
+            **observability.outbound_headers(),
+        }
         if operation_id and parent_event_id:
             kwargs["extra_headers"] = {
                 **(kwargs.get("extra_headers") or {}),
@@ -109,7 +202,18 @@ class TraceChatOpenAI(ChatOpenAI):
             }
         response_metadata: dict[str, Any] = {}
         trace_body: dict[str, Any] = {}
+        # The gateway takes the usage on a stream's chunks as running totals,
+        # the last one counting (mf-model-api llm_utils); some upstreams repeat
+        # them on every chunk and others send zeros before the real count. The
+        # largest count of each field is that total, as the gateway meters it.
+        stream_usage: Optional[dict[str, int]] = None
         async for chunk in super()._astream(*args, **kwargs):
+            counts = _usage_counts(getattr(chunk.message, "usage_metadata", None))
+            if counts is not None:
+                stream_usage = {
+                    "input_tokens": max((stream_usage or {}).get("input_tokens", 0), counts[0]),
+                    "output_tokens": max((stream_usage or {}).get("output_tokens", 0), counts[1]),
+                }
             if chunk.message.response_metadata:
                 response_metadata.update(chunk.message.response_metadata)
             if chunk.generation_info:
@@ -118,11 +222,17 @@ class TraceChatOpenAI(ChatOpenAI):
             if isinstance(candidate_body, dict):
                 trace_body.update(candidate_body)
             yield chunk
+        _record_task_model(self.model_name, response_metadata)
+        _record_task_tokens(stream_usage)
         if operation_id:
-            receipt = type("ModelFactReceipt", (), {
-                "response_metadata": response_metadata,
-                "additional_kwargs": {"bkn_trace": trace_body},
-            })()
+            receipt = type(
+                "ModelFactReceipt",
+                (),
+                {
+                    "response_metadata": response_metadata,
+                    "additional_kwargs": {"bkn_trace": trace_body},
+                },
+            )()
             _record_model_response(receipt, operation_id)
 
 

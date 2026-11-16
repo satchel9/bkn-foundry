@@ -20,7 +20,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"github.com/spf13/viper"
 
-	"bkn-backend/version"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/version"
 )
 
 // ServerSetting contains server configuration.
@@ -42,7 +42,28 @@ type ServerSetting struct {
 	ProxySyncLeaseSeconds      int  `mapstructure:"proxySyncLeaseSeconds"`
 	ProxySyncMaxAttempts       int  `mapstructure:"proxySyncMaxAttempts"`
 	ProxyOutboxCleanupInterval int  `mapstructure:"proxyOutboxCleanupInterval"`
+	// CypherExecutor chooses how a compiled Cypher query runs: "sql" sends one
+	// statement to vega-backend's raw query route, "bindjoin" reads each table
+	// through the resource data API and joins in memory. BKN_CYPHER_EXECUTOR
+	// overrides the file.
+	CypherExecutor string `mapstructure:"cypherExecutor"`
+	// CypherQueryTimeoutSec is how long one Cypher query may run at the data
+	// source, every statement it runs together, and the most a request may
+	// ask for. It stays under the
+	// gateway's 60-second read timeout so that a timeout is reported by this
+	// service rather than cut off by the gateway. BKN_CYPHER_QUERY_TIMEOUT_SEC
+	// overrides the file.
+	CypherQueryTimeoutSec int `mapstructure:"cypherQueryTimeoutSec"`
 }
+
+// The Cypher executors CypherExecutor selects between.
+const (
+	CypherExecutorSQL      = "sql"
+	CypherExecutorBindJoin = "bindjoin"
+)
+
+// DefaultCypherQueryTimeoutSec is CypherQueryTimeoutSec when nothing sets it.
+const DefaultCypherQueryTimeoutSec = 55
 
 // AppSetting contains application configuration.
 type AppSetting struct {
@@ -66,7 +87,6 @@ type AppSetting struct {
 	VegaBackendUrl string
 	// AgentOperatorUrl is the single agent-operator-integration internal-v1 base, e.g.
 	// {scheme}://{host}:{port}/api/agent-operator-integration/internal-v1
-	// (A trailing /operator suffix is accepted for backward compatibility and normalized away.)
 	AgentOperatorUrl string
 }
 
@@ -114,6 +134,10 @@ func initSetting(vp *viper.Viper) {
 	// contain the newly introduced switch. An explicit false still disables it
 	// for the stopped upgrade procedure.
 	vp.SetDefault("server.proxySyncWorkerEnabled", true)
+	vp.SetDefault("server.cypherExecutor", CypherExecutorSQL)
+	_ = vp.BindEnv("server.cypherExecutor", "BKN_CYPHER_EXECUTOR")
+	vp.SetDefault("server.cypherQueryTimeoutSec", DefaultCypherQueryTimeoutSec)
+	_ = vp.BindEnv("server.cypherQueryTimeoutSec", "BKN_CYPHER_QUERY_TIMEOUT_SEC")
 
 	vp.AddConfigPath(configPath)
 	vp.SetConfigName(configName)

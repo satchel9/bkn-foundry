@@ -30,9 +30,11 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/config"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/federation"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/accesslog"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/auth"
@@ -69,6 +71,7 @@ type App struct {
 	// Casbin/marker schema. An old but empty store must still run the explicit
 	// offline migration and therefore is never inferred as fresh later.
 	freshAuthorizationStore bool
+	started                 bool
 }
 
 // Boot brings up config, database, authz, the license hub, and the license
@@ -110,11 +113,21 @@ func Boot(opts Options) (*App, error) {
 		return nil, fmt.Errorf("reconcile withdrawn normal user role: %w", err)
 	}
 
+	if err := seed.ReconcileRetiredBusinessProvenanceOwner(db, enforcer); err != nil {
+		return nil, fmt.Errorf("retire business provenance owner: %w", err)
+	}
+
 	if cfg.SeedOnStart {
 		if err := seed.ApplyWithAudit(db, enforcer, auditRuntime.Recorder); err != nil {
 			return nil, fmt.Errorf("seed: %w", err)
 		}
 		slog.Info("seed applied (roles + catalog + grants)")
+	}
+
+	// Seed-disabled startup loads the persisted registry without seed writes.
+	// Seed-enabled startup already published the same snapshot before grants.
+	if err := enforcer.InitializeRegistry(context.Background()); err != nil {
+		return nil, fmt.Errorf("init authorization registry: %w", err)
 	}
 
 	userStore := auth.NewUserStore(db)
@@ -192,6 +205,7 @@ func Boot(opts Options) (*App, error) {
 			DB:                            db,
 			Provider:                      provider,
 			Hydra:                         hydraAdmin,
+			TokenHookKey:                  os.Getenv("SAFE_SSO_HOOK_KEY"),
 			HydraBrowserPublicURL:         cfg.Hydra.BrowserPublicURL,
 			Directory:                     dir,
 			Users:                         userStore,
@@ -200,6 +214,7 @@ func Boot(opts Options) (*App, error) {
 			AccessLog:                     accessLogRecorder,
 			Decisions:                     decisionRecorder,
 			OAuthAccessOrigins:            oauthAccessOrigins,
+			OAuthDynamicRegistration:      dynamicRegistration(cfg, hydraAdmin),
 			License:                       licSvc,
 			AuthorizationResources:        authorizationResources,
 			PermissionRequestResources:    permissionRequestResources,
@@ -214,12 +229,33 @@ func Boot(opts Options) (*App, error) {
 // drop anything core owns (open-core-gating §2.6 constraint 1, enforced by CI).
 func (a *App) DB() *gorm.DB { return a.db }
 
+// RegisterIdentityProvider installs a private identity implementation before Run.
+// The extension initializes only its own tables using Runtime.DB.
+func (a *App) RegisterIdentityProvider(factory func(federation.Runtime) (*federation.Extension, error)) error {
+	if a.started || a.deps.IdentityProvider != nil {
+		return fmt.Errorf("identity provider already registered or app started")
+	}
+	extension, err := factory(federation.Runtime{DB: a.db, Hydra: a.deps.Hydra,
+		HydraAdminURL: a.cfg.Hydra.AdminURL, HydraPublicURL: a.cfg.Hydra.PublicURL, BrowserPublicURL: a.cfg.Hydra.BrowserPublicURL, Redirect: func(c *gin.Context, target string) {
+			httpapi.RedirectIdentityContinuation(c, target, a.cfg.Hydra.BrowserPublicURL)
+		}})
+	if err != nil {
+		return err
+	}
+	if extension == nil {
+		return fmt.Errorf("identity provider factory returned nil")
+	}
+	a.deps.IdentityProvider = extension
+	return nil
+}
+
 // Addr is the configured listen address.
 func (a *App) Addr() string { return a.cfg.HTTPAddr }
 
 // Run closes the extension registry and serves until the listener fails.
 // Registering an extension after this point panics, by design.
 func (a *App) Run() error {
+	a.started = true
 	// Enterprise Setup calls happen between Boot and Run. Checking here lets a
 	// fresh Enterprise install record present_empty after its private table has
 	// been created, while an upgraded store still needs the offline marker before
@@ -248,4 +284,18 @@ func (a *App) ensureAuthorizationMigrationReady(ctx context.Context) error {
 		return err
 	}
 	return authzgate.VerifyCurrentMarker(ctx, a.db)
+}
+
+// dynamicRegistration is the MCP client sign-in surface, nil when disabled.
+func dynamicRegistration(cfg *config.Config, hydraAdmin *auth.HydraAdmin) *httpapi.OAuthDynamicRegistration {
+	reg := cfg.OAuth.DynamicRegistration
+	if !reg.Enabled {
+		return nil
+	}
+	return &httpapi.OAuthDynamicRegistration{
+		Registrar:              hydraAdmin,
+		HydraPublicURL:         cfg.Hydra.PublicURL,
+		AllowedRedirectOrigins: reg.AllowedRedirectOrigins,
+		RatePerMinute:          reg.RatePerMinute,
+	}
 }

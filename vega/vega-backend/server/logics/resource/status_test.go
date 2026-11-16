@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
@@ -32,6 +32,26 @@ func TestHasAvailableLocalIndex(t *testing.T) {
 		LocalIndexName:   "vega-build-abc",
 		LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
 	}))
+}
+
+func TestShouldIgnoreLocalIndex(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		category string
+		params   *interfaces.ResourceDataQueryParams
+		want     bool
+	}{
+		{name: "no query", category: interfaces.ResourceCategoryTable},
+		{name: "ordinary table query", category: interfaces.ResourceCategoryTable, params: &interfaces.ResourceDataQueryParams{}},
+		{name: "explicit bypass", category: interfaces.ResourceCategoryTable, params: &interfaces.ResourceDataQueryParams{IgnoreLocalIndex: new(true)}, want: true},
+		{name: "exact table", category: interfaces.ResourceCategoryTable, params: &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Aggr: "count_distinct", AllowApproximate: new(false)}}, want: true},
+		{name: "index has no separate source", category: interfaces.ResourceCategoryIndex, params: &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Aggr: "count_distinct", AllowApproximate: new(false)}}},
+		{name: "dataset has no separate source", category: interfaces.ResourceCategoryDataset, params: &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Aggr: "count_distinct", AllowApproximate: new(false)}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ShouldIgnoreLocalIndex(&interfaces.Resource{Category: tc.category}, tc.params))
+		})
+	}
 }
 
 func TestEnsureResourceQueryable(t *testing.T) {
@@ -103,15 +123,15 @@ func TestEnsureResourceQueryable(t *testing.T) {
 				if err == nil {
 					t.Fatalf("expected error, got nil")
 				}
-				var he *rest.HTTPError
+				var he *httperrors.HTTPError
 				if !errors.As(err, &he) {
-					t.Fatalf("expected *rest.HTTPError, got %T", err)
+					t.Fatalf("expected *httperrors.HTTPError, got %T", err)
 				}
 				if he.HTTPCode != http.StatusConflict {
 					t.Errorf("expected status 409, got %d", he.HTTPCode)
 				}
-				if he.BaseError.ErrorCode != tc.wantErrCode {
-					t.Errorf("expected error code %q, got %q", tc.wantErrCode, he.BaseError.ErrorCode)
+				if he.ErrorCode != tc.wantErrCode {
+					t.Errorf("expected error code %q, got %q", tc.wantErrCode, he.ErrorCode)
 				}
 				return
 			}

@@ -27,10 +27,12 @@ type KnSearchLocalRequest struct {
 	// to the deployment default (config.concept_search_config.rerank_model).
 	RerankModel string `json:"rerank_model,omitempty"`
 	// IncludeColumns adds each data property's physical column name (mapped_field)
-	// to the response for run_sql. Off by default to keep responses compact.
+	// to the response. Off by default to keep responses compact.
 	IncludeColumns bool `json:"include_columns" default:"false"`
 	// IndexOpsOnly See SearchSchemaReq field of the same name.
 	IndexOpsOnly bool `json:"-"`
+	// EnumQuery looks up enum items by display name or code. See SearchSchemaReq.
+	EnumQuery string `json:"enum_query,omitempty"`
 }
 
 // KnSearchRetrievalConfig recall configuration parameters.
@@ -46,16 +48,16 @@ type KnSearchConceptRetrievalConfig struct {
 	// ObjectTypes / ExcludeObjectTypes scope recall to (or away from) the given object type ids.
 	// Both are applied to the candidate pool *before* relevance ranking and the TopK cut: filtering
 	// afterwards would silently drop a pinned object type that happened to rank below TopK.
-	ObjectTypes            []string `json:"object_types,omitempty"`
-	ExcludeObjectTypes     []string `json:"exclude_object_types,omitempty"`
-	TopK                   int      `json:"top_k" default:"10"`
-	IncludeSampleData      *bool    `json:"include_sample_data" default:"false"`
-	SchemaBrief            *bool    `json:"schema_brief" default:"false"`
-	CoarseObjectLimit      int      `json:"coarse_object_limit" default:"2000"`
-	CoarseRelationLimit    int      `json:"coarse_relation_limit" default:"300"`
-	EnablePropertyBrief    *bool    `json:"enable_property_brief" default:"true"`
-	PerObjectPropertyTopK  int      `json:"per_object_property_top_k" default:"8"`
-	GlobalPropertyTopK     int      `json:"global_property_top_k" default:"30"`
+	ObjectTypes           []string `json:"object_types,omitempty"`
+	ExcludeObjectTypes    []string `json:"exclude_object_types,omitempty"`
+	TopK                  int      `json:"top_k" default:"10"`
+	IncludeSampleData     *bool    `json:"include_sample_data" default:"false"`
+	SchemaBrief           *bool    `json:"schema_brief" default:"false"`
+	CoarseObjectLimit     int      `json:"coarse_object_limit" default:"2000"`
+	CoarseRelationLimit   int      `json:"coarse_relation_limit" default:"300"`
+	EnablePropertyBrief   *bool    `json:"enable_property_brief" default:"true"`
+	PerObjectPropertyTopK int      `json:"per_object_property_top_k" default:"8"`
+	GlobalPropertyTopK    int      `json:"global_property_top_k" default:"30"`
 	// ObjectRerankCandidateLimit caps how many object types the concept rerank call carries, best
 	// coarse score first. It bounds one model call, not the response: everything below the cut keeps
 	// its place in the schema, it just cannot outrank a reranked object type. 0 turns object
@@ -171,6 +173,7 @@ type KnSearchObjectType struct {
 	ConceptType    string                  `json:"concept_type,omitempty"`
 	ConceptID      string                  `json:"concept_id"`
 	ConceptName    string                  `json:"concept_name"`
+	Aliases        []string                `json:"aliases,omitempty"`
 	Comment        string                  `json:"comment,omitempty"`
 	Tags           []string                `json:"tags,omitempty"`
 	DataSource     *ResourceInfo           `json:"data_source,omitempty"`
@@ -184,6 +187,9 @@ type KnSearchObjectType struct {
 	PrimaryKeys          []string                       `json:"primary_keys,omitempty"`
 	SampleData           map[string]any                 `json:"sample_data,omitempty"`
 	EffectivePermissions map[string]PropertyAccessLevel `json:"effective_permissions,omitempty"`
+	// Lifecycle is omitted while the object type is active. Recall leaves deprecated object types
+	// out, so it shows on one the caller pinned by id, saying what replaces it.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 	// Score is concept recall's relevance score for this object type, kept off the wire (json:"-").
 	//
 	// It exists so instance recall can skip object types the query has nothing to do with, before
@@ -200,8 +206,8 @@ type KnSearchObjectType struct {
 // KnSearchDataProperty data property (local response shape)
 type KnSearchDataProperty struct {
 	Name string `json:"name,omitempty"`
-	// Column is the physical column name (from mapped_field) to use when writing
-	// run_sql against the object type's data resource. It can differ from Name
+	// Column is the physical column name (from mapped_field) in the object type's
+	// data resource. It can differ from Name
 	// (logical), and one resource may back several object types with different
 	// logical names. Only populated when the request sets include_columns=true.
 	Column              string            `json:"column,omitempty"`
@@ -211,6 +217,31 @@ type KnSearchDataProperty struct {
 	// Indexed says this property supports the operators its object type publishes as
 	// index_operations. It stands in for repeating that list on every indexed property.
 	Indexed bool `json:"indexed,omitempty"`
+	// BKN spec 3.0 property declarations (SPECIFICATION.md §6.8). Each is omitted when the
+	// property does not declare it; brief mode keeps only semantic. unit, crs and timezone come
+	// from the property's constraints.
+	Aliases  []string `json:"aliases,omitempty"`
+	Semantic string   `json:"semantic,omitempty"`
+	Required bool     `json:"required,omitempty"`
+	Unit     string   `json:"unit,omitempty"`
+	CRS      string   `json:"crs,omitempty"`
+	Timezone string   `json:"timezone,omitempty"`
+	// ValueType names the enum value type the property takes its values from (SPECIFICATION.md
+	// §16). Enum lists its items when the enum is expanded, or the items enum_query matched when
+	// it is not; EnumCount says how many items there are whenever Enum is not all of them.
+	// EnumMatchCount says how many items enum_query matched when Enum lists only the first of them.
+	ValueType      string              `json:"value_type,omitempty"`
+	Enum           []*KnSearchEnumItem `json:"enum,omitempty"`
+	EnumCount      int                 `json:"enum_count,omitempty"`
+	EnumMatchCount int                 `json:"enum_match_count,omitempty"`
+}
+
+// KnSearchEnumItem is one enum item of a property's value type. A deprecated item stays listed:
+// stored data still holds it.
+type KnSearchEnumItem struct {
+	Value      string `json:"value"`
+	Display    string `json:"display"`
+	Deprecated bool   `json:"deprecated,omitempty"`
 }
 
 // KnSearchLogicProperty logic property (local response shape)
@@ -224,23 +255,51 @@ type KnSearchLogicProperty struct {
 
 // KnSearchRelationType relation type (local response shape)
 type KnSearchRelationType struct {
-	ConceptType        string `json:"concept_type,omitempty"`
-	ConceptID          string `json:"concept_id"`
-	ConceptName        string `json:"concept_name"`
-	Comment            string `json:"comment,omitempty"`
-	SourceObjectTypeID string `json:"source_object_type_id"`
-	TargetObjectTypeID string `json:"target_object_type_id"`
+	ConceptType        string   `json:"concept_type,omitempty"`
+	ConceptID          string   `json:"concept_id"`
+	ConceptName        string   `json:"concept_name"`
+	Aliases            []string `json:"aliases,omitempty"`
+	Comment            string   `json:"comment,omitempty"`
+	SourceObjectTypeID string   `json:"source_object_type_id"`
+	TargetObjectTypeID string   `json:"target_object_type_id"`
+
+	// BKN spec 3.0 relation declarations (SPECIFICATION.md §7.6), each omitted when undeclared.
+	// required and characteristics come from the relation's constraints; importance is omitted
+	// when primary, lifecycle when active.
+	ReverseName     string                  `json:"reverse_name,omitempty"`
+	Cardinality     string                  `json:"cardinality,omitempty"`
+	Required        []string                `json:"required,omitempty"`
+	Characteristics []string                `json:"characteristics,omitempty"`
+	Importance      string                  `json:"importance,omitempty"`
+	Verification    string                  `json:"verification,omitempty"`
+	Lifecycle       *Lifecycle              `json:"lifecycle,omitempty"`
+	DataProperties  []*KnSearchDataProperty `json:"data_properties,omitempty"`
+	// Fallback is the relation's fallback path with the rule for using it. A fallback path does
+	// not appear in the response on its own: it comes with its primary relation.
+	Fallback *KnSearchRelationFallback `json:"fallback,omitempty"`
+}
+
+// KnSearchRelationFallback is the fallback path paired with a primary relation in search_schema.
+type KnSearchRelationFallback struct {
+	RelationID   string `json:"relation_id"`
+	RelationName string `json:"relation_name,omitempty"`
+	Comment      string `json:"comment,omitempty"`
+	Verification string `json:"verification,omitempty"`
+	Rule         string `json:"rule"`
 }
 
 // KnSearchActionType action type (local response shape)
 type KnSearchActionType struct {
 	ID             string   `json:"id"`
 	Name           string   `json:"name"`
+	Aliases        []string `json:"aliases,omitempty"`
 	ObjectTypeID   string   `json:"object_type_id"`
 	ObjectTypeName string   `json:"object_type_name"`
 	Comment        string   `json:"comment,omitempty"`
 	Tags           []string `json:"tags,omitempty"`
 	KnID           string   `json:"kn_id"`
+	// Lifecycle is omitted while the action type is active.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 }
 
 // KnSearchNode node (semantic instance) in local response

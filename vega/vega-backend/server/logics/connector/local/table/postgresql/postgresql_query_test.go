@@ -1,36 +1,366 @@
+// Copyright openbkn.ai
+//
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
 package postgresql
 
 import (
 	"context"
-	"errors"
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/lib/pq"
+	"github.com/lib/pq/pqerror"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sb "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
-func TestPostgresqlConnectorExecuteRawSQLInvalidParameter(t *testing.T) {
-	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
-	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
-	connector := &PostgresqlConnector{db: db, connected: true}
-	driverErr := &pq.Error{Code: "42703", Message: `column "missing" does not exist`}
-	mock.ExpectQuery("SELECT missing FROM orders").WillReturnError(driverErr)
-	result, err := connector.ExecuteRawSQL(context.Background(), "SELECT missing FROM orders")
-	assert.Nil(t, result)
-	var invalid *interfaces.SourceQueryInvalidParameterError
-	require.ErrorAs(t, err, &invalid)
-	assert.Equal(t, interfaces.SourceQueryInvalidParameterUnknownColumn, invalid.Reason)
-	assert.True(t, errors.Is(err, driverErr))
-	require.NoError(t, mock.ExpectationsWereMet())
-}
+func TestPostgresqlConnectorExecuteQuery(t *testing.T) {
+	t.Run("corrupt source columns stop before querying", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			raw  any
+		}{{"null", nil}, {"typed nil", []interfaces.TableColumnMeta(nil)}, {"wrong shape", "corrupt"}} {
+			t.Run(tc.name, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				connector := &PostgresqlConnector{db: db, connected: true}
+				field := &interfaces.Property{Name: "id", OriginalName: "native_id", OriginalType: "integer", Type: interfaces.DataType_Integer}
+				condition, err := filter_condition.NewFilterCondition(t.Context(), &interfaces.FilterCondCfg{Field: "id", Operation: filter_condition.OperationEqual, Value: 1}, map[string]*interfaces.Property{"id": field})
+				require.NoError(t, err)
+				resource := &interfaces.Resource{SourceIdentifier: "orders", SourceMetadata: map[string]any{"columns": tc.raw}, SchemaDefinition: []*interfaces.Property{field}}
+				result, err := connector.ExecuteQuery(t.Context(), resource, &interfaces.ResourceDataQueryParams{ActualFilterCond: condition, Paging: interfaces.PagingRequest{Limit: 10}})
+				require.ErrorContains(t, err, "invalid stored source column metadata")
+				assert.Nil(t, result)
+				var invalid *interfaces.ConditionBuildError
+				assert.NotErrorAs(t, err, &invalid)
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	})
+	t.Run("money reads preserve exact decimal text and null values", func(t *testing.T) {
+		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		db.SetMaxOpenConns(1)
+		connector := &PostgresqlConnector{db: db, connected: true}
+		field := &interfaces.Property{Name: "amount", OriginalName: "source_amount", OriginalType: "money", Type: interfaces.DataType_Decimal}
+		resource := &interfaces.Resource{SourceIdentifier: `"public"."payments"`, SchemaDefinition: []*interfaces.Property{field}}
+		cond, err := filter_condition.NewFilterCondition(t.Context(), &interfaces.FilterCondCfg{Field: "amount", Operation: ">=", Value: json.Number("-92233720368547758.08")}, map[string]*interfaces.Property{"amount": field})
+		require.NoError(t, err)
+		base := `SELECT CAST("source_amount" AS NUMERIC) AS "amount" FROM "public"."payments" WHERE (CAST("source_amount" AS NUMERIC) >= $1)`
+		mock.ExpectQuery(base + ` ORDER BY CAST("source_amount" AS NUMERIC) ASC NULLS LAST LIMIT 10`).WithArgs("-92233720368547758.08").WillReturnRows(sqlmock.NewRows([]string{"amount"}).
+			AddRow([]byte("92233720368547758.07")).AddRow([]byte("-92233720368547758.08")).AddRow([]byte("0.00")).AddRow(nil)).RowsWillBeClosed()
+		mock.ExpectQuery(`SELECT COUNT(*) FROM (` + base + `) AS "_resource_total"`).WithArgs("-92233720368547758.08").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(4))
+		result, err := connector.ExecuteQuery(t.Context(), resource, &interfaces.ResourceDataQueryParams{ActualFilterCond: cond, Sort: []*interfaces.SortField{{Field: "amount", Direction: interfaces.ASC_DIRECTION}}, Paging: interfaces.PagingRequest{Limit: 10}, NeedTotal: true})
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"amount": "92233720368547758.07"}, {"amount": "-92233720368547758.08"}, {"amount": "0.00"}, {"amount": nil}}, result.Entries)
+		assert.Equal(t, int64(4), result.TotalCount)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
 
-func TestPostgresqlConnectorExecuteQueryInvalidParameter(t *testing.T) {
+	t.Run("money grouping and aggregate HAVING use the same numeric expression", func(t *testing.T) {
+		for _, aggr := range []string{"sum", "avg", "min", "max", "count", "count_distinct"} {
+			t.Run(aggr, func(t *testing.T) {
+				connector := &PostgresqlConnector{}
+				resource := &interfaces.Resource{SourceIdentifier: `"public"."payments"`, SchemaDefinition: []*interfaces.Property{{Name: "amount", OriginalType: "money", Type: interfaces.DataType_Decimal}}}
+				params := &interfaces.ResourceDataQueryParams{GroupBy: []*interfaces.GroupByItem{{Property: "amount"}}, Aggregation: &interfaces.Aggregation{Property: "amount", Aggr: aggr, Alias: "total"}, Having: &interfaces.HavingClause{Field: "__value", Operation: ">", Value: json.Number("0.001")}, Paging: interfaces.PagingRequest{Limit: 10}}
+				query, err := connector.buildSelectBuilder(resource, params)
+				require.NoError(t, err)
+				statement, args, err := ToSql(query)
+				require.NoError(t, err)
+				metric := strings.ToUpper(aggr) + `(CAST("amount" AS NUMERIC))`
+				if aggr == "count_distinct" {
+					metric = `COUNT(DISTINCT CAST("amount" AS NUMERIC))`
+				}
+				assert.Equal(t, `SELECT CAST("amount" AS NUMERIC) AS "amount", `+metric+` AS "total" FROM "public"."payments" GROUP BY CAST("amount" AS NUMERIC) HAVING (`+metric+` > $1) ORDER BY "amount" ASC NULLS FIRST LIMIT 10`, statement)
+				assert.Equal(t, []any{"0.001"}, args)
+			})
+		}
+	})
+
+	t.Run("aggregate sort aliases and group tie breaks precede pagination", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			sort     []*interfaces.SortField
+			groups   []*interfaces.GroupByItem
+			alias    string
+			implicit bool
+			expected string
+		}{
+			{name: "custom alias through value placeholder", sort: []*interfaces.SortField{{Field: "__value", Direction: interfaces.DESC_DIRECTION}}, alias: "total", expected: "ORDER BY \"total\" DESC NULLS LAST, \"key\" ASC NULLS FIRST"},
+			{name: "custom alias directly", sort: []*interfaces.SortField{{Field: "total", Direction: interfaces.DESC_DIRECTION}}, alias: "total", expected: "ORDER BY \"total\" DESC NULLS LAST, \"key\" ASC NULLS FIRST"},
+			{name: "default aggregate alias", sort: []*interfaces.SortField{{Field: "__value", Direction: interfaces.DESC_DIRECTION}}, expected: "ORDER BY \"__value\" DESC NULLS LAST, \"key\" ASC NULLS FIRST"},
+			{name: "implicit count output", implicit: true, sort: []*interfaces.SortField{{Field: "__value", Direction: interfaces.DESC_DIRECTION}}, expected: "ORDER BY \"__value\" DESC NULLS LAST, \"key\" ASC NULLS FIRST"},
+			{name: "no explicit sorting", alias: "total", expected: "ORDER BY \"key\" ASC NULLS FIRST"},
+			{name: "explicit group direction is retained", sort: []*interfaces.SortField{{Field: "key", Direction: interfaces.DESC_DIRECTION}}, alias: "total", expected: "ORDER BY \"key\" DESC NULLS LAST"},
+			{name: "multi dimension completes only missing keys", sort: []*interfaces.SortField{{Field: "secondary", Direction: interfaces.DESC_DIRECTION}, {Field: "total", Direction: interfaces.ASC_DIRECTION}}, groups: []*interfaces.GroupByItem{{Property: "key"}, {Property: "secondary"}}, alias: "total", expected: "ORDER BY \"secondary\" DESC NULLS LAST, \"total\" ASC NULLS FIRST, \"key\" ASC NULLS FIRST"},
+			{name: "calendar tie break uses grouped output", sort: []*interfaces.SortField{{Field: "total", Direction: interfaces.DESC_DIRECTION}}, groups: []*interfaces.GroupByItem{{Property: "created", CalendarInterval: "month"}}, alias: "total", expected: "ORDER BY \"total\" DESC NULLS LAST, \"created\" ASC NULLS FIRST"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				connector := &PostgresqlConnector{}
+				groups := tc.groups
+				if groups == nil {
+					groups = []*interfaces.GroupByItem{{Property: "key"}}
+				}
+				params := &interfaces.ResourceDataQueryParams{GroupBy: groups, Aggregation: &interfaces.Aggregation{Property: "amount", Aggr: "sum", Alias: tc.alias}, Sort: tc.sort, Paging: interfaces.PagingRequest{Offset: 1, Limit: 1}}
+				if tc.implicit {
+					params.Aggregation = nil
+					params.Having = &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 0}
+				}
+				before, err := json.Marshal(params)
+				require.NoError(t, err)
+				resource := &interfaces.Resource{SourceIdentifier: "orders", SchemaDefinition: []*interfaces.Property{{Name: "key", OriginalName: "SOURCE_KEY", Type: interfaces.DataType_Integer}, {Name: "secondary", Type: interfaces.DataType_Integer}, {Name: "amount", Type: interfaces.DataType_Integer}, {Name: "created", Type: interfaces.DataType_Datetime}}}
+				query, err := connector.buildSelectBuilder(resource, params)
+				require.NoError(t, err)
+				statement, _, err := ToSql(query)
+				require.NoError(t, err)
+				assert.Contains(t, statement, tc.expected+" LIMIT 1 OFFSET 1")
+				after, err := json.Marshal(params)
+				require.NoError(t, err)
+				assert.Equal(t, string(before), string(after), "building SQL must not modify query sort fields")
+			})
+		}
+	})
+
+	t.Run("group NULL ordering matches index pagination without changing detail queries", func(t *testing.T) {
+		for _, grouped := range []bool{false, true} {
+			for _, direction := range []string{interfaces.ASC_DIRECTION, interfaces.DESC_DIRECTION} {
+				for _, metric := range []bool{false, true} {
+					if metric && !grouped {
+						continue
+					}
+					t.Run(fmt.Sprintf("grouped=%v/direction=%s/metric=%v", grouped, direction, metric), func(t *testing.T) {
+						db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+						require.NoError(t, err)
+						t.Cleanup(func() {
+							mock.ExpectClose()
+							require.NoError(t, db.Close())
+							require.NoError(t, mock.ExpectationsWereMet())
+						})
+						connector := &PostgresqlConnector{db: db, connected: true}
+						resource := &interfaces.Resource{SourceIdentifier: `"public"."orders"`, SchemaDefinition: []*interfaces.Property{{Name: "key", Type: interfaces.DataType_Integer}}}
+						params := &interfaces.ResourceDataQueryParams{Sort: []*interfaces.SortField{{Field: "key", Direction: direction}}, Paging: interfaces.PagingRequest{Limit: 1, Offset: 1}}
+						statement := `SELECT "key" AS "key" FROM "public"."orders"`
+						columns := []string{"key"}
+						values := []driver.Value{int64(1)}
+						if grouped {
+							params.GroupBy = []*interfaces.GroupByItem{{Property: "key"}}
+							statement += ` GROUP BY "key"`
+						}
+						if metric {
+							params.Aggregation = &interfaces.Aggregation{Property: "key", Aggr: "sum", Alias: "total"}
+							params.Sort[0].Field = "total"
+							statement = `SELECT "key" AS "key", SUM("key") AS "total" FROM "public"."orders" GROUP BY "key"`
+							columns = append(columns, "total")
+							values = append(values, int64(1))
+						}
+						nulls := "LAST"
+						if grouped && direction == interfaces.ASC_DIRECTION || !grouped && direction == interfaces.DESC_DIRECTION {
+							nulls = "FIRST"
+						}
+						statement += fmt.Sprintf(` ORDER BY "%s" %s NULLS %s`, params.Sort[0].Field, strings.ToUpper(direction), nulls)
+						if grouped && metric {
+							statement += `, "key" ASC NULLS FIRST`
+						}
+						statement += " LIMIT 1 OFFSET 1"
+						mock.ExpectQuery(statement).WithoutArgs().WillReturnRows(sqlmock.NewRows(columns).AddRow(values...)).RowsWillBeClosed()
+						result, err := connector.ExecuteQuery(t.Context(), resource, params)
+						require.NoError(t, err)
+						require.Len(t, result.Entries, 1)
+						assert.Equal(t, int64(1), result.Entries[0]["key"])
+					})
+				}
+			}
+		}
+	})
+
+	t.Run("aggregate timezone follows its input rather than same-name source field", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			mock.ExpectClose()
+			require.NoError(t, db.Close())
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+		connector := &PostgresqlConnector{db: db, connected: true}
+		resource := &interfaces.Resource{SourceIdentifier: "events", SchemaDefinition: []*interfaces.Property{
+			{Name: "created_at", OriginalType: "timestamptz", Type: interfaces.DataType_Datetime},
+			{Name: "payload", OriginalType: "bytea", Type: interfaces.DataType_Binary},
+		}}
+		value := time.Date(2026, 9, 9, 8, 0, 0, 0, time.FixedZone("source", 2*60*60))
+		mock.ExpectQuery("SELECT MAX").WillReturnRows(sqlmock.NewRows([]string{"payload"}).AddRow(value))
+		result, err := connector.ExecuteQuery(context.Background(), resource, &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "created_at", Aggr: "max", Alias: "payload"}})
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"payload": value.Local()}}, result.Entries)
+	})
+
+	t.Run("aggregate alias conflicts reject duplicate result columns", func(t *testing.T) {
+		for _, kind := range []string{"explicit", "default", "implicit"} {
+			t.Run(kind, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					mock.ExpectClose()
+					require.NoError(t, db.Close())
+					require.NoError(t, mock.ExpectationsWereMet())
+				})
+				connector := &PostgresqlConnector{db: db, connected: true}
+				column := "__value"
+				params := &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "*", Aggr: "count"}}
+				if kind == "explicit" {
+					column = "label"
+					params.Aggregation.Alias = column
+				}
+				if kind == "implicit" {
+					params.Aggregation = nil
+					params.Having = &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 0}
+				}
+				params.GroupBy = []*interfaces.GroupByItem{{Property: column}}
+				resource := &interfaces.Resource{Schema: "APP", SourceIdentifier: "values_table", SchemaDefinition: []*interfaces.Property{{Name: column, OriginalName: "SOURCE_LABEL", OriginalType: "varchar", Type: interfaces.DataType_String}}}
+				result, err := connector.ExecuteQuery(context.Background(), resource, params)
+				var conflict *interfaces.ConditionBuildError
+				require.ErrorAs(t, err, &conflict)
+				assert.Equal(t, "aggregate alias conflicts with a group field", conflict.Reason)
+				assert.Nil(t, result)
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	})
+
+	t.Run("aggregate aliases may match unprojected binary fields", func(t *testing.T) {
+		metadata, content := interfaces.BinaryModeMetadata, interfaces.BinaryModeContent
+		for _, mode := range []*string{nil, &metadata, &content} {
+			modeName := "not requested"
+			if mode != nil {
+				modeName = *mode
+			}
+			for _, alias := range []string{"payload", ""} {
+				t.Run(modeName+"/"+alias, func(t *testing.T) {
+					db, mock, err := sqlmock.New()
+					require.NoError(t, err)
+					t.Cleanup(func() {
+						mock.ExpectClose()
+						require.NoError(t, db.Close())
+						require.NoError(t, mock.ExpectationsWereMet())
+					})
+					connector := &PostgresqlConnector{db: db, connected: true}
+					column := alias
+					if column == "" {
+						column = "__value"
+					}
+					resource := &interfaces.Resource{Schema: "APP", SourceIdentifier: "values_table", SchemaDefinition: []*interfaces.Property{{Name: column, OriginalName: "PAYLOAD", OriginalType: "BINARY", Type: interfaces.DataType_Binary}}}
+					mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{column}).AddRow(int64(7)))
+					result, err := connector.ExecuteQuery(context.Background(), resource, &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "*", Aggr: "count", Alias: alias}, BinaryMode: mode})
+					require.NoError(t, err)
+					assert.Equal(t, []map[string]any{{column: int64(7)}}, result.Entries)
+					require.NoError(t, mock.ExpectationsWereMet())
+				})
+			}
+		}
+	})
+
+	t.Run("aggregate byte values do not inherit source binary content mode", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			mock.ExpectClose()
+			require.NoError(t, db.Close())
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+		connector := &PostgresqlConnector{db: db, connected: true}
+		content := interfaces.BinaryModeContent
+		resource := &interfaces.Resource{SourceIdentifier: "values_table", SchemaDefinition: []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Binary}}}
+		mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"payload"}).AddRow([]byte("7")))
+		result, err := connector.ExecuteQuery(context.Background(), resource, &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "*", Aggr: "count", Alias: "payload"}, BinaryMode: &content})
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"payload": "7"}}, result.Entries)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("shared unavailable rule preserves readable Other and actual NULL", func(t *testing.T) {
+		metadata := interfaces.BinaryModeMetadata
+		for _, mode := range []*string{nil, &metadata} {
+			modeName := "not requested"
+			if mode != nil {
+				modeName = *mode
+			}
+			t.Run(modeName, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					mock.ExpectClose()
+					require.NoError(t, db.Close())
+					require.NoError(t, mock.ExpectationsWereMet())
+				})
+				connector := &PostgresqlConnector{db: db, connected: true}
+				resource := &interfaces.Resource{Schema: "APP", SourceIdentifier: "values_table", SchemaDefinition: []*interfaces.Property{
+					{Name: "blob", Type: interfaces.DataType_Binary}, {Name: "other", Type: interfaces.DataType_Other},
+				}}
+				mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"blob", "other"}).AddRow(nil, "[1,2]").AddRow(nil, nil))
+				result, err := connector.ExecuteQuery(context.Background(), resource, &interfaces.ResourceDataQueryParams{BinaryMode: mode})
+				require.NoError(t, err)
+				require.Len(t, result.Entries, 2)
+				assert.Equal(t, "[1,2]", result.Entries[0]["other"])
+				assert.Contains(t, result.Entries[1], "other")
+				assert.Nil(t, result.Entries[1]["other"])
+				for _, entry := range result.Entries {
+					if mode == nil {
+						assert.Equal(t, interfaces.ResourceValue{Mode: interfaces.ResourceValueModeUnavailable, Reason: interfaces.ResourceValueReasonNotRequested}, entry["blob"])
+					} else {
+						assert.Contains(t, entry, "blob")
+						assert.Nil(t, entry["blob"])
+					}
+				}
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	})
+
+	t.Run("invalid projections fail before source execution", func(t *testing.T) {
+
+		for _, tc := range []struct {
+			name   string
+			schema []*interfaces.Property
+			fields []string
+			reason interfaces.OutputFieldErrorReason
+			field  string
+		}{
+			{name: "unknown output", schema: []*interfaces.Property{{Name: "id"}}, fields: []string{"missing"}, reason: interfaces.OutputFieldUnknown, field: "missing"},
+			{name: "mixed output", schema: []*interfaces.Property{{Name: "id"}}, fields: []string{"id", "missing"}, reason: interfaces.OutputFieldUnknown, field: "missing"},
+			{name: "empty output name", schema: []*interfaces.Property{{Name: "id"}}, fields: []string{""}, reason: interfaces.OutputFieldUnknown},
+			{name: "empty schema", reason: interfaces.OutputFieldNoneQueryable},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				connector := &PostgresqlConnector{db: db, connected: true}
+				resource := &interfaces.Resource{SourceIdentifier: "orders", SchemaDefinition: tc.schema}
+				params := &interfaces.ResourceDataQueryParams{OutputFields: tc.fields, NeedTotal: true}
+				before := append([]string(nil), tc.fields...)
+				result, err := connector.ExecuteQuery(context.Background(), resource, params)
+				var output *interfaces.OutputFieldError
+				require.ErrorAs(t, err, &output)
+				assert.Equal(t, tc.reason, output.Reason)
+				assert.Equal(t, tc.field, output.Field)
+				assert.Nil(t, result)
+				assert.Equal(t, before, params.OutputFields)
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+
+	})
 	for _, tc := range []struct {
 		name      string
 		needTotal bool
@@ -67,36 +397,109 @@ func TestPostgresqlConnectorExecuteQueryInvalidParameter(t *testing.T) {
 			require.NoError(t, mock.ExpectationsWereMet())
 		})
 	}
+	for _, tc := range []struct {
+		name        string
+		groups      []*interfaces.GroupByItem
+		aggregation *interfaces.Aggregation
+		having      *interfaces.HavingClause
+		statement   string
+		args        []driver.Value
+		total       int64
+	}{
+		{name: "groups without a metric", groups: []*interfaces.GroupByItem{{Property: "label"}}, statement: `SELECT "label" AS "label" FROM "public"."orders" GROUP BY "label"`, total: 8},
+		{name: "HAVING aggregate alias matches its source column", groups: []*interfaces.GroupByItem{{Property: "label"}}, aggregation: &interfaces.Aggregation{Property: "id", Aggr: "sum", Alias: "id"}, having: &interfaces.HavingClause{Field: "__value", Operation: ">", Value: 2}, statement: `SELECT "label" AS "label", SUM("id") AS "id" FROM "public"."orders" GROUP BY "label" HAVING (SUM("id") > CAST($1 AS BIGINT))`, args: []driver.Value{2}, total: 3},
+		{name: "group count after HAVING", groups: []*interfaces.GroupByItem{{Property: "label"}}, aggregation: &interfaces.Aggregation{Property: "id", Aggr: "count", Alias: "total"}, having: &interfaces.HavingClause{Field: "__value", Operation: ">", Value: 2}, statement: `SELECT "label" AS "label", COUNT("id") AS "total" FROM "public"."orders" GROUP BY "label" HAVING (COUNT("id") > CAST($1 AS BIGINT))`, args: []driver.Value{2}, total: 3},
+		{name: "ungrouped aggregate is one result row", aggregation: &interfaces.Aggregation{Property: "*", Aggr: "count"}, statement: `SELECT COUNT(*) AS "__value" FROM "public"."orders"`, total: 1},
+		{name: "implicit count HAVING without grouping", having: &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 100}, statement: `SELECT COUNT(*) AS "__value" FROM "public"."orders" HAVING (COUNT(*) > CAST($1 AS BIGINT))`, args: []driver.Value{100}, total: 0},
+		{name: "timestamp max HAVING milliseconds", aggregation: &interfaces.Aggregation{Property: "created", Aggr: "max"}, having: &interfaces.HavingClause{Field: "__value", Operation: ">", Value: json.Number("1767225600000")}, statement: `SELECT MAX("created_at") AS "__value" FROM "public"."orders" HAVING (MAX("created_at") > CAST($1 AS TIMESTAMP))`, args: []driver.Value{time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}, total: 1},
+		{name: "date min HAVING calendar date", aggregation: &interfaces.Aggregation{Property: "day", Aggr: "min"}, having: &interfaces.HavingClause{Field: "__value", Operation: "==", Value: "2026-01-01"}, statement: `SELECT MIN("day") AS "__value" FROM "public"."orders" HAVING (MIN("day") = CAST($1 AS DATE))`, args: []driver.Value{"2026-01-01"}, total: 1},
+		{name: "zoned max HAVING list", aggregation: &interfaces.Aggregation{Property: "zoned", Aggr: "max"}, having: &interfaces.HavingClause{Field: "__value", Operation: "in", Value: []any{int64(1767225600000), "2026-01-02T00:00:00Z"}}, statement: `SELECT MAX("zoned") AS "__value" FROM "public"."orders" HAVING (MAX("zoned") IN ($1, $2))`, args: []driver.Value{time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}, total: 1},
+		{name: "date min HAVING not in", aggregation: &interfaces.Aggregation{Property: "day", Aggr: "min"}, having: &interfaces.HavingClause{Field: "__value", Operation: "not_in", Value: []any{"2026-01-01"}}, statement: `SELECT MIN("day") AS "__value" FROM "public"."orders" HAVING (MIN("day") NOT IN (CAST($1 AS DATE)))`, args: []driver.Value{"2026-01-01"}, total: 1},
+		{name: "date min HAVING range", aggregation: &interfaces.Aggregation{Property: "day", Aggr: "min"}, having: &interfaces.HavingClause{Field: "__value", Operation: "range", Value: []any{"2026-01-01", "2026-01-02"}}, statement: `SELECT MIN("day") AS "__value" FROM "public"."orders" HAVING ((MIN("day") >= CAST($1 AS DATE)) AND (MIN("day") <= CAST($2 AS DATE)))`, args: []driver.Value{"2026-01-01", "2026-01-02"}, total: 1},
+		{name: "date max HAVING out range", aggregation: &interfaces.Aggregation{Property: "day", Aggr: "max"}, having: &interfaces.HavingClause{Field: "__value", Operation: "out_range", Value: []any{"2026-01-01", "2026-01-02"}}, statement: `SELECT MAX("day") AS "__value" FROM "public"."orders" HAVING ((MAX("day") < CAST($1 AS DATE)) OR (MAX("day") > CAST($2 AS DATE)))`, args: []driver.Value{"2026-01-01", "2026-01-02"}, total: 1},
+		{name: "timestamp min HAVING RFC3339", aggregation: &interfaces.Aggregation{Property: "created", Aggr: "min"}, having: &interfaces.HavingClause{Field: "__value", Operation: ">=", Value: "2026-01-01T00:00:00Z"}, statement: `SELECT MIN("created_at") AS "__value" FROM "public"."orders" HAVING (MIN("created_at") >= CAST($1 AS TIMESTAMP))`, args: []driver.Value{time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}, total: 1},
+		{name: "count HAVING beside date aggregate stays numeric", aggregation: &interfaces.Aggregation{Property: "day", Aggr: "min"}, having: &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 2}, statement: `SELECT MIN("day") AS "__value" FROM "public"."orders" HAVING (COUNT(*) > CAST($1 AS BIGINT))`, args: []driver.Value{2}, total: 1},
+	} {
+		for _, needTotal := range []bool{false, true} {
+			name := tc.name + " without total"
+			if needTotal {
+				name = tc.name + " with total"
+			}
+			t.Run(name, func(t *testing.T) {
+				db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+				require.NoError(t, err)
+				defer func() { _ = db.Close() }()
+				db.SetMaxOpenConns(1)
+				connector := &PostgresqlConnector{db: db, connected: true}
+				resource := &interfaces.Resource{SourceIdentifier: `"public"."orders"`, SchemaDefinition: []*interfaces.Property{{Name: "label", Type: interfaces.DataType_String}, {Name: "id", Type: interfaces.DataType_Integer}, {Name: "created", OriginalName: "created_at", Type: interfaces.DataType_Datetime, OriginalType: "timestamp without time zone"}, {Name: "day", Type: interfaces.DataType_Date, OriginalType: "date"}, {Name: "zoned", Type: interfaces.DataType_Datetime, OriginalType: "timestamptz"}}}
+				params := &interfaces.ResourceDataQueryParams{GroupBy: tc.groups, Aggregation: tc.aggregation, Having: tc.having, NeedTotal: needTotal, Paging: interfaces.PagingRequest{Offset: 10, Limit: 1}}
+				// An empty page must still return the full aggregate total when requested.
+				pageStatement := tc.statement
+				if len(tc.groups) > 0 {
+					pageStatement += ` ORDER BY "label" ASC NULLS FIRST`
+				}
+				mock.ExpectQuery(pageStatement + " LIMIT 1 OFFSET 10").WithArgs(tc.args...).WillReturnRows(sqlmock.NewRows([]string{"value"})).RowsWillBeClosed()
+				if needTotal {
+					mock.ExpectQuery(`SELECT COUNT(*) FROM (` + tc.statement + `) AS "_resource_total"`).WithArgs(tc.args...).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(tc.total))
+				}
+				result, err := connector.ExecuteQuery(context.Background(), resource, params)
+				require.NoError(t, err)
+				assert.Empty(t, result.Entries)
+				wantTotal := int64(0)
+				if needTotal {
+					wantTotal = tc.total
+				}
+				assert.Equal(t, wantTotal, result.TotalCount)
+				require.NoError(t, mock.ExpectationsWereMet())
+			})
+		}
+	}
+
+	t.Run("implicit count cannot overwrite the grouped __value field", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		connector := &PostgresqlConnector{db: db, connected: true}
+		resource := &interfaces.Resource{SourceIdentifier: "orders", SchemaDefinition: []*interfaces.Property{{Name: "__value", Type: interfaces.DataType_String}}}
+		result, err := connector.ExecuteQuery(context.Background(), resource, &interfaces.ResourceDataQueryParams{
+			GroupBy: []*interfaces.GroupByItem{{Property: "__value"}}, Having: &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 0},
+		})
+		require.ErrorContains(t, err, "aggregate alias conflicts with a group field")
+		assert.Nil(t, result)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
 }
 
-func TestPostgresqlConnectorBuildPagedSQL(t *testing.T) {
-	connector := &PostgresqlConnector{}
-	assert.Equal(t,
-		"SELECT * FROM (SELECT id FROM orders) AS _raw_query_page LIMIT 10 OFFSET 20",
-		connector.BuildPagedSQL("SELECT id FROM orders", 20, 10),
-	)
-}
-
-func TestPostgresqlConnectorBuildDateFormat(t *testing.T) {
-	connector := &PostgresqlConnector{}
+func TestSQLCalendarGroup(t *testing.T) {
 	tests := []struct {
 		name     string
 		interval string
 		want     string
 	}{
-		{name: "minute", interval: interfaces.CALENDAR_UNIT_MINUTE, want: "to_char(date_trunc('minute',created_at),'YYYY-MM-DD HH24:MI')"},
-		{name: "hour", interval: interfaces.CALENDAR_UNIT_HOUR, want: "to_char(date_trunc('hour',created_at),'YYYY-MM-DD HH24')"},
-		{name: "day", interval: interfaces.CALENDAR_UNIT_DAY, want: "to_char(date_trunc('day',created_at),'YYYY-MM-DD')"},
-		{name: "week", interval: interfaces.CALENDAR_UNIT_WEEK, want: "to_char(date_trunc('week',created_at),'IYYY-IW')"},
-		{name: "month", interval: interfaces.CALENDAR_UNIT_MONTH, want: "to_char(date_trunc('month',created_at),'YYYY-MM')"},
-		{name: "quarter", interval: interfaces.CALENDAR_UNIT_QUARTER, want: "to_char(date_trunc('quarter',created_at),'YYYY-\"Q\"Q')"},
-		{name: "year", interval: interfaces.CALENDAR_UNIT_YEAR, want: "to_char(date_trunc('year',created_at),'YYYY')"},
+		{name: "minute", interval: interfaces.CALENDAR_UNIT_MINUTE, want: "YYYY-MM-DD HH24:MI"},
+		{name: "hour", interval: interfaces.CALENDAR_UNIT_HOUR, want: "YYYY-MM-DD HH24"},
+		{name: "day", interval: interfaces.CALENDAR_UNIT_DAY, want: "YYYY-MM-DD"},
+		{name: "week", interval: interfaces.CALENDAR_UNIT_WEEK, want: "IYYY-IW"},
+		{name: "month", interval: interfaces.CALENDAR_UNIT_MONTH, want: "YYYY-MM"},
+		{name: "quarter", interval: interfaces.CALENDAR_UNIT_QUARTER, want: "YYYY-\"Q\"Q"},
+		{name: "year", interval: interfaces.CALENDAR_UNIT_YEAR, want: "YYYY"},
 		{name: "unknown", interval: "unknown", want: ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, connector.buildDateFormat("created_at", tt.interval))
+			expr, err := sqlCalendarGroup(&sb.Column{Name: "created_at"}, tt.interval)
+			if tt.interval == "unknown" {
+				require.Error(t, err)
+				assert.Nil(t, expr)
+				return
+			}
+			require.NoError(t, err)
+			text, args, err := renderFilterSQL(expr)
+			require.NoError(t, err)
+			assert.Equal(t, `TO_CHAR(DATE_TRUNC('`+tt.name+`', "created_at"), '`+tt.want+`')`, text)
+			assert.Equal(t, []any(nil), args)
 		})
 	}
 }
@@ -119,15 +522,17 @@ func TestPostgresqlConnectorExecuteQueryQuotesCalendarIntervalIdentifiers(t *tes
 		Aggregation: &interfaces.Aggregation{Property: "id", Aggr: "count"},
 		Sort:        []*interfaces.SortField{{Field: "createdAt", Direction: interfaces.ASC_DIRECTION}},
 		Paging:      interfaces.PagingRequest{Limit: 20},
+		NeedTotal:   true,
 	}
-	expectedQuery := "SELECT to_char(date_trunc('day',\"createdAt\"),'YYYY-MM-DD') AS \"createdAt\", COUNT(\"id\") AS \"__value\" " +
-		"FROM \"public\".\"events\" GROUP BY to_char(date_trunc('day',\"createdAt\"),'YYYY-MM-DD') ORDER BY to_char(date_trunc('day',\"createdAt\"),'YYYY-MM-DD') ASC LIMIT 20 OFFSET 0"
-	mock.ExpectQuery(expectedQuery).
+	expectedQuery := `SELECT TO_CHAR(DATE_TRUNC('day', "createdAt"), 'YYYY-MM-DD') AS "createdAt", COUNT("id") AS "__value" FROM "public"."events" GROUP BY TO_CHAR(DATE_TRUNC('day', "createdAt"), 'YYYY-MM-DD') ORDER BY "createdAt" ASC NULLS FIRST LIMIT 20`
+	mock.ExpectQuery(expectedQuery).WithoutArgs().
 		WillReturnRows(sqlmock.NewRows([]string{"createdAt", "__value"}).AddRow("2024-01-01", 1))
 
+	mock.ExpectQuery(`SELECT COUNT(*) FROM (SELECT TO_CHAR(DATE_TRUNC('day', "createdAt"), 'YYYY-MM-DD') AS "createdAt", COUNT("id") AS "__value" FROM "public"."events" GROUP BY TO_CHAR(DATE_TRUNC('day', "createdAt"), 'YYYY-MM-DD')) AS "_resource_total"`).WithoutArgs().WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 	result, err := connector.ExecuteQuery(context.Background(), resource, params)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"createdAt", "__value"}, result.Columns)
+	assert.Equal(t, int64(1), result.TotalCount)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -150,7 +555,7 @@ func TestPostgresqlConnectorExecuteQueryAliasesGroupByFields(t *testing.T) {
 		Paging:      interfaces.PagingRequest{Limit: 20},
 	}
 	expectedQuery := "SELECT \"group_key\" AS \"groupKey\", COUNT(\"id\") AS \"__value\" " +
-		"FROM \"public\".\"events\" GROUP BY \"group_key\" LIMIT 20 OFFSET 0"
+		"FROM \"public\".\"events\" GROUP BY \"group_key\" ORDER BY \"groupKey\" ASC NULLS FIRST LIMIT 20"
 	mock.ExpectQuery(expectedQuery).
 		WillReturnRows(sqlmock.NewRows([]string{"groupKey", "__value"}).AddRow("priority", 1))
 
@@ -174,7 +579,7 @@ func TestPostgresqlConnectorExecuteQueryConvertsAliasedTimezoneField(t *testing.
 	}
 	params := &interfaces.ResourceDataQueryParams{Paging: interfaces.PagingRequest{Limit: 1}}
 	utc := time.Date(2026, 9, 9, 8, 0, 0, 0, time.UTC)
-	mock.ExpectQuery("SELECT \"created_at\" AS \"createdAt\" FROM \"public\".\"events\" LIMIT 1 OFFSET 0").
+	mock.ExpectQuery("SELECT \"created_at\" AS \"createdAt\" FROM \"public\".\"events\" LIMIT 1").
 		WillReturnRows(sqlmock.NewRows([]string{"createdAt"}).AddRow(utc))
 
 	result, err := connector.ExecuteQuery(context.Background(), resource, params)
@@ -184,72 +589,61 @@ func TestPostgresqlConnectorExecuteQueryConvertsAliasedTimezoneField(t *testing.
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestPostgresqlBuildHavingCondition(t *testing.T) {
-	connector := &PostgresqlConnector{}
-	tests := []struct {
-		name       string
-		having     *interfaces.HavingClause
-		aggAlias   string
-		want       string
-		errContain string
+func TestSQLHavingCondition(t *testing.T) {
+	t.Run("invalid temporal value is a request error", func(t *testing.T) {
+		field := &interfaces.Property{Name: "created", Type: interfaces.DataType_Datetime}
+		_, err := sqlHavingCondition(&interfaces.HavingClause{Field: "__value", Operation: ">", Value: "2026-10-19"}, &sb.Function{Name: "MIN", Args: []sb.SqlNode{&sb.Column{Name: "created"}}}, field)
+		var conditionErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &conditionErr)
+		_, request := interfaces.RequestSideQueryError(err)
+		assert.True(t, request)
+	})
+
+	for _, tc := range []struct {
+		name, operation, sql string
+		value                any
+		args                 []any
 	}{
-		{
-			name:     "equal uses placeholder",
-			having:   &interfaces.HavingClause{Field: "__value", Operation: "==", Value: 10},
-			aggAlias: "total",
-			want:     "total = ?",
-		},
-		{
-			name:     "not in formats list",
-			having:   &interfaces.HavingClause{Field: "__value", Operation: "not_in", Value: []string{"a", "b"}},
-			aggAlias: "total",
-			want:     "total NOT IN ('a', 'b')",
-		},
-		{
-			name:     "out range uses placeholders",
-			having:   &interfaces.HavingClause{Field: "__value", Operation: "out_range", Value: []any{1, 3}},
-			aggAlias: "total",
-			want:     "total NOT BETWEEN ? AND ?",
-		},
-		{
-			name:       "rejects unsupported field",
-			having:     &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 1},
-			aggAlias:   "total",
-			errContain: "HAVING field must be",
-		},
-		{
-			name:       "rejects invalid operation",
-			having:     &interfaces.HavingClause{Field: "__value", Operation: "like", Value: 1},
-			aggAlias:   "total",
-			errContain: "unsupported HAVING operation",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := connector.buildHavingCondition(tt.having, tt.aggAlias)
-
-			if tt.errContain != "" {
-				require.Error(t, err)
-				assert.ErrorContains(t, err, tt.errContain)
-				assert.Empty(t, got)
-				return
-			}
+		{"equal", "==", `(COUNT("id") = CAST($1 AS BIGINT))`, 10, []any{10}},
+		{"quoted string stays bound", "!=", `(COUNT("id") <> $1)`, "a' OR 1=1 --", []any{"a' OR 1=1 --"}},
+		{"greater equal", ">=", `(COUNT("id") >= CAST($1 AS BIGINT))`, 3, []any{3}},
+		{"string list", "in", `(COUNT("id") IN ($1, $2))`, []string{"a'", "b"}, []any{"a'", "b"}},
+		{"not in", "not_in", `(COUNT("id") NOT IN (CAST($1 AS BIGINT), CAST($2 AS BIGINT)))`, []any{1, 2}, []any{1, 2}},
+		{"range", "range", `((COUNT("id") >= CAST($1 AS BIGINT)) AND (COUNT("id") <= CAST($2 AS BIGINT)))`, []any{1, 3}, []any{1, 3}},
+		{"out range", "out_range", `((COUNT("id") < CAST($1 AS BIGINT)) OR (COUNT("id") > CAST($2 AS BIGINT)))`, []any{1, 3}, []any{1, 3}},
+		{"empty in", "in", "FALSE", []any{}, nil},
+		{"empty not in", "not_in", "TRUE", []any{}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expression, err := sqlHavingCondition(&interfaces.HavingClause{Field: "__value", Operation: tc.operation, Value: tc.value}, &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Column{Name: "id"}}}, nil)
 			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			sql, args, err := renderFilterSQL(expression)
+			require.NoError(t, err)
+			assert.Equal(t, tc.sql, sql)
+			assert.Equal(t, tc.args, args)
 		})
 	}
-}
-
-func TestPostgresqlFormatInValues(t *testing.T) {
-	t.Run("postgresql format in values", func(t *testing.T) {
-		assert.Equal(t, "1, 2", formatInValues([]any{1, 2}))
-		assert.Equal(t, "'a', 'b'", formatInValues([]string{"a", "b"}))
-		assert.Equal(t, "single", formatInValues("single"))
-	})
+	for _, having := range []*interfaces.HavingClause{
+		{Field: "name", Operation: "==", Value: 1},
+		{Field: "__value", Operation: "like", Value: 1},
+		{Field: "__value", Operation: "range", Value: []any{1}},
+		{Field: "__value", Operation: "in", Value: 1},
+		{Field: "__value", Operation: "=="},
+	} {
+		_, err := sqlHavingCondition(having, &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Column{Name: "id"}}}, nil)
+		require.Error(t, err)
+	}
 }
 
 func TestPostgresqlConvertValue(t *testing.T) {
+	t.Run("JSON text is opaque", func(t *testing.T) {
+		for _, text := range []string{`{"n":9007199254740993}`, `[1,true]`, `"scalar"`, "", "true", "null", `{"incomplete":`, "引号\"反斜杠\\\n"} {
+			for _, raw := range []any{text, []byte(text)} {
+				assert.Equal(t, text, convertValue(raw, "payload", map[string]string{"payload": "jsonb"}, false))
+			}
+		}
+	})
+
 	t.Run("postgresql convert value", func(t *testing.T) {
 		utc := time.Date(2026, 7, 9, 8, 0, 0, 0, time.UTC)
 		converted := convertValue(utc, "created_at", map[string]string{
@@ -289,5 +683,108 @@ func TestPostgresqlConnectorConnectionString(t *testing.T) {
 
 		connector.config.Options = nil
 		assert.Contains(t, connector.connectionString(), "sslmode=disable")
+	})
+}
+
+// TestPostgresqlConnectorExecuteSQLBuilder 验证真正执行 $n 参数、二进制内容及源错误分类。
+func TestPostgresqlConnectorExecuteSQLBuilder(t *testing.T) {
+	t.Run("SQL money source projections return decimal text and preserve nulls", func(t *testing.T) {
+		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		connector := &PostgresqlConnector{db: db, connected: true}
+		query := sb.Select(&sb.Star{}).From(&sb.Table{SourceIdentifier: `"public"."payments"`, SourceName: "payments", ColumnNames: []string{"amount"}, ColumnOriginalTypes: map[string]string{"amount": "money"}})
+		mock.ExpectQuery(`SELECT * FROM (SELECT CAST("amount" AS NUMERIC) AS "amount" FROM "public"."payments") AS "payments"`).WillReturnRows(sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("amount").OfType("NUMERIC", "")).AddRow([]byte("92233720368547758.07")).AddRow([]byte("-0.001")).AddRow(nil)).RowsWillBeClosed()
+		result, err := connector.ExecuteSQLBuilder(t.Context(), query)
+		require.NoError(t, err)
+		assert.Equal(t, []interfaces.ColumnInfo{{Name: "amount", Type: interfaces.DataType_Decimal}}, result.Columns)
+		assert.Equal(t, []map[string]any{{"amount": "92233720368547758.07"}, {"amount": "-0.001"}, {"amount": nil}}, result.Entries)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("bound numeric parameters and native bytea survive scanning", func(t *testing.T) {
+		db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		connector := &PostgresqlConnector{db: db, connected: true}
+		query := sb.Select(&sb.Column{Name: "payload"}, &sb.Alias{Expr: &sb.Param{Value: json.Number("10.1234567890")}, Name: "amount"})
+		mock.ExpectQuery(`SELECT "payload", CAST($1 AS NUMERIC) AS "amount"`).WithArgs("10.1234567890").WillReturnRows(sqlmock.NewRowsWithColumnDefinition(sqlmock.NewColumn("payload").OfType("BYTEA", []byte{}), sqlmock.NewColumn("amount").OfType("NUMERIC", "")).AddRow([]byte{0, 255}, []byte("10.1234567890"))).RowsWillBeClosed()
+		result, err := connector.ExecuteSQLBuilder(context.Background(), query)
+		require.NoError(t, err)
+		require.Len(t, result.Entries, 1)
+		assert.Equal(t, []byte{0, 255}, result.Entries[0]["payload"])
+		assert.Equal(t, "10.1234567890", result.Entries[0]["amount"])
+		require.NotNil(t, result.TotalCount)
+		assert.Equal(t, int64(1), *result.TotalCount)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+	for _, code := range []string{"42601", "42703", "42803", "42804", "42883", "22P02", "22003", "22021", "08006"} {
+		t.Run(code, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			require.NoError(t, err)
+			defer func() { _ = db.Close() }()
+			connector := &PostgresqlConnector{db: db, connected: true}
+			cause := &pq.Error{Code: pqerror.Code(code), Message: "private source SQL and values"}
+			mock.ExpectQuery("SELECT").WillReturnError(cause)
+			result, err := connector.ExecuteSQLBuilder(context.Background(), sb.Select(&sb.Star{}))
+			assert.Nil(t, result)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, cause)
+			var invalid *interfaces.SourceQueryInvalidParameterError
+			if code == "08006" {
+				assert.NotErrorAs(t, err, &invalid)
+			} else {
+				require.ErrorAs(t, err, &invalid)
+				want := interfaces.SourceQueryInvalidParameterInvalidQuery
+				if code == "42703" {
+					want = interfaces.SourceQueryInvalidParameterUnknownColumn
+				}
+				assert.Equal(t, want, invalid.Reason)
+				detail, ok := interfaces.RequestSideQueryError(err)
+				assert.True(t, ok)
+				assert.NotContains(t, detail, "private")
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// TestPostgresqlConnectorOpenSQLBuilder 检查 Rows 转交、重复列关闭及取消前不创建连接。
+func TestPostgresqlConnectorOpenSQLBuilder(t *testing.T) {
+	t.Run("duplicate names close Rows before returning error", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+		connector := &PostgresqlConnector{db: db, connected: true}
+		mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"id", "id"}).AddRow(1, 2)).RowsWillBeClosed()
+		rows, columns, err := connector.OpenSQLBuilder(context.Background(), sb.Select(&sb.Star{}))
+		if rows != nil {
+			assert.NoError(t, rows.Err())
+			defer func() { assert.NoError(t, rows.Close()) }()
+		}
+		require.Error(t, err)
+		assert.Nil(t, rows)
+		assert.Nil(t, columns)
+		require.NoError(t, mock.ExpectationsWereMet())
+	})
+	t.Run("cancellation and unsupported casts do not connect", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		connector := &PostgresqlConnector{}
+		rows, _, err := connector.OpenSQLBuilder(ctx, sb.Select(&sb.Star{}))
+		if rows != nil {
+			assert.NoError(t, rows.Err())
+			defer func() { assert.NoError(t, rows.Close()) }()
+		}
+		assert.Nil(t, rows)
+		assert.ErrorIs(t, err, context.Canceled)
+		rows, _, err = connector.OpenSQLBuilder(context.Background(), sb.Select(&sb.Cast{Expr: &sb.Param{Value: 1}, Type: sb.CastUnsignedInteger}))
+		if rows != nil {
+			assert.NoError(t, rows.Err())
+			defer func() { assert.NoError(t, rows.Close()) }()
+		}
+		assert.Nil(t, rows)
+		var invalid *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &invalid)
 	})
 }

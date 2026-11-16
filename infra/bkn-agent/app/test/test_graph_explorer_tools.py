@@ -1,0 +1,1096 @@
+# Copyright openbkn.ai
+#
+# Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
+"""The graph explorer provider's query tools against a stand-in Context Loader.
+
+The id, row and Cypher rules mirror the EE explorer's
+(studio/src/graph-explorer/graph-explorer.service.ts, cypher-pattern.ts): a node
+the server plans must carry the id the Web already gives the same instance.
+"""
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+from langchain_core.tools import ToolException
+
+from app.core import builtin_tools
+from app.core import graph_explorer_data as data
+from app.core import graph_explorer_tools as graph
+
+TEAMS = data.ObjectTypeMeta("teams", "球队", ["key_id"], {"key_id": "integer", "team_name": "string"})
+
+
+def test_instance_ids_follow_ontology_query():
+    assert data.instance_id("teams", ["key_id"], {"key_id": 9}) == "teams-9"
+    assert data.instance_id("a", ["x", "y"], {"x": "1"}) == "a-1___NULL__"
+    assert data.instance_id("a", [], {"x": 1}) is None
+    assert data.identity_key(["x", "y"], {"x": 1}) is None
+    assert data.key_value_for(TEAMS, "9") == 9
+    assert data.key_value_for(data.ObjectTypeMeta("p", "p", ["code"], {"code": "string"}), "09") == "09"
+
+
+def test_ids_split_on_the_longest_object_type_prefix():
+    items, unknown = data.parse_ids(
+        ["team_appearances-6", "teams-9", "teams-9", "ghost-1"], ["teams", "team_appearances"]
+    )
+    assert items == [("team_appearances", "6"), ("teams", "9")]
+    assert unknown == ["ghost-1"]
+
+
+def test_rows_and_search_hits_become_nodes():
+    [node] = data.nodes_from_rows(TEAMS, {"datas": [{"key_id": 9, "team_name": "Brazil", "_display": "Brazil", "_score": 1}]})
+    assert node["id"] == "teams-9" and node["identity"] == {"key_id": 9}
+    assert node["label"] == "Brazil" and "_score" not in node["properties"]
+    hits = data.nodes_from_search(
+        {
+            "nodes": [
+                {"object_type_id": "teams", "instance_name": "Brazil", "unique_identities": {"key_id": 9}, "properties": {}},
+                {"object_type_id": "unknown", "properties": {}},
+            ]
+        },
+        {"teams": TEAMS},
+    )
+    assert [(n["id"], n["label"]) for n in hits] == [("teams-9", "Brazil")]
+
+
+def _obj(ot, key, **props):
+    return {"kind": "object", "object_type_id": ot, "key": {"key_id": {"type": "integer", "value": str(key)}}, "properties": props}
+
+
+def test_cypher_rows_become_nodes_relations_and_computed_values():
+    result = {
+        "entries": [
+            {
+                "t": _obj("teams", 9),
+                "r": {"kind": "relation", "relation_type_id": "rel_home", "source": _obj("matches", 1), "target": _obj("teams", 9)},
+                "m": _obj("matches", 1),
+                "t_goals": 3,
+                "note": "x",
+            }
+        ]
+    }
+    out = data.graph_from_cypher(result, {"teams": TEAMS}, {"rel_home": "主队"})
+    assert out.holds_graph
+    assert {n["id"] for n in out.nodes} == {"teams-9", "matches-1"}
+    assert [(e["id"], e["relation_type_name"]) for e in out.edges] == [("matches-1|rel_home|teams-9", "主队")]
+    # With two node columns, `t_goals` belongs to t and `note` to nobody.
+    assert next(n for n in out.nodes if n["id"] == "teams-9")["computed"] == {"t_goals": 3}
+    assert out.table == {"columns": ["t", "m", "note"], "rows": [{"t": "teams-9", "m": "matches-1", "note": "x"}]}
+
+
+def test_cypher_derived_edges_count_their_evidence():
+    rows = [
+        {"source": _obj("teams", 9), "relationType": "参加过", "target": _obj("matches", m), "n": 2}
+        for m in (1, 1)
+    ] + [{"source": _obj("teams", 9), "relationType": "参加过", "target": _obj("matches", 2), "evidence": [_obj("players", 7)]}]
+    out = data.graph_from_cypher({"entries": rows}, {}, {})
+    derived = {e["id"]: e for e in out.edges if e.get("virtual")}
+    assert derived["virtual|teams-9|参加过|matches-1"]["evidence_count"] == 4
+    assert derived["virtual|teams-9|参加过|matches-1"]["computed"] == {"n": 4}
+    assert derived["virtual|teams-9|参加过|matches-2"]["evidence_count"] == 1
+    assert "evidence|players-7|teams-9" in derived and "evidence|players-7|matches-2" in derived
+
+
+def test_cypher_derived_edge_may_end_at_a_value():
+    rows = [
+        {"source": _obj("teams", 1), "relationType": "主场结果", "target": "胜", "score": "3–3"},
+        {"source": _obj("teams", 2), "relationType": "主场结果", "target": "胜", "score": "2–0"},
+        {"source": _obj("teams", 3), "relationType": "主场结果", "target": "未胜"},
+        {"source": 2.0, "relationType": "进球数", "target": _obj("teams", 4)},
+        {"source": _obj("teams", 5), "relationType": "晋级", "target": True},
+        # Both ends values, an empty or overlong value, or a list: not a derived edge.
+        {"source": "胜", "relationType": "主场结果", "target": "未胜"},
+        {"source": _obj("teams", 6), "relationType": "主场结果", "target": ""},
+        {"source": _obj("teams", 7), "relationType": "主场结果", "target": "x" * 201},
+        {"source": _obj("teams", 8), "relationType": "主场结果", "target": ["胜"]},
+    ]
+    out = data.graph_from_cypher({"entries": rows}, {}, {})
+    values = {n["id"]: n for n in out.nodes if n.get("value")}
+    assert list(values) == ["value|主场结果|胜", "value|主场结果|未胜", "value|进球数|2", "value|晋级|true"]
+    assert values["value|主场结果|胜"] == {
+        "id": "value|主场结果|胜", "object_type_id": "@value:主场结果", "identity": {},
+        "properties": {}, "label": "胜", "value": True,
+    }
+    derived = {e["id"]: e for e in out.edges if e.get("virtual")}
+    assert set(derived) == {
+        "virtual|teams-1|主场结果|value|主场结果|胜",
+        "virtual|teams-2|主场结果|value|主场结果|胜",
+        "virtual|teams-3|主场结果|value|主场结果|未胜",
+        "virtual|value|进球数|2|进球数|teams-4",
+        "virtual|teams-5|晋级|value|晋级|true",
+    }
+    assert derived["virtual|teams-1|主场结果|value|主场结果|胜"]["computed"] == {"score": "3–3"}
+    # Rows that are not derived edges fall back to nodes and table rows.
+    assert {"teams-6", "teams-7", "teams-8"} <= {n["id"] for n in out.nodes}
+
+
+def test_scalar_only_cypher_holds_no_graph():
+    out = data.graph_from_cypher({"entries": [{"n": 3}]}, {}, {})
+    assert not out.holds_graph and out.nodes == [] and out.table == {"columns": ["n"], "rows": [{"n": 3}]}
+
+
+# ---- tools against a stand-in Context Loader ----
+
+DETAIL = {
+    "object_types": [
+        {"id": "teams", "name": "球队", "primary_keys": ["key_id"], "properties": [{"name": "team_name", "type": "string"}]},
+        {"id": "matches", "name": "比赛"},
+    ],
+    "relation_types": [
+        {"id": "rel_home", "name": "主队", "source_object_type_id": "matches", "target_object_type_id": "teams"}
+    ],
+}
+OBJECT_TYPES = {
+    "object_types": [
+        {"id": "teams", "name": "球队", "primary_keys": ["key_id"], "data_properties": [{"name": "key_id", "type": "integer"}]},
+        {"id": "matches", "name": "比赛", "primary_keys": ["key_id"], "data_properties": [{"name": "key_id", "type": "integer"}]},
+    ]
+}
+ROWS = {
+    "teams": [{"key_id": 9, "team_name": "Brazil", "_display": "Brazil"}],
+    "matches": [{"key_id": 1, "_display": "M-1"}, {"key_id": 2, "_display": "M-2"}],
+}
+
+
+def _tool(name, calls, answer):
+    async def coroutine(**kwargs):
+        calls.append((name, kwargs))
+        value = answer(kwargs) if callable(answer) else answer
+        return json.dumps(value, ensure_ascii=False), None
+
+    return SimpleNamespace(name=name, coroutine=coroutine)
+
+
+def _rows(kwargs):
+    wanted = set(kwargs.get("condition", {}).get("value") or [])
+    return {"datas": [r for r in ROWS[kwargs["ot_id"]] if not wanted or r["key_id"] in wanted]}
+
+
+def _subgraph(kwargs):
+    return {
+        "entries": [
+            {
+                "relation_paths": [
+                    {
+                        "relations": [
+                            {"source_object_id": "matches-1", "target_object_id": "teams-9", "relation_type_id": "rel_home"},
+                            {"source_object_id": "matches-2", "target_object_id": "teams-1", "relation_type_id": "rel_home"},
+                        ]
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _run(nodes=(), cypher=None):
+    run = builtin_tools.Run(
+        provider=builtin_tools.get("graph_explorer"),
+        kn_id="network-1",
+        context=graph.CanvasContext(canvas_id="c1", revision=2, nodes=list(nodes)),
+        account_id="user-1",
+        account_type="user",
+    )
+    calls: list = []
+    run.state["context_loader"] = {
+        name: _tool(name, calls, answer)
+        for name, answer in {
+            "get_kn_detail": DETAIL,
+            "get_object_types": OBJECT_TYPES,
+            "search_instance": {
+                "nodes": [{"object_type_id": "teams", "unique_identities": {"key_id": 9}, "properties": {"team_name": "Brazil"}}]
+            },
+            "query_object_instance": _rows,
+            "query_instance_subgraph": _subgraph,
+            "run_cypher": cypher or {"entries": []},
+        }.items()
+    }
+    tools = {t.name: t for t in graph._tools(run)}
+    return run, tools, calls
+
+
+def _invoke(tool, **arguments):
+    return json.loads(asyncio.run(tool.ainvoke(arguments)))
+
+
+def test_search_finds_candidates_without_planning_them():
+    run, tools, calls = _run()
+    found = _invoke(tools["search_instances"], query="巴西")
+    assert found["items"][0]["id"] == "teams-9"
+    assert "teams-9" in run.state["candidates"] and not run.state.get("actions")
+    # Every call is made as the run's network, in JSON.
+    assert all(c[1]["kn_id"] == "network-1" and c[1]["response_format"] == "json" for c in calls)
+
+
+def test_show_plans_instances_and_the_relations_among_them():
+    run, tools, calls = _run()
+    shown = _invoke(tools["show_instances"], ids=["teams-9", "matches-1", "nobody-3"])
+    assert shown["planned_added"] == {"nodes": 2, "edges": 1}
+    assert shown["not_found"] == ["nobody-3"]
+    query = next(c[1] for c in calls if c[0] == "query_object_instance" and c[1]["ot_id"] == "teams")
+    assert query["condition"] == {"field": "key_id", "operation": "in", "value": [9]}
+    result = builtin_tools.get("graph_explorer").result(run)
+    assert [a["type"] for a in result["actions"]] == ["merge_subgraph"]
+    # The edge to teams-1, which was not asked for, is left out.
+    assert [e["id"] for e in result["edges"]] == ["matches-1|rel_home|teams-9"]
+    # A second look at the canvas sees the plan.
+    state = _invoke(tools["canvas_state"])
+    assert state["total_nodes"] == 2 and all(n["planned"] for n in state["nodes"]["items"])
+
+
+def test_nodes_already_on_the_canvas_are_not_planned_again():
+    run, tools, _ = _run(nodes=[{"id": "teams-9", "object_type_id": "teams"}])
+    shown = _invoke(tools["show_instances"], ids=["teams-9", "matches-1"])
+    assert shown["planned_added"] == {"nodes": 1, "edges": 1}
+    result = builtin_tools.get("graph_explorer").result(run)
+    assert [n["id"] for n in result["nodes"]] == ["matches-1"]
+
+
+def test_composite_keys_need_a_found_identity():
+    run, tools, _ = _run()
+    run.state["metas"] = {"pair": data.ObjectTypeMeta("pair", "pair", ["a", "b"])}
+    run.state["network"] = {"object_types": {"pair": {"name": "pair", "properties": []}}, "relation_types": {}}
+    with pytest.raises(Exception, match="composite key"):
+        asyncio.run(tools["show_instances"].coroutine(ids=["pair-1_2"]))
+
+
+def test_cypher_plans_graph_results_and_fills_in_key_only_nodes():
+    cypher = {
+        "entries": [
+            {
+                "t": _obj("teams", 9),
+                "r": {"kind": "relation", "relation_type_id": "rel_home", "source": _obj("matches", 1), "target": _obj("teams", 9)},
+                "m": _obj("matches", 1),
+            }
+        ]
+    }
+    run, tools, _ = _run(cypher=cypher)
+    out = _invoke(tools["run_cypher"], query="MATCH (m:matches)-[r:rel_home]->(t:teams) RETURN t, r, m LIMIT 5")
+    assert out["planned_added"] == {"nodes": 2, "edges": 1}
+    labels = {n["id"]: n["label"] for n in builtin_tools.get("graph_explorer").result(run)["nodes"]}
+    assert labels == {"teams-9": "Brazil", "matches-1": "M-1"}
+
+
+def test_cypher_scalars_come_back_as_a_table_and_plan_nothing():
+    run, tools, _ = _run(cypher={"columns": [{"name": "n"}], "entries": [{"n": 3}]})
+    out = _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN count(t) AS n LIMIT 1")
+    assert out["table"] == {"columns": ["n"], "rows": [{"n": 3}], "total": 1}
+    assert "planned_added" not in out and not run.state.get("actions")
+
+
+def test_cypher_tables_come_back_whole_up_to_a_size_and_say_when_cut():
+    # 87 rows used to come back as 20, and the model queried again in slices to read them all.
+    rows = [{"team": f"T{i}", "host": "Brazil", "performance": "group stage"} for i in range(87)]
+    run, tools, _ = _run(cypher={"columns": [{"name": "team"}], "entries": rows})
+    out = _invoke(tools["run_cypher"], query="MATCH (q:qualified_teams) RETURN q.team AS team")
+    assert out["table"]["rows"] == rows and out["table"]["total"] == 87
+    assert "cut" not in out["table"]
+
+    wide = [{"text": "x" * 500, "i": i} for i in range(87)]
+    run, tools, _ = _run(cypher={"columns": [{"name": "text"}], "entries": wide})
+    out = _invoke(tools["run_cypher"], query="MATCH (q:qualified_teams) RETURN q.text AS text")
+    shown = out["table"]["rows"]
+    assert 0 < len(shown) < 87 and shown == wide[: len(shown)]
+    assert "Aggregate" in out["table"]["cut"] and f"{len(shown)} of 87" in out["table"]["cut"]
+
+
+def test_cypher_must_be_complete():
+    _, tools, calls = _run()
+    with pytest.raises(Exception, match="complete query"):
+        asyncio.run(tools["run_cypher"].coroutine(query="MATCH (t:teams)"))
+    assert not any(c[0] == "run_cypher" for c in calls)
+
+
+def test_cypher_without_limit_runs_and_says_when_the_platform_cut_it():
+    # The canvas limit, not a row limit, bounds what is planned.
+    _, tools, calls = _run(cypher={"entries": [], "execution": {"conclusions_limited": True}})
+    out = _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t.team_name AS name")
+    assert any(c[0] == "run_cypher" for c in calls)
+    assert "default limit" in out["limited"]
+
+
+def test_the_canvas_limit_cuts_and_warns():
+    run, tools, _ = _run(nodes=[{"id": f"x-{i}", "object_type_id": "x"} for i in range(graph.NODE_LIMIT - 1)])
+    shown = _invoke(tools["show_instances"], ids=["teams-9", "matches-1"])
+    assert shown["planned_added"]["nodes"] == 1 and shown["left_out"] == 1
+    assert run.state["warnings"]
+
+
+def test_the_prompt_carries_the_network_schema():
+    run, _, _ = _run()
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)" in text and "team_name:string" in text
+    assert "- rel_home (主队): matches -> teams" in text
+
+
+def test_the_prompt_lists_properties_the_network_detail_leaves_out():
+    """Regression: get_kn_detail names object types without their properties, so the
+    schema in the prompt had none and the model queried instances of each type to
+    learn them, a tool call per type out of the run's budget."""
+    run, _, calls = _run()
+    run.state["context_loader"]["get_kn_detail"] = _tool(
+        "get_kn_detail", calls, {**DETAIL, "object_types": [{"id": "teams", "name": "球队"}, {"id": "matches", "name": "比赛"}]}
+    )
+    run.state["context_loader"]["get_object_types"] = _tool(
+        "get_object_types",
+        calls,
+        {
+            "object_types": [
+                {
+                    "id": "teams",
+                    "name": "球队",
+                    "primary_keys": ["key_id"],
+                    "data_properties": [{"name": "key_id", "type": "integer"}, {"name": "team_name", "type": "string"}, {"name": "secret"}],
+                    "effective_permissions": {"key_id": "full", "team_name": "full", "secret": "masked"},
+                },
+                OBJECT_TYPES["object_types"][1],
+            ]
+        },
+    )
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)\n  properties: key_id:integer, team_name:string" in text
+    assert "secret" not in text
+    assert "- matches (比赛)\n  properties: key_id:integer" in text
+    # One call for every type, and the definitions serve the tools after it.
+    assert [c[1]["ids"] for c in calls if c[0] == "get_object_types"] == [["teams", "matches"]]
+    assert set(run.state["metas"]) == {"teams", "matches"}
+
+
+def test_a_large_network_lists_names_only_and_a_failed_lookup_keeps_them(monkeypatch):
+    run, _, calls = _run()
+    run.state["context_loader"]["get_kn_detail"] = _tool(
+        "get_kn_detail", calls, {**DETAIL, "object_types": [{"id": "teams", "name": "球队"}, {"id": "matches", "name": "比赛"}]}
+    )
+    monkeypatch.setattr(graph, "SCHEMA_PROPERTY_TYPES", 1)
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)" in text and "properties" not in text
+    assert not any(c[0] == "get_object_types" for c in calls)
+
+    monkeypatch.setattr(graph, "SCHEMA_PROPERTY_TYPES", 100)
+    run.state.pop("network")
+
+    async def broken(**kwargs):
+        raise TimeoutError("read timed out")
+
+    run.state["context_loader"]["get_object_types"] = SimpleNamespace(name="get_object_types", coroutine=broken)
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)" in text and "- matches (比赛)" in text and "properties" not in text
+
+
+def test_the_schema_properties_fit_a_budget_and_say_so(monkeypatch):
+    """A network of many wide object types listed every property of each, crowding the
+    conversation out of the prompt; each type now keeps the same number of its first ones."""
+    run, _, calls = _run()
+    wide = {"id": "teams", "name": "球队", "properties": [{"name": "key_id", "type": "integer"}, {"name": "team_name", "type": "string"}]}
+    run.state["context_loader"]["get_kn_detail"] = _tool(
+        "get_kn_detail", calls, {**DETAIL, "object_types": [wide, {"id": "matches", "name": "比赛"}]}
+    )
+    monkeypatch.setattr(graph, "SCHEMA_PROPERTY_CHARS", len("key_id:integer") * 2)
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)\n  properties: key_id:integer\n" in text
+    assert "team_name" not in text
+    assert "Only the first 1 properties of each object type fit here" in text
+
+    monkeypatch.undo()
+    run, _, _ = _run()
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "team_name:string" in text and "fit here" not in text
+
+
+def test_a_keyword_alias_failure_says_which_word_to_rename():
+    """Regression: `RETURN m AS match` failed with only `mismatched input 'match'`; the
+    model renamed the variable, kept the alias and failed again until the budget ran out."""
+
+    def refuse(kwargs):
+        return {"error": "Cypher 查询语法解析失败: line 1, column 30: mismatched input 'match'"}
+
+    run, tools, _ = _run(cypher=refuse)
+    with pytest.raises(ToolException) as failed:
+        asyncio.run(tools["run_cypher"].coroutine(query="MATCH (mt:matches) RETURN mt AS match"))
+    assert "mismatched input 'match'" in str(failed.value)
+    assert "match is a Cypher keyword" in str(failed.value)
+    with pytest.raises(ToolException) as plain:
+        asyncio.run(tools["run_cypher"].coroutine(query="MATCH (mt:matches) RETURN mt AS game"))
+    assert "Hint" not in str(plain.value)
+
+
+def test_a_keyword_alias_hint_needs_the_parser_to_stop_at_it():
+    """`count` is a legal alias, and a query that failed for another reason has no
+    keyword to rename: neither gets the hint."""
+
+    def refuse(kwargs):
+        return {"error": "object type matchez not found"}
+
+    run, tools, _ = _run(cypher=refuse)
+    for query in ("MATCH (mt:matchez) RETURN count(mt) AS count", "MATCH (mt:matchez) RETURN mt AS match"):
+        with pytest.raises(ToolException) as failed:
+            asyncio.run(tools["run_cypher"].coroutine(query=query))
+        assert "Hint" not in str(failed.value), query
+
+
+def test_without_context_loader_the_tools_say_so():
+    run, tools, _ = _run()
+    run.state.pop("context_loader")
+    with pytest.raises(Exception, match="Context Loader is unavailable"):
+        asyncio.run(tools["search_instances"].coroutine(query="x"))
+
+
+def test_a_relation_path_covers_every_pair_of_its_ends():
+    """Regression: the path limit capped the relations returned in total, so one
+    team and thirty matches came back with ten edges."""
+    run, tools, calls = _run()
+    ROWS["matches"] = [{"key_id": i, "_display": f"M-{i}"} for i in range(1, 31)]
+    try:
+        relations = [
+            {"source_object_id": f"matches-{i}", "target_object_id": "teams-9", "relation_type_id": "rel_home"}
+            for i in range(1, 31)
+        ]
+        run.state["context_loader"]["query_instance_subgraph"] = _tool(
+            "query_instance_subgraph",
+            calls,
+            lambda kwargs: {"entries": [{"relation_paths": [{"relations": relations[: kwargs["relation_type_paths"][0]["limit"]]}]}]},
+        )
+        shown = _invoke(tools["show_instances"], ids=["teams-9", *[f"matches-{i}" for i in range(1, 31)]])
+    finally:
+        ROWS["matches"] = [{"key_id": 1, "_display": "M-1"}, {"key_id": 2, "_display": "M-2"}]
+    path = next(c[1] for c in calls if c[0] == "query_instance_subgraph")["relation_type_paths"][0]
+    assert path["limit"] == 30
+    assert shown["planned_added"]["edges"] == 30
+    # Every pair was asked for, so a full answer is not a truncated one.
+    assert not any("may be incomplete" in w for w in run.state.get("warnings", []))
+
+
+def test_a_path_cut_at_the_backend_limit_says_it_may_be_incomplete(monkeypatch):
+    monkeypatch.setattr(graph, "PATH_LIMIT", 1)
+    run, tools, _ = _run()
+    _invoke(tools["show_instances"], ids=["teams-9", "matches-1", "matches-2"])
+    assert any("reached the 1 limit" in w for w in run.state["warnings"])
+
+
+def test_a_context_loader_transport_failure_is_the_tools_error():
+    run, tools, _ = _run()
+
+    async def broken(**kwargs):
+        raise TimeoutError("read timed out")
+
+    run.state["context_loader"]["search_instance"] = SimpleNamespace(name="search_instance", coroutine=broken)
+    with pytest.raises(ToolException, match="could not reach Context Loader: TimeoutError"):
+        asyncio.run(tools["search_instances"].coroutine(query="x"))
+
+
+def test_large_networks_list_object_types_by_page_and_say_relations_are_unlisted():
+    run, tools, calls = _run()
+    run.state["context_loader"]["get_kn_detail"] = _tool(
+        "get_kn_detail", calls, {"object_types": None, "relation_types": None, "notice": "too large"}
+    )
+    pages = {0: {"object_types": OBJECT_TYPES["object_types"][:1], "next_offset": 5}, 5: {"object_types": OBJECT_TYPES["object_types"][1:]}}
+    run.state["context_loader"]["get_object_types"] = _tool(
+        "get_object_types", calls, lambda kwargs: pages[kwargs["offset"]] if "offset" in kwargs else OBJECT_TYPES
+    )
+    shown = _invoke(tools["show_instances"], ids=["teams-9"])
+    assert shown["planned_added"] == {"nodes": 1, "edges": 0}
+    # Paged by next_offset, not by how many came back.
+    assert [c[1]["offset"] for c in calls if c[0] == "get_object_types" and "offset" in c[1]] == [0, 5]
+    assert set(run.state["network"]["object_types"]) == {"teams", "matches"}
+    assert any("too large to list its relation types" in w for w in run.state["warnings"])
+    text = asyncio.run(builtin_tools.get("graph_explorer").instructions(run))
+    assert "- teams (球队)" in text and "too large to list its relation types" in text
+# ---- expand_neighbours ----
+
+
+def _expand_run(counts: dict[int, int], threshold=20, max_nodes=500, nodes=None):
+    """A run whose run_cypher answers count and fetch queries for teams-9 via rel_home (in)."""
+
+    def cypher(kwargs):
+        query = kwargs["query"]
+        seeds = list(kwargs.get("parameters", {}).values())
+        if "count(" in query:
+            return {"entries": [{"s__key_id": s, "n": counts.get(s, 0)} for s in seeds]}
+        limit = int(query.rsplit("LIMIT", 1)[1])
+        rows = [
+            {"s__key_id": s, "t__key_id": str(100 * s + i), "t__match_name": f"M-{s}-{i}"}
+            for s in seeds
+            for i in range(counts.get(s, 0))
+        ]
+        return {"entries": rows[:limit]}
+
+    run, tools, calls = _run(
+        nodes=nodes if nodes is not None else [{"id": "teams-9", "object_type_id": "teams"}],
+        cypher=cypher,
+    )
+    run.context.limits.expand_threshold = threshold
+    run.context.limits.max_nodes = max_nodes
+    return run, tools, calls
+
+
+def test_expand_counts_then_draws_small_groups():
+    run, tools, calls = _expand_run({9: 3})
+    out = _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    assert out["planned_added"] == {"nodes": 3, "edges": 3}
+    count, fetch = [c[1] for c in calls if c[0] == "run_cypher"]
+    assert count["query"].startswith("MATCH (s:`teams`)<-[:`rel_home`]-(t:`matches`)")
+    assert count["parameters"] == {"p0": 9}
+    assert "LIMIT 3" in fetch["query"]
+    result = builtin_tools.get("graph_explorer").result(run)
+    assert {e["id"] for e in result["edges"]} == {f"matches-{900 + i}|rel_home|teams-9" for i in range(3)}
+    # Keys come back as text and are typed by their declaration; labels prefer a name.
+    node = next(n for n in result["nodes"] if n["id"] == "matches-900")
+    assert node["identity"] == {"key_id": 900} and node["label"] == "M-9-0"
+    assert result["actions"][0]["anchor_id"] == "teams-9"
+
+
+def test_expand_folds_large_groups_into_aggregates():
+    run, tools, calls = _expand_run({9: 50}, threshold=20)
+    out = _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    assert out["aggregated"] == [{"seed": "teams-9", "relation": "主队", "target_type": "比赛", "total": 50}]
+    assert out["planned_added"] == {"nodes": 0, "edges": 0}
+    # Counted, not fetched.
+    assert len([c for c in calls if c[0] == "run_cypher"]) == 1
+    result = builtin_tools.get("graph_explorer").result(run)
+    assert result["aggregates"] == [
+        {
+            "id": "agg|teams-9|rel_home|in",
+            "seed_id": "teams-9",
+            "relation_type_id": "rel_home",
+            "relation_type_name": "主队",
+            "walk": "in",
+            "peer_object_type_id": "matches",
+            "total": 50,
+        }
+    ]
+    assert result["actions"][0]["aggregate_ids"] == ["agg|teams-9|rel_home|in"]
+
+
+def test_expand_without_room_falls_back_to_an_aggregate():
+    run, tools, _ = _expand_run({9: 5}, threshold=20, max_nodes=3)
+    out = _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    assert out["aggregated"][0]["total"] == 5 and out["planned_added"]["nodes"] == 0
+
+
+def test_expand_reports_no_neighbours_and_unknown_seeds():
+    _, tools, _ = _expand_run({})
+    assert _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")["note"]
+    with pytest.raises(Exception, match="Unknown instance ids"):
+        asyncio.run(tools["expand_neighbours"].coroutine(ids=["teams-404"], direction="in"))
+
+
+def test_expanding_a_candidate_puts_it_on_the_canvas_too():
+    run, tools, _ = _expand_run({9: 2}, nodes=[])
+    _invoke(tools["search_instances"], query="巴西")
+    out = _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    assert out["planned_added"] == {"nodes": 3, "edges": 2}
+
+
+def test_plan_space_matches_the_ee_rules():
+    rel = data.IncidentRelation("r", "r", "out", "a", "b")
+    groups = [data.ExpandGroup("a-1", rel, 30), data.ExpandGroup("a-2", rel, 4), data.ExpandGroup("a-3", rel, 8)]
+    plan = data.plan_space(groups, threshold=20, room=10, existing=set())
+    assert [g.seed_id for g in plan.aggregate] == ["a-1", "a-3"]
+    assert [g.seed_id for g in plan.draw] == ["a-2"]
+    refreshed = data.plan_space(groups[:1], threshold=20, room=0, existing={"agg|a-1|r|out"})
+    assert [g.seed_id for g in refreshed.refresh] == ["a-1"]
+
+
+def test_fetch_reads_only_properties_the_caller_may_see_in_full():
+    # One masked property in RETURN makes bkn-backend refuse the whole query.
+    peer = data.meta_from(
+        {
+            "id": "matches",
+            "primary_keys": ["key_id"],
+            "data_properties": [{"name": "key_id", "type": "integer"}, {"name": "match_name"}, {"name": "phone"}],
+            "effective_permissions": {"key_id": "full", "match_name": "full", "phone": "masked"},
+        }
+    )
+    rel = data.IncidentRelation("rel_home", "主队", "in", "teams", "matches")
+    query, _ = data.fetch_query(rel, TEAMS, peer, [{"key_id": 9}], 10)
+    assert "match_name" in query and "phone" not in query
+    # Without permissions in the answer every property is read, as before.
+    assert data.meta_from({"id": "x", "data_properties": [{"name": "a"}]}).readable is None
+
+
+def test_keys_beyond_exact_numbers_stay_text():
+    meta = data.ObjectTypeMeta("orders", "订单", ["id"], {"id": "integer"})
+    assert data.typed(meta, "id", "1234567890123456789") == "1234567890123456789"
+    assert data.typed(meta, "id", "42") == 42
+
+
+def test_expand_refuses_when_the_network_lists_no_relations():
+    run, tools, _ = _expand_run({9: 3})
+    run.state["network"] = {"object_types": {}, "relation_types": {}, "relations_unlisted": True}
+    with pytest.raises(ToolException, match="too large"):
+        asyncio.run(tools["expand_neighbours"].coroutine(ids=["teams-9"], direction="in"))
+
+
+def test_expand_says_which_ids_it_left_out():
+    run, tools, _ = _expand_run({9: 3})
+    out = _invoke(tools["expand_neighbours"], ids=["teams-9", "teams-404"], direction="in")
+    assert out["not_found"] == ["teams-404"]
+
+
+def test_expand_skips_value_nodes_and_never_looks_up_their_type():
+    value = {"id": "value|主场结果|胜", "object_type_id": "@value:主场结果"}
+    run, tools, calls = _expand_run({9: 3}, nodes=[{"id": "teams-9", "object_type_id": "teams"}, value])
+    out = _invoke(tools["expand_neighbours"], ids=["value|主场结果|胜", "teams-9"], direction="in")
+    assert out["skipped_seeds"] == ["value|主场结果|胜"]
+    assert out["planned_added"] == {"nodes": 3, "edges": 3}
+    asked = [i for c in calls if c[0] == "get_object_types" for i in c[1].get("ids") or []]
+    assert not any(i.startswith("@value:") for i in asked)
+    with pytest.raises(ToolException, match="cannot be expanded"):
+        asyncio.run(tools["expand_neighbours"].coroutine(ids=["value|主场结果|胜"], direction="in"))
+
+
+def test_the_canvas_reads_aggregates_this_run_planned():
+    run, tools, _ = _expand_run({9: 50}, threshold=20)
+    _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    aggregates = _invoke(tools["canvas_state"])["aggregates"]
+    assert aggregates["total"] == 1
+    assert aggregates["items"][0]["total"] == 50 and aggregates["items"][0]["planned"]
+
+
+# ---- canvas tools ----
+
+
+def _canvas_run(**context):
+    run, tools, _ = _run(
+        nodes=[
+            {"id": "teams-1", "object_type_id": "teams"},
+            {"id": "teams-9", "object_type_id": "teams"},
+            {"id": "matches-1", "object_type_id": "matches"},
+        ]
+    )
+    for key, value in context.items():
+        setattr(run.context, key, value)
+    return run, tools
+
+
+def _result(run):
+    return builtin_tools.get("graph_explorer").result(run)
+
+
+def test_remove_plans_removal_and_the_canvas_reads_without_them():
+    run, tools = _canvas_run()
+    removed = _invoke(tools["remove_instances"], ids=["teams-1", "teams-404"])
+    assert removed == {"planned_removed": 1, "not_on_canvas": ["teams-404"]}
+    state = _invoke(tools["canvas_state"])
+    assert sorted(n["id"] for n in state["nodes"]["items"]) == ["matches-1", "teams-9"]
+    assert _result(run)["actions"] == [{"action_id": "1", "type": "remove_nodes", "node_ids": ["teams-1"]}]
+
+
+def test_a_removed_node_shown_again_comes_back():
+    run, tools = _canvas_run()
+    _invoke(tools["remove_instances"], ids=["teams-9"])
+    _invoke(tools["show_instances"], ids=["teams-9"])
+    assert "teams-9" in {n["id"] for n in _invoke(tools["canvas_state"])["nodes"]["items"]}
+    result = _result(run)
+    assert [a["type"] for a in result["actions"]] == ["remove_nodes", "merge_subgraph"]
+    assert "teams-9" in {n["id"] for n in result["nodes"]}
+
+
+def test_view_tools_record_their_patches():
+    run, tools = _canvas_run(object_types=[graph.ObjectTypeRef(id="teams"), graph.ObjectTypeRef(id="matches")])
+    _invoke(tools["configure_display"], labels=[{"object_type": "teams", "label": "{team_name}"}], node_size_by="")
+    _invoke(tools["configure_analysis"], chart={"kind": "category", "propertyByOt": {"teams": "region"}})
+    _invoke(tools["arrange_canvas"], layout="radial")
+    with pytest.raises(ToolException, match="Unknown object types"):
+        asyncio.run(tools["configure_display"].coroutine(labels=[{"object_type": "nope", "label": None}]))
+    with pytest.raises(Exception):
+        asyncio.run(tools["arrange_canvas"].ainvoke({"layout": "spiral"}))
+    actions = _result(run)["actions"]
+    assert [a["type"] for a in actions] == ["set_display", "set_analysis", "set_layout"]
+    assert actions[0]["patch"] == {"labels": [{"object_type": "teams", "label": "{team_name}"}], "node_size_by": None}
+    assert actions[2]["layout"] == "radial"
+    assert len(_invoke(tools["view_state"])["planned_view_actions"]) == 3
+
+
+def test_canvas_control_checks_ids_and_tracks_the_selection():
+    run, tools = _canvas_run()
+    with pytest.raises(ToolException, match="Not on the canvas"):
+        asyncio.run(tools["canvas_control"].coroutine(action="select", ids=["teams-404"]))
+    _invoke(tools["canvas_control"], action="select", ids=["teams-1", "teams-9"])
+    _invoke(tools["canvas_control"], action="arrange_selection", layout="grid")
+    assert _invoke(tools["canvas_control"], action="remove_selected") == {"planned_removed": 2}
+    assert _invoke(tools["canvas_state"])["total_nodes"] == 1
+    with pytest.raises(ToolException, match="No nodes are selected"):
+        asyncio.run(tools["canvas_control"].coroutine(action="remove_selected"))
+    assert [a["type"] for a in _result(run)["actions"]] == ["select", "arrange_selection", "remove_nodes"]
+
+
+def test_a_value_node_cannot_start_or_end_a_path():
+    run, tools, _ = _run(
+        nodes=[
+            {"id": "teams-1", "object_type_id": "teams"},
+            {"id": "value|主场结果|胜", "object_type_id": "@value:主场结果"},
+        ]
+    )
+    for action in ("path_start", "path_end"):
+        with pytest.raises(ToolException, match="Value nodes cannot start or end a path"):
+            asyncio.run(tools["canvas_control"].coroutine(action=action, id="value|主场结果|胜"))
+    with pytest.raises(ToolException, match="Value nodes cannot start or end a path"):
+        asyncio.run(tools["canvas_control"].coroutine(action="find_path", start="teams-1", end="value|主场结果|胜"))
+    # A value node may still anchor the views that stay on the canvas.
+    _invoke(tools["canvas_control"], action="distance_heatmap", id="value|主场结果|胜")
+    _invoke(tools["canvas_control"], action="path_start", id="teams-1")
+    assert [a["type"] for a in _result(run)["actions"]] == ["distance_heatmap", "path_start"]
+
+
+def test_undo_takes_back_only_this_runs_view_actions():
+    run, tools = _canvas_run()
+    with pytest.raises(ToolException, match="nothing to undo"):
+        asyncio.run(tools["canvas_control"].coroutine(action="undo"))
+    _invoke(tools["remove_instances"], ids=["teams-1"])
+    _invoke(tools["canvas_control"], action="undo")
+    assert _invoke(tools["canvas_state"])["total_nodes"] == 3
+    # The page may already show the removal, so the undo is an action too.
+    assert [(a["type"], a.get("undoes")) for a in _result(run)["actions"]] == [("remove_nodes", None), ("undo", "1")]
+    with pytest.raises(ToolException, match="nothing to undo"):
+        asyncio.run(tools["canvas_control"].coroutine(action="undo"))
+    run.state["actions"].append({"action_id": "9", "type": "merge_subgraph", "node_ids": [], "edge_ids": []})
+    with pytest.raises(ToolException, match="remove_instances"):
+        asyncio.run(tools["canvas_control"].coroutine(action="undo"))
+
+
+def test_clear_takes_everything_off_and_is_left_to_the_web():
+    run, tools = _canvas_run()
+    cleared = _invoke(tools["canvas_control"], action="clear")
+    assert cleared["planned"] == "clear"
+    assert _invoke(tools["canvas_state"])["total_nodes"] == 0
+    assert [a["type"] for a in _result(run)["actions"]] == ["clear"]
+
+
+def test_manual_groups_get_ids_the_run_can_use_again():
+    run, tools = _canvas_run(view={"canvas": {"manual_groups": [{"id": "g1", "name": "old"}]}})
+    created = _invoke(tools["manual_group"], action="create", name="南美", ids=["teams-1", "teams-9"], color="#3366ff")
+    group = created["planned"]["id"]
+    _invoke(tools["manual_group"], action="rename", id=group, name="南美球队")
+    _invoke(tools["manual_group"], action="collapse", id="g1")
+    with pytest.raises(ToolException, match="Unknown manual group"):
+        asyncio.run(tools["manual_group"].coroutine(action="dissolve", id="g404"))
+    with pytest.raises(ToolException, match="hex"):
+        asyncio.run(tools["manual_group"].coroutine(action="recolor", id="g1", color="blue"))
+    actions = _result(run)["actions"]
+    assert [a["action"] for a in actions] == ["create", "rename", "collapse"]
+    assert actions[0]["ids"] == ["teams-1", "teams-9"] and actions[1]["id"] == group
+
+
+def test_progress_sends_each_new_plan_once_with_its_data():
+    run, tools = _canvas_run()
+    provider = builtin_tools.get("graph_explorer")
+    assert provider.progress(run) is None
+    run.context.nodes = []
+    _invoke(tools["show_instances"], ids=["teams-9", "matches-1"])
+    _invoke(tools["arrange_canvas"], layout="grid")
+    first = provider.progress(run)
+    assert [a["type"] for a in first["actions"]] == ["merge_subgraph", "set_layout"]
+    assert {n["id"] for n in first["nodes"]} == {"teams-9", "matches-1"} and len(first["edges"]) == 1
+    assert provider.progress(run) is None
+    _invoke(tools["remove_instances"], ids=["teams-9"])
+    assert [a["type"] for a in provider.progress(run)["actions"]] == ["remove_nodes"]
+
+
+def test_removing_an_aggregate_keeps_the_result_valid():
+    # Regression: removal named the aggregate, and the result checked it as a node.
+    run, tools, _ = _expand_run({9: 50}, threshold=20)
+    _invoke(tools["expand_neighbours"], ids=["teams-9"], direction="in")
+    assert _invoke(tools["remove_instances"], ids=["agg|teams-9|rel_home|in"])["planned_removed"] == 1
+    result = builtin_tools.get("graph_explorer").result(run)
+    assert result["actions"][-1] == {"action_id": "2", "type": "remove_nodes", "node_ids": ["agg|teams-9|rel_home|in"]}
+
+
+def test_scalar_rows_cut_at_the_default_limit_say_so():
+    # bkn-backend marks it at the top level; execution only comes with graph values.
+    _, tools, _ = _run(cypher={"entries": [{"name": "Messi"}], "limited": True})
+    out = _invoke(tools["run_cypher"], query="MATCH (p:players) RETURN p.name AS name")
+    assert "default limit" in out["limited"]
+
+
+def test_a_node_shown_again_takes_room_and_stays_off_when_there_is_none():
+    run, tools = _canvas_run()
+    run.context.limits.max_nodes = 3
+    _invoke(tools["remove_instances"], ids=["teams-9"])
+    # A full canvas again before teams-9 comes back: it stays off, and is not in the merge.
+    run.state["nodes"]["x-1"] = {"id": "x-1", "object_type_id": "x", "properties": {}, "identity": {}}
+    out = _invoke(tools["show_instances"], ids=["teams-9"])
+    assert out.get("left_out") == 1
+    merges = [a for a in builtin_tools.get("graph_explorer").result(run)["actions"] if a["type"] == "merge_subgraph"]
+    assert all("teams-9" not in a["node_ids"] for a in merges)
+
+
+def test_manual_group_ids_do_not_repeat_across_runs():
+    run, tools = _canvas_run(view={"canvas": {"manual_groups": [{"id": "g-ai-1", "name": "上一轮"}]}})
+    created = _invoke(tools["manual_group"], action="create", name="南美", ids=["teams-1"])
+    assert created["planned"]["id"] != "g-ai-1"
+
+
+def test_cypher_fills_in_only_nodes_the_canvas_has_room_for():
+    cypher = {"entries": [{"t": _obj("teams", i)} for i in (1, 9, 21, 22, 23)]}
+    run, tools, calls = _run(cypher=cypher)
+    run.context.limits.max_nodes = 2
+    out = _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t")
+    looked_up = [v for c in calls if c[0] == "query_object_instance" for v in c[1]["condition"]["value"]]
+    # Two fit; the other three are left out, so they are not looked up either.
+    assert looked_up == [1, 9] and out["left_out"] == 3
+
+
+def test_cypher_keeps_the_label_the_canvas_has_for_its_nodes():
+    # Key-only rows for nodes already on the canvas are not looked up again; their label stays.
+    run, tools, _ = _run(
+        nodes=[{"id": "teams-9", "object_type_id": "teams", "label": "Brazil"}],
+        cypher={"entries": [{"t": _obj("teams", 9)}]},
+    )
+    out = _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t")
+    assert out["items"][0]["label"] == "Brazil"
+
+
+# ---- what a graph query found, sent with the progress ----
+
+_HOME = "MATCH (m:matches)-[r:rel_home]->(t:teams) RETURN t, r, m"
+
+
+def _home(match, team, **computed):
+    rel = {"kind": "relation", "relation_type_id": "rel_home", "source": _obj("matches", match), "target": _obj("teams", team)}
+    return {"t": _obj("teams", team), "r": rel, "m": _obj("matches", match), **computed}
+
+
+def test_progress_carries_what_a_graph_query_found():
+    run, tools, _ = _run(cypher={"entries": [_home(1, 9)]})
+    provider = builtin_tools.get("graph_explorer")
+    _invoke(tools["run_cypher"], query=_HOME)
+    progress = provider.progress(run)
+    [found] = progress["cypher"]
+    assert found["query"] == _HOME and found["truncated"] is False
+    nodes = {n["id"]: n for n in found["nodes"]}
+    assert set(nodes) == {"teams-9", "matches-1"}
+    # The same filled-in data the plan carries.
+    assert nodes["teams-9"]["label"] == "Brazil" and nodes["teams-9"]["properties"]["team_name"] == "Brazil"
+    assert [e["id"] for e in found["edges"]] == ["matches-1|rel_home|teams-9"]
+    # Sent once.
+    assert provider.progress(run) is None
+
+
+def test_a_graph_query_result_names_nodes_the_canvas_already_has():
+    # teams-9 is on the canvas: the plan adds only matches-1, the result holds both,
+    # with this query's computed value on the node it did not add.
+    run, tools, _ = _run(
+        nodes=[{"id": "teams-9", "object_type_id": "teams", "label": "Brazil"}],
+        cypher={"entries": [_home(1, 9, t_goals=3)]},
+    )
+    _invoke(tools["run_cypher"], query=_HOME)
+    progress = builtin_tools.get("graph_explorer").progress(run)
+    assert {n["id"] for n in progress["nodes"]} == {"matches-1"}
+    [found] = progress["cypher"]
+    nodes = {n["id"]: n for n in found["nodes"]}
+    assert set(nodes) == {"teams-9", "matches-1"}
+    assert nodes["teams-9"]["label"] == "Brazil" and nodes["teams-9"]["computed"] == {"t_goals": 3}
+    assert [e["id"] for e in found["edges"]] == ["matches-1|rel_home|teams-9"]
+
+
+def test_a_graph_query_keeps_its_own_computed_values_on_nodes_planned_earlier():
+    run, tools, _ = _run(cypher={"entries": [{"t": _obj("teams", 9), "goals": 3}]})
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t, 3 AS goals")
+    builtin_tools.get("graph_explorer").progress(run)
+    run.state["context_loader"]["run_cypher"] = _tool("run_cypher", [], {"entries": [{"t": _obj("teams", 9), "wins": 1}]})
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t, 1 AS wins")
+    progress = builtin_tools.get("graph_explorer").progress(run)
+    [found] = progress["cypher"]
+    [node] = found["nodes"]
+    assert node["computed"] == {"wins": 1} and node["label"] == "Brazil"
+    # The planned node keeps both, for the canvas.
+    assert run.state["nodes"]["teams-9"]["computed"] == {"goals": 3, "wins": 1}
+
+
+def test_a_graph_query_result_that_plans_nothing_is_still_sent():
+    # A full canvas: nothing is planned, and the page still learns what the query found.
+    run, tools, _ = _run(
+        nodes=[{"id": "teams-1", "object_type_id": "teams"}],
+        cypher={"entries": [{"t": _obj("teams", 9)}]},
+    )
+    run.context.limits.max_nodes = 1
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t")
+    progress = builtin_tools.get("graph_explorer").progress(run)
+    assert progress["actions"] == [] and progress["nodes"] == [] and progress["edges"] == []
+    assert progress["cypher"] == [
+        {"query": "MATCH (t:teams) RETURN t", "nodes": [], "edges": [], "truncated": True}
+    ]
+
+
+@pytest.mark.parametrize(
+    "extra, room",
+    [({"limited": True}, None), ({"execution": {"conclusions_limited": True}}, None), ({}, 2)],
+)
+def test_a_cut_graph_query_result_says_so(extra, room):
+    run, tools, _ = _run(cypher={"entries": [{"t": _obj("teams", i)} for i in (1, 9, 21)], **extra})
+    if room:
+        run.context.limits.max_nodes = room
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t")
+    [found] = builtin_tools.get("graph_explorer").progress(run)["cypher"]
+    assert found["truncated"] is True
+    # Nodes left out for lack of room are not in it.
+    assert len(found["nodes"]) == (room or 3)
+
+
+def test_graph_queries_finished_together_are_sent_with_their_text():
+    run, tools, _ = _run(cypher={"entries": [{"t": _obj("teams", 9)}]})
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t")
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN t LIMIT 1")
+    found = builtin_tools.get("graph_explorer").progress(run)["cypher"]
+    assert [f["query"] for f in found] == ["MATCH (t:teams) RETURN t", "MATCH (t:teams) RETURN t LIMIT 1"]
+
+
+def test_table_only_queries_and_other_tools_send_no_query_result():
+    run, tools, _ = _run(cypher={"columns": [{"name": "n"}], "entries": [{"n": 3}]})
+    provider = builtin_tools.get("graph_explorer")
+    _invoke(tools["run_cypher"], query="MATCH (t:teams) RETURN count(t) AS n")
+    assert provider.progress(run) is None
+    _invoke(tools["show_instances"], ids=["teams-9"])
+    assert "cypher" not in provider.progress(run)
+
+
+def _analysis_run(cards):
+    run = builtin_tools.Run(
+        provider=builtin_tools.get("graph_explorer"),
+        kn_id="network-1",
+        context=graph.CanvasContext(canvas_id="c1", revision=0, analysis_cards=cards),
+        account_id="user-1",
+        account_type="user",
+    )
+    run.state["context_loader"] = {}
+    return run, {t.name: t for t in graph._tools(run)}
+
+
+def test_cards_are_edited_only_in_an_analysis():
+    run, tools, _ = _run()
+    # Outside an analysis the instructions say nothing of cards and the tool refuses.
+    assert graph._card_instructions(run) == []
+    with pytest.raises(ToolException, match="not asked in an analysis"):
+        asyncio.run(tools["edit_analysis_cards"].ainvoke({"remove": [1]}))
+
+
+def test_card_instructions_list_cards_by_number():
+    run, _ = _analysis_run([{"no": 19, "title": "图表", "kind": "chart"}, {"no": 20, "kind": "merge"}])
+    text = "\n".join(graph._card_instructions(run))
+    assert "never a node" in text
+    # Clearing in an analysis starts a new line; no confirmation is promised.
+    assert "starts a new line" in text and "not asked to confirm" in text
+    assert "- #19 图表 (chart)" in text and "- #20 merge (merge)" in text
+
+
+def test_card_edits_name_listed_cards_only():
+    run, tools = _analysis_run([{"no": 19, "title": "图表", "kind": "chart"}, {"no": 20, "kind": "merge"}])
+    edited = _invoke(tools["edit_analysis_cards"], remove=[19, 19], rename=[{"no": 20, "title": " 合并结果 "}])
+    assert edited == {"removed": [19], "renamed": [{"no": 20, "title": "合并结果"}]}
+    # Nothing is planned for the canvas: the page applies card edits itself.
+    assert not run.state.get("actions")
+    with pytest.raises(ToolException, match="#7"):
+        asyncio.run(tools["edit_analysis_cards"].ainvoke({"remove": [7]}))
+    with pytest.raises(ToolException, match="Nothing"):
+        asyncio.run(tools["edit_analysis_cards"].ainvoke({}))
+
+
+def test_html_is_shown_only_in_an_analysis():
+    _, tools, _ = _run()
+    with pytest.raises(ToolException, match="not asked in an analysis"):
+        asyncio.run(tools["show_html"].ainvoke({"title": "t", "html": "<p>1</p>"}))
+
+
+def test_html_travels_whole_as_an_action():
+    run, tools = _analysis_run([{"no": 1, "kind": "select"}])
+    html = "<!doctype html><svg xmlns='http://www.w3.org/2000/svg'></svg>" + "<p>x</p>" * 2000
+    shown = _invoke(tools["show_html"], title=" 交期对比 ", html=html, description=" 按供应商 ")
+    assert shown == {"shown": {"title": "交期对比", "description": "按供应商"}}
+    # The page reads the HTML from the action: a tool's input reaches it cut short.
+    action = {"action_id": "1", "type": "show_html", "html": html, "title": "交期对比", "description": "按供应商"}
+    assert graph._progress(run)["actions"] == [action]
+    assert _result(run)["actions"] == [action]
+    assert "show_html" in "\n".join(graph._card_instructions(run))
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<img src="https://cdn.example.com/a.png">',
+        '<script src="//cdn.example.com/lib.js"></script>',
+        "<script>location.href = '?d=' + data</script>",
+        "<script>window.open('x')</script>",
+        '<meta http-equiv="refresh" content="0;url=x">',
+    ],
+)
+def test_html_that_reaches_outside_is_refused(html):
+    run, tools = _analysis_run([])
+    with pytest.raises(ToolException, match="reaches outside"):
+        asyncio.run(tools["show_html"].ainvoke({"title": "t", "html": html}))
+    assert not run.state.get("actions")
+
+
+def test_metric_cards_name_known_types():
+    run, tools = _canvas_run(object_types=[graph.ObjectTypeRef(id="teams"), graph.ObjectTypeRef(id="matches")])
+    metric = {"kind": "metric", "metrics": [{"label": "球队", "otId": "teams", "measure": "count"}]}
+    planned = _invoke(tools["configure_analysis"], chart=metric)
+    assert planned["planned"]["config"]["metrics"][0]["otId"] == "teams"
+    with pytest.raises(ToolException, match="ghosts"):
+        asyncio.run(
+            tools["configure_analysis"].ainvoke(
+                {"chart": {"kind": "metric", "metrics": [{"label": "x", "otId": "ghosts", "measure": "count"}]}}
+            )
+        )
+
+
+def test_instructions_name_each_type_key():
+    run, _, _ = _run()
+    text = asyncio.run(graph._instructions(run))
+    # A code in a question is matched against the key, which the model need not guess.
+    assert "- teams (球队)\n  key: key_id\n  properties: team_name:string" in text
+    assert "- matches (比赛)" in text and "matches (比赛)\n  key" not in text
+
+
+def test_a_filter_on_a_missing_property_names_the_real_ones():
+    """Regression: a guessed field name reached ontology-query, which answers a bare
+    invalid parameter, so the model could not tell what to fix."""
+    run, tools, calls = _run()
+    with pytest.raises(ToolException, match=r"teams has no property team_code\. Its properties are: key_id$"):
+        asyncio.run(
+            tools["query_instances"].coroutine(
+                object_type="teams", filters=[{"field": "team_code", "operation": "==", "value": "x"}]
+            )
+        )
+    assert not any(c[0] == "query_object_instance" for c in calls)
+
+
+def test_clearing_in_an_analysis_promises_no_confirmation():
+    _, tools = _analysis_run([{"no": 1, "kind": "select"}])
+    cleared = _invoke(tools["canvas_control"], action="clear")
+    # The model read "the user confirms" here, undid the clear and cleared again.
+    assert "confirm" in cleared["note"] and "nobody is asked" in cleared["note"]
+
+
+def test_a_chain_chart_follows_a_relation_from_a_type_to_itself():
+    run, tools = _canvas_run(object_types=[graph.ObjectTypeRef(id="segment"), graph.ObjectTypeRef(id="company")])
+    run.state["network"] = {
+        "relation_types": {
+            "supplies": {"name": "上游供给", "source": "segment", "target": "segment"},
+            "works_in": {"name": "参与环节", "source": "company", "target": "segment"},
+        }
+    }
+    chain = {"kind": "chain", "otIds": ["segment"], "chainRelByOt": {"segment": "supplies"}}
+    planned = _invoke(tools["configure_analysis"], chart=chain)
+    assert planned["planned"]["config"]["chainRelByOt"] == {"segment": "supplies"}
+    with pytest.raises(ToolException, match="to itself"):
+        asyncio.run(
+            tools["configure_analysis"].ainvoke(
+                {"chart": {"kind": "chain", "otIds": ["company"], "chainRelByOt": {"company": "works_in"}}}
+            )
+        )
+    with pytest.raises(ToolException, match="needs chainRelByOt"):
+        asyncio.run(tools["configure_analysis"].ainvoke({"chart": {"kind": "chain", "otIds": ["segment"]}}))
+    with pytest.raises(ToolException, match="Unknown object types"):
+        asyncio.run(
+            tools["configure_analysis"].ainvoke({"chart": {"kind": "chain", "chainRelByOt": {"ghosts": "supplies"}}})
+        )
+
+
+def test_analysis_instructions_draw_a_chain_as_a_chart():
+    run, _ = _analysis_run([])
+    text = "\n".join(graph._card_instructions(run))
+    assert "industry chain" in text and "kind chain" in text and "do not clear" in text

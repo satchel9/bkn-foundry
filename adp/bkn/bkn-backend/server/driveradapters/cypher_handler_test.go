@@ -16,13 +16,13 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 const cypherKNID = "kn_1"
@@ -137,6 +137,25 @@ func TestRunCypherQueryPassesTheBranch(t *testing.T) {
 	}
 }
 
+// #2090: a caller may ask for a shorter statement timeout; the value reaches
+// the service, which decides whether it is allowed.
+func TestRunCypherQueryPassesTheTimeout(t *testing.T) {
+	engine, cypherQueries, knowledgeNetworks := cypherTestHandler(t)
+	knowledgeNetworks.EXPECT().CheckKNExistByID(gomock.Any(), cypherKNID, interfaces.MAIN_BRANCH).
+		Return(cypherKNID, true, nil)
+	cypherQueries.EXPECT().
+		Query(gomock.Any(), interfaces.CypherQuery{
+			KNID: cypherKNID, Branch: interfaces.MAIN_BRANCH, Query: "MATCH (o:Order) RETURN o.id", TimeoutSec: 10,
+		}).
+		Return(&interfaces.CypherQueryResult{}, nil)
+
+	recorder := postCypher(engine, cypherURL("in/", cypherKNID),
+		`{"query":"MATCH (o:Order) RETURN o.id","timeout_sec":10}`, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 // The caller's identity has to be in the context before the service runs:
 // everything below authorizes against it.
 func TestRunCypherQueryPutsTheCallerInContext(t *testing.T) {
@@ -205,7 +224,7 @@ func TestRunCypherQueryKeepsTheServiceStatus(t *testing.T) {
 	knowledgeNetworks.EXPECT().CheckKNExistByID(gomock.Any(), cypherKNID, gomock.Any()).
 		Return(cypherKNID, true, nil)
 	cypherQueries.EXPECT().Query(gomock.Any(), gomock.Any()).
-		Return(nil, rest.NewHTTPError(context.Background(), http.StatusForbidden, rest.PublicError_Forbidden))
+		Return(nil, httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden))
 
 	recorder := postCypher(engine, cypherURL("in/", cypherKNID),
 		`{"query":"MATCH (o:Order) RETURN o.id"}`, nil)
@@ -243,5 +262,64 @@ func TestRunCypherQueryReportsAFailedExistenceCheck(t *testing.T) {
 		`{"query":"MATCH (o:Order) RETURN o.id"}`, nil)
 	if recorder.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+}
+
+// explain reaches the service, and its plan comes back on both faces in place
+// of rows.
+func TestRunCypherQueryPassesExplain(t *testing.T) {
+	for _, face := range []string{"", "in/"} {
+		t.Run("face "+face, func(t *testing.T) {
+			engine, cypherQueries, knowledgeNetworks := cypherTestHandler(t)
+			knowledgeNetworks.EXPECT().CheckKNExistByID(gomock.Any(), cypherKNID, interfaces.MAIN_BRANCH).
+				Return(cypherKNID, true, nil)
+			cypherQueries.EXPECT().
+				Query(gomock.Any(), interfaces.CypherQuery{
+					KNID: cypherKNID, Branch: interfaces.MAIN_BRANCH, Query: "MATCH (o:Order) RETURN o.id", Explain: true,
+				}).
+				Return(&interfaces.CypherQueryResult{
+					Columns: []interfaces.RawQueryColumn{}, Entries: []map[string]any{},
+					Plan: &interfaces.CypherPlan{Shape: "match", Limit: interfaces.CYPHER_DEFAULT_LIMIT, LimitSource: "default"},
+				}, nil)
+
+			recorder := postCypher(engine, cypherURL(face, cypherKNID),
+				`{"query":"MATCH (o:Order) RETURN o.id","explain":true}`,
+				map[string]string{
+					interfaces.HTTP_HEADER_ACCOUNT_ID:   "user-42",
+					interfaces.HTTP_HEADER_ACCOUNT_TYPE: "user",
+				})
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if !bytes.Contains(recorder.Body.Bytes(), []byte(`"plan":{"shape":"match"`)) {
+				t.Fatalf("body = %s, want the plan", recorder.Body.String())
+			}
+		})
+	}
+}
+
+// limited comes back on both faces: the internal one lists its fields, and a
+// field it leaves out is dropped.
+func TestRunCypherQueryPassesLimited(t *testing.T) {
+	for _, face := range []string{"", "in/"} {
+		t.Run("face "+face, func(t *testing.T) {
+			engine, cypherQueries, knowledgeNetworks := cypherTestHandler(t)
+			knowledgeNetworks.EXPECT().CheckKNExistByID(gomock.Any(), cypherKNID, interfaces.MAIN_BRANCH).
+				Return(cypherKNID, true, nil)
+			cypherQueries.EXPECT().Query(gomock.Any(), gomock.Any()).
+				Return(&interfaces.CypherQueryResult{
+					Columns: []interfaces.RawQueryColumn{{Name: "id"}}, Entries: []map[string]any{{"id": 1}}, Limited: true,
+				}, nil)
+
+			recorder := postCypher(engine, cypherURL(face, cypherKNID),
+				`{"query":"MATCH (o:Order) RETURN o.id AS id"}`,
+				map[string]string{
+					interfaces.HTTP_HEADER_ACCOUNT_ID:   "user-42",
+					interfaces.HTTP_HEADER_ACCOUNT_TYPE: "user",
+				})
+			if recorder.Code != http.StatusOK || !bytes.Contains(recorder.Body.Bytes(), []byte(`"limited":true`)) {
+				t.Fatalf("status = %d, body = %s, want limited", recorder.Code, recorder.Body.String())
+			}
+		})
 	}
 }

@@ -10,14 +10,14 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
-
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
 )
 
@@ -38,6 +38,10 @@ func (viewService *queryViewService) QueryWithPaging(_ context.Context, resource
 	viewService.resource = resource
 	viewService.params = params
 	return &interfaces.ResourceDataQueryResult{Entries: []map[string]any{{"id": "row-1"}}, Paging: &interfaces.PagingResponse{}}, nil
+}
+
+func (*queryViewService) PrepareSQLQuery(ctx context.Context, _ *sqlbuilder.SelectBuilder, _ []*interfaces.Resource) (*interfaces.SQLViewQuery, error) {
+	return nil, httperrors.NewHTTPError(ctx, http.StatusNotImplemented, httperrors.PublicError_NotImplemented)
 }
 
 func TestResourceDataServiceQueryWithPagingUsesLogicalViewService(t *testing.T) {
@@ -79,7 +83,7 @@ func TestResourceDataServiceQueryWithPagingWithoutLogicalViewService(t *testing.
 		SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}}}
 
 	_, err := service.QueryWithPaging(context.Background(), view, &interfaces.ResourceDataQueryParams{})
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	require.ErrorAs(t, err, &httpErr)
 	assert.Equal(t, http.StatusNotImplemented, httpErr.HTTPCode)
 }

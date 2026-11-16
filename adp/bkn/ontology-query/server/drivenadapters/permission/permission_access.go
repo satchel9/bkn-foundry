@@ -15,8 +15,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"ontology-query/common"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 const permissionRequestTimeoutSeconds = 5
@@ -27,6 +27,10 @@ type permissionAccess struct {
 }
 
 func NewPermissionAccess(appSetting *common.AppSetting) interfaces.PermissionAccess {
+	return newPermissionAccess(appSetting)
+}
+
+func newPermissionAccess(appSetting *common.AppSetting) *permissionAccess {
 	baseURL := ""
 	if appSetting != nil {
 		baseURL = strings.TrimRight(strings.TrimSpace(appSetting.BknSafeURL), "/")

@@ -1,9 +1,16 @@
+// Copyright openbkn.ai
+//
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
 package dataset
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -11,10 +18,65 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
 )
+
+func TestPrepareDocument(t *testing.T) {
+	t.Run("scale may exceed precision without accepting out of range values", func(t *testing.T) {
+		resource := &interfaces.Resource{LocalIndexName: "index", Category: interfaces.ResourceCategoryDataset, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"precision": 3, "scale": 5}}}}
+		for _, value := range []string{"0.00123", "0.01234", "0.001234"} {
+			original := map[string]any{"amount": value}
+			document, pending, err := prepareDocument(context.Background(), resource, original)
+			if value == "0.00123" {
+				require.NoError(t, err)
+				assert.Equal(t, value, document["amount"])
+			} else {
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+				assert.Nil(t, document)
+			}
+			assert.Empty(t, pending)
+			assert.Equal(t, value, original["amount"])
+		}
+	})
+
+	t.Run("integer decimal encoding preserves the source document", func(t *testing.T) {
+		resource := &interfaces.Resource{LocalIndexName: "index", Category: interfaces.ResourceCategoryDataset, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"precision": 38, "scale": 0}}}}
+		original := map[string]any{"amount": "9007199254740993"}
+		encoded, pending, err := prepareDocument(context.Background(), resource, original)
+		require.NoError(t, err)
+		assert.Equal(t, int64(9007199254740993), encoded["amount"])
+		assert.Equal(t, "9007199254740993", original["amount"])
+		assert.Empty(t, pending)
+	})
+
+	res := &interfaces.Resource{LocalIndexName: "index", Category: interfaces.ResourceCategoryDataset, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"precision": 12, "scale": 2}}}}
+	for _, tc := range []struct {
+		value string
+		valid bool
+	}{{"13052.52", true}, {"-123456.78", true}, {"10.00", true}, {"10000000000.00", false}, {"1.234", false}} {
+		t.Run(tc.value, func(t *testing.T) {
+			original := map[string]any{"amount": tc.value}
+			document, pending, err := prepareDocument(context.Background(), res, original)
+			if tc.valid {
+				require.NoError(t, err)
+				assert.Equal(t, original, document)
+				assert.Empty(t, pending)
+			} else {
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+				assert.Nil(t, document)
+				assert.Empty(t, pending)
+			}
+			assert.Equal(t, tc.value, original["amount"])
+		})
+	}
+}
 
 func TestMaterializeDocument(t *testing.T) {
 	resource := &interfaces.Resource{
@@ -115,4 +177,101 @@ func TestMaterializeDocument(t *testing.T) {
 
 		require.ErrorContains(t, err, "no valid dimension")
 	})
+}
+
+func TestMaterializeDocuments(t *testing.T) {
+	t.Run("invalid decimal batch fails before any downstream request", func(t *testing.T) {
+		manager := vmock.NewMockLocalIndexManager(gomock.NewController(t))
+		service := &datasetService{lim: manager}
+		resource := &interfaces.Resource{LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"precision": 12, "scale": 2}}}}
+		result, err := service.materializeDocuments(context.Background(), resource, []map[string]any{{"amount": "13052.52"}, {"amount": "1.234"}})
+		require.Error(t, err)
+		assert.Nil(t, result)
+	})
+
+	for i, id := range []any{nil, 123, "", " \t", strings.Repeat("a", 513), strings.Repeat("界", 171), string([]byte{0xff})} {
+		t.Run(fmt.Sprintf("invalid ID %d", i), func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mfs := vmock.NewMockModelFactoryService(ctrl)
+			resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+			results, err := (&datasetService{mfs: mfs}).materializeDocuments(context.Background(), resource, []map[string]any{{"_id": "valid", "content": "hello"}, {"_id": id}})
+			require.Error(t, err)
+			assert.Nil(t, results)
+		})
+	}
+	for _, tc := range []struct {
+		name                string
+		modelErr, vectorErr error
+	}{
+		{name: "batches inference"}, {name: "registry failure", modelErr: errors.New("secret registry detail")}, {name: "inference failure", vectorErr: errors.New("secret model detail")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mfs := vmock.NewMockModelFactoryService(ctrl)
+			resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+			model := &interfaces.SmallModel{ModelID: "model"}
+			mfs.EXPECT().GetModelByID(gomock.Any(), "model").Return(model, tc.modelErr).Times(1)
+			if tc.modelErr == nil {
+				mfs.EXPECT().GetVector(gomock.Any(), model, []string{"one", "two"}).Return([]*interfaces.VectorResp{{Vector: []float32{1, 2}}, {Vector: []float32{3, 4}}}, tc.vectorErr).Times(1)
+			}
+			inputs := []map[string]any{{"_id": "first", "content": "one"}, {"_id": "second", "content": "two"}, {"_id": "explicit", "content_vector": []float32{5, 6}}}
+
+			results, err := (&datasetService{mfs: mfs}).materializeDocuments(context.Background(), resource, inputs)
+			if tc.modelErr != nil || tc.vectorErr != nil {
+				require.Error(t, err)
+				assert.Nil(t, results)
+				if tc.modelErr != nil {
+					assert.ErrorIs(t, err, tc.modelErr)
+				} else {
+					assert.ErrorIs(t, err, tc.vectorErr)
+				}
+			} else {
+				require.NoError(t, err)
+				require.Len(t, results, 3)
+				assert.Equal(t, "first", results[0].ID)
+				assert.Equal(t, "second", results[1].ID)
+				assert.Equal(t, "explicit", results[2].ID)
+				for i, result := range results {
+					assert.NotContains(t, result.Document, "_id")
+					assert.Equal(t, result.ID, inputs[i]["_id"])
+				}
+				assert.Equal(t, []float32{1, 2}, results[0].Document["content_vector"])
+				assert.Equal(t, []float32{3, 4}, results[1].Document["content_vector"])
+				assert.Equal(t, []float32{5, 6}, results[2].Document["content_vector"])
+			}
+			assert.NotContains(t, inputs[0], "content_vector")
+		})
+	}
+	t.Run("bounds inference calls and keeps document association", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mfs := vmock.NewMockModelFactoryService(ctrl)
+		model := &interfaces.SmallModel{ModelID: "model"}
+		resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 1}}}}}}
+		mfs.EXPECT().GetModelByID(gomock.Any(), "model").Return(model, nil).Times(1)
+		calls := 0
+		mfs.EXPECT().GetVector(gomock.Any(), model, gomock.Any()).DoAndReturn(func(_ context.Context, _ *interfaces.SmallModel, words []string) ([]*interfaces.VectorResp, error) {
+			calls++
+			assert.LessOrEqual(t, len(words), 128)
+			result := make([]*interfaces.VectorResp, len(words))
+			for i, word := range words {
+				value, err := strconv.Atoi(word)
+				require.NoError(t, err)
+				result[i] = &interfaces.VectorResp{Vector: []float32{float32(value)}}
+			}
+			return result, nil
+		}).Times(2)
+		inputs := make([]map[string]any, 129)
+		for i := range inputs {
+			inputs[i] = map[string]any{"_id": strconv.Itoa(i), "content": strconv.Itoa(i)}
+		}
+		results, err := (&datasetService{mfs: mfs}).materializeDocuments(context.Background(), resource, inputs)
+		assert.Equal(t, 2, calls)
+		require.NoError(t, err)
+		for i := range inputs {
+			assert.Equal(t, strconv.Itoa(i), results[i].ID)
+			assert.NotContains(t, results[i].Document, "_id")
+			assert.Equal(t, []float32{float32(i)}, results[i].Document["content_vector"])
+		}
+	})
+
 }

@@ -7,23 +7,24 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
-	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/localize"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces/model"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 )
 
-// requireOperatorTypePermission verifies that the caller holds the specified operation permission on the operator type.
+// requireToolBoxTypePermission verifies that the caller holds the specified operation permission on the tool_box type.
 //
-// The classification is a global classification method and does not belong to any single operator. There is no resource ID to judge, so it is based on type level (ResourceIDAll)
+// The classification is a global classification method and does not belong to any single resource. There is no resource ID to judge, so it is based on type level (ResourceIDAll)
 // Determination, the semantics is the same as CheckCreatePermission in logics/auth/decision.go.
 //
 // It only takes effect on the public side: the internal side (internal-v1) is called between services, and the built-in classification injection during startup also takes this path.
 // (see driveradapters/category/init_data.go), following the existing idiom within the service to skip the determination.
 // The read interface (GetCategoryList) does not judge: the taxonomy is just a name dictionary and contains no caller-specific data. Tightening will interrupt the non-super management front end.
-func (c *categoryManager) requireOperatorTypePermission(ctx context.Context, userID string,
+func (c *categoryManager) requireToolBoxTypePermission(ctx context.Context, userID string,
 	operation interfaces.AuthOperationType) error {
 	if !common.IsPublicAPIFromCtx(ctx) {
 		return nil
@@ -33,7 +34,7 @@ func (c *categoryManager) requireOperatorTypePermission(ctx context.Context, use
 		return err
 	}
 	authorized, err := c.AuthService.OperationCheckAll(ctx, accessor,
-		interfaces.ResourceIDAll, interfaces.AuthResourceTypeOperator, operation)
+		interfaces.ResourceIDAll, interfaces.AuthResourceTypeToolBox, operation)
 	if err != nil {
 		return err
 	}
@@ -117,8 +118,10 @@ func (c *categoryManager) GetCategoryList(ctx context.Context) (categoryList []*
 
 func (c *categoryManager) getCategoryOther(ctx context.Context) *interfaces.CategoryInfo {
 	language := common.GetLanguageByCtx(ctx)
-	tr := localize.NewI18nTranslator(language)
-	categoryName := tr.Trans("category." + interfaces.CategoryTypeOther.String())
+	categoryName, renderErr := i18n.Render(language, "AgentOperatorIntegration.category."+interfaces.CategoryTypeOther.String(), nil)
+	if renderErr != nil {
+		c.logger.Errorf("localized category failed: %v", renderErr)
+	}
 	return &interfaces.CategoryInfo{
 		CategoryType: interfaces.CategoryTypeOther,
 		CategoryName: categoryName,
@@ -127,8 +130,10 @@ func (c *categoryManager) getCategoryOther(ctx context.Context) *interfaces.Cate
 
 func (c *categoryManager) getCategorySystem(ctx context.Context) *interfaces.CategoryInfo {
 	language := common.GetLanguageByCtx(ctx)
-	tr := localize.NewI18nTranslator(language)
-	categoryName := tr.Trans("category." + interfaces.CategoryTypeSystem.String())
+	categoryName, renderErr := i18n.Render(language, "AgentOperatorIntegration.category."+interfaces.CategoryTypeSystem.String(), nil)
+	if renderErr != nil {
+		c.logger.Errorf("localized category failed: %v", renderErr)
+	}
 	return &interfaces.CategoryInfo{
 		CategoryType: interfaces.CategoryTypeSystem,
 		CategoryName: categoryName,
@@ -139,7 +144,7 @@ func (c *categoryManager) getCategorySystem(ctx context.Context) *interfaces.Cat
 func (c *categoryManager) UpdateCategory(ctx context.Context, req *interfaces.UpdateCategoryReq) (resp *interfaces.UpdateCategoryResp, err error) {
 	ctx, _ = oteltrace.StartInternalSpan(ctx)
 	defer oteltrace.EndSpan(ctx, err)
-	if err = c.requireOperatorTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeModify); err != nil {
+	if err = c.requireToolBoxTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeModify); err != nil {
 		return
 	}
 	// Check classification name.
@@ -192,7 +197,7 @@ func (c *categoryManager) UpdateCategory(ctx context.Context, req *interfaces.Up
 func (c *categoryManager) CreateCategory(ctx context.Context, req *interfaces.CreateCategoryReq) (resp *interfaces.CreateCategoryResp, err error) {
 	ctx, _ = oteltrace.StartInternalSpan(ctx)
 	defer oteltrace.EndSpan(ctx, err)
-	if err = c.requireOperatorTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeCreate); err != nil {
+	if err = c.requireToolBoxTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeCreate); err != nil {
 		return
 	}
 	// Check classification name.
@@ -259,7 +264,7 @@ func (c *categoryManager) BatchCreateCategory(ctx context.Context, req []*interf
 func (c *categoryManager) DeleteCategory(ctx context.Context, req *interfaces.DeleteCategoryReq) (err error) {
 	ctx, _ = oteltrace.StartInternalSpan(ctx)
 	defer oteltrace.EndSpan(ctx, err)
-	if err = c.requireOperatorTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeDelete); err != nil {
+	if err = c.requireToolBoxTypePermission(ctx, req.UserID, interfaces.AuthOperationTypeDelete); err != nil {
 		return
 	}
 	if string(req.CategoryType) == interfaces.CategoryTypeOther.String() {

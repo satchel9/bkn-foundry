@@ -10,13 +10,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf16"
 
 	"github.com/antlr4-go/antlr/v4"
 
-	"bkn-backend/interfaces"
-	"bkn-backend/logics/cypher/parsing"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/cypher/parsing"
 )
 
 // The parser accepts all of openCypher; this file decides what the compiler
@@ -72,15 +73,53 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 	if regular == nil {
 		return nil, unsupported(statement.OC_Query(), "procedure calls")
 	}
-	if len(regular.AllOC_Union()) > 0 {
-		return nil, unsupported(regular, "UNION")
+	unions := regular.AllOC_Union()
+	if len(unions) == 0 {
+		return analyzeSingle(regular.OC_SingleQuery())
 	}
-	single := regular.OC_SingleQuery()
-	if single.OC_MultiPartQuery() != nil {
-		return nil, unsupported(single, "WITH")
+	first, err := analyzeSingle(regular.OC_SingleQuery())
+	if err != nil {
+		return nil, err
 	}
+	union := &Union{Parts: []*Query{first}, All: unions[0].ALL() != nil}
+	for _, next := range unions {
+		// openCypher does not let the two be mixed: which rows repeat would
+		// depend on the order the parts are put together in.
+		if (next.ALL() != nil) != union.All {
+			return nil, unsupportedf(next, "mixing UNION and UNION ALL", "write UNION ALL between every part, or UNION between every part")
+		}
+		part, err := analyzeSingle(next.OC_SingleQuery())
+		if err != nil {
+			return nil, err
+		}
+		union.Parts = append(union.Parts, part)
+	}
+	return &Query{Union: union}, nil
+}
 
+// analyzeSingle reads one query: a part of a UNION, or the whole query.
+func analyzeSingle(single parsing.IOC_SingleQueryContext) (*Query, error) {
+	if multi := single.OC_MultiPartQuery(); multi != nil {
+		return analyzeMultiPart(multi)
+	}
 	part := single.OC_SinglePartQuery()
+	returning, err := readOnlyReturn(part)
+	if err != nil {
+		return nil, err
+	}
+	query, err := analyzeReading(part.AllOC_ReadingClause(), part, nameScope{})
+	if err != nil {
+		return nil, err
+	}
+	if err := analyzeProjectionBody(query, returning.OC_ProjectionBody(), nil, nil); err != nil {
+		return nil, err
+	}
+	return query, nil
+}
+
+// readOnlyReturn checks that the last part of a query writes nothing and
+// returns something.
+func readOnlyReturn(part parsing.IOC_SinglePartQueryContext) (parsing.IOC_ReturnContext, error) {
 	if updating := part.AllOC_UpdatingClause(); len(updating) > 0 {
 		// The subset is read-only by construction, not by permission check, so
 		// a write clause is refused before anything is bound or generated.
@@ -90,14 +129,23 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 	if returning == nil {
 		return nil, unsupportedf(part, "a query without RETURN", "add a RETURN clause")
 	}
+	return returning, nil
+}
 
-	reading := part.AllOC_ReadingClause()
+// analyzeReading reads MATCH clauses into a pattern and its conditions, with
+// the names an earlier WITH introduced resolved.
+func analyzeReading(reading []parsing.IOC_ReadingClauseContext, at antlr.ParserRuleContext, scope nameScope) (*Query, error) {
 	if len(reading) == 0 {
-		return nil, unsupportedf(part, "a query without MATCH", "add a MATCH clause")
+		return nil, unsupportedf(at, "a query without MATCH", "add a MATCH clause")
 	}
 
 	query := &Query{}
 	builder := newPatternBuilder()
+	for name, binding := range scope {
+		if binding.label != "" {
+			builder.carried[name] = binding.label
+		}
+	}
 	var inline []Predicate
 	var lastMatch parsing.IOC_MatchContext
 
@@ -108,7 +156,7 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 		match := clause.OC_Match()
 		if match == nil {
 			if clause.OC_Unwind() != nil {
-				return nil, unsupported(clause, "UNWIND")
+				return nil, unwindError(clause)
 			}
 			return nil, unsupported(clause, "procedure calls")
 		}
@@ -137,10 +185,13 @@ func Analyze(tree parsing.IOC_CypherContext) (*Query, error) {
 	// Conditions from the pattern and from WHERE mean the same thing and are
 	// joined the way Cypher joins them.
 	query.Where = combine("AND", inline, positionOf(lastMatch))
-	if err := refuseRequiredUseOfOptional(query); err != nil {
+	if err := refuseBareNullChecks(query.Where); err != nil {
 		return nil, err
 	}
-	if err := analyzeProjectionBody(query, returning.OC_ProjectionBody()); err != nil {
+	if err := scope.resolve(query); err != nil {
+		return nil, err
+	}
+	if err := refuseRequiredUseOfOptional(query); err != nil {
 		return nil, err
 	}
 	return query, nil
@@ -206,6 +257,10 @@ func predicateProperties(predicate Predicate) []PropertyRef {
 		return []PropertyRef{node.Property}
 	case ExpressionComparison:
 		return append(expressionProperties(node.Left), expressionProperties(node.Right)...)
+	case PropertyComparison:
+		return []PropertyRef{node.Left, node.Right}
+	case SemiJoin:
+		return []PropertyRef{node.Outer}
 	case Negation:
 		return predicateProperties(node.Operand)
 	case LogicalOperator:
@@ -234,10 +289,13 @@ type patternBuilder struct {
 	// variable is one node wherever it is written, which is what makes several
 	// MATCH clauses one shape.
 	clause int
+	// carried labels the nodes a carried stage passed on, which a MATCH may
+	// name without writing their label again.
+	carried map[string]string
 }
 
 func newPatternBuilder() *patternBuilder {
-	return &patternBuilder{nodeOf: map[string]int{}}
+	return &patternBuilder{nodeOf: map[string]int{}, carried: map[string]string{}}
 }
 
 // addPattern reads one MATCH's worth of comma-separated paths. Everything it
@@ -406,6 +464,13 @@ func (b *patternBuilder) addNode(ctx parsing.IOC_NodePatternContext) (int, error
 			return existing, nil
 		}
 	}
+	if label, carried := b.carried[node.Variable]; carried && node.Variable != "" && !node.Anonymous {
+		if node.Label != "" && node.Label != label {
+			return 0, unsupportedf(ctx, "one variable with two labels",
+				"%q is already %q here", node.Variable, label)
+		}
+		node.Label = label
+	}
 	if node.Label == "" {
 		// A first mention has to say what it is: without a label there is no
 		// object type, and without an object type there is no table to read.
@@ -506,7 +571,9 @@ func analyzeInlineProperties(ctx parsing.IOC_PropertiesContext, variable string)
 	for i, key := range keys {
 		value, err := analyzeOperand(values[i])
 		if err != nil {
-			return nil, err
+			if value, err = nameOperand(values[i], err); err != nil {
+				return nil, err
+			}
 		}
 		if value.operand() == nil {
 			return nil, unsupportedf(values[i], "a property map holding something other than a value",
@@ -554,9 +621,12 @@ func analyzeRelationship(ctx parsing.IOC_RelationshipPatternContext) (*EdgeRef, 
 		return nil, unsupportedf(ctx, "relationships without a type",
 			"every relationship must name one relation type, as in -[:RELATION]->")
 	}
-	if detail.OC_Variable() != nil {
-		return nil, unsupportedf(detail, "relationship variables",
-			"a relationship is a join here and has no properties to project")
+	if variable := detail.OC_Variable(); variable != nil {
+		name, err := namedIdentifier(variable, "relationship variable")
+		if err != nil {
+			return nil, err
+		}
+		edge.Variable = name
 	}
 	if detail.OC_RangeLiteral() != nil {
 		return nil, unsupported(detail, "variable-length relationships")
@@ -583,7 +653,12 @@ func analyzeRelationship(ctx parsing.IOC_RelationshipPatternContext) (*EdgeRef, 
 	return edge, nil
 }
 
-func analyzeProjectionBody(query *Query, ctx parsing.IOC_ProjectionBodyContext) error {
+// analyzeProjectionBody reads RETURN. names maps a name an earlier WITH
+// introduced to the property it was found equal to, so that RETURN may use it;
+// carried names the values a carried stage named, which RETURN and ORDER BY
+// may use; see analyzeCarried.
+func analyzeProjectionBody(query *Query, ctx parsing.IOC_ProjectionBodyContext, names map[string]PropertyRef,
+	carried map[string]bool) error {
 	query.Distinct = ctx.DISTINCT() != nil
 
 	items := ctx.OC_ProjectionItems()
@@ -593,9 +668,20 @@ func analyzeProjectionBody(query *Query, ctx parsing.IOC_ProjectionBodyContext) 
 		return unsupportedf(items, "RETURN *", "list the properties to return")
 	}
 	for _, item := range items.AllOC_ProjectionItem() {
-		projection, err := analyzeProjection(item.OC_Expression())
+		projection, _, err := carriedProjection(item.OC_Expression(), carried)
 		if err != nil {
 			return err
+		}
+		if name, ok := bareVariable(item.OC_Expression()); ok && names != nil && projection == nil {
+			if property, known := names[name]; known {
+				projection = &Projection{Property: &property, Alias: name, Pos: positionOf(item)}
+			}
+		}
+		if projection == nil {
+			var err error
+			if projection, err = analyzeProjection(item.OC_Expression()); err != nil {
+				return err
+			}
 		}
 		if variable := item.OC_Variable(); variable != nil {
 			alias, err := namedIdentifier(variable, "column name")
@@ -609,52 +695,119 @@ func analyzeProjectionBody(query *Query, ctx parsing.IOC_ProjectionBodyContext) 
 
 	if order := ctx.OC_Order(); order != nil {
 		for _, item := range order.AllOC_SortItem() {
-			key, err := analyzeSortKey(item.OC_Expression())
+			key, _, err := carriedSortKey(item.OC_Expression(), carried, query)
 			if err != nil {
 				return err
+			}
+			if key == nil {
+				if key, err = analyzeSortKey(item.OC_Expression()); err != nil {
+					return err
+				}
+			}
+			if property, known := names[key.Alias]; known && !returnsAlias(query, key.Alias) {
+				key = &SortKey{Property: &property, Pos: key.Pos}
 			}
 			key.Descending = item.DESCENDING() != nil || item.DESC() != nil
 			query.OrderBy = append(query.OrderBy, *key)
 		}
 	}
 	if skip := ctx.OC_Skip(); skip != nil {
-		value, err := analyzeRowCount(skip.OC_Expression(), "SKIP")
-		if err != nil {
+		if err := analyzeRowCount(skip.OC_Expression(), "SKIP", &query.Skip, &query.SkipParameter); err != nil {
 			return err
 		}
-		query.Skip = &value
 	}
 	if limit := ctx.OC_Limit(); limit != nil {
-		value, err := analyzeRowCount(limit.OC_Expression(), "LIMIT")
-		if err != nil {
+		if err := analyzeRowCount(limit.OC_Expression(), "LIMIT", &query.Limit, &query.LimitParameter); err != nil {
 			return err
 		}
-		query.Limit = &value
 	}
 	return nil
 }
 
-// analyzeRowCount reads SKIP and LIMIT, which must be plain non-negative
-// integers: anything computed would have to be evaluated before the query is
-// generated.
-func analyzeRowCount(ctx parsing.IOC_ExpressionContext, clause string) (int64, error) {
+// analyzeRowCount reads SKIP and LIMIT: a non-negative integer, or a parameter
+// that bindRowCounts replaces with one before the query is planned. Anything
+// computed would have to be evaluated before the query is generated.
+func analyzeRowCount(ctx parsing.IOC_ExpressionContext, clause string, count **int64, parameter **ParameterRef) error {
 	value, err := analyzeOperand(ctx)
 	if err != nil {
-		return 0, err
+		return err
+	}
+	if value.parameter != nil && value.parameter.Temporal == "" {
+		ref := *value.parameter
+		*parameter = &ref
+		return nil
 	}
 	if value.literal == nil || value.literal.Kind != LiteralInteger {
-		return 0, unsupportedf(ctx, "a non-integer "+clause, "%s takes an integer literal", clause)
+		return unsupportedf(ctx, "a non-integer "+clause, "%s takes an integer or a $parameter", clause)
 	}
 	if value.literal.Integer < 0 {
-		return 0, unsupportedf(ctx, "a negative "+clause, "%s must not be negative", clause)
+		return unsupportedf(ctx, "a negative "+clause, "%s must not be negative", clause)
 	}
-	return value.literal.Integer, nil
+	integer := value.literal.Integer
+	*count = &integer
+	return nil
+}
+
+// bindRowCounts puts the values of SKIP $name and LIMIT $name in place, in the
+// query and in each part of a UNION. A bound value follows the rules of one
+// written in the query, a non-negative integer, and is bound before the LIMIT
+// ceiling is checked, so it meets the same ceiling. Binding twice changes
+// nothing: a count already in place is kept.
+func bindRowCounts(query *Query, parameters map[string]any) error {
+	if query.Union != nil {
+		for _, part := range query.Union.Parts {
+			if err := bindRowCounts(part, parameters); err != nil {
+				return err
+			}
+		}
+	}
+	for _, slot := range []struct {
+		clause    string
+		parameter *ParameterRef
+		count     **int64
+	}{
+		{"SKIP", query.SkipParameter, &query.Skip},
+		{"LIMIT", query.LimitParameter, &query.Limit},
+	} {
+		if slot.parameter == nil || *slot.count != nil {
+			continue
+		}
+		value, err := rowCountFromParameter(*slot.parameter, slot.clause, parameters)
+		if err != nil {
+			return err
+		}
+		*slot.count = &value
+	}
+	return nil
+}
+
+func rowCountFromParameter(parameter ParameterRef, clause string, parameters map[string]any) (int64, error) {
+	supplied, ok := parameters[parameter.Name]
+	if !ok {
+		return 0, planErrorf(parameter.Pos, "parameter %q was not supplied", parameter.Name)
+	}
+	got := describeParameterValue(supplied)
+	literal, err := literalFromParameter(supplied)
+	if err == nil {
+		if literal.Kind == LiteralInteger && literal.Integer >= 0 {
+			return literal.Integer, nil
+		}
+		got = literal.describe()
+	}
+	return 0, planErrorf(parameter.Pos, "parameter %q is used as %s, which takes a non-negative integer; got %s",
+		parameter.Name, clause, got)
 }
 
 // analyzeProjection reads one RETURN item: a property, an aggregate over one,
 // or a value computed from those. The alias defaults to what was written,
 // which is how Cypher names a column nobody named.
 func analyzeProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
+	if projection, ok, err := analyzeGraphProjection(ctx); ok || err != nil {
+		return projection, err
+	}
+	if _, err := valueChain(ctx); err != nil {
+		return analyzeConditionProjection(ctx)
+	}
 	if computed(ctx) {
 		return analyzeComputedProjection(ctx)
 	}
@@ -671,10 +824,34 @@ func analyzeProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
 	return &Projection{Property: property, Alias: property.String()}, nil
 }
 
+// analyzeConditionProjection reads a RETURN item that is a condition, which
+// returns whether each row meets it. It is read exactly as WHERE reads one, so
+// it accepts and refuses the same things.
+func analyzeConditionProjection(ctx parsing.IOC_ExpressionContext) (*Projection, error) {
+	predicate, err := analyzePredicate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A bare name reads as a WITH's value only in WHERE; here it would
+	// silently compare with nothing.
+	if err := refuseNames(predicate); err != nil {
+		return nil, err
+	}
+	return &Projection{
+		Expression: ConditionValue{Predicate: predicate, Pos: positionOf(ctx)},
+		Alias:      sourceText(ctx),
+		Pos:        positionOf(ctx),
+	}, nil
+}
+
 // analyzeSortKey reads one ORDER BY item. Besides a property it accepts the
 // name of a returned column and an aggregate written out again, because with
 // aggregates in RETURN those are the only ways to say what to sort by.
 func analyzeSortKey(ctx parsing.IOC_ExpressionContext) (*SortKey, error) {
+	if _, err := valueChain(ctx); err != nil {
+		return nil, unsupportedf(ctx, "sorting by a condition",
+			"return the condition with an alias, as in RETURN ... AS flag, and sort by the alias")
+	}
 	if computed(ctx) {
 		value, err := analyzeExpression(ctx)
 		if err != nil {
@@ -685,7 +862,7 @@ func analyzeSortKey(ctx parsing.IOC_ExpressionContext) (*SortKey, error) {
 			return &SortKey{Property: &value, Pos: value.Pos}, nil
 		case Aggregate:
 			return &SortKey{Aggregate: &value, Pos: value.Pos}, nil
-		case Arithmetic, Negative:
+		case Arithmetic, Negative, CaseValue, Coalesce, ScalarFunction:
 		default:
 			return nil, unsupportedf(ctx, "sorting by a constant", "sort by a property, an aggregate or a returned column")
 		}
@@ -796,7 +973,7 @@ func analyzeAggregateAtom(atom parsing.IOC_AtomContext) (*Aggregate, bool, error
 		case PropertyRef:
 			aggregate.Property = &value
 			return aggregate, true, nil
-		case Arithmetic, Negative:
+		case Arithmetic, Negative, CaseValue, Coalesce, ScalarFunction:
 		default:
 			return nil, false, unsupportedf(arguments[0], "an expression here",
 				"only variable.property references are supported")
@@ -810,6 +987,15 @@ func analyzeAggregateAtom(atom parsing.IOC_AtomContext) (*Aggregate, bool, error
 				"aggregate a property or a value computed from properties")
 		}
 		aggregate.Argument, aggregate.ArgumentText = argument, sourceText(arguments[0])
+		return aggregate, true, nil
+	}
+	if variable, ok := bareVariable(arguments[0]); ok {
+		if function != "COUNT" {
+			return nil, false, unsupportedf(arguments[0], name+" over a whole node or relationship",
+				"%s takes a value; aggregate a property of a node, as in %s(%s.property), "+
+					"or count it with count(%s)", name, name, variable, variable)
+		}
+		aggregate.Variable = variable
 		return aggregate, true, nil
 	}
 	property, err := analyzePropertyRef(arguments[0])
@@ -853,7 +1039,7 @@ func computedSum(sum parsing.IOC_AddOrSubtractExpressionContext) bool {
 		return false
 	}
 	atom := listOperator.OC_PropertyOrLabelsExpression().OC_Atom()
-	if atom.OC_ParenthesizedExpression() != nil {
+	if atom.OC_ParenthesizedExpression() != nil || caseOrCoalesce(atom) {
 		return true
 	}
 	return negates(unaries[0]) && atom.OC_Literal() == nil
@@ -906,7 +1092,7 @@ func analyzeComputedProjection(ctx parsing.IOC_ExpressionContext) (*Projection, 
 		return &Projection{Property: &value, Alias: alias, Pos: value.Pos}, nil
 	case Aggregate:
 		return &Projection{Aggregate: &value, Alias: alias, Pos: value.Pos}, nil
-	case Arithmetic, Negative:
+	case Arithmetic, Negative, CaseValue, Coalesce, ScalarFunction:
 	default:
 		return nil, unsupportedf(ctx, "an expression here", "only variable.property references are supported")
 	}
@@ -932,14 +1118,24 @@ func analyzeExpression(ctx parsing.IOC_ExpressionContext) (Expression, error) {
 }
 
 func analyzeSum(ctx parsing.IOC_AddOrSubtractExpressionContext) (Expression, error) {
+	return readSum(ctx, analyzeTerm)
+}
+
+// termReader reads one term of an arithmetic expression: what a name means
+// depends on where the expression stands, so the descent below leaves that to
+// its caller. analyzeTerm reads the names of the pattern; after a WITH, the
+// names are what the WITH passed on.
+type termReader func(ctx parsing.IOC_PropertyOrLabelsExpressionContext, atom parsing.IOC_AtomContext) (Expression, error)
+
+func readSum(ctx parsing.IOC_AddOrSubtractExpressionContext, term termReader) (Expression, error) {
 	products := ctx.AllOC_MultiplyDivideModuloExpression()
 	operators := operatorTokens(ctx)
-	left, err := analyzeProduct(products[0])
+	left, err := readProduct(products[0], term)
 	if err != nil {
 		return nil, err
 	}
 	for i, product := range products[1:] {
-		right, err := analyzeProduct(product)
+		right, err := readProduct(product, term)
 		if err != nil {
 			return nil, err
 		}
@@ -950,15 +1146,15 @@ func analyzeSum(ctx parsing.IOC_AddOrSubtractExpressionContext) (Expression, err
 	return left, nil
 }
 
-func analyzeProduct(ctx parsing.IOC_MultiplyDivideModuloExpressionContext) (Expression, error) {
+func readProduct(ctx parsing.IOC_MultiplyDivideModuloExpressionContext, term termReader) (Expression, error) {
 	powers := ctx.AllOC_PowerOfExpression()
 	operators := operatorTokens(ctx)
-	left, err := analyzePower(powers[0])
+	left, err := readPower(powers[0], term)
 	if err != nil {
 		return nil, err
 	}
 	for i, power := range powers[1:] {
-		right, err := analyzePower(power)
+		right, err := readPower(power, term)
 		if err != nil {
 			return nil, err
 		}
@@ -969,21 +1165,21 @@ func analyzeProduct(ctx parsing.IOC_MultiplyDivideModuloExpressionContext) (Expr
 	return left, nil
 }
 
-// analyzePower refuses ^. Cypher computes it in floating point, MySQL reads ^
+// readPower refuses ^. Cypher computes it in floating point, MySQL reads ^
 // as bitwise XOR, and the portable spelling is a function call; none of that
 // is worth the surprise for something this rare.
-func analyzePower(ctx parsing.IOC_PowerOfExpressionContext) (Expression, error) {
+func readPower(ctx parsing.IOC_PowerOfExpressionContext, term termReader) (Expression, error) {
 	unaries := ctx.AllOC_UnaryAddOrSubtractExpression()
 	if len(unaries) != 1 {
 		return nil, unsupportedf(ctx, "exponentiation", "multiply the value out instead of using ^")
 	}
-	return analyzeSignedTerm(unaries[0])
+	return readSignedTerm(unaries[0], term)
 }
 
-// analyzeSignedTerm reads one term and the sign in front of it. A minus on a
+// readSignedTerm reads one term and the sign in front of it. A minus on a
 // number written in the query is folded into the number, as it is everywhere
 // else; on anything else it stays an operation.
-func analyzeSignedTerm(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (Expression, error) {
+func readSignedTerm(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext, term termReader) (Expression, error) {
 	listOperator := ctx.OC_ListOperatorExpression()
 	if listOperator.GetChildCount() > 1 {
 		return nil, unsupported(listOperator, "list indexing and slicing")
@@ -994,7 +1190,7 @@ func analyzeSignedTerm(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (Exp
 	}
 	atom := propertyOrLabels.OC_Atom()
 	if !negates(ctx) {
-		return analyzeTerm(propertyOrLabels, atom)
+		return term(propertyOrLabels, atom)
 	}
 	if atom.OC_Literal() != nil {
 		value, err := analyzeUnaryOperand(ctx)
@@ -1003,7 +1199,7 @@ func analyzeSignedTerm(ctx parsing.IOC_UnaryAddOrSubtractExpressionContext) (Exp
 		}
 		return *value.literal, nil
 	}
-	operand, err := analyzeTerm(propertyOrLabels, atom)
+	operand, err := term(propertyOrLabels, atom)
 	if err != nil {
 		return nil, err
 	}
@@ -1017,6 +1213,9 @@ func analyzeTerm(ctx parsing.IOC_PropertyOrLabelsExpressionContext, atom parsing
 	if len(ctx.AllOC_PropertyLookup()) == 0 {
 		if parenthesized := atom.OC_ParenthesizedExpression(); parenthesized != nil {
 			return analyzeExpression(parenthesized.OC_Expression())
+		}
+		if caseOrCoalesce(atom) {
+			return analyzeCaseOrCoalesce(atom, patternCaseReaders())
 		}
 		aggregate, ok, err := analyzeAggregateAtom(atom)
 		if err != nil {
@@ -1112,6 +1311,9 @@ func sourceText(ctx antlr.ParserRuleContext) string {
 	if start == nil || stop == nil || start.GetInputStream() == nil {
 		return ctx.GetText()
 	}
+	if stream, ok := start.GetInputStream().(*writtenStream); ok {
+		return stream.writtenText(start.GetStart(), stop.GetStop())
+	}
 	return start.GetInputStream().GetTextFromInterval(antlr.NewInterval(start.GetStart(), stop.GetStop()))
 }
 
@@ -1131,7 +1333,15 @@ func expressionProperties(value Expression) []PropertyRef {
 	case Negative:
 		return expressionProperties(node.Operand)
 	default:
-		return nil
+		conditions, values, _ := caseParts(value)
+		var refs []PropertyRef
+		for _, condition := range conditions {
+			refs = append(refs, predicateProperties(condition)...)
+		}
+		for _, part := range values {
+			refs = append(refs, expressionProperties(part)...)
+		}
+		return refs
 	}
 }
 
@@ -1144,6 +1354,20 @@ func containsAggregate(value Expression) bool {
 	case Negative:
 		return containsAggregate(node.Operand)
 	default:
+		conditions, values, ok := caseParts(value)
+		if !ok {
+			return false
+		}
+		for _, condition := range conditions {
+			if predicateAggregates(condition) {
+				return true
+			}
+		}
+		for _, part := range values {
+			if containsAggregate(part) {
+				return true
+			}
+		}
 		return false
 	}
 }
@@ -1333,11 +1557,22 @@ func analyzeComparison(ctx parsing.IOC_ComparisonExpressionContext) (Predicate, 
 		return nil, unsupportedf(ctx, "comparing a condition",
 			"a comparison must be variable.property against a value")
 	}
-	if leftValue.property == nil || rightValue.property != nil || rightValue.operand() == nil {
-		// One side has to be a column and the other a value; anything else
-		// would need expression generation the subset does not have yet.
+	operator := comparisonOperator(partials[0])
+	if leftValue.property != nil && rightValue.property != nil {
+		return PropertyComparison{
+			Left: *leftValue.property, Operator: operator, Right: *rightValue.property, Pos: positionOf(ctx),
+		}, nil
+	}
+	if leftValue.property == nil && rightValue.property != nil && leftValue.operand() != nil {
+		// A value on the left reads the same turned around: 5 < o.amount is
+		// o.amount > 5.
+		leftValue, rightValue = rightValue, leftValue
+		operator = mirroredOperators[operator]
+	}
+	if leftValue.property == nil || rightValue.operand() == nil {
+		// One side has to be a column; two values say nothing about the rows.
 		return nil, unsupportedf(ctx, "this comparison",
-			"a comparison must be variable.property against a literal or a parameter")
+			"a comparison must read a property, as in n.property = 'value' or n.a < n.b")
 	}
 	if rightValue.literal != nil && rightValue.literal.Kind == LiteralNull {
 		return nil, unsupportedf(ctx, "comparing against null",
@@ -1345,11 +1580,15 @@ func analyzeComparison(ctx parsing.IOC_ComparisonExpressionContext) (Predicate, 
 	}
 	return Comparison{
 		Left:     *leftValue.property,
-		Operator: comparisonOperator(partials[0]),
+		Operator: operator,
 		Right:    *rightValue.operand(),
 		Pos:      positionOf(ctx),
 	}, nil
 }
+
+// mirroredOperators turns a comparison around, for a value written on the
+// left.
+var mirroredOperators = map[string]string{"=": "=", "<>": "<>", "<": ">", ">": "<", "<=": ">=", ">=": "<="}
 
 // analyzeExpressionComparison reads a comparison with arithmetic on either
 // side. It reports false for anything else, which keeps the path every other
@@ -1452,7 +1691,14 @@ func analyzeStringListNullPredicate(ctx parsing.IOC_StringListNullPredicateExpre
 
 	subject, err := analyzeAddOrSubtractOperand(ctx.OC_AddOrSubtractExpression())
 	if err != nil {
-		return nil, operand{}, err
+		// A bare name is kept only as one side of a condition, where an
+		// earlier WITH may have given it a value.
+		if parentheses != groupsConditions {
+			return nil, operand{}, err
+		}
+		if subject, err = nameOperand(ctx.OC_AddOrSubtractExpression(), err); err != nil {
+			return nil, operand{}, err
+		}
 	}
 
 	lists := ctx.AllOC_ListPredicateExpression()
@@ -1464,9 +1710,18 @@ func analyzeStringListNullPredicate(ctx parsing.IOC_StringListNullPredicateExpre
 		return nil, operand{}, unsupportedf(ctx, "combining IN and IS NULL in one term",
 			"write them as separate terms joined by AND")
 	}
+	// $name IS NULL makes the condition beside it optional; see optional_filter.go.
+	if len(nulls) == 1 && subject.parameter != nil && subject.parameter.Temporal == "" &&
+		parentheses == groupsConditions {
+		return ParameterNullCheck{
+			Parameter: *subject.parameter,
+			Negated:   nulls[0].NOT() != nil,
+			Pos:       positionOf(ctx),
+		}, operand{}, nil
+	}
 	if subject.property == nil {
 		return nil, operand{}, unsupportedf(ctx, "this predicate",
-			"IN and IS NULL apply to variable.property")
+			"IN applies to variable.property, and IS NULL to variable.property or $parameter")
 	}
 
 	if len(nulls) == 1 {
@@ -1477,6 +1732,11 @@ func analyzeStringListNullPredicate(ctx parsing.IOC_StringListNullPredicateExpre
 		}, operand{}, nil
 	}
 
+	if name, ok := sumBareVariable(lists[0].OC_AddOrSubtractExpression()); ok && parentheses == groupsConditions {
+		return Membership{
+			Property: *subject.property, ListName: &NameRef{Name: name, Pos: positionOf(lists[0])}, Pos: positionOf(ctx),
+		}, operand{}, nil
+	}
 	values, listParameter, err := analyzeListOperands(lists[0].OC_AddOrSubtractExpression())
 	if err != nil {
 		return nil, operand{}, err
@@ -1643,6 +1903,9 @@ type operand struct {
 	property  *PropertyRef
 	literal   *Literal
 	parameter *ParameterRef
+	// name is a bare name, which only an earlier WITH can give a value; see
+	// resolveNames.
+	name *NameRef
 }
 
 // operand returns the value this side carries, or nil when it is a column.
@@ -1652,9 +1915,74 @@ func (o operand) operand() *Operand {
 		return &Operand{Literal: o.literal}
 	case o.parameter != nil:
 		return &Operand{Parameter: o.parameter}
+	case o.name != nil:
+		return &Operand{Name: o.name}
 	default:
 		return nil
 	}
+}
+
+// nameOperand reads a bare name where a value is expected. The analyzer
+// refuses one everywhere else; here it is kept, so that a name an earlier
+// WITH introduced can be resolved, and an unknown one is refused then.
+func nameOperand(ctx antlr.ParserRuleContext, err error) (operand, error) {
+	expression, ok := ctx.(parsing.IOC_ExpressionContext)
+	var name string
+	if ok {
+		name, ok = bareVariable(expression)
+	} else if sum, isSum := ctx.(parsing.IOC_AddOrSubtractExpressionContext); isSum {
+		name, ok = sumBareVariable(sum)
+	}
+	if !ok {
+		return operand{}, err
+	}
+	return operand{name: &NameRef{Name: name, Pos: positionOf(ctx)}}, nil
+}
+
+// refuseNames refuses a bare name anywhere in a condition, the way a name
+// nothing introduced is refused in WHERE.
+func refuseNames(predicate Predicate) error {
+	switch node := predicate.(type) {
+	case Comparison:
+		if node.Right.Name != nil {
+			return unsupportedAt(node.Right.Name.Pos, "referring to a node as a value", "use %s.property", node.Right.Name.Name)
+		}
+	case Membership:
+		if node.ListName != nil {
+			return unsupportedAt(node.ListName.Pos, "IN over something other than a list",
+				"write the values as a list, as in n.property IN [1, 2], or pass one list parameter, as in n.property IN $values")
+		}
+	case ParameterNullCheck:
+		return refuseParameterNullChecks(node)
+	case Negation:
+		return refuseNames(node.Operand)
+	case LogicalOperator:
+		for _, operand := range node.Operands {
+			if err := refuseNames(operand); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// sumBareVariable is bareVariable for one side of a comparison.
+func sumBareVariable(sum parsing.IOC_AddOrSubtractExpressionContext) (string, bool) {
+	if computedSum(sum) {
+		return "", false
+	}
+	listOperator := sum.AllOC_MultiplyDivideModuloExpression()[0].AllOC_PowerOfExpression()[0].
+		AllOC_UnaryAddOrSubtractExpression()[0].OC_ListOperatorExpression()
+	if listOperator.GetChildCount() > 1 {
+		// An index or a slice, as in ids[0] or ids[0..2], is not the name.
+		return "", false
+	}
+	atom := listOperator.OC_PropertyOrLabelsExpression()
+	if len(atom.AllOC_PropertyLookup()) > 0 || atom.OC_NodeLabels() != nil || atom.OC_Atom().OC_Variable() == nil {
+		return "", false
+	}
+	name := identifier(atom.OC_Atom().OC_Variable().GetText())
+	return name, name != ""
 }
 
 func analyzeOperand(ctx parsing.IOC_ExpressionContext) (operand, error) {
@@ -1812,6 +2140,9 @@ func analyzeAtomOperand(ctx parsing.IOC_PropertyOrLabelsExpressionContext) (oper
 }
 
 func analyzeAtomLiteral(ctx parsing.IOC_AtomContext) (operand, error) {
+	if invocation := ctx.OC_FunctionInvocation(); invocation != nil {
+		return analyzeTemporal(invocation)
+	}
 	literal := ctx.OC_Literal()
 	if literal == nil {
 		return operand{}, unsupported(ctx, describeAtom(ctx))
@@ -1856,12 +2187,27 @@ func analyzeAtomLiteral(ctx parsing.IOC_AtomContext) (operand, error) {
 	return operand{literal: &value}, nil
 }
 
+// supportedFunctions lists, for a refusal, the functions a query may call.
+// size() is left out: it is read only in the shapes analyzeIntersection and
+// the WITH reader name, not as a function of any value.
+const supportedFunctions = "the aggregates count, sum, avg, min, max and collect, coalesce, " +
+	"round, abs, toUpper, toLower, toString, toInteger and toFloat, " +
+	"and date, datetime and localdatetime over a date string"
+
+// unsupportedFunction refuses a call to a function the subset does not have,
+// naming it: in a statement with several calls, "function calls" alone does
+// not say which one to change.
+func unsupportedFunction(invocation parsing.IOC_FunctionInvocationContext) error {
+	name := identifier(invocation.OC_FunctionName().GetText())
+	return unsupportedf(invocation, "the function "+name+"()", "a query may call %s", supportedFunctions)
+}
+
 // describeAtom names the construct found where a value was expected, so the
 // rejection says what was written rather than that something was wrong.
 func describeAtom(ctx parsing.IOC_AtomContext) string {
 	switch {
 	case ctx.OC_FunctionInvocation() != nil:
-		return "function calls"
+		return "the function " + identifier(ctx.OC_FunctionInvocation().OC_FunctionName().GetText()) + "()"
 	case ctx.COUNT() != nil:
 		return "count(*)"
 	case ctx.OC_Parameter() != nil:
@@ -1885,11 +2231,16 @@ func describeAtom(ctx parsing.IOC_AtomContext) string {
 	}
 }
 
-// parameterName reads $name. The numeric form ($0) is refused: it is a
-// positional parameter, and the request carries parameters by name.
+// parameterName reads $name. A name may be a reserved word, as in $end or
+// $limit, and is kept as written: $END and $end are two parameters. The
+// numeric form ($0) is refused: it is a positional parameter, and the request
+// carries parameters by name.
 func parameterName(ctx parsing.IOC_ParameterContext) (string, error) {
 	if symbolic := ctx.OC_SymbolicName(); symbolic != nil {
 		return namedIdentifier(symbolic, "parameter name")
+	}
+	if reserved := ctx.OC_ReservedWord(); reserved != nil {
+		return reserved.GetText(), nil
 	}
 	return "", unsupportedf(ctx, "positional parameters", "name the parameter, as in $value")
 }
@@ -2017,4 +2368,58 @@ func codePoint(value uint64, digits string) (rune, error) {
 		return 0, fmt.Errorf("unpaired surrogate in unicode escape sequence \\u%s", digits)
 	}
 	return decoded, nil
+}
+
+// temporalFunctions are the date constructors a comparison may use, as in
+// f.due <= date('2026-08-13'). Each takes one string, written in the query or
+// passed as a parameter.
+var temporalFunctions = map[string]bool{"date": true, "datetime": true, "localdatetime": true}
+
+// analyzeTemporal reads date('...') and its kin as a date constant. Every
+// other function is still refused, and so is date() with no argument: the
+// current date depends on a clock and a time zone the query does not name.
+func analyzeTemporal(invocation parsing.IOC_FunctionInvocationContext) (operand, error) {
+	name := strings.ToLower(identifier(invocation.OC_FunctionName().GetText()))
+	if !temporalFunctions[name] {
+		return operand{}, unsupportedFunction(invocation)
+	}
+	arguments := invocation.AllOC_Expression()
+	if len(arguments) != 1 || invocation.DISTINCT() != nil {
+		return operand{}, unsupportedf(invocation, name+"() without one string",
+			"write the date itself, as in %s('2026-08-13')", name)
+	}
+	value, err := analyzeOperand(arguments[0])
+	if err != nil {
+		return operand{}, err
+	}
+	switch {
+	case value.parameter != nil:
+		value.parameter.Temporal = name
+		return value, nil
+	case value.literal != nil && value.literal.Kind == LiteralString:
+		if !plainDate(value.literal.String) {
+			return operand{}, unsupportedf(invocation, "this "+name,
+				"%q is not a date; write it as 2026-08-13 or 2026-08-13T09:30:00, without a time zone",
+				value.literal.String)
+		}
+		value.literal.Temporal = name
+		return value, nil
+	default:
+		return operand{}, unsupportedf(invocation, name+"() over something other than a string",
+			"write the date as a string, as in %s('2026-08-13')", name)
+	}
+}
+
+// plainDateLayouts are the forms a date constant may take: a wall-clock date
+// or time with no time zone. An offset would be read by the data source and
+// dropped by the executor, so the two would compare different instants.
+var plainDateLayouts = []string{"2006-01-02", "2006-01-02T15:04:05.999999999", "2006-01-02 15:04:05.999999999"}
+
+func plainDate(text string) bool {
+	for _, layout := range plainDateLayouts {
+		if _, err := time.Parse(layout, strings.TrimSpace(text)); err == nil {
+			return true
+		}
+	}
+	return false
 }

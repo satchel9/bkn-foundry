@@ -17,6 +17,42 @@ import (
 )
 
 func TestIndexConfigFingerprint(t *testing.T) {
+	t.Run("corrupt source columns cannot produce a fingerprint from fallback declarations", func(t *testing.T) {
+		resource := &interfaces.Resource{SourceMetadata: map[string]any{"columns": "invalid metadata"}, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(12,2)"}}}
+		contract, err := BuildIndexConfigContract(resource)
+		require.Error(t, err)
+		assert.Zero(t, contract)
+		fingerprint, err := ResourceIndexConfigFingerprint(resource)
+		require.Error(t, err)
+		assert.Empty(t, fingerprint)
+		assert.Nil(t, resource.SchemaDefinition[0].Attributes)
+	})
+	t.Run("decimal metadata changes invalidate snapshots without including unrelated source metadata", func(t *testing.T) {
+		resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{{Name: "amount", OriginalName: "AMOUNT", Type: interfaces.DataType_Decimal, OriginalType: "numeric"}}, SourceMetadata: map[string]any{"columns": []interfaces.TableColumnMeta{{Name: "AMOUNT", NumPrecision: 12, NumScale: 2}}}}
+		contract, err := BuildIndexConfigContract(resource)
+		require.NoError(t, err)
+		original, err := IndexConfigFingerprint(contract)
+		require.NoError(t, err)
+		legacy := contract
+		legacy.Fields = append([]interfaces.IndexConfigFieldContract(nil), contract.Fields...)
+		legacy.Fields[0].Decimal = nil
+		old, err := IndexConfigFingerprint(legacy)
+		require.NoError(t, err)
+		assert.NotEqual(t, original, old)
+		snapshot := &interfaces.BuildTaskIndexConfig{IndexConfigContract: contract}
+		fromSnapshot, err := BuildTaskIndexConfigFingerprint(snapshot)
+		require.NoError(t, err)
+		assert.Equal(t, original, fromSnapshot)
+		for _, column := range []interfaces.TableColumnMeta{{Name: "AMOUNT", NumPrecision: 12, NumScale: 3}, {Name: "AMOUNT", NumPrecision: 13, NumScale: 2}} {
+			resource.SourceMetadata["columns"] = []interfaces.TableColumnMeta{column}
+			changed, err := ResourceIndexConfigFingerprint(resource)
+			require.NoError(t, err)
+			assert.NotEqual(t, original, changed)
+		}
+		cloned := cloneIndexConfigContract(contract)
+		cloned.Fields[0].Decimal.Scale = 4
+		assert.Equal(t, 2, contract.Fields[0].Decimal.Scale)
+	})
 	base := fingerprintTestResource(false)
 	contract, err := BuildIndexConfigContract(base)
 	require.NoError(t, err)

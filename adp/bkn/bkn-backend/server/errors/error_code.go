@@ -8,9 +8,9 @@
 package errors
 
 import (
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	"bkn-backend/locale"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/locale"
 )
 
 // Public error codes available to all service modules.
@@ -93,18 +93,23 @@ var (
 	}
 )
 
+// init prepares messages before registering the service error codes.
 func init() {
 	locale.Register()
-	rest.Register(errCodeList)
-	rest.Register(KNErrCodeList)
-	rest.Register(ObjectTypeErrCodeList)
-	rest.Register(RelationTypeErrCodeList)
-	rest.Register(ActionTypeErrCodeList)
-	rest.Register(actionScheduleErrCodeList)
-	rest.Register(ConceptGroupErrCodeList)
-	rest.Register(RiskTypeErrCodeList)
-	rest.Register(MetricErrCodeList)
-	rest.Register(CapabilityBindingErrCodeList)
-	rest.Register(CypherErrCodeList)
-	rest.Register(KNDiffErrCodeList)
+
+	httperrors.Register(errCodeList)
+	httperrors.Register(KNErrCodeList)
+	httperrors.Register(ObjectTypeErrCodeList)
+	httperrors.Register(RelationTypeErrCodeList)
+	httperrors.Register(ActionTypeErrCodeList)
+	httperrors.Register(actionScheduleErrCodeList)
+	httperrors.Register(ConceptGroupErrCodeList)
+	httperrors.Register(RiskTypeErrCodeList)
+	httperrors.Register(ValueTypeErrCodeList)
+	httperrors.Register(ObjectMetricErrCodeList)
+	httperrors.Register(KnEventErrCodeList)
+	httperrors.Register(CapabilityBindingErrCodeList)
+	httperrors.Register(CypherErrCodeList)
+	httperrors.Register(KNDiffErrCodeList)
+	httperrors.Register(KNVersionErrCodeList)
 }

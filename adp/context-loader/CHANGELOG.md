@@ -4,7 +4,40 @@ Chinese version: [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)
 
 ## Unreleased
 
+- Align MCP catalog group labels in Chinese and English, and preserve optional HTTP extension titles, group titles, and ordering in both MCP discovery profiles. Tool names, schemas, and execution behavior are unchanged.
+  - Deployment: Rebuild and upgrade the sandbox image together with Context Loader. Catalog metadata contributes to the generated SDK toolkit fingerprint; `run_code` rejects an older sandbox image with `sandbox toolkit version mismatch`.
+
+- `list_knowledge_networks` returns each network's `description` again. bkn-backend names the field `comment`, so it was dropped while reading the list and every network came back with an empty description.
+
+- `get_kn_detail` answers within about 30000 characters, counted in the format the caller reads; over MCP the bound holds for both the text and the `structuredContent` JSON beside it. A larger summary or full answer is narrowed with a `notice`: first object types drop their property lists for `data_property_count` / `logic_property_count`, then the answer falls back to the navigation shell. New `detail_level=brief` returns only the network's name, description, concept groups and concept counts; the MCP instructions now start exploration with it. The default level stays `summary`; networks whose answer fits are unchanged.
+
+- `get_relation_types` lists the relation type index when called without `ids`: one page in name order (50 by default, 200 at most) with `total_count` and `next_offset`, entries without `mapping_rules` and with the first 120 characters of `comment`; a page past about 30,000 characters is cut short and continues at `next_offset`. `object_type_ids` keeps the relation types that start or end at the given object types. The tool also takes `branch` in both modes. Calls with `ids` on main are unchanged.
+
+- `get_object_types` bounds a listing page (called without `ids`) the way `get_relation_types` does: an index entry keeps the first 120 characters of `comment` (ending in `…` when cut), and a page past about 30,000 characters is cut short, continues at the first entry it left out through `next_offset`, and says why in `notice`. Naming ids returns the whole comment and is unchanged.
+
+- `search_schema` gives the unit of a property's value type. A property that names a value type cannot declare its own unit, so in full mode `unit` now comes from the value type, enum or not, as it does from a property that declares it; brief mode and value types without a unit are unchanged. Reading the value types still happens at most once per request, and a failed read leaves `value_type` in place without a unit.
+
+- Add opt-in HTTP MCP extensions with same-origin authenticated forwarding, licence gating, and direct control-plane tools in the full and compact profiles. Enables the EE Eval participant tools without embedding Eval business logic; the default catalogue is unchanged. (#2570)
+
+- `search_schema` expands enums and outputs aliases (BKN spec 3.0 stage 2). A property whose value type is an enum carries `value_type` and its items as `enum: [{value, display, deprecated}]`, deprecated items included; an enum over the expansion limit (`concept_search_config.enum_expand_limit`, default 50), or any enum in brief mode, gives `enum_count` instead, and the new `enum_query` parameter looks its items up by display name or code; when it matches more items than the limit, `enum_match_count` gives the number of matches. The value type read is bounded by `schema_read_timeout_ms`. Object, relation and action types carry `aliases` at either level, data properties in full mode only. `get_kn_detail`, `get_object_types` and `get_relation_types` do not carry aliases. A network without value types or aliases gets the same output as before. (#2282)
+
+- `search_schema` outputs the BKN spec 3.0 relation declarations: `reverse_name`, `cardinality`, `required`, `characteristics`, `verification`, `importance` (omitted when primary) and relation properties. A primary relation carries its fallback path under `fallback` with the rule for using it, and a fallback path no longer appears on its own: recalling one brings its primary in. Object, relation and action types carry `lifecycle` when not active, so a deprecated definition looked up by id (`get_object_types`, `get_relation_types`, a pinned object type) says what replaces it. A network without these declarations gets the same output as before. (#2285)
+
+- Reserve acknowledgement-recovery time inside existing lifecycle budgets, replay start with its original idempotency key, and freeze terminal payload/artifact envelopes across retries without re-executing business tools. (#2539)
+
 ### Features & Improvements
+
+- `search_schema` outputs the BKN spec 3.0 stage 1 property declarations on data properties: `semantic`, `required`, `unit`, `crs` and `timezone` in full mode, only `semantic` in brief mode. An undeclared field is omitted, so a network without declarations gets the same output as before. `get_kn_detail` and `get_object_types` do not carry them. (#2260)
+
+- Platform Functions reuse governed Evidence capture to record existing structured result snapshots and actual execution identity without tool-side evidence declarations for Core Claim assembly. Snapshots omitted before publication preserve existing receipt completeness. Once a snapshot event is declared, delivery/confirmation failure can still make evidence partial. Runtime capture failures emit sanitized diagnostics; managed finish still rejects caller-owned claims. (#1332)
+
+- Submit Interaction finish with a separate bounded POST/replay budget (default 5 seconds), preserving the exact request/key across finite retries. Unconfirmed submission now returns an MCP tool error with `retry_same_finish`; only a matching Core terminal acknowledgement is success. Tool execution is never repeated. (#2340)
+
+- Preserve canonical business references, operation edges and causation IDs through Kafka evidence publishing; recover transient attempt-finalization infrastructure failures within the existing bounded budget without re-executing tools. (#2425)
+
+- Stop retrying artifact uploads when ingest authentication is explicitly unconfigured. Distinguish artifact-endpoint outages from lifecycle Core outages while preserving committed start IDs, capture authorization failures, and the existing Trace I/O budgets. (#1691)
+
+- Add opt-in durable answer handoff to Core managed finish, avoiding synchronous answer-artifact uploads while retaining the existing Trace time budget. Business completion and pending evidence are returned separately; the default legacy path is unchanged. Enable only after all Core workers have upgraded. (#1691)
 
 - Surface actionable permission-request guidance from `run_cypher`, `search_instance`, and `get_logic_properties_values`
   - Preserve explicit row-filter and property-masking impacts across BKN Backend and Context Loader boundaries
@@ -59,3 +92,7 @@ Chinese version: [CHANGELOG.zh-CN.md](CHANGELOG.zh-CN.md)
 ### Documentation
 
 - Update release overview and tool usage documentation for the `search_schema` entry unification and metric schema recall contract
+
+- Allow REST `execute_tool` without lifecycle context, matching `search_schema`;
+  keep permission checks and explicit-context validation, and leave the MCP
+  managed-context requirement unchanged.

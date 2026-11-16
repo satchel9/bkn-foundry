@@ -9,12 +9,17 @@ package mariadb
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
+	"maps"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/agiledragon/gomonkey/v2"
+	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -25,23 +30,25 @@ func TestMariaDBConnectorMetadataAndConfig(t *testing.T) {
 	t.Run("maria dbconnector metadata and config", func(t *testing.T) {
 		connector := &MariaDBConnector{}
 
-		assert.Equal(t, interfaces.ConnectorTypeMariaDB, connector.GetType())
-		assert.Equal(t, interfaces.ConnectorTypeMariaDB, connector.GetName())
+		assert.Equal(t, "mariadb", connector.GetType())
+		assert.Equal(t, "mariadb", connector.GetName())
 		assert.Equal(t, interfaces.ConnectorModeLocal, connector.GetMode())
 		assert.Equal(t, interfaces.ConnectorCategoryTable, connector.GetCategory())
-		assert.Equal(t, []string{"password"}, connector.GetSensitiveFields())
+		protectedFields, metadataErr := connector.GetSensitiveFields(nil)
+		require.NoError(t, metadataErr)
+		assert.Equal(t, []string{"password"}, protectedFields)
 		assert.False(t, connector.GetEnabled())
 		connector.SetEnabled(true)
 		assert.True(t, connector.GetEnabled())
 
 		fields := connector.GetFieldConfig()
 		assert.Equal(t, map[string]interfaces.ConnectorFieldConfig{
-			"host":      {Name: "主机地址", Type: "string", Description: "数据库服务器主机地址", Required: true, Encrypted: false},
-			"port":      {Name: "端口号", Type: "integer", Description: "数据库服务器端口", Required: true, Encrypted: false},
-			"username":  {Name: "用户名", Type: "string", Description: "数据库用户名", Required: true, Encrypted: false},
-			"password":  {Name: "密码", Type: "string", Description: "数据库密码", Required: true, Encrypted: true},
-			"databases": {Name: "数据库列表", Type: "array", Description: "数据库名称列表（可选，为空则连接实例级别）", Required: false, Encrypted: false},
-			"options":   {Name: "连接参数", Type: "object", Description: "连接参数（如 charset, timeout 等）", Required: false, Encrypted: false},
+			"host":      {Name: "Host", Type: "string", Description: "Database server host", Required: true, Encrypted: false},
+			"port":      {Name: "Port", Type: "integer", Description: "Database server port", Required: true, Encrypted: false},
+			"username":  {Name: "Username", Type: "string", Description: "Database username", Required: true, Encrypted: false},
+			"password":  {Name: "Password", Type: "string", Description: "Database password", Required: true, Encrypted: true},
+			"databases": {Name: "Databases", Type: "array", Description: "Optional database names; leave empty to connect at instance scope", Required: false, Encrypted: false},
+			"options":   {Name: "Connection options", Type: "object", Description: "Optional connection options such as charset and timeout. time_zone: if omitted, use the service time zone; an empty or whitespace-only string leaves the database session default. Non-empty values are trimmed and validated by the database. Driver loc always uses the service time zone.", Required: false, Encrypted: false},
 		}, fields)
 		require.Contains(t, fields, "password")
 		assert.True(t, fields["password"].Encrypted)
@@ -54,16 +61,36 @@ func TestMariaDBConnectorMetadataAndConfig(t *testing.T) {
 func TestMySQLConnectorMetadataAndConfig(t *testing.T) {
 	connector := NewMySQLConnector()
 
-	assert.Equal(t, interfaces.ConnectorTypeMySQL, connector.GetType())
-	assert.Equal(t, interfaces.ConnectorTypeMySQL, connector.GetName())
+	assert.Equal(t, "mysql", connector.GetType())
+	assert.Equal(t, "mysql", connector.GetName())
 
 	instance, err := connector.New(validMariaDBConfig(3306))
 
 	require.NoError(t, err)
-	assert.Equal(t, interfaces.ConnectorTypeMySQL, instance.GetType())
+	assert.Equal(t, "mysql", instance.GetType())
 }
 
 func TestMariaDBConnectorNew(t *testing.T) {
+	t.Run("fixed config fields require exact case", func(t *testing.T) {
+		cfg := validMariaDBConfig(3306)
+		cfg["Password"] = cfg["password"]
+		delete(cfg, "password")
+		instance, err := (&MariaDBConnector{}).New(cfg)
+		require.Error(t, err)
+		assert.Nil(t, instance)
+		cfg["password"] = "canonical-fixture"
+		cfg["Password"] = map[string]any{"ignored": true}
+		instance, err = (&MariaDBConnector{}).New(cfg)
+		require.NoError(t, err)
+		assert.Equal(t, "canonical-fixture", instance.(*MariaDBConnector).config.Password)
+	})
+	t.Run("decode errors exclude submitted credential values", func(t *testing.T) {
+		cfg := interfaces.ConnectorConfig{"password": map[string]any{"value": "private-fixture"}}
+		_, err := (&MariaDBConnector{}).New(cfg)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "private-fixture")
+	})
+
 	builder := &MariaDBConnector{}
 
 	t.Run("success", func(t *testing.T) {
@@ -184,9 +211,10 @@ func TestMariaDBConnectorNew(t *testing.T) {
 	})
 }
 
-func TestNormalizeOptions(t *testing.T) {
+func TestMariaDBConnectorNormalizeOptions(t *testing.T) {
+	connector := &MariaDBConnector{}
 	t.Run("trims duration before validation", func(t *testing.T) {
-		got, err := normalizeOptions(map[string]any{"timeout": " 5s ", "readTimeout": " 1.5s ", "writeTimeout": " 0s "})
+		got, err := connector.normalizeOptions(map[string]any{"timeout": " 5s ", "readTimeout": " 1.5s ", "writeTimeout": " 0s "})
 		require.NoError(t, err)
 		assert.Equal(t, map[string]any{"timeout": "5s", "readTimeout": "1.5s", "writeTimeout": "0s"}, got)
 	})
@@ -197,6 +225,9 @@ func TestNormalizeOptions(t *testing.T) {
 		wantErr string
 	}{
 		{"empty", nil, ""},
+		{"null timezone", map[string]any{"time_zone": nil}, "time_zone"},
+		{"numeric timezone", map[string]any{"time_zone": 8}, "time_zone"},
+		{"boolean timezone", map[string]any{"time_zone": false}, "time_zone"},
 		{"charset fallback", map[string]any{"charset": "utf8mb4,utf8"}, ""},
 		{"collation", map[string]any{"collation": "utf8mb4_general_ci"}, ""},
 		{"timeout", map[string]any{"timeout": "500ms"}, ""},
@@ -225,7 +256,7 @@ func TestNormalizeOptions(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := normalizeOptions(tt.options)
+			got, err := connector.normalizeOptions(tt.options)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				assert.Nil(t, got)
@@ -249,14 +280,64 @@ func TestNormalizeOptions(t *testing.T) {
 		{"false", false, "false"},
 	} {
 		t.Run("boolean "+tt.name, func(t *testing.T) {
-			got, err := normalizeOptions(map[string]any{"tls": tt.input})
+			got, err := connector.normalizeOptions(map[string]any{"tls": tt.input})
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got["tls"])
 		})
 	}
 }
 
-func TestMariaDBConnectorConnectionStringSupportsIPv6(t *testing.T) {
+func TestMariaDBConnectorConnectionString(t *testing.T) {
+	t.Run("missing service zone preserves the UTC default", func(t *testing.T) {
+		t.Setenv("TZ", "")
+		instance, err := NewMySQLConnector().New(validMariaDBConfig(3306))
+		require.NoError(t, err)
+		parsed, err := mysql.ParseDSN(instance.(*MariaDBConnector).connectionString())
+		require.NoError(t, err)
+		assert.Equal(t, "'UTC'", parsed.Params["time_zone"])
+		assert.Equal(t, "UTC", parsed.Loc.String())
+	})
+
+	t.Run("time_zone distinguishes absent empty and user supplied values", func(t *testing.T) {
+		t.Setenv("TZ", "Asia/Shanghai")
+		cases := []struct {
+			name    string
+			options map[string]any
+			want    string
+			present bool
+		}{
+			{"absent", nil, "'Asia/Shanghai'", true},
+			{"empty", map[string]any{"time_zone": ""}, "", false},
+			{"blank", map[string]any{"time_zone": "  "}, "", false},
+			{"offset", map[string]any{"time_zone": "+08:00"}, "'+08:00'", true},
+			{"name", map[string]any{"time_zone": "Asia/Shanghai"}, "'Asia/Shanghai'", true},
+			{"trimmed", map[string]any{"time_zone": " UTC "}, "'UTC'", true},
+			{"database validates", map[string]any{"time_zone": "Unknown/Zone"}, "'Unknown/Zone'", true},
+			{"offset is database validated", map[string]any{"time_zone": "+99:99"}, "'+99:99'", true},
+			{"SQL string escaping", map[string]any{"time_zone": "zone';SET @x=1;--"}, "'zone'';SET @x=1;--'", true},
+			{"backslash escaping", map[string]any{"time_zone": `zone\';SET @x=1;--`}, `'zone\\'';SET @x=1;--'`, true},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				for _, builder := range []interfaces.TableConnector{NewMySQLConnector(), NewMariaDBConnector()} {
+					cfg := validMariaDBConfig(3306)
+					cfg["options"] = tc.options
+					originalOptions := maps.Clone(tc.options)
+					instance, err := builder.New(cfg)
+					require.NoError(t, err)
+					dsn := instance.(*MariaDBConnector).connectionString()
+					parsed, err := mysql.ParseDSN(dsn)
+					require.NoError(t, err)
+					zone, exists := parsed.Params["time_zone"]
+					assert.Equal(t, tc.present, exists)
+					assert.Equal(t, tc.want, zone)
+					assert.Equal(t, "Asia/Shanghai", parsed.Loc.String())
+					assert.True(t, parsed.ParseTime)
+					assert.Equal(t, originalOptions, cfg["options"])
+				}
+			})
+		}
+	})
 	t.Setenv("TZ", "Asia/Shanghai")
 	connector := &MariaDBConnector{config: &mariadbConfig{
 		Host: "2001:db8::1", Port: 3306, Username: "root", Password: "secret",
@@ -270,8 +351,8 @@ func TestMariaDBConnectorConnectionStringSupportsIPv6(t *testing.T) {
 
 func TestMariaDBConnectorValidateDatabases(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
-		connector, mock, cleanup := newMariaDBConnectorMock(t, []string{"app", "audit"})
-		defer cleanup()
+		connector, mock := newMariaDBConnectorMock(t, []string{"app", "audit"})
+		defer cleanupMariaDBConnectorMock(t, connector, mock)
 
 		mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema\\.SCHEMATA WHERE SCHEMA_NAME IN").
 			WithArgs("app", "audit").
@@ -282,8 +363,8 @@ func TestMariaDBConnectorValidateDatabases(t *testing.T) {
 	})
 
 	t.Run("query error", func(t *testing.T) {
-		connector, mock, cleanup := newMariaDBConnectorMock(t, []string{"app"})
-		defer cleanup()
+		connector, mock := newMariaDBConnectorMock(t, []string{"app"})
+		defer cleanupMariaDBConnectorMock(t, connector, mock)
 
 		mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema\\.SCHEMATA WHERE SCHEMA_NAME IN").
 			WithArgs("app").
@@ -297,8 +378,8 @@ func TestMariaDBConnectorValidateDatabases(t *testing.T) {
 	})
 
 	t.Run("missing configured database", func(t *testing.T) {
-		connector, mock, cleanup := newMariaDBConnectorMock(t, []string{"missing"})
-		defer cleanup()
+		connector, mock := newMariaDBConnectorMock(t, []string{"missing"})
+		defer cleanupMariaDBConnectorMock(t, connector, mock)
 
 		mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema\\.SCHEMATA WHERE SCHEMA_NAME IN").
 			WithArgs("missing").
@@ -312,8 +393,8 @@ func TestMariaDBConnectorValidateDatabases(t *testing.T) {
 	})
 
 	t.Run("reports first missing database", func(t *testing.T) {
-		connector, mock, cleanup := newMariaDBConnectorMock(t, []string{"app", "first_missing", "second_missing"})
-		defer cleanup()
+		connector, mock := newMariaDBConnectorMock(t, []string{"app", "first_missing", "second_missing"})
+		defer cleanupMariaDBConnectorMock(t, connector, mock)
 
 		mock.ExpectQuery("SELECT SCHEMA_NAME FROM information_schema\\.SCHEMATA WHERE SCHEMA_NAME IN").
 			WithArgs("app", "first_missing", "second_missing").
@@ -326,8 +407,8 @@ func TestMariaDBConnectorValidateDatabases(t *testing.T) {
 	})
 
 	t.Run("empty database scope skips query", func(t *testing.T) {
-		connector, mock, cleanup := newMariaDBConnectorMock(t, nil)
-		defer cleanup()
+		connector, mock := newMariaDBConnectorMock(t, nil)
+		defer cleanupMariaDBConnectorMock(t, connector, mock)
 		require.NoError(t, connector.validateDatabases(context.Background()))
 		require.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -373,21 +454,22 @@ func TestMariaDBConnectorPing(t *testing.T) {
 }
 
 func TestMariaDBConnectorGetTableMetaRejectsMissingTable(t *testing.T) {
-	connector, mock, cleanup := newMariaDBConnectorMock(t, nil)
-	defer cleanup()
+	connector, mock := newMariaDBConnectorMock(t, nil)
+	defer cleanupMariaDBConnectorMock(t, connector, mock)
 	connector.connected = true
 
 	mock.ExpectQuery("SELECT TABLE_TYPE").
 		WithArgs("app", "deleted_orders").
 		WillReturnError(sql.ErrNoRows)
 
-	err := connector.GetTableMeta(context.Background(), &interfaces.TableMeta{Database: "app", Name: "deleted_orders"})
+	err := connector.GetTableMeta(context.Background(), &interfaces.TableMeta{Database: "app", Name: "deleted_orders"}, true)
 
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "table metadata not found or inaccessible: app.deleted_orders")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// validMariaDBConfig returns minimal connection settings with the supplied test port.
 func validMariaDBConfig(port int) interfaces.ConnectorConfig {
 	return interfaces.ConnectorConfig{
 		"host":     "127.0.0.1",
@@ -397,17 +479,111 @@ func validMariaDBConfig(port int) interfaces.ConnectorConfig {
 	}
 }
 
-func newMariaDBConnectorMock(t *testing.T, databases []string) (*MariaDBConnector, sqlmock.Sqlmock, func()) {
+// newMariaDBConnectorMock returns a scoped connector with a mock pool.
+func newMariaDBConnectorMock(t *testing.T, databases []string) (*MariaDBConnector, sqlmock.Sqlmock) {
 	t.Helper()
 
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
 
 	return &MariaDBConnector{
-			config: &mariadbConfig{Databases: databases},
-			db:     db,
-		}, mock, func() {
-			mock.ExpectClose()
-			require.NoError(t, db.Close())
+		config: &mariadbConfig{Databases: databases},
+		db:     db,
+	}, mock
+}
+
+func cleanupMariaDBConnectorMock(t *testing.T, connector *MariaDBConnector, mock sqlmock.Sqlmock) {
+	t.Helper()
+
+	mock.ExpectClose()
+	require.NoError(t, connector.db.Close())
+}
+
+func TestMariaDBConnectorFilterabilityValidation(t *testing.T) {
+	connector := &MariaDBConnector{}
+	for _, tc := range []struct {
+		native string
+		want   bool
+	}{{"int", true}, {"blob", false}, {"json", false}, {"unknown", false}, {"", false}} {
+		t.Run(tc.native, func(t *testing.T) {
+			enabled := true
+			resource := &interfaces.Resource{SourceMetadata: map[string]any{"columns": []interfaces.TableColumnMeta{{Name: "field", Type: tc.native}}}, SchemaDefinition: []*interfaces.Property{{Name: "field", Type: interfaces.DataType_Integer, OriginalType: tc.native, Filterable: &enabled}}}
+			before, err := json.Marshal(resource)
+			require.NoError(t, err)
+			columns, err := table.ColumnMetadata(resource)
+			require.NoError(t, err)
+			err = table.ValidateFilterability(resource, connector, columns)
+			if tc.want {
+				require.NoError(t, err)
+			} else {
+				var invalid *interfaces.ConditionBuildError
+				require.ErrorAs(t, err, &invalid)
+				assert.Contains(t, invalid.Reason, "field")
+			}
+			assert.True(t, *resource.SchemaDefinition[0].Filterable)
+			after, err := json.Marshal(resource)
+			require.NoError(t, err)
+			assert.JSONEq(t, string(before), string(after))
+		})
+	}
+	t.Run("missing source columns cannot be fabricated from schema", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			metadata map[string]any
+		}{
+			{"no metadata", nil},
+			{"no columns", map[string]any{}},
+			{"empty columns", map[string]any{"columns": []interfaces.TableColumnMeta{}}},
+			{"only another column", map[string]any{"columns": []interfaces.TableColumnMeta{{Name: "other", Type: "int"}}}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				enabled := true
+				resource := &interfaces.Resource{SourceMetadata: tc.metadata, SchemaDefinition: []*interfaces.Property{{Name: "published", OriginalName: "native_field", Type: interfaces.DataType_Integer, OriginalType: "int", Attributes: map[string]any{"type": "int"}, Filterable: &enabled}}}
+				before, err := json.Marshal(resource)
+				require.NoError(t, err)
+				columns, err := table.ColumnMetadata(resource)
+				require.NoError(t, err)
+				err = table.ValidateFilterability(resource, connector, columns)
+				var invalid *interfaces.ConditionBuildError
+				require.ErrorAs(t, err, &invalid)
+				assert.Contains(t, invalid.Reason, "published")
+				after, err := json.Marshal(resource)
+				require.NoError(t, err)
+				assert.JSONEq(t, string(before), string(after))
+				assert.Same(t, &enabled, resource.SchemaDefinition[0].Filterable)
+			})
 		}
+	})
+	t.Run("closed or omitted flags need no source columns", func(t *testing.T) {
+		closed := false
+		for _, flag := range []*bool{&closed, nil} {
+			resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{{Name: "published", OriginalName: "native_field", OriginalType: "int", Filterable: flag}}}
+			columns, err := table.ColumnMetadata(resource)
+			require.NoError(t, err)
+			require.NoError(t, table.ValidateFilterability(resource, connector, columns))
+			assert.True(t, flag == resource.SchemaDefinition[0].Filterable)
+		}
+	})
+}
+
+func TestMariaDBConnectorConnect(t *testing.T) {
+	for _, cause := range []error{errors.New("private-driver-fixture"), &mysql.MySQLError{Number: 1045, Message: "private-driver-fixture"}, context.Canceled, context.DeadlineExceeded} {
+		t.Run("driver errors exclude source contents "+cause.Error(), func(t *testing.T) {
+			patches := gomonkey.ApplyFunc(sql.Open, func(string, string) (*sql.DB, error) { return nil, cause })
+			defer patches.Reset()
+			connector := &MariaDBConnector{config: &mariadbConfig{}}
+			err := connector.Connect(context.Background())
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "private-driver-fixture")
+			var originalErr *mysql.MySQLError
+			if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+				assert.ErrorIs(t, err, cause)
+			} else if errors.As(cause, &originalErr) {
+				var sourceErr *mysql.MySQLError
+				require.ErrorAs(t, err, &sourceErr)
+				assert.Equal(t, uint16(1045), sourceErr.Number)
+			}
+		})
+	}
+
 }

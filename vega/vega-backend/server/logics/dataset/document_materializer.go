@@ -1,3 +1,7 @@
+// Copyright openbkn.ai
+//
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
 package dataset
 
 import (
@@ -6,38 +10,50 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/local_index"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/query/query_error"
 )
 
 type pendingEmbedding struct {
+	modelID   string
 	field     string
 	text      string
 	dimension int
 }
 
 func (ds *datasetService) materializeDocument(ctx context.Context, res *interfaces.Resource, document map[string]any) (map[string]any, error) {
+	documents, err := ds.materializeDocuments(ctx, res, []map[string]any{document})
+	if err != nil {
+		return nil, err
+	}
+	return documents[0].Document, nil
+}
+
+func prepareDocument(ctx context.Context, res *interfaces.Resource, document map[string]any) (map[string]any, []pendingEmbedding, error) {
 	// Protect the internal service boundary: a caller must not write when the
 	// Dataset resource has already lost its physical index.
 	if res == nil || strings.TrimSpace(res.LocalIndexName) == "" {
-		return nil, invalidDocumentError(ctx, "dataset resource has no available local index")
+		return nil, nil, invalidDocumentError(ctx, "dataset resource has no available local index")
 	}
 	// A nil map cannot be materialized or sent to the local index.
 	if document == nil {
-		return nil, invalidDocumentError(ctx, "document is required")
+		return nil, nil, invalidDocumentError(ctx, "document is required")
 	}
-	result := make(map[string]any, len(document))
-	for key, value := range document {
-		result[key] = value
+	encoded, err := local_index.EncodeDecimalDocument(res, document)
+	if err != nil {
+		return nil, nil, query_error.DecimalIndexHTTPError(ctx, err)
 	}
-	models := map[string]*interfaces.SmallModel{}
-	pending := map[string][]pendingEmbedding{}
-	modelOrder := make([]string, 0)
+	result := encoded
+	delete(result, "_id")
+
+	pending := []pendingEmbedding{}
 
 	for _, prop := range res.SchemaDefinition {
 		// Persisted schemas never contain nil properties. Keep this guard for
@@ -51,12 +67,12 @@ func (ds *datasetService) materializeDocument(ctx context.Context, res *interfac
 			}
 			dimension, err := vectorFeatureDimension(feature.Config, prop.Name)
 			if err != nil {
-				return nil, invalidDocumentError(ctx, err.Error())
+				return nil, nil, invalidDocumentError(ctx, err.Error())
 			}
 			if prop.Type == interfaces.DataType_Vector {
 				if value, exists := result[prop.Name]; exists {
 					if err := validateVector(value, dimension, prop.Name); err != nil {
-						return nil, invalidDocumentError(ctx, err.Error())
+						return nil, nil, invalidDocumentError(ctx, err.Error())
 					}
 				}
 				continue
@@ -66,66 +82,94 @@ func (ds *datasetService) materializeDocument(ctx context.Context, res *interfac
 				// An explicit vector wins over inference, but validate it before it
 				// reaches OpenSearch.
 				if err := validateVector(value, dimension, outputField); err != nil {
-					return nil, invalidDocumentError(ctx, err.Error())
+					return nil, nil, invalidDocumentError(ctx, err.Error())
 				}
 				continue
 			}
 			if text, ok := result[prop.Name].(string); ok && strings.TrimSpace(text) != "" {
 				modelID, _ := feature.Config["embedding_model"].(string)
 				if modelID == "" {
-					modelID = res.IndexConfig.DefaultEmbeddingModel
-				}
-				if _, exists := models[modelID]; !exists {
-					model, err := ds.mfs.GetModelByID(ctx, modelID)
-					if err != nil {
-						// The registry is an external dependency. Abort before any local
-						// index write so the document is never partially materialized.
-						return nil, fmt.Errorf("get embedding model %q: %w", modelID, err)
+					if res.IndexConfig != nil {
+						modelID = res.IndexConfig.DefaultEmbeddingModel
 					}
-					models[modelID] = model
-					modelOrder = append(modelOrder, modelID)
 				}
-				if _, exists := pending[modelID]; !exists {
-					pending[modelID] = []pendingEmbedding{}
-				}
-				pending[modelID] = append(pending[modelID], pendingEmbedding{field: outputField, text: text, dimension: dimension})
+				pending = append(pending, pendingEmbedding{modelID: modelID, field: outputField, text: text, dimension: dimension})
 			}
 		}
 	}
 
-	for _, modelID := range modelOrder {
-		requests := pending[modelID]
-		if len(requests) == 0 {
-			continue
+	return result, pending, nil
+}
+
+// materializeDocuments 按模型聚合推理，任一文档失败即整体返回错误。
+func (ds *datasetService) materializeDocuments(ctx context.Context,
+	res *interfaces.Resource, documents []map[string]any) ([]interfaces.DocumentWrite, error) {
+	results := make([]interfaces.DocumentWrite, len(documents))
+	if len(documents) == 0 {
+		return results, nil
+	}
+	type embeddingTarget struct {
+		document int
+		pendingEmbedding
+	}
+	pending := map[string][]embeddingTarget{}
+	modelOrder := []string{}
+	for i, document := range documents {
+		if value, exists := document["_id"]; exists {
+			id, ok := value.(string)
+			if !ok || strings.TrimSpace(id) == "" || len(id) > 512 || !utf8.ValidString(id) {
+				return nil, invalidDocumentError(ctx, "document id must be a non-blank valid UTF-8 string of at most 512 bytes")
+			}
 		}
-		words := make([]string, len(requests))
-		for i, request := range requests {
-			words[i] = request.text
-		}
-		vectors, err := ds.mfs.GetVector(ctx, models[modelID], words)
+		result, requests, err := prepareDocument(ctx, res, document)
 		if err != nil {
-			// Inference is an external side effect; do not write a document when
-			// it fails.
-			return nil, fmt.Errorf("generate embeddings for model %q: %w", modelID, err)
+			return nil, err
 		}
-		// The response must still match the request after crossing the model
-		// service boundary, otherwise fields could receive the wrong vectors.
-		if len(vectors) != len(requests) {
-			return nil, fmt.Errorf("embedding model %q returned %d vectors for %d fields", modelID, len(vectors), len(requests))
-		}
-		for i, vector := range vectors {
-			// A malformed model response must not produce a partially indexed
-			// document.
-			if vector == nil {
-				return nil, fmt.Errorf("embedding model %q returned an empty vector", modelID)
+		id, _ := document["_id"].(string)
+		results[i] = interfaces.DocumentWrite{ID: id, Document: result}
+
+		for _, request := range requests {
+			if _, exists := pending[request.modelID]; !exists {
+				modelOrder = append(modelOrder, request.modelID)
 			}
-			if err := validateVector(vector.Vector, requests[i].dimension, requests[i].field); err != nil {
-				return nil, fmt.Errorf("embedding model %q returned invalid vector: %w", modelID, err)
-			}
-			result[requests[i].field] = vector.Vector
+			pending[request.modelID] = append(pending[request.modelID], embeddingTarget{i, request})
 		}
 	}
-	return result, nil
+	for _, modelID := range modelOrder {
+		requests := pending[modelID]
+		model, err := ds.mfs.GetModelByID(ctx, modelID)
+		if err != nil {
+			return nil, fmt.Errorf("get embedding model %q: %w", modelID, err)
+		}
+		// 模型调用单独限制批量大小，不随 HTTP 文档数无限增长。
+		const embeddingBatchSize = 128
+		for start := 0; start < len(requests); start += embeddingBatchSize {
+			end := min(start+embeddingBatchSize, len(requests))
+			chunk := requests[start:end]
+			words := make([]string, len(chunk))
+			for i, request := range chunk {
+				words[i] = request.text
+			}
+			vectors, err := ds.mfs.GetVector(ctx, model, words)
+			if err == nil && len(vectors) != len(chunk) {
+				err = fmt.Errorf("returned %d vectors for %d fields", len(vectors), len(chunk))
+			}
+			if err != nil {
+				return nil, fmt.Errorf("generate embeddings for model %q: %w", modelID, err)
+			}
+			for i, vector := range vectors {
+				request := chunk[i]
+				if vector == nil {
+					return nil, fmt.Errorf("embedding model %q returned an empty vector", modelID)
+				}
+				if err := validateVector(vector.Vector, request.dimension, request.field); err != nil {
+					return nil, fmt.Errorf("embedding model %q returned invalid vector: %w", modelID, err)
+				}
+				results[request.document].Document[request.field] = vector.Vector
+			}
+		}
+	}
+	return results, nil
 }
 
 // vectorFeatureDimension validates persisted schema data before it controls
@@ -212,5 +256,5 @@ func vectorElementNumber(value any) (float64, bool) {
 }
 
 func invalidDocumentError(ctx context.Context, details string) error {
-	return rest.NewHTTPError(ctx, 400, verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails(details)
+	return httperrors.NewHTTPError(ctx, 400, verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails(details)
 }

@@ -6,7 +6,13 @@
 
 package bkntrace
 
-import "strings"
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/knversion"
+)
 
 var businessRefPrefixes = map[string]string{
 	"knowledge_network": "kn",
@@ -112,10 +118,13 @@ func DeriveToolBusinessRefs(toolName string, input map[string]any, currentKNID s
 		return refs
 	case "query_metric":
 		metricID := businessRefString(input["metric_id"])
-		if metricID == "" {
+		version := intValue(input["version"], 0)
+		if metricID == "" || version < 1 {
 			return nil
 		}
-		return append(refs, BusinessRef{RefType: "metric", RefID: "metric:" + currentKNID + ":" + metricID, Version: "unversioned"})
+		return append(refs, BusinessRef{
+			RefType: "metric", RefID: fmt.Sprintf("metric:%s:%s:v%d", currentKNID, metricID, version), Version: fmt.Sprintf("v%d", version),
+		})
 	default:
 		return nil
 	}
@@ -186,4 +195,60 @@ func invalidBusinessRefError() *APIError {
 func businessRefString(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+// stampKnVersion records the knowledge-network version a tool actually read on
+// the refs that live inside a network. Instance data is not versioned, so
+// other ref types keep their version, and an unversioned network (empty label)
+// keeps "unversioned".
+func stampKnVersion(refs []BusinessRef, label string) []BusinessRef {
+	if label == "" || len(refs) == 0 {
+		return refs
+	}
+	out := make([]BusinessRef, len(refs))
+	copy(out, refs)
+	for i := range out {
+		switch out[i].RefType {
+		case "knowledge_network", "object_type", "relation_type":
+			if out[i].Version == "unversioned" {
+				out[i].Version = label
+			}
+		}
+	}
+	return out
+}
+
+// knVersionLabel is the version the current tool call has read so far.
+func knVersionLabel(ctx context.Context) string {
+	return knversion.FromContext(ctx).Label()
+}
+
+// knVersionStatus is the version_status of a ref inside a knowledge network.
+func knVersionStatus(ctx context.Context) string {
+	if knVersionLabel(ctx) != "" {
+		return "versioned"
+	}
+	return "unversioned"
+}
+
+// RecordKnVersion remembers, for the attempt's receipt, the knowledge-network
+// version the tool read.
+func RecordKnVersion(ctx context.Context, label string) {
+	outcome := evidenceOutcomeFromContext(ctx)
+	if outcome == nil || label == "" {
+		return
+	}
+	outcome.mu.Lock()
+	outcome.knVersion = label
+	outcome.mu.Unlock()
+}
+
+func recordedKnVersion(ctx context.Context) string {
+	outcome := evidenceOutcomeFromContext(ctx)
+	if outcome == nil {
+		return ""
+	}
+	outcome.mu.Lock()
+	defer outcome.mu.Unlock()
+	return outcome.knVersion
 }

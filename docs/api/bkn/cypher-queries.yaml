@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.2
 info:
-  title: CypherQuery
+  title: BKN 知识网络 · Cypher 查询 API
   version: 0.1.0
   description: |-
     Read-only Cypher queries over the instance data of a knowledge network.
@@ -9,9 +9,10 @@ info:
     subset accepted here is what compiles that way: one MATCH over a single path, a WHERE over
     properties, and a projection of properties and aggregates of them. Everything else is
     refused by name rather than approximated.
-    Paging is written in the query itself with SKIP and LIMIT; there is no paging parameter.
-    Exposed under /api/bkn-backend/v1 (OAuth2) and /api/ontology-manager/v1 (alias), with the
-    branch query parameter defaulting to main.
+    Paging is written in the query itself with SKIP and LIMIT; there is no paging parameter. Both take
+    an integer or a $parameter (SKIP $from LIMIT $size) whose value is a non-negative integer.
+    Exposed under /api/bkn-backend/v1 (OAuth2), with the branch query parameter defaulting
+    to main.
 security:
   - OAuth2: []
 paths:
@@ -75,6 +76,8 @@ paths:
           schema:
             type: string
             default: main
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       requestBody:
         required: true
         content:
@@ -83,6 +86,13 @@ paths:
               $ref: "#/components/schemas/CypherQueryRequest"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: The query ran. Returns its columns and rows.
           content:
             application/json:
@@ -95,7 +105,9 @@ paths:
             BknBackend.Cypher.Unsupported (valid openCypher outside the supported subset),
             BknBackend.Cypher.InvalidQuery (does not match the knowledge network model),
             BknBackend.Cypher.LimitExceeded (LIMIT above the ceiling),
-            BknBackend.Cypher.InvalidParameter (missing or oversized query).
+            BknBackend.Cypher.InvalidParameter (missing or oversized query),
+            BknBackend.Cypher.ReadBudgetExceeded (the evidence a collect(...) query reads
+            reaches 10000 rows; add conditions or lower LIMIT).
             error_details carries the compiler's message, with a line and column where the
             construct appears.
           content:
@@ -129,11 +141,24 @@ paths:
         "500":
           description: |-
             BknBackend.Cypher.QueryFailed: the compiled statement failed to run for a reason other
-            than a refused resource. The dependency's message is not passed through.
+            than a refused resource or a timeout. The dependency's message is not passed through.
           content:
             application/json:
               schema:
                 $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "504":
+          description: |-
+            BknBackend.Cypher.QueryTimeout: the data source did not finish the compiled statement
+            within its timeout (timeout_sec, or the configured 55 seconds) and stopped it. Retrying the same query will time out
+            again; add conditions on the nodes the pattern matches so that less data is read or joined.
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
 components:
   securitySchemes:
     OAuth2:
@@ -155,14 +180,52 @@ components:
           description: |-
             Values for the $name references in the query. A parameter is a value and never an
             identifier: it can change which rows come back, never which resource or column is
-            read. Strings, numbers and booleans are accepted; a null is refused, because IS
-            NULL says that and a comparison against null never matches. A parameter used as
-            IN $name takes a non-empty array of scalars of one kind (integers and floats both
-            count as numbers), with no null and at most 500 elements. Several long lists in
+            read. Strings, numbers and booleans are accepted. A null is accepted only where the
+            query tests $name IS NULL, which makes a condition optional: WHERE ($code IS NULL OR
+            s.code = $code) filters by $code when it has a value and drops the condition when
+            it is null or left out. The test is decided before the query runs, so the data
+            source sees the plain condition or none. Anywhere else a null is refused, because a
+            comparison against null never matches. A parameter used as
+            IN $name takes an array of scalars of one kind (integers and floats both count as
+            numbers), with no null and at most 500 elements; an empty array matches nothing, as
+            IN [] does. A string compared with a date, datetime or timestamp property has to be
+            a date, such as 2026-08-13 or 2026-08-13T09:30:00 (an RFC 3339 offset is accepted);
+            any other string is refused with 400 rather than read as some instant. Several long lists in
             one query can still be refused with 400 as too large; split them across queries.
           example:
             region: "eu"
             floor: 100
+        object_properties:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          description: |-
+            Properties a returned node carries besides its identity, keyed by the node's
+            variable. Each variable must be a node the query returns, and at most 128
+            properties may be named in all, across every variable; the properties are read
+            under the same authorization as any other property the query names.
+          example:
+            t: ["team_name"]
+        explain:
+          type: boolean
+          description: |-
+            Return the query's plan instead of its rows. The query is read, authorized and
+            compiled exactly as it would be to run, so it is refused in the same cases and with
+            the same error, but nothing is read from the data and no SQL is returned. entries is
+            then empty and plan is set. One exception: explain does not see where the data lives,
+            so a form refused only on datasets, indexes or across data sources (see the query
+            description) passes explain and is refused when run.
+        timeout_sec:
+          type: integer
+          minimum: 1
+          description: |-
+            How long the query may run at the data source, in seconds. Every statement it runs (the
+            parts of a UNION, or a bind-join and its SQL fallback) shares this one limit. Leave it out
+            to use the service's configured timeout (55 seconds unless the deployment sets
+            BKN_CYPHER_QUERY_TIMEOUT_SEC). It can only shorten that timeout: a value above it, or
+            below 1, is refused with BknBackend.Cypher.InvalidParameter.
         query:
           type: string
           maxLength: 8192
@@ -170,27 +233,164 @@ components:
             The Cypher query. Supported shape:
             MATCH (a:Label [{property: value, ...}]) [-[:RELATION]-(b:Label) ...]
             [WHERE <condition>]
-            RETURN [DISTINCT] a.property | aggregate(a.property) [AS alias], ...
+            RETURN [DISTINCT] a.property | aggregate(a.property) | <condition> | a | r | collect(x) | {k: x} [AS alias], ...
             [ORDER BY a.property | alias | aggregate(a.property) [DESC]] [SKIP n] [LIMIT n]
 
-            A condition compares a property with =, <>, <, >, <= or >= against a literal or a
-            parameter, or tests it with IN [ ... ], IN $list (the whole list as one parameter),
+            or, to filter after aggregating, with WITHs after every MATCH:
+            MATCH ... [WHERE <condition>]
+            WITH a | a.property AS name | aggregate(...) AS name | collect(a.property) AS list, ... [WHERE <condition over those names>]
+            [WITH name | <value computed from names> AS name, ... [WHERE ...]] ...
+            RETURN name | a.property | <value computed from names> [AS alias], ... [ORDER BY ...] [SKIP n] [LIMIT n]
+              | RETURN count(*) | aggregate([DISTINCT] name) [AS alias], ... [SKIP n] [LIMIT n]
+
+            or, to filter by the values of an earlier stage (a semi-join):
+            MATCH ... [WHERE ...]
+            WITH [DISTINCT] a.property AS v | collect(a.property) AS s
+            MATCH ... WHERE b.property = v | b.property IN s [AND ...]
+            RETURN ...
+
+            or, to pass nodes on to the next MATCH:
+            MATCH ... [WHERE ...] WITH a, ..., aggregate(...) AS name, ... [WHERE ...]
+            MATCH (a)-[...]-(b...) [WHERE <condition on the new MATCH>]
+            RETURN a | b | b.property | name | aggregate(...) | <value computed from those> [AS alias], ...
+
+            or, to compare two collected lists:
+            MATCH ... [WHERE ...] WITH collect([DISTINCT] a.property) AS l1
+            MATCH ... [WHERE ...] WITH l1, collect([DISTINCT] b.property) AS l2
+            RETURN size([x IN l1 WHERE x IN l2]) | size(l1) | size(l2) [AS alias], ...
+
+            Each form may open with WITH <literal> | [<literal>, ...] | $param AS name, ...,
+            whose names the conditions of the MATCH that follows use, as in
+            WITH ['a', 'b'] AS codes MATCH (n:Label) WHERE n.code IN codes.
+
+            A condition compares a property with =, <>, <, >, <= or >= against a literal, a
+            parameter or another property (o.shipped < o.ordered, a.code = b.code; properties the
+            model types as a string and a number cannot be compared), or tests it with IN [ ... ], IN $list (the whole list as one parameter),
             IS NULL or IS NOT NULL. A string property can also be matched with STARTS WITH,
             ENDS WITH or CONTAINS against a string literal or parameter: the match is a literal
             substring match (% and _ are not wildcards), a null property never matches, case
             sensitivity follows the column collation, and using them on a non-string property
             is refused with 400. Conditions combine with AND, OR and NOT, and parentheses group
-            them. XOR is not supported.
+            them. XOR is not supported. Not-equal is written <>; != is read as <> too. A date or
+            time property can be compared
+            with date('2026-08-13'), datetime(...) or localdatetime(...) over a string literal or
+            parameter; functions other than these, coalesce, the scalar functions below, size
+            (of a list a WITH collected) and the aggregates, and date() with no argument, are
+            refused.
+
+            The scalar functions round(x) and round(x, n) (n an integer literal from 0 to 30,
+            giving a number), abs(x), toInteger(x) (truncated toward zero), toFloat(x),
+            toUpper(s), toLower(s) and toString(x) may stand wherever CASE and coalesce may.
+            round, abs, toInteger and toFloat take numbers, and toUpper and toLower strings;
+            another type is refused with 400. Numeric columns, including DECIMAL and sum() over
+            DECIMAL, return JSON numbers with their exact decimal digits (without a float64
+            conversion). Text columns remain strings. Clients must use an exact numeric decoder
+            for values outside IEEE 754 precision. Queries using these functions always run on the SQL path.
+
+            CASE and coalesce compute a value wherever arithmetic may stand: in RETURN, WITH,
+            ORDER BY, either side of a comparison and the argument of an aggregate, as in
+            `sum(CASE WHEN g.penalty = '1' THEN 1 ELSE 0 END)` or `coalesce(o.region, 'unknown')`.
+            Both forms of CASE are accepted (CASE WHEN <condition> THEN ... and
+            CASE x WHEN v THEN ...); without ELSE an unmatched row gives null. The branches of a
+            CASE, and the arguments of coalesce, must all be numbers or all be other values (a
+            null literal fits either), and none may be a boolean: return the condition itself
+            for that, a boolean property included. Compared with something, a string result
+            takes a string literal, parameter or property on the other side and a number result
+            a number; a string against a number is refused, since MySQL would convert the string.
+            After a WITH a branch's condition may test the names the WITH passed on,
+            including aggregates (CASE WHEN n > 10 THEN ... where n is count(*)); before one,
+            aggregates belong in RETURN, not in a branch's condition. Queries using CASE or
+            coalesce always run on the SQL path.
+
+            RETURN can also return a condition, written as in WHERE, as in
+            `g.tournament_name CONTAINS 'Men' AS mens`. Its value is true, false, or null when
+            the condition cannot be decided (a null property, or a node an OPTIONAL MATCH did
+            not find). Like any other returned value it groups an aggregated result. To sort
+            by a condition, return it with an alias and sort by the alias.
+
+            A WITH groups by what it passes on that is not an aggregate; a node groups by its
+            primary key, so two objects that share a name stay two groups. Values in WITH are
+            named with AS. Its WHERE compares those names, properties of the nodes it passed
+            on, values computed from them, literals and parameters: a condition on grouping
+            keys filters rows before grouping, and one on aggregates is tested per group (SQL
+            HAVING). A list a WITH collected is read only as size(list), the count of what it
+            collected. Further WITHs pass on names and values computed from them, each with its
+            own WHERE; only the first may aggregate. RETURN lists the names, properties of the
+            nodes and values computed from them; after a WITH that does not aggregate, count(*)
+            may follow. After a WITH that aggregates, RETURN may instead aggregate its groups,
+            as in RETURN count(*) AS groups: then it holds only such aggregates and returns one
+            row. Refused: MATCH after a second WITH, a WITH after the second MATCH other than to compare two lists, WITH DISTINCT, WITH *, ORDER BY / SKIP /
+            LIMIT on WITH, IN / string predicates in its WHERE, and aggregating in a WITH after
+            the first.
+
+            Object types bound to a resource outside a SQL data source (a dataset or an index),
+            or read from more than one data source, are read through the resource data API and
+            joined instead of as one SQL statement. There only the basic forms run: CASE,
+            coalesce, the scalar functions, totals over groups, comparing two lists, passing nodes on and collect are
+            refused with 400, and a read too large or too slow is refused too. Nodes,
+            relationships and derived relationships are returned as on a SQL data source,
+            and UNION works, each part read on its own.
+
+            In the semi-join form each row of the second stage is kept once if its value is
+            among the first stage's, however often the first stage produced it; v may also be
+            an inline property value ({property: v}). The first stage's properties and rows are
+            authorized like any other part of the query. The WITH holds one item; without
+            DISTINCT, RETURN must be DISTINCT and not aggregate. v is used only as = and s only
+            as IN, each as a condition of its own at the top of WHERE (not under OR or NOT).
+
+            Passing nodes on joins each row the WITH passed on to the rows the next MATCH finds
+            for its nodes, matched up by primary key; the nodes may be written there without
+            their labels. The WITH's named values may be returned, sorted by and computed with;
+            when the query aggregates, those read in an expression or ORDER BY must also be
+            returned on their own, as grouping keys. They cannot be tested in the next MATCH's WHERE (test them in the WITH's
+            WHERE). Every node passed on must be used in the next MATCH, nodes cannot be renamed
+            or passed beside a collected list, the next MATCH cannot be OPTIONAL, and that
+            WITH takes no DISTINCT, ORDER BY, SKIP or LIMIT. After any
+            WITH, RETURN may return the nodes it passed on. Such a query always runs on the SQL
+            path.
+
+            Comparing two lists returns one row of sizes: of each list, and of the elements of
+            one list the other also holds, size([x IN l1 WHERE x IN l2]). A list collected
+            without DISTINCT keeps its repeats, and the shared count counts the filtered list's
+            repeats, as Cypher does; counting both ways round needs DISTINCT on both lists.
+            When the second stage matches nothing there is no row. Neither WITH takes a WHERE,
+            the second MATCH may not use the first list, the lists themselves cannot be
+            returned (to list shared values, share a node in one MATCH), and the two
+            properties must not be a string and a number. UNWIND is refused. Such a query
+            always runs on the SQL path.
+
+            RETURN can return a node or a relationship itself. A node is its object type and
+            its full primary key, each key value as exact text with its declared type, plus the
+            properties object_properties names; a relationship is its relation type, the
+            identities of its two ends and the key pairs that joined them. collect(x) gathers
+            x over each group into a list, keeping duplicates and skipping null; {k: x} builds
+            a map. Nodes and relationships group by identity, so RETURN t, count(*) counts per
+            object. Such a query runs as one SQL statement, whatever executor is configured.
+            With collect, each result row is a conclusion, the values beside collect, and LIMIT
+            counts conclusions: every matched row of each conclusion it keeps is collected. The
+            answer is complete or refused: evidence reaching 10000 rows fails with 400
+            BknBackend.Cypher.ReadBudgetExceeded rather than returning part of it. Graph values
+            cannot be sorted or made DISTINCT, collect cannot be mixed with other aggregates,
+            beside collect only nodes, relationships, properties and constants may be returned
+            and sorting is by the alias of a returned property, and relationships have no
+            properties of their own (r.x is refused).
 
             Aggregates are count, sum, avg, min and max, each also in its DISTINCT form, plus
-            count(*). Cypher has no GROUP BY: aggregating anything groups by everything else
-            the query returns. A grouped or DISTINCT result can only be sorted by a value it
+            count(*). count(n) counts the rows where node n was found, and count(DISTINCT n)
+            counts distinct objects by their primary key, by all its properties together when it
+            has several (an object type without one is refused). count(r) counts relationship r:
+            every row of a MATCH holds one, and in an OPTIONAL MATCH a row with no relationship found
+            is not counted (the node that clause introduces needs a primary key); count(DISTINCT r)
+            counts each pair of objects once by both ends' primary keys, so both need one. Cypher has no GROUP BY, and writing one is a syntax error that says
+            so: aggregating anything groups by everything else the query returns. A grouped or DISTINCT result can only be sorted by a value it
             returns.
 
             A MATCH may contain several comma-separated paths, and a query may contain several
             MATCH clauses; both mean one shape. A variable written twice is the node it named
-            the first time, which is how two paths meet, and paths that share no variable are
-            a cartesian product. The first mention of a node names its object type; a later
+            the first time, which is how two paths meet, and paths that share no variable
+            combine pairwise. Two parts that are neither connected nor narrowed by any condition
+            (every row of one table against every row of another) are refused with 400
+            Unsupported. The first mention of a node names its object type; a later
             one may omit the label but must not contradict it.
 
             A path may contain several relationships. Each names exactly one relation type and
@@ -216,15 +416,207 @@ components:
       properties:
         columns:
           type: array
-          description: Output columns, in RETURN order. The name is the AS alias, or the source text of the property reference when no alias was written.
+          description: Output columns, in RETURN order. The name is the AS alias, or the source text of what was returned when no alias was written.
           items:
             $ref: "#/components/schemas/CypherQueryColumn"
         entries:
           type: array
-          description: Result rows, keyed by column name.
+          description: "Result rows, keyed by column name. A node is a CypherObjectValue, a relationship a CypherRelationValue, collect(...) a list and {k: x} an object."
           items:
             type: object
             additionalProperties: true
+        value_types:
+          type: object
+          description: Present when graph values are returned. The value type of each column, keyed by column name.
+          additionalProperties:
+            $ref: "#/components/schemas/CypherValueType"
+        execution:
+          $ref: "#/components/schemas/CypherExecution"
+        plan:
+          $ref: "#/components/schemas/CypherPlan"
+        limited:
+          type: boolean
+          description: >-
+            True when the query wrote no LIMIT and returned the default 1000 rows, so more may
+            match. Absent otherwise.
+    CypherPlan:
+      type: object
+      description: >-
+        Present when the request set explain. How the query would run, in the model's terms;
+        the SQL it becomes is never included.
+      properties:
+        shape:
+          type: string
+          enum: [match, aggregate, totals, semi_join, list_comparison, carried, union]
+          description: The query's form; see the WITH section above.
+        graph:
+          type: boolean
+          description: The result holds nodes, relationships or other graph values.
+        objects:
+          type: array
+          description: Each node of the pattern. A node of an earlier stage carries its prefix, as in stage0.o or carried.o.
+          items:
+            type: object
+            properties:
+              alias: {type: string}
+              object_type_id: {type: string}
+        relations:
+          type: array
+          items:
+            type: object
+            properties:
+              relation_type_id: {type: string}
+              source: {type: string}
+              target: {type: string}
+              direction: {type: string}
+        conditions:
+          type: array
+          description: >-
+            Each condition by operator and the properties it reads (object_type_id.property);
+            where says what it applies to: where (rows), having (groups), optional_match, or
+            either of those in an earlier stage. Values are not repeated.
+          items:
+            type: object
+            properties:
+              operator: {type: string}
+              expression: {type: string}
+              properties: {type: array, items: {type: string}}
+              where: {type: string}
+        grouping:
+          type: array
+          items: {type: string}
+          description: Properties the result is grouped by.
+        columns:
+          type: array
+          description: Each returned column, with what computes it (property, count, sum, node, arithmetic, case and so on) and its value type.
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              kind: {type: string}
+              type:
+                $ref: "#/components/schemas/CypherValueType"
+        ordering:
+          type: array
+          items:
+            type: object
+            properties:
+              column: {type: string}
+              property: {type: string}
+              descending: {type: boolean}
+        limit:
+          type: integer
+          description: The most rows the query returns.
+        limit_source:
+          type: string
+          enum: [explicit, default]
+        reads:
+          type: array
+          items: {type: string}
+          description: Every property the query reads, each authorized before it runs.
+        row_filtered:
+          type: array
+          items: {type: string}
+          description: Object types whose rows the caller's access policy narrows.
+        warnings:
+          type: array
+          items: {type: string}
+          description: >-
+            What to know before running: parts of the pattern that no relationship or equality
+            joins, the default row cap, row filters, and the evidence cap of collect.
+        warning_codes:
+          type: array
+          items:
+            type: string
+            enum: [disconnected_parts, default_limit, row_filtered, collect_cap]
+          description: The code of each warning, in the same order, for wording it in another language.
+    CypherValueType:
+      type: object
+      properties:
+        kind:
+          type: string
+          description: object, relation, map, list, or the scalar type of the value.
+        object_type_id:
+          type: string
+        relation_type_id:
+          type: string
+        fields:
+          type: object
+          description: For a map, the type of each key.
+          additionalProperties:
+            $ref: "#/components/schemas/CypherValueType"
+        element:
+          $ref: "#/components/schemas/CypherValueType"
+    CypherExecution:
+      type: object
+      description: Present when graph values are returned.
+      properties:
+        match_rows:
+          type: integer
+          description: >-
+            Rows the statement returned: the matched rows of the conclusions when RETURN
+            collects, the result rows otherwise.
+        match_complete:
+          type: boolean
+          description: Every matched row was read; a query that could not read them all fails instead.
+        conclusions_limited:
+          type: boolean
+          description: >-
+            The number of results reached LIMIT (or the default 1000), so more may exist. LIMIT
+            never cuts the evidence inside a collected list.
+    CypherObjectValue:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [object]
+        network_id:
+          type: string
+        branch:
+          type: string
+        object_type_id:
+          type: string
+        key:
+          type: object
+          description: Each primary key property, as exact text with its declared type.
+          additionalProperties:
+            type: object
+            properties:
+              type:
+                type: string
+              value:
+                type: string
+        properties:
+          type: object
+          description: The properties object_properties named.
+          additionalProperties: true
+    CypherRelationValue:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [relation]
+        relation_type_id:
+          type: string
+        source:
+          $ref: "#/components/schemas/CypherObjectValue"
+        target:
+          $ref: "#/components/schemas/CypherObjectValue"
+        basis:
+          type: array
+          description: The key pairs that joined the two ends.
+          items:
+            type: object
+            properties:
+              source_property:
+                type: string
+              source_value: {}
+              target_property:
+                type: string
+              target_value: {}
+        binding_digest:
+          type: string
+          description: Identifies the relation type's mapping the relationship was read through.
     CypherQueryColumn:
       type: object
       properties:

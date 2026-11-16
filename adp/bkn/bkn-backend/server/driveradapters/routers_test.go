@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -17,8 +18,8 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 // setGinMode sets Gin to test mode and returns a restore function.
@@ -107,6 +108,105 @@ func TestRegisterPublicIncludesOAuthProxyGovernanceRoutes(t *testing.T) {
 	} {
 		if !routes[want] {
 			t.Fatalf("public proxy governance route %q is not registered", want)
+		}
+	}
+}
+
+func TestOntologyManagerAliasesAreNotRegistered(t *testing.T) {
+	restoreGin := setGinMode()
+	defer restoreGin()
+	engine := gin.New()
+	(&restHandler{appSetting: &common.AppSetting{}}).RegisterPublic(engine)
+
+	routes := map[string]bool{}
+	for _, route := range engine.Routes() {
+		if strings.HasPrefix(route.Path, "/api/ontology-manager/") {
+			t.Fatalf("retired ontology-manager alias remains registered: %s %s", route.Method, route.Path)
+		}
+		routes[route.Method+" "+route.Path] = true
+	}
+	for _, want := range []string{
+		"POST /api/bkn-backend/v1/knowledge-networks",
+		"POST /api/bkn-backend/in/v1/knowledge-networks",
+	} {
+		if !routes[want] {
+			t.Fatalf("canonical route %q is not registered", want)
+		}
+	}
+
+	for _, path := range []string{
+		"/api/ontology-manager/v1/knowledge-networks",
+		"/api/ontology-manager/in/v1/knowledge-networks",
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("retired alias %q returned %d, want 404", path, response.Code)
+		}
+	}
+}
+
+func TestObjectMetricRoutesRequireExplicitExtensionRegistration(t *testing.T) {
+	restoreGin := setGinMode()
+	defer restoreGin()
+	engine := gin.New()
+	handler := &restHandler{appSetting: &common.AppSetting{}}
+	handler.RegisterPublic(engine)
+
+	objectMetricPath := "/api/bkn-backend/v1/knowledge-networks/:kn_id/object-metrics"
+	for _, route := range engine.Routes() {
+		if route.Path == objectMetricPath {
+			t.Fatalf("community handler unexpectedly registered %q", objectMetricPath)
+		}
+	}
+
+	RegisterObjectMetricRoutes(engine, &common.AppSetting{}, nil, nil)
+	found := false
+	for _, route := range engine.Routes() {
+		if route.Path == "/api/bkn-backend/v2/knowledge-networks/:kn_id/object-metrics" {
+			t.Fatalf("obsolete V2 object-metric route remains registered: %q", route.Path)
+		}
+		if strings.Contains(route.Path, "/object-metrics/") && strings.Contains(route.Path, "/logic-properties") {
+			t.Fatalf("removed metric logical-property route remains registered: %s %s", route.Method, route.Path)
+		}
+		if route.Method == http.MethodPost && route.Path == objectMetricPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("extension registration did not mount POST %q", objectMetricPath)
+	}
+	internalList := "/api/bkn-backend/in/v1/knowledge-networks/:kn_id/object-metrics"
+	found = false
+	for _, route := range engine.Routes() {
+		if route.Method == http.MethodGet && route.Path == internalList {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("extension registration did not mount GET %q", internalList)
+	}
+	internalProvenance := "/api/bkn-backend/in/v1/knowledge-networks/:kn_id/object-metrics/:metric_id/provenance"
+	found = false
+	for _, route := range engine.Routes() {
+		if route.Method == http.MethodGet && route.Path == internalProvenance {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("extension registration did not mount GET %q", internalProvenance)
+	}
+}
+
+func TestLegacyMetricRoutesAreNotRegistered(t *testing.T) {
+	restoreGin := setGinMode()
+	defer restoreGin()
+	engine := gin.New()
+	(&restHandler{appSetting: &common.AppSetting{}}).RegisterPublic(engine)
+
+	for _, route := range engine.Routes() {
+		if strings.Contains(route.Path, "/knowledge-networks/:kn_id/metrics") {
+			t.Fatalf("legacy metric route remains registered: %s %s", route.Method, route.Path)
 		}
 	}
 }

@@ -1,3 +1,4 @@
+from app.utils.operation_audit import set_operation_audit_target
 import time
 import asyncio
 from datetime import datetime, timedelta
@@ -38,7 +39,7 @@ async def can_manage_default_llm(user_id, role):
 
 
 # Save a large model configuration.
-async def add_model(schema_para, userId, language, role=""):
+async def add_model(schema_para, userId, language, role="", audit_request=None):
     global redis_util
     required_params = ["max_model_len"]
     missing_params = await validate_required_params(schema_para, required_params)
@@ -137,6 +138,7 @@ async def add_model(schema_para, userId, language, role=""):
                 raise
             # Return Snowflake IDs as strings because 19-digit values exceed JavaScript's safe integer range.
             # Numeric JSON would lose precision and make the returned resource impossible to query or delete.
+            set_operation_audit_target(audit_request, [model_id], [schema_para["model_name"]])
             content = {"status": "ok", "id": str(model_id), "default": is_default}
             if is_default:
                 llm_default_key = "dip:model-api:llm:default_model_3ed523:list"
@@ -153,7 +155,7 @@ async def add_model(schema_para, userId, language, role=""):
             return JSONResponse(status_code=500, content=DataBaseError)
 
 
-async def remove_model(model_ids, userId, language, role=""):
+async def remove_model(model_ids, userId, language, role="", audit_request=None):
     try:
         if "model_ids" not in model_ids.keys():
             raise RequestValidationError([{"loc": ('body', "model_ids"), "type": "value_error.missing"}])
@@ -179,6 +181,7 @@ async def remove_model(model_ids, userId, language, role=""):
                 error_dict["detail"] = "One or more models cannot be deleted by the current identity."
                 return JSONResponse(status_code=403, content=error_dict)
         llm_model_dao.delete_model_by_id(model_ids["model_ids"])
+        set_operation_audit_target(audit_request, model_ids["model_ids"], model_names)
         model_quota_dao.delete_model_quota_by_model_id(model_ids["model_ids"])
         # Remove all bkn-safe authorization policies for the deleted model instances.
         await permission_manager.delete_permission(resource_type="large_model",
@@ -256,7 +259,8 @@ async def test_model(model_config, userId, language):
                 model_type = info[0]["f_model_type"]
             else:
                 config = model_config['model_config']
-                if 'api_key' in config:
+                # Clients may omit an unchanged secret; keep keyless models keyless.
+                if 'api_key' in model_config_old or 'api_key' in config:
                     config['api_key'] = model_config_old.get("api_key","")
                 series = model_config['model_series']
                 model_type = model_config['model_type']
@@ -282,7 +286,7 @@ async def test_model(model_config, userId, language):
         return JSONResponse(status_code=400, content=error_dict)
 
 
-async def edit_model(model_para, userId, language, role=""):
+async def edit_model(model_para, userId, language, role="", audit_request=None):
     content = llm_edit_verify(model_para)
     if content:
         StandLogger.error(content)
@@ -327,7 +331,8 @@ async def edit_model(model_para, userId, language, role=""):
                         config_new["api_key"], config_old.get("api_key", "")):
                     change = False
                 if not change:
-                    if 'api_key' in config_new:
+                    # Preserve stored credentials even when omitted by the client.
+                    if 'api_key' in config_old or 'api_key' in config_new:
                         config_new["api_key"] = config_old.get("api_key","")
                 model_config = config_new
                 model_series = model_para["model_series"]
@@ -339,6 +344,7 @@ async def edit_model(model_para, userId, language, role=""):
                                              model_para["max_model_len"],
                                              model_para.get("model_parameters", None), quota, json.dumps(model_config),
                                              model_series, model_type)
+                    set_operation_audit_target(audit_request, [model_para["model_id"]], [re_name])
                     global redis_util
                     if redis_util is None:
                         redis_util = await get_redis_util()
@@ -1053,7 +1059,7 @@ async def get_monitor_data(userId, language, model_id, role=""):
         return JSONResponse(status_code=500, content=DataBaseError)
 
 
-async def edit_default_model(model_para, userId, language, role=""):
+async def edit_default_model(model_para, userId, language, role="", audit_request=None):
     global redis_util
     if not await can_manage_default_llm(userId, role):
         error_dict = error_with_message(
@@ -1082,9 +1088,16 @@ async def edit_default_model(model_para, userId, language, role=""):
             error_dict['detail'] = "The specified model does not exist."
             return JSONResponse(status_code=400, content=error_dict)
 
+        audit_name = ""
+        if audit_request is not None:
+            try:
+                audit_name = llm_model_dao.get_model_name_by_id(model_id)
+            except Exception:
+                pass  # Audit lookup cannot alter the management response.
         set_default = model_para["default"]
         if not set_default:
             llm_model_dao.update_model_default_status(model_id, False)
+            set_operation_audit_target(audit_request, [model_id], [audit_name])
             default_cache_name = "default_model_3ed523"
             default_cache_key = f"dip:model-api:llm:{default_cache_name}:list"
             if redis_util is None:
@@ -1101,6 +1114,7 @@ async def edit_default_model(model_para, userId, language, role=""):
             return JSONResponse(status_code=400, content=error_dict)
 
         llm_model_dao.set_default_model(model_id)
+        set_operation_audit_target(audit_request, [model_id], [audit_name])
         default_cache_name = "default_model_3ed523"
         default_cache_key = f"dip:model-api:llm:{default_cache_name}:list"
         if redis_util is None:

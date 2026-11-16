@@ -263,6 +263,10 @@ openbkn bkn object-type query kn_abc123 ot_customer \
   '{"conditions":[],"limit":20,"search_after":["2024-01-15T10:30:00Z","cust_500"]}'
 ```
 
+`like` 和 `not_like` 的值是完整的 SQL LIKE 模式：`张` 只匹配完整值，`%张%` 匹配包含“张”的值，`张%` 匹配以“张”开头的值，`_` 匹配一个字符。用 `\%`、`\_`、`\\` 匹配字面上的通配符或反斜杠；末尾孤立的反斜杠无效。升级前保存的无通配符 `like` 条件可能原本用于“包含”，需要逐项检查并显式调整，系统不会自动改写。
+
+部署时须让 BKN 与采用完整 LIKE 模式规则的 Vega 版本一起切换，并使用支持该模式的 Studio 版本。旧 Studio 的筛选器会拒绝未转义的 `%`，且预览仍按字面子串匹配。新 Vega 搭配旧 BKN 会把旧的“包含”条件误读为完整匹配；新 BKN 搭配旧 Vega 则可能拒绝带 `%` 的新条件。切换前应盘点已保存条件和调用方传入的值，逐项记录条件位置、原始值、预期匹配方式和调整后的值；对需要保留“包含”含义的裸值明确加上通配符，并在切换后的环境用代表性数据核对结果。发布记录应写明 BKN、Vega 和 Studio 的配套版本与切换时间。
+
 ### 关系类
 
 ```bash
@@ -287,13 +291,15 @@ openbkn bkn search kn_abc123 "近三个月高价值客户"
 openbkn bkn action-type list kn_abc123
 openbkn bkn action-type query kn_abc123 at_send_email
 openbkn bkn action-type execute kn_abc123 at_send_email \
-  --params '{"to":"user@example.com","subject":"提醒","body":"您好"}'
+  --body '{"dynamic_params":{"to":"user@example.com","subject":"提醒","body":"您好"}}'
 
 openbkn bkn action-log list kn_abc123 --limit 20
 openbkn bkn action-log get kn_abc123 log_789
 openbkn bkn action-log cancel kn_abc123 log_789
-openbkn bkn action-execution get kn_abc123 exec_456
+openbkn bkn action-execution kn_abc123 exec_456
 ```
+
+`--body` 是执行请求体。执行目标按行动类的操作类别填写，不按适用条件扫描：修改、删除传 `_instance_identities` 指定实例；新建传 `object_input` 给出新实例被引用的属性值；建立或解除关系传 `relation_target`（`source_identity` 与 `target_identity` 各一个实例）；独立的工具调用（如上例）只传 `dynamic_params`。
 
 ### 端到端流程
 
@@ -394,15 +400,15 @@ console.log('build:', buildTask);
 
 ```bash
 # 列出知识网络
-curl -sk "https://<访问地址>/api/ontology-manager/v1/knowledge-networks?name=客户&sort=update_time&direction=desc&limit=50" \
+curl -sk "https://<访问地址>/api/bkn-backend/v1/knowledge-networks?name=客户&sort=update_time&direction=desc&limit=50" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # 获取知识网络详情
-curl -sk "https://<访问地址>/api/ontology-manager/v1/knowledge-networks/kn_abc123" \
+curl -sk "https://<访问地址>/api/bkn-backend/v1/knowledge-networks/kn_abc123" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # 列出对象类
-curl -sk "https://<访问地址>/api/ontology-manager/v1/knowledge-networks/kn_abc123/object-types" \
+curl -sk "https://<访问地址>/api/bkn-backend/v1/knowledge-networks/kn_abc123/object-types" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # 查询对象类实例
@@ -431,7 +437,7 @@ curl -sk -X POST "https://<访问地址>/api/ontology-query/v1/search" \
   }'
 
 # 创建对象类
-curl -sk -X POST "https://<访问地址>/api/ontology-manager/v1/knowledge-networks/kn_abc123/object-types" \
+curl -sk -X POST "https://<访问地址>/api/bkn-backend/v1/knowledge-networks/kn_abc123/object-types" \
   -H "Authorization: Bearer $(openbkn token)" \
   -H "Content-Type: application/json" \
   -d '{
@@ -448,10 +454,14 @@ curl -sk -X POST "https://<访问地址>/api/ontology-manager/v1/knowledge-netwo
   }'
 
 # 执行动作
-curl -sk -X POST "https://<访问地址>/api/bkn-backend/v1/knowledge-networks/kn_abc123/actions/at_send_email/execute" \
+curl -sk -X POST "https://<访问地址>/api/ontology-query/v1/knowledge-networks/kn_abc123/action-types/at_send_email/execute" \
   -H "Authorization: Bearer $(openbkn token)" \
   -H "Content-Type: application/json" \
   -d '{
-    "params": {"to": "user@example.com", "subject": "提醒", "body": "您好"}
+    "dynamic_params": {"to": "user@example.com", "subject": "提醒", "body": "您好"}
   }'
+
+# 查询执行结果（execution_id 取自上一步的响应）
+curl -sk "https://<访问地址>/api/ontology-query/v1/knowledge-networks/kn_abc123/action-executions/exec_456" \
+  -H "Authorization: Bearer $(openbkn token)"
 ```

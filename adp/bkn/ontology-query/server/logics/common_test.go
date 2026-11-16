@@ -12,13 +12,13 @@ import (
 	"testing"
 	"time"
 
-	cond "ontology-query/common/condition"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	dtype "ontology-query/interfaces/data_type"
-
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
+
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/data_type"
 )
 
 func Test_BuildViewSort(t *testing.T) {
@@ -806,7 +806,7 @@ func Test_BuildDirectBatchConditions(t *testing.T) {
 				{
 					ObjectID: "obj1",
 					ObjectData: map[string]any{
-						"id": "123",
+						"target_id": "123",
 					},
 				},
 			}
@@ -848,8 +848,8 @@ func Test_BuildDirectBatchConditions(t *testing.T) {
 
 			conditions, err := BuildDirectBatchConditions(currentLevelObjects, edge, true)
 			So(err, ShouldBeNil)
-			// When inValue is nil, return a normal condition instead of an in condition.
-			So(len(conditions), ShouldBeGreaterThanOrEqualTo, 0)
+			// An object without the mapped value joins nothing: no condition on a null.
+			So(conditions, ShouldBeEmpty)
 		})
 
 		Convey("成功 - 空对象列表", func() {
@@ -1047,9 +1047,7 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "target_id",
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "123",
-				},
+				Value:     "123",
 			}
 			mappingRules := []interfaces.Mapping{
 				{
@@ -1068,9 +1066,7 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "target_id",
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "123",
-				},
+				Value:     "123",
 			}
 			mappingRules := []interfaces.Mapping{
 				{
@@ -1087,9 +1083,7 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "target_id",
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "123",
-				},
+				Value:     "123",
 			}
 			mappingRules := []interfaces.Mapping{
 				{
@@ -1108,9 +1102,7 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "source_id",
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "123",
-				},
+				Value:     "123",
 			}
 			mappingRules := []interfaces.Mapping{
 				{
@@ -1130,9 +1122,7 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "source_id",
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "123",
-				},
+				Value:     "123",
 			}
 			mappingRules := []interfaces.Mapping{
 				{
@@ -1143,6 +1133,133 @@ func Test_CheckViewDataMatchesCondition(t *testing.T) {
 
 			result := CheckViewDataMatchesCondition(viewData, condition, mappingRules, false)
 			So(result, ShouldBeFalse)
+		})
+
+		Convey("成功 - 日期和业务键的AND条件全部匹配", func() {
+			viewData := map[string]any{
+				"membership_date": "2026-10-19",
+				"business_key":    "ORDER-001",
+			}
+			condition := &cond.CondCfg{
+				Operation: cond.OperationAnd,
+				SubConds: []*cond.CondCfg{
+					{
+						Name:      "membership_date",
+						Operation: cond.OperationEq,
+						Value:     "2026-10-19",
+					},
+					{
+						Name:      "business_key",
+						Operation: cond.OperationEq,
+						Value:     "ORDER-001",
+					},
+				},
+			}
+			mappingRules := []interfaces.Mapping{
+				{
+					SourceProp: interfaces.SimpleProperty{Name: "object_date"},
+					TargetProp: interfaces.SimpleProperty{Name: "membership_date"},
+				},
+				{
+					SourceProp: interfaces.SimpleProperty{Name: "object_business_key"},
+					TargetProp: interfaces.SimpleProperty{Name: "business_key"},
+				},
+			}
+
+			result := CheckViewDataMatchesCondition(viewData, condition, mappingRules, true)
+			So(result, ShouldBeTrue)
+		})
+
+		Convey("失败 - AND条件任一子条件不匹配", func() {
+			viewData := map[string]any{
+				"employee_code":     "U001",
+				"employee_org_code": "B",
+			}
+			condition := &cond.CondCfg{
+				Operation: cond.OperationAnd,
+				SubConds: []*cond.CondCfg{
+					{
+						Name:      "employee_code",
+						Operation: cond.OperationEq,
+						Value:     "U001",
+					},
+					{
+						Name:      "employee_org_code",
+						Operation: cond.OperationEq,
+						Value:     "A",
+					},
+				},
+			}
+			mappingRules := []interfaces.Mapping{
+				{TargetProp: interfaces.SimpleProperty{Name: "employee_code"}},
+				{TargetProp: interfaces.SimpleProperty{Name: "employee_org_code"}},
+			}
+
+			result := CheckViewDataMatchesCondition(viewData, condition, mappingRules, true)
+			So(result, ShouldBeFalse)
+		})
+
+		Convey("失败 - AND条件的中间表字段缺失", func() {
+			viewData := map[string]any{
+				"employee_code": "U001",
+			}
+			condition := &cond.CondCfg{
+				Operation: cond.OperationAnd,
+				SubConds: []*cond.CondCfg{
+					{
+						Name:      "employee_code",
+						Operation: cond.OperationEq,
+						Value:     "U001",
+					},
+					{
+						Name:      "employee_org_code",
+						Operation: cond.OperationEq,
+						Value:     "A",
+					},
+				},
+			}
+			mappingRules := []interfaces.Mapping{
+				{TargetProp: interfaces.SimpleProperty{Name: "employee_code"}},
+				{TargetProp: interfaces.SimpleProperty{Name: "employee_org_code"}},
+			}
+
+			result := CheckViewDataMatchesCondition(viewData, condition, mappingRules, true)
+			So(result, ShouldBeFalse)
+		})
+
+		Convey("成功 - 反向多字段AND条件匹配", func() {
+			viewData := map[string]any{
+				"project_code":     "PR001",
+				"project_org_code": "A",
+			}
+			condition := &cond.CondCfg{
+				Operation: cond.OperationAnd,
+				SubConds: []*cond.CondCfg{
+					{
+						Name:      "project_code",
+						Operation: cond.OperationEq,
+						Value:     "PR001",
+					},
+					{
+						Name:      "project_org_code",
+						Operation: cond.OperationEq,
+						Value:     "A",
+					},
+				},
+			}
+			mappingRules := []interfaces.Mapping{
+				{
+					SourceProp: interfaces.SimpleProperty{Name: "project_code"},
+					TargetProp: interfaces.SimpleProperty{Name: "object_project_code"},
+				},
+				{
+					SourceProp: interfaces.SimpleProperty{Name: "project_org_code"},
+					TargetProp: interfaces.SimpleProperty{Name: "object_org_code"},
+				},
+			}
+
+			result := CheckViewDataMatchesCondition(viewData, condition, mappingRules, false)
+			So(result, ShouldBeTrue)
 		})
 	})
 }
@@ -1483,9 +1600,9 @@ func Test_BuildDslQuery(t *testing.T) {
 			result, err := BuildDslQuery(ctx, queryStr, query)
 			So(err, ShouldNotBeNil)
 			So(len(result), ShouldEqual, 0)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed)
+			So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed)
 		})
 
 		Convey("成功 - 空查询字符串", func() {
@@ -1573,9 +1690,7 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "amount",
 				Operation: cond.OperationEq,
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 100,
-				},
+				Value:     100,
 			}
 			paramDefs := []interfaces.Parameter{{Name: "amount", Type: dtype.DATATYPE_INTEGER}}
 			result, err := EvaluateDataAgainstCondition(ctx, data, condition, paramDefs)
@@ -1588,9 +1703,7 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 			condition := &cond.CondCfg{
 				Name:      "amount",
 				Operation: cond.OperationEq,
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 200,
-				},
+				Value:     200,
 			}
 			paramDefs := []interfaces.Parameter{{Name: "amount", Type: dtype.DATATYPE_INTEGER}}
 			result, err := EvaluateDataAgainstCondition(ctx, data, condition, paramDefs)
@@ -1604,14 +1717,14 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 				Operation: cond.OperationAnd,
 				SubConds: []*cond.CondCfg{
 					{
-						Name:        "amount",
-						Operation:   cond.OperationGte,
-						ValueOptCfg: cond.ValueOptCfg{Value: 50},
+						Name:      "amount",
+						Operation: cond.OperationGte,
+						Value:     50,
 					},
 					{
-						Name:        "level",
-						Operation:   cond.OperationEq,
-						ValueOptCfg: cond.ValueOptCfg{Value: "high"},
+						Name:      "level",
+						Operation: cond.OperationEq,
+						Value:     "high",
 					},
 				},
 			}
@@ -1630,14 +1743,14 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 				Operation: cond.OperationAnd,
 				SubConds: []*cond.CondCfg{
 					{
-						Name:        "amount",
-						Operation:   cond.OperationGte,
-						ValueOptCfg: cond.ValueOptCfg{Value: 50},
+						Name:      "amount",
+						Operation: cond.OperationGte,
+						Value:     50,
 					},
 					{
-						Name:        "level",
-						Operation:   cond.OperationEq,
-						ValueOptCfg: cond.ValueOptCfg{Value: "high"},
+						Name:      "level",
+						Operation: cond.OperationEq,
+						Value:     "high",
 					},
 				},
 			}
@@ -1653,9 +1766,9 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 		Convey("成功 - paramDefs 为空仍可评估", func() {
 			data := map[string]any{"amount": 100}
 			condition := &cond.CondCfg{
-				Name:        "amount",
-				Operation:   cond.OperationEq,
-				ValueOptCfg: cond.ValueOptCfg{Value: 100},
+				Name:      "amount",
+				Operation: cond.OperationEq,
+				Value:     100,
 			}
 			result, err := EvaluateDataAgainstCondition(ctx, data, condition, nil)
 			So(err, ShouldBeNil)
@@ -1665,9 +1778,9 @@ func Test_EvaluateDataAgainstCondition(t *testing.T) {
 		Convey("失败 - 字段不存在", func() {
 			data := map[string]any{}
 			condition := &cond.CondCfg{
-				Name:        "amount",
-				Operation:   cond.OperationEq,
-				ValueOptCfg: cond.ValueOptCfg{Value: 100},
+				Name:      "amount",
+				Operation: cond.OperationEq,
+				Value:     100,
 			}
 			paramDefs := []interfaces.Parameter{{Name: "amount", Type: dtype.DATATYPE_INTEGER}}
 			result, err := EvaluateDataAgainstCondition(ctx, data, condition, paramDefs)
@@ -1683,9 +1796,9 @@ func Test_EvaluateDataAgainstCondition_EmptyConditionSets(t *testing.T) {
 		data := map[string]any{"amount": 100}
 		paramDefs := []interfaces.Parameter{{Name: "amount", Type: dtype.DATATYPE_INTEGER}}
 		miss := &cond.CondCfg{
-			Name:        "amount",
-			Operation:   cond.OperationEq,
-			ValueOptCfg: cond.ValueOptCfg{Value: 200},
+			Name:      "amount",
+			Operation: cond.OperationEq,
+			Value:     200,
 		}
 
 		Convey("empty AND matches", func() {
@@ -1748,7 +1861,7 @@ func TestCondCfgToFilterMap(t *testing.T) {
 		So(CondCfgToFilterMap(nil), ShouldBeNil)
 	})
 	Convey("serializes simple cond", t, func() {
-		c := &cond.CondCfg{Name: "f1", Operation: "==", ValueOptCfg: cond.ValueOptCfg{ValueFrom: "const", Value: "v"}}
+		c := &cond.CondCfg{Name: "f1", Operation: "==", ValueFrom: "const", Value: "v"}
 		m := CondCfgToFilterMap(c)
 		So(m, ShouldNotBeNil)
 		So(m["field"], ShouldEqual, "f1")
@@ -1811,4 +1924,30 @@ func Test_FormatMissingParamNames(t *testing.T) {
 			So(FormatMissingParamNames(nil), ShouldEqual, "")
 		})
 	})
+}
+
+func TestLikeCompletePatternLocalEvaluation(t *testing.T) {
+	tests := []struct {
+		operation string
+		data      map[string]any
+		pattern   string
+		want      bool
+	}{
+		{cond.OperationLike, map[string]any{"name": "apple"}, "apple", true},
+		{cond.OperationLike, map[string]any{"name": "pineapple"}, "apple", false},
+		{cond.OperationLike, map[string]any{"name": "pineapple"}, "%apple", true},
+		{cond.OperationLike, map[string]any{"name": "a%b"}, `a\%b`, true},
+		{cond.OperationLike, map[string]any{"name": "a中b"}, "a_b", true},
+		{cond.OperationNotLike, map[string]any{"name": "pineapple"}, "apple", true},
+		{cond.OperationNotLike, map[string]any{"name": "apple"}, "apple", false},
+		{cond.OperationNotLike, map[string]any{"name": nil}, "apple", false},
+		{cond.OperationNotLike, map[string]any{}, "apple", false},
+	}
+	for _, tc := range tests {
+		result, err := evaluateConditionRecursive(context.Background(), tc.data,
+			&cond.CondCfg{Name: "name", Operation: tc.operation, Value: tc.pattern}, nil)
+		if err != nil || result != tc.want {
+			t.Errorf("%s %v %q = %v, %v; want %v", tc.operation, tc.data, tc.pattern, result, err, tc.want)
+		}
+	}
 }

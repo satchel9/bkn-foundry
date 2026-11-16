@@ -65,7 +65,7 @@ Representative public routes are registered in `server/driveradapters/routers.go
 | Metrics | `/knowledge-networks/{kn_id}/metrics` |
 | Risk types | `/knowledge-networks/{kn_id}/risk-types` |
 | Action schedules | `/knowledge-networks/{kn_id}/action-schedules` |
-| BKN import/export | `/bkns`, `/bkns/{kn_id}` |
+| BKN import/export | `/bkns`, `/bkns/{kn_id}`, `/bkns/{kn_id}/check` |
 | Resources | `/resources` |
 
 The canonical OpenAPI source is maintained at the repository root:
@@ -93,6 +93,7 @@ bkn-backend/
     driveradapters/      # HTTP handlers, routers, request validation
     errors/              # BKN Backend error definitions
     interfaces/          # DTOs and service interfaces
+    knevent/             # Knowledge-network events: ledger, change feed, event classes
     locale/              # i18n resources
     logics/              # Business logic
     version/             # Build/version metadata
@@ -119,7 +120,7 @@ Core logic packages:
 
 Prerequisites:
 
-- Go 1.25+
+- Go 1.26.0+
 - MariaDB 11.4+ or DM8
 - OpenSearch 2.x
 - Reachable VEGA, model-factory, and bkn-safe dependencies when
@@ -145,6 +146,7 @@ The Helm values are:
 | Value | Default | Meaning |
 | --- | --- | --- |
 | `bknSafe.url` | `http://bkn-safe:3000` | bkn-safe service root |
+| `knowledgeBase.url` | `""` | Enterprise kb-api root (`KB_API_URL`), read to mount knowledge bases on a network; empty where kb-api is not deployed, and mounting one is then refused |
 | `auth.knChildResourceFilterChunkSize` | `0` | Optional caller-side chunk size; `0` sends one request and is not a server limit |
 
 The authorization resource and operation contract, including error behavior,

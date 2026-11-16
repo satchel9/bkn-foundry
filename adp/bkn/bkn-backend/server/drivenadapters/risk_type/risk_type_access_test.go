@@ -13,18 +13,18 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 var (
 	testUpdateTime = int64(1735786555379)
 	testTags       = []string{"tag1", "tag2", "tag3"}
 
-	testCtx = rest.WithLanguage(context.Background(), rest.DefaultLanguage)
+	testCtx = i18n.WithLanguage(context.Background(), i18n.DefaultLanguage)
 
 	testRiskType = &interfaces.RiskType{
 		RTID:   "rt1",
@@ -200,8 +200,8 @@ func Test_RiskTypeAccess_CreateRiskType(t *testing.T) {
 
 		sqlStr := fmt.Sprintf(
 			"INSERT INTO %s (f_id,f_name,f_comment,f_tags,f_icon,f_color,f_bkn_raw_content,f_kn_id,f_branch,"+
-				"f_creator,f_creator_type,f_create_time,f_updater,f_updater_type,f_update_time) "+
-				"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+				"f_creator,f_creator_type,f_create_time,f_updater,f_updater_type,f_update_time,f_revision) "+
+				"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 			RT_TABLE_NAME,
 		)
 
@@ -468,7 +468,7 @@ func Test_RiskTypeAccess_UpdateRiskType(t *testing.T) {
 
 		// squirrel SetMap sorts keys alphabetically
 		sqlStr := fmt.Sprintf(
-			"UPDATE %s SET f_bkn_raw_content = ?, f_color = ?, f_comment = ?, f_icon = ?, f_name = ?, f_tags = ?, "+
+			"UPDATE %s SET f_bkn_raw_content = ?, f_color = ?, f_comment = ?, f_icon = ?, f_name = ?, f_revision = ?, f_tags = ?, "+
 				"f_update_time = ?, f_updater = ?, f_updater_type = ? "+
 				"WHERE f_id = ? AND f_kn_id = ? AND f_branch = ?",
 			RT_TABLE_NAME,

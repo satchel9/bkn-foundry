@@ -1,12 +1,12 @@
 ---
 openapi: 3.0.3
 info:
-  title: Skill
+  title: 执行工厂 · Skill API
   description: |
     Skill 是一个**文件包**——一份 `SKILL.md` 加上配套脚本与资源，描述「怎么做一件
     事」。Agent 按需装载它，而不是把全部说明塞进上下文。
 
-    与算子 / 工具的区别：算子和工具是**可调用的函数**，Skill 是**给 Agent 读的
+    与工具的区别：工具是**可调用的函数**，Skill 是**给 Agent 读的
     工作手册 + 随手册附带的可执行文件**。召回入口在 context-loader 的
     `search_capabilities`，那边只返回最小元数据；真正的内容读取与下载在这里。
 
@@ -117,7 +117,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -191,7 +191,7 @@ paths:
       summary: 按 ID 批量取技能名
       operationId: getSkillNames
       description: |
-        与 `/operator/names`、`/tool-box/names` 同契约：不存在的 ID 静默略过、不占位。
+        与 `/tool-box/names` 同契约：不存在的 ID 静默略过、不占位。
 
         **也注册在 `internal-v1`**。公开面按调用者的 `view` 过滤（无权限的 ID 与不存在的
         ID 一样被略过），内部面不过滤——服务间调用要的是「这些 ID 还在不在」，用于知识网络
@@ -410,7 +410,7 @@ paths:
         **只接受 `published` 与 `offline` 两个值**——不能通过这个接口把技能改回
         `unpublish` 或 `editing`，那两个状态由注册与编辑动作产生。
 
-        本面用的是 PUT（工具箱与算子的同类接口用 POST），注意区别。
+        本面用的是 PUT（工具箱的同类接口用 POST），注意区别。
       parameters:
         - $ref: '#/components/parameters/SkillID'
       requestBody:
@@ -515,7 +515,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '404':
@@ -764,9 +764,24 @@ paths:
         - Skill
       summary: 读取技能内的单个文件（管理态）
       operationId: readSkillManagementFile
-      description: '`/files/read` 的管理态版本：读草稿里的文件。'
+      description: |
+        `/files/read` 的管理态版本：读草稿里的文件。默认返回下载地址；
+        `response_mode=content` 时直接返回文件文本内容。
       parameters:
         - $ref: '#/components/parameters/SkillID'
+        - name: response_mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - url
+              - content
+            default: url
+          description: |
+            `url`（默认）返回文件下载地址 `url`，不带 `content`；`content` 把文件
+            内容放进 `content` 字段（`url` 为空串）。`content` 模式下文件按文本读取
+            下载，二进制文件不适用。
       requestBody:
         required: true
         content:
@@ -785,7 +800,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SkillFileRef'
+                $ref: '#/components/schemas/ManagementSkillFileRef'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -825,8 +840,15 @@ paths:
       summary: 执行技能
       operationId: executeSkill
       description: |
-        在沙箱里跑技能包里的一条命令。技能包被上传到沙箱工作目录，然后执行
-        `entry_shell` 指定的命令。
+        在沙箱里跑技能包里的一个 Python 脚本。技能包被上传到沙箱工作目录，然后用
+        `python3` 执行 `entry_point` 指定的脚本，`arguments` 作为它的 argv。
+
+        **Skill 只支持 Python 入口。** `entry_point` 必须是技能包内已有的 `.py` 文件
+        （相对路径，不接受绝对路径和 `..`）；参数逐个作为 argv 传入；沙箱会在 `;`、`&`、`|` 和换行符处拆分命令行（引号内也一样），
+        因此 `entry_point` 和 `arguments` 中包含这些字符会被拒绝，错误码 `SkillEntryInvalid`。
+        Shell / Bash 入口（例如 `bash run.sh`）会被拒绝，错误码 `SkillEntryInvalid`；
+        只含 `.sh` 脚本的技能包在内容接口的 `runtime` 里标记为 `executable: false`，
+        需要改写成 Python（标准库即可）后才能执行。
 
         当前主体必须对具体 `skill:{skill_id}` 持有 `execute`。请求体不能替换
         OAuth/AppKey 或受信任内部上下文产生的执行主体。
@@ -844,12 +866,22 @@ paths:
             schema:
               type: object
               required:
-                - entry_shell
+                - entry_point
               properties:
+                entry_point:
+                  type: string
+                  description: 技能包内的 Python 脚本，相对路径。
+                  example: scripts/run.py
+                arguments:
+                  type: array
+                  items:
+                    type: string
+                  description: 脚本的 argv，逐个传入。任一元素不允许包含 `;`、`&`、`|`、换行或回车，否则返回 `SkillEntryInvalid`。
+                  example: ["--mode", "full"]
                 entry_shell:
                   type: string
-                  description: 要执行的命令。
-                  example: python scripts/run.py --mode full
+                  deprecated: true
+                  description: 已弃用，请改用 `entry_point` + `arguments`。仍接受 `python <脚本> [参数...]`，其余（含 `bash run.sh` 和任何 shell 语法）一律拒绝；脚本和参数同样不允许包含 `;`、`&`、`|`、换行或回车。
                 timeout:
                   type: integer
                   description: 超时（秒）。
@@ -869,7 +901,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -1175,25 +1207,25 @@ components:
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Unauthorized:
       description: 凭据缺失或无效
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     NotFound:
       description: 技能或任务不存在
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     InternalError:
       description: 服务内部错误
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   schemas:
     BizStatus:
@@ -1553,6 +1585,21 @@ components:
           type: string
         file_type:
           type: string
+
+    ManagementSkillFileRef:
+      description: |
+        管理态单个文件的引用，在 `SkillFileRef` 之上多了 `size` 与 `content`。
+      allOf:
+        - $ref: '#/components/schemas/SkillFileRef'
+        - type: object
+          properties:
+            size:
+              type: integer
+              format: int64
+              description: 文件字节数，始终返回。
+            content:
+              type: string
+              description: 文件文本内容。仅 `response_mode=content` 时返回，默认的 `url` 模式不带该字段。
 
     DownloadSkillResponse:
       type: object

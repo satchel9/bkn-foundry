@@ -8,6 +8,7 @@ package knactionrecall
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -85,6 +86,11 @@ func TestGetActionInfo_ActionSourceNil(t *testing.T) {
 		// Mock QueryActions returns ActionSource as nil.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
+				ActionType: &interfaces.ActionTypeInfo{
+					ID: "at-001", Name: "Restart pod",
+					OperationConfig: map[string]any{"type": "object"},
+				},
 				ActionSource: nil,
 				Actions:      []interfaces.ActionParams{},
 			}, nil)
@@ -92,6 +98,7 @@ func TestGetActionInfo_ActionSourceNil(t *testing.T) {
 		resp, err := service.GetActionInfo(ctx, req)
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resp, convey.ShouldNotBeNil)
+		convey.So(resp.ActionType.Name, convey.ShouldEqual, "Restart pod")
 		convey.So(len(resp.DynamicTools), convey.ShouldEqual, 0)
 	})
 }
@@ -126,6 +133,11 @@ func TestGetActionInfo_ActionsEmpty(t *testing.T) {
 		// Mock QueryActions returns empty Actions.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
+				ActionType: &interfaces.ActionTypeInfo{
+					ID: "at-001", Name: "Restart pod",
+					OperationConfig: map[string]any{"type": "object"},
+				},
 				ActionSource: &interfaces.ActionSource{Type: interfaces.ActionSourceTypeTool},
 				Actions:      []interfaces.ActionParams{},
 			}, nil)
@@ -133,8 +145,39 @@ func TestGetActionInfo_ActionsEmpty(t *testing.T) {
 		resp, err := service.GetActionInfo(ctx, req)
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resp, convey.ShouldNotBeNil)
+		convey.So(resp.ActionType.Name, convey.ShouldEqual, "Restart pod")
 		convey.So(len(resp.DynamicTools), convey.ShouldEqual, 0)
 	})
+}
+
+func TestGetActionInfo_LegacyTypeInfoOmitted(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockOntologyQuery := mocks.NewMockDrivenOntologyQuery(ctrl)
+	mockLogger.EXPECT().WithContext(gomock.Any()).Return(mockLogger).AnyTimes()
+	mockLogger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
+	mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).Return(
+		&interfaces.QueryActionsResponse{Actions: []interfaces.ActionParams{}}, nil,
+	)
+	service := &knActionRecallServiceImpl{logger: mockLogger, ontologyQuery: mockOntologyQuery}
+	resp, err := service.GetActionInfo(context.Background(), &interfaces.KnActionRecallRequest{KnID: "kn-001", AtID: "at-001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ActionType != nil {
+		t.Fatalf("legacy response must omit action type, got %+v", resp.ActionType)
+	}
+	encoded, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := payload["action_type"]; exists {
+		t.Fatalf("legacy response unexpectedly exposes action_type: %s", encoded)
+	}
 }
 
 // TestGetActionInfo_UnsupportedType Tests an unsupported action_source type.
@@ -167,7 +210,8 @@ func TestGetActionInfo_UnsupportedType(t *testing.T) {
 		// Mock QueryActions returns unsupported type.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
-				ActionSource: &interfaces.ActionSource{Type: "unsupported_type"},
+				ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
+				ActionSource:    &interfaces.ActionSource{Type: "unsupported_type"},
 				Actions: []interfaces.ActionParams{
 					{Parameters: map[string]interface{}{"key": "value"}},
 				},
@@ -215,6 +259,12 @@ func TestGetActionInfo_ToolType_Success(t *testing.T) {
 		// Mock QueryActions returning the Tool type.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
+				ActionType: &interfaces.ActionTypeInfo{
+					ID: "at-001", Name: "Restart pod", Comment: "Restart the selected pod",
+					ActionIntent: "modify", ObjectTypeID: "pod",
+					OperationConfig: map[string]any{"type": "object"},
+				},
 				ActionSource: &interfaces.ActionSource{
 					Type:   interfaces.ActionSourceTypeTool,
 					BoxID:  "box-001",
@@ -263,6 +313,10 @@ func TestGetActionInfo_ToolType_Success(t *testing.T) {
 
 		tool := resp.DynamicTools[0]
 		convey.So(tool.Name, convey.ShouldEqual, "TestTool")
+		convey.So(resp.ActionType.Name, convey.ShouldEqual, "Restart pod")
+		convey.So(resp.ActionType.Description, convey.ShouldEqual, "Restart the selected pod")
+		convey.So(resp.ActionType.ActionIntent, convey.ShouldEqual, "modify")
+		convey.So(resp.ActionType.OperationConfig["type"], convey.ShouldEqual, "object")
 		convey.So(tool.APICallStrategy, convey.ShouldEqual, interfaces.ResultProcessStrategyKnActionRecall)
 		convey.So(tool.OriginalSchema, convey.ShouldBeNil)
 
@@ -329,7 +383,13 @@ func TestGetActionInfo_WithoutInstanceIdentity_Success(t *testing.T) {
 			DoAndReturn(func(_ context.Context, actionsReq *interfaces.QueryActionsRequest) (*interfaces.QueryActionsResponse, error) {
 				convey.So(actionsReq.InstanceIdentities, convey.ShouldNotBeNil)
 				convey.So(len(actionsReq.InstanceIdentities), convey.ShouldEqual, 0)
+				convey.So(actionsReq.IncludeTypeInfo, convey.ShouldBeTrue)
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
+					ActionType: &interfaces.ActionTypeInfo{
+						ID: "at-001", Name: "Send alert", Comment: "Notify the on-call team",
+						OperationConfig: map[string]any{"type": "tool"},
+					},
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",
@@ -363,6 +423,9 @@ func TestGetActionInfo_WithoutInstanceIdentity_Success(t *testing.T) {
 		convey.So(err, convey.ShouldBeNil)
 		convey.So(resp, convey.ShouldNotBeNil)
 		convey.So(len(resp.DynamicTools), convey.ShouldEqual, 1)
+		convey.So(resp.ActionType.Name, convey.ShouldEqual, "Send alert")
+		convey.So(resp.ActionType.ObjectTypeID, convey.ShouldBeEmpty)
+		convey.So(resp.ActionType.OperationConfig["type"], convey.ShouldEqual, "tool")
 
 		fixedParams, ok := resp.DynamicTools[0].FixedParams.(interfaces.ActionDriverFixedParams)
 		convey.So(ok, convey.ShouldBeTrue)
@@ -408,6 +471,12 @@ func TestGetActionInfo_MCPType_Success(t *testing.T) {
 		// Mock QueryActions returning the MCP type.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("disease_id"),
+				ActionType: &interfaces.ActionTypeInfo{
+					ID: "at-001", Name: "Connect disease", ActionType: "add",
+					ObjectTypeID:    "disease",
+					OperationConfig: map[string]any{"type": "relation", "relation_type_id": "related_disease", "relation_operation": "create"},
+				},
 				ActionSource: &interfaces.ActionSource{
 					Type:     interfaces.ActionSourceTypeMCP,
 					McpID:    "mcp-001",
@@ -439,6 +508,9 @@ func TestGetActionInfo_MCPType_Success(t *testing.T) {
 
 		tool := resp.DynamicTools[0]
 		convey.So(tool.Name, convey.ShouldEqual, "TestMCPTool")
+		convey.So(resp.ActionType.Name, convey.ShouldEqual, "Connect disease")
+		convey.So(resp.ActionType.ActionIntent, convey.ShouldEqual, "add")
+		convey.So(resp.ActionType.OperationConfig["relation_operation"], convey.ShouldEqual, "create")
 		convey.So(tool.APICallStrategy, convey.ShouldEqual, interfaces.ResultProcessStrategyKnActionRecall)
 		convey.So(tool.OriginalSchema, convey.ShouldBeNil)
 
@@ -499,6 +571,7 @@ func TestGetActionInfo_GetToolDetailError(t *testing.T) {
 		// Mock QueryActions returning the Tool type.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 				ActionSource: &interfaces.ActionSource{
 					Type:   interfaces.ActionSourceTypeTool,
 					BoxID:  "box-001",
@@ -550,6 +623,7 @@ func TestGetActionInfo_GetMCPToolDetailError(t *testing.T) {
 		// Mock QueryActions returning the MCP type.
 		mockOntologyQuery.EXPECT().QueryActions(gomock.Any(), gomock.Any()).
 			Return(&interfaces.QueryActionsResponse{
+				ExecutionSchema: testActionExecutionSchema("disease_id"),
 				ActionSource: &interfaces.ActionSource{
 					Type:     interfaces.ActionSourceTypeMCP,
 					McpID:    "mcp-001",
@@ -709,6 +783,7 @@ func TestGetActionInfo_InstanceIdentities_MultipleValid(t *testing.T) {
 				convey.So(actionsReq.InstanceIdentities[0]["code"], convey.ShouldEqual, "A")
 				convey.So(actionsReq.InstanceIdentities[1]["code"], convey.ShouldEqual, "B")
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",
@@ -795,6 +870,7 @@ func TestGetActionInfo_InstanceIdentities_FilterEmptyMaps(t *testing.T) {
 				convey.So(actionsReq.InstanceIdentities[0]["code"], convey.ShouldEqual, "A")
 				convey.So(actionsReq.InstanceIdentities[1]["code"], convey.ShouldEqual, "C")
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",
@@ -878,6 +954,7 @@ func TestGetActionInfo_InstanceIdentities_PriorityOverIdentity(t *testing.T) {
 				convey.So(actionsReq.InstanceIdentities[0]["id"], convey.ShouldEqual, "from-identities-1")
 				convey.So(actionsReq.InstanceIdentities[1]["id"], convey.ShouldEqual, "from-identities-2")
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",
@@ -959,6 +1036,7 @@ func TestGetActionInfo_InstanceIdentities_AllEmpty(t *testing.T) {
 			DoAndReturn(func(_ context.Context, actionsReq *interfaces.QueryActionsRequest) (*interfaces.QueryActionsResponse, error) {
 				convey.So(len(actionsReq.InstanceIdentities), convey.ShouldEqual, 0)
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",
@@ -1037,6 +1115,7 @@ func TestGetActionInfo_InstanceIdentities_FallbackToIdentity(t *testing.T) {
 				convey.So(len(actionsReq.InstanceIdentities), convey.ShouldEqual, 1)
 				convey.So(actionsReq.InstanceIdentities[0]["id"], convey.ShouldEqual, "legacy-obj-001")
 				return &interfaces.QueryActionsResponse{
+					ExecutionSchema: testActionExecutionSchema("pod_name", "namespace"),
 					ActionSource: &interfaces.ActionSource{
 						Type:   interfaces.ActionSourceTypeTool,
 						BoxID:  "box-001",

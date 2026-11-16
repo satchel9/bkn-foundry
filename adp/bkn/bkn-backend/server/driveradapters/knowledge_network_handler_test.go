@@ -22,17 +22,18 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/projectiongrant"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	"bkn-backend/common/bkntrace"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/bkntrace"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 func MockNewKnowledgeNetworkRestHandler(appSetting *common.AppSetting,
@@ -79,13 +80,30 @@ func TestKnowledgeNetworkProjectionReadRequiresGrantForClaimedNetwork(t *testing
 	engine := gin.New()
 	engine.GET("/api/bkn-backend/in/v1/trace/projection/knowledge-networks/:kn_id", handler.GetKNByProjectionGrant)
 
-	kns.EXPECT().ExportKNForProjection(gomock.Any(), "kn-allowed").Return(&interfaces.KN{KNID: "kn-allowed", KNName: "Allowed"}, nil)
+	kns.EXPECT().ExportKNForProjection(gomock.Any(), "kn-allowed").Return(&interfaces.KN{
+		KNID: "kn-allowed", KNName: "Allowed",
+		ObjectMetrics: []*interfaces.ObjectMetricRecordV1{
+			{Definition: interfaces.ObjectMetricDefinitionV1{ID: "published", Version: 2, Lifecycle: interfaces.ObjectMetricLifecycleV1{Status: "published"}}},
+			{Definition: interfaces.ObjectMetricDefinitionV1{ID: "deprecated", Version: 1, Lifecycle: interfaces.ObjectMetricLifecycleV1{Status: "deprecated"}}},
+			{Definition: interfaces.ObjectMetricDefinitionV1{ID: "draft", Version: 3, Lifecycle: interfaces.ObjectMetricLifecycleV1{Status: "draft"}}},
+		},
+	}, nil)
 	request := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/in/v1/trace/projection/knowledge-networks/kn-allowed", nil)
 	request.Header.Set(projectionGrantHeader, token)
 	response := httptest.NewRecorder()
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("claimed network response = %d, want 200", response.Code)
+	}
+	var projection struct {
+		ObjectMetrics []interfaces.ObjectMetricRecordV1 `json:"object_metrics"`
+	}
+	if err := sonic.Unmarshal(response.Body.Bytes(), &projection); err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.ObjectMetrics) != 2 || projection.ObjectMetrics[0].Definition.ID != "published" ||
+		projection.ObjectMetrics[0].Definition.Version != 2 || projection.ObjectMetrics[1].Definition.ID != "deprecated" {
+		t.Fatalf("projection object metrics = %#v, want published and deprecated V1 only", projection.ObjectMetrics)
 	}
 
 	for _, request := range []*http.Request{
@@ -275,10 +293,10 @@ func Test_KnowledgeNetworkRestHandler_CreateKN(t *testing.T) {
 		})
 
 		Convey("CreateKN failed\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError,
 				},
 			}
@@ -338,6 +356,29 @@ func Test_KnowledgeNetworkRestHandler_UpdateKN(t *testing.T) {
 			engine.ServeHTTP(w, req)
 
 			So(w.Result().StatusCode, ShouldEqual, http.StatusNoContent)
+		})
+
+		// Studio saves the basic info only; that must not clear the network's skill content.
+		Convey("UpdateKN keeps skill content the request leaves out\n", func() {
+			for body, keep := range map[string]bool{
+				`{"name":"kn1"}`:                     true,
+				`{"name":"kn1","skill_content":""}`:  false,
+				`{"name":"kn1","skill_content":"s"}`: false,
+			} {
+				kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return("kn1", true, nil)
+				kns.EXPECT().UpdateKN(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+					DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.KN, _ bool) error {
+						So(got.KeepSkillContent, ShouldEqual, keep)
+						return nil
+					})
+
+				req := httptest.NewRequest(http.MethodPut, url, bytes.NewReader([]byte(body)))
+				req.Header.Set(interfaces.CONTENT_TYPE_NAME, interfaces.CONTENT_TYPE_JSON)
+				w := httptest.NewRecorder()
+				engine.ServeHTTP(w, req)
+
+				So(w.Result().StatusCode, ShouldEqual, http.StatusNoContent)
+			}
 		})
 
 		Convey("Failed UpdateKN ShouldBind Error\n", func() {
@@ -543,10 +584,10 @@ func Test_KnowledgeNetworkRestHandler_GetKN(t *testing.T) {
 		})
 
 		Convey("KN not found\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusNotFound,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_KnowledgeNetwork_NotFound,
 				},
 			}
@@ -913,10 +954,10 @@ func Test_KnowledgeNetworkRestHandler_DeleteKN_extraCases(t *testing.T) {
 		url := "/api/bkn-backend/v1/knowledge-networks/" + knID
 
 		Convey("Failed when GetKNByID returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError},
 			}
 			kns.EXPECT().GetKNByID(gomock.Any(), knID, gomock.Any(), gomock.Any()).Return(nil, httpErr)
 			req := httptest.NewRequest(http.MethodDelete, url, nil)
@@ -926,10 +967,10 @@ func Test_KnowledgeNetworkRestHandler_DeleteKN_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when DeleteKN service returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError},
 			}
 			kns.EXPECT().GetKNByID(gomock.Any(), knID, gomock.Any(), gomock.Any()).Return(&interfaces.KN{
 				KNID: knID, KNName: "kn1",

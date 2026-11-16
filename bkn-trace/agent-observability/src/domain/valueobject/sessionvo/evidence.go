@@ -6,6 +6,7 @@
 package sessionvo
 
 import (
+	"strconv"
 	"strings"
 	"time"
 )
@@ -57,6 +58,18 @@ func (value BusinessRefType) CanonicalRefPrefix() string {
 }
 
 func (value BusinessRefType) MatchesCanonicalRefID(refID string) bool {
+	if value == BusinessRefMetric {
+		parts := strings.Split(refID, ":")
+		if len(parts) != 3 && len(parts) != 4 {
+			return false
+		}
+		if parts[0] != value.CanonicalRefPrefix() || parts[1] == "" || parts[2] == "" {
+			return false
+		}
+		// Three segments are retained for historical evidence. New object-metric
+		// references carry the immutable version as a fourth v<n> segment.
+		return len(parts) == 3 || validMetricVersionSegment(parts[3])
+	}
 	var parts []string
 	if value == BusinessRefObjectInstance || value == BusinessRefActionInstance {
 		parts = strings.SplitN(refID, ":", value.canonicalRefSegmentCount())
@@ -72,6 +85,14 @@ func (value BusinessRefType) MatchesCanonicalRefID(refID string) bool {
 		}
 	}
 	return true
+}
+
+func validMetricVersionSegment(value string) bool {
+	if len(value) < 2 || value[0] != 'v' {
+		return false
+	}
+	version, err := strconv.Atoi(value[1:])
+	return err == nil && version > 0
 }
 
 func (value BusinessRefType) canonicalRefSegmentCount() int {
@@ -111,6 +132,14 @@ type EvidenceRef struct {
 	ContentHash         string          `json:"content_hash" binding:"required"`
 	AsOf                *time.Time      `json:"as_of,omitempty"`
 }
+
+// Function result capture is an optional addition to the managed execution receipt.
+const (
+	ManagedFunctionExecutionContract = "managed_function_execution/v1"
+	FunctionResultContract           = "function_result_evidence/v1"
+	FunctionResultSourceModule       = "context-loader-function-result/v1"
+	FunctionResultProducerID         = "agent-retrieval"
+)
 
 type ClaimMateriality string
 type ClaimStatus string

@@ -5,6 +5,7 @@ bkn-safe 是 OpenBKN 的认证、鉴权和用户目录服务。它配合**上游
 与用户目录管理。
 
 **文档**：
+
 - 领域知识网络权限调用合同：[`docs/api/knowledge-network-authorization.md`](../docs/api/knowledge-network-authorization.md)
 - 自助授权范围 OpenAPI：[`docs/api/bkn-safe/self-service.yaml`](../docs/api/bkn-safe/self-service.yaml)
 - Managed KN proxy internal OpenAPI: [`docs/api/bkn-safe/managed-proxy.yaml`](../docs/api/bkn-safe/managed-proxy.yaml)
@@ -14,16 +15,16 @@ bkn-safe 是 OpenBKN 的认证、鉴权和用户目录服务。它配合**上游
 ## 三职责
 
 1. **认证** —— hydra 的 login/consent/device 验证页；用**自有用户库 + bcrypt** 验密码
-   （不调 eacp/anyshare）；在 consent 时把 introspect 的 `ext` claims 注入 token session。
+   （不依赖外部用户服务）；在 consent 时把 introspect 的 `ext` claims 注入 token session。
 2. **鉴权** —— Casbin（RBAC + 资源实例，`keyMatch`，显式 deny 优先于普通 allow；
    `super_admin` 作为恢复角色不可被 deny），policy 存 GORM（gorm-adapter）。
 3. **用户管理** —— 自建目录（users/departments/groups/roles）+ 名称解析 + LDAP 连接器（轻）。
 
 ## 目录
 
-```
+``` bash
 bkn-safe/
-  server/                 服务本体 (module bkn-safe, go 1.25)
+  server/                 服务本体 (module bkn-safe, go 1.26)
     main.go               装配: db -> migrate -> authz -> seed -> http
     config/               环境变量配置
     internal/
@@ -41,9 +42,22 @@ bkn-safe/
 ## 构建 / 测试
 
 ```bash
-# 用 gvm go1.25.6 (见 memory: go-env-gvm)
+# 使用 Go 1.26.0 或更新版本
 cd server && go build ./... && go test ./...
 ```
+
+## 静态授权注册表
+
+`internal/seed/data/authorization-registry.json` 是资源类型、操作、前置依赖、
+父操作映射和派生规则的声明来源。启用 `SAFE_SEED_ON_START` 时，启动先将声明
+同步到数据库，再加载并验证一份只读内存快照；关闭时直接加载数据库中已应用的
+注册表，不为加载快照执行 seed 写入。数据库注册表为空、加载失败或规则无效时，
+启动失败，不提供不完整的授权规则。
+
+所有静态规则读取（包括授权写入校验和注册表 API）共享这份快照。运行期间修改
+数据库注册表不会刷新快照；更新规则后需重启服务，重复初始化不会替换已发布的
+快照。用户及角色授权、显式拒绝、账号状态、代理授权来源和具体资源父子关系
+继续动态生效。现有历史授权的启动处理保持不变，不因快照加载新增权限回填。
 
 ## 跑起来（dev 栈，在 VM 上）
 
@@ -96,6 +110,25 @@ VS Code / Cursor：打开 `bkn-safe` 根目录，选 **Run and Debug → bkn-saf
 | `SAFE_LDAP_URL` | （空=禁用） | LDAP 联邦；配了则 local→LDAP 链式认证 |
 | `SAFE_SEED_ON_START` | `true` | 启动时灌角色/资源类型/操作/权限 |
 
+## OIDC ID Token 与 `/userinfo`
+
+consent 时 bkn-safe 按授予的 scope 写入 ID Token 声明，hydra 在 `/userinfo` 返回同一组声明：
+
+| scope | 声明 | 来源 |
+| --- | --- | --- |
+| `openid` | `sub` | 用户 ID（hydra 自动写入） |
+| `profile` | `name`、`preferred_username`、`updated_at` | 用户名称、登录账号、资料更新时间（Unix 秒） |
+| `email` | `email` | 用户邮箱 |
+| `phone` | `phone_number` | 用户电话（按库中原值输出，不转 E.164） |
+
+- 值为空的声明不输出；不输出 `email_verified`、`phone_number_verified`，因为本地用户库不校验邮箱和电话。
+- 声明在登录时写入，刷新 token 不会更新；用户资料变更后需重新登录。
+- 访问令牌的 introspect `ext` 不受影响，仍是冻结契约中的五个字段。
+- 预置的 `openbkn-studio`、`openbkn-sdk`、`openbkn-cli` 允许申请 `profile email phone`，客户端按需申请；
+  自注册客户端仍只允许 `openid offline offline_access`。
+- 跨系统关联用户使用 `sub`；`preferred_username`、`email`、`phone_number` 可能变化，不作为关联键。
+- 部门、用户组、角色不放进 ID Token：需要时调用 `GET /api/safe/v1/me` 实时获取。
+
 ## HTTP 接口（节选）
 
 - 认证（hydra 重定向到这里）：`GET/POST /login`、`GET /consent`、`GET/POST /device`
@@ -113,6 +146,23 @@ VS Code / Cursor：打开 `bkn-safe` 根目录，选 **Run and Debug → bkn-saf
 - 目录 `/api/safe/v1/directory`：`GET /users/:id`、`POST /names`、`GET /departments`、
   `GET /groups/:id/members`、`POST /search-org`、`POST /users`、`PUT /users/:id/password`
 - 健康：`GET /health/ready`、`/health/alive`
+
+### 账号停用与会话失效
+
+`PUT /api/safe/v1/admin/users/:id` 设置 `enabled=false` 后，先保存停用状态，
+再调用 Hydra Admin API 撤销该 subject 的所有授权会话（`all=true`，不限定 client）
+和登录会话。成功返回 `204`；清理失败返回 `503`，错误详情包含
+`reason=session_revocation_failed` 和 `account_enabled=false`。账号保持停用，
+可重试相同请求。重新启用停用账号前也必须完成会话清理，避免恢复旧会话。
+
+`/me` 和 capabilities 读取每次检查账号状态，禁用或不存在的账号返回 `401`；
+认证只合并并发请求，不保留成功结果。浏览器在刷新失败或刷新后仍收到 `401`
+时清除本地登录状态，下一次访问显示登录页。普通权限不足的 `403` 不触发退出。
+账号密码正确但账号停用时，登录页显示“账号已停用，请联系管理员”。
+
+Hydra 撤销对 token 的覆盖范围取决于部署版本和发放流程；发布验收需要使用实际
+版本验证 Studio、CLI、SDK 的旧 access token 和 refresh token，不能仅以撤销接口
+返回成功作为凭证全部失效的证据。业务服务仍须检查实时账号状态。
 
 ### `POST /api/safe/v1/authz/resource-filter`（列表页批量判定）
 
@@ -245,3 +295,54 @@ resolver 只能在此基础上收窄；core 会再次取最小档，不能通过
 - **角色 UUID 保号**（`internal/seed/data/roles.json`，9 个；DA/flow-automation 硬编码业务 3 个）。
 - introspect 的 user-type `ext` 5 字段必须齐全，否则旧 lib 解析 panic（无 nil 检查）——
   `ExtClaims` 保证这一点，`contract/` 用真实 lib 守护。
+
+## BKN 项目文档存储账户（openbkn-ee#611）
+
+启用 `SAFE_SEED_ON_START` 时，启动会预置应用账户 `bkn-project-dataset-storage`
+（固定 UUID `e68bf3bc-3754-4b64-9fbd-e8919e544112`，无密码、不能登录），并只授予
+`catalog:*` 的 `create`。专业版 BKN 项目在未配置存储账户时用它创建自己的文档
+数据目录，目录内的权限来自创建者授权，不由 seed 授予。账户只在缺失时创建：
+管理员禁用后重启不会恢复启用；删除后重启会重新创建。账户名已被其他账户占用时
+只记日志，不阻断启动。
+
+## 业务溯源旧内置账户清理（#2823）
+
+业务溯源不再初始化 `openbkn-business-provenance` 应用账户。启动时仅清理
+固定 UUID、账户名、显示名、来源和类型均符合旧内置记录、且未设置密码或
+联系信息的账户；账号存在冲突、被定制或登记为托管代理时保留。该清理不依赖
+`SAFE_SEED_ON_START`。账户、API Key、目录成员关系和授权在同一事务内删除，
+失败则回滚。历史审计和 Agent/Prompt 创建者字段不改写。
+
+升级需同时使用撤掉业务溯源 bootstrap Job 的 Trace Chart 和不再注入专用
+bootstrap Secret 的 bkn-agent Chart/镜像；不要单独删库或回滚到会重新创建
+账户的旧版 Safe。旧 Helm keep Secret 可留存，不再被新版本引用。
+
+## Project build delegation (K4)
+
+The internal [build-grant API](../docs/api/bkn-safe/build-grants.yaml) provides
+non-credentialed project/job identities, an immutable file/version manifest and
+live delegator permission checks. Each check batches every distinct knowledge base
+in the immutable manifest through current effective permissions, without caching
+a prior authorization result. Protected identity mappings use the globally unique
+grant id so different projects can reuse local job names. It does not add general Casbin grants to these
+identities or admit them as knowledge-network proxies. The project coordinator
+must authenticate the owner, persist the private grant id before remote creation,
+fence cancellation/archive/model changes and reject late results. KB API checks
+the grant before every content read; this service slice alone does not implement
+that integration or complete K4.
+
+Revocation retains a protected identity solely for releasing private holds.
+Unknown ids are tombstoned so late creates cannot restore access. Retire an
+identity only after the coordinator verifies retention cleanup and published
+references. Neither read/check requests nor rejected requests emit business
+logs or Trace. Grant rows contain the delegator and scope, never user credentials.
+
+Before a rollout, back up bkn-safe and manually apply
+[`20261101-build-grants.sql`](server/migrations/20261101-build-grants.sql).
+The script targets the Safe database (`safe` by default); use the configured Safe
+database if the installation overrides that name. The migration adds two tables
+and changes no existing account or grant. Reverting
+the service version leaves those tables for recovery; do not drop retained
+identities or journals while holds remain. This change has not been deployed to
+8081. Local MariaDB tests apply the script twice and verify concurrent creation,
+revocation, idempotency and absence of orphaned identities.

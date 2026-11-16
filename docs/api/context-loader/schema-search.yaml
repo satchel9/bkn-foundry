@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: Schema 检索
+  title: 上下文加载 · Schema 检索 API
   description: |
     Context Loader（服务名 `agent-retrieval`）的 Schema 探索入口：把一句自然语言
     映射到知识网络里的**概念**（对象类 / 关系类 / 行动类 / 指标类），供 Agent
@@ -19,9 +19,9 @@ info:
     基础上做一轮语义实例召回，并把命中实例放在 `nodes` 里。参与召回的只有
     `condition_operations` 里带 `match` / `knn` / `==` 的属性——没建索引的对象类不出实例。
 
-    拿到概念后，实例数据也可以走
+    拿到概念后，实例数据可以走
     [object-instance.yaml](object-instance.yaml)、[instance-subgraph.yaml](instance-subgraph.yaml)，
-    或 [data-access.yaml](data-access.yaml) 的 `run_sql`。
+    或 [cypher.yaml](cypher.yaml) 的 `run_cypher`。
 
     **响应格式**：本模块所有端点都支持 `?response_format=toon`，返回
     `application/toon`（同构数组压成表格，比 JSON 省 token）；默认 `json`。
@@ -53,9 +53,13 @@ paths:
         统一的 Schema 探索入口。适用于还不确定该继续调用哪个 `query_*` / `find_*` /
         `get_*` 接口时，先探索相关概念。
 
-        **写 SQL 时注意 `include_columns`**：`data_properties[].name` 是逻辑名，
+        **`include_columns`**：`data_properties[].name` 是逻辑名，
         物理列名在 `mapped_field` 里，二者可以不同（同一份资源可被多个对象类以不同
-        逻辑名映射）。要用 `run_sql` 直查时置 `include_columns=true` 拿物理列名。
+        逻辑名映射）。置 `include_columns=true` 可拿到物理列名。
+
+        **`unit`**：非精简模式下，`data_properties[].unit` 来自属性本身，或来自它引用的值类型
+        （引用了值类型的属性不能自己声明单位，单位只写在值类型里）；枚举与非枚举值类型都适用。
+        精简模式不输出；读取值类型失败时不输出，属性保留 `value_type`。
       parameters:
         - $ref: '#/components/parameters/ResponseFormat'
         - name: x-kn-id
@@ -243,7 +247,14 @@ components:
           default: false
           description: |
             是否在每个对象类的 `data_properties` 上附带物理列名（取自 `mapped_field`）。
-            写 `run_sql` 需要物理列名时置 true；默认 false 以保持响应精简。
+            默认 false 以保持响应精简。
+        enum_query:
+          type: string
+          description: |
+            按显示名或编码检索枚举项，多个词用空格隔开，任一词命中即返回。用于没有展开的枚举：
+            超过展开上限（默认 50 项）的大字典，以及精简模式下的所有枚举。不传时这些枚举只给
+            `value_type` 与 `enum_count`。命中超过展开上限时只列前面一部分，另给 `enum_match_count`
+            表示命中总数。
 
     SearchSchemaScope:
       type: object
@@ -387,6 +398,9 @@ components:
           type: boolean
           default: false
           description: 是否附带物理列名。
+        enum_query:
+          type: string
+          description: 按显示名或编码检索未展开枚举的枚举项。
 
     SearchSchemaResponse:
       type: object

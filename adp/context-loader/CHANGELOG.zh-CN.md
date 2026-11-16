@@ -4,7 +4,40 @@
 
 ## Unreleased
 
+- 统一 MCP 工具分类的中英文名称；HTTP 扩展透传可选的工具标题、分组名称及排序，完整与精简 MCP 接口均可正确展示。工具调用名称、参数及执行行为保持不变。
+  - 发布注意：沙箱镜像需要重新构建，并与 Context Loader 配套升级。工具分类元数据参与 SDK 工具包指纹计算；`run_code` 会拒绝旧沙箱镜像并返回 `sandbox toolkit version mismatch`。
+
+- `list_knowledge_networks` 恢复返回各知识网络的 `description`。bkn-backend 的字段名是 `comment`，读取列表时被丢弃，所有网络的说明都是空的。
+
+- `get_kn_detail` 的返回限制在约 30000 字符以内，按调用方实际读到的格式计数；MCP 返回时，文本和同时附带的 `structuredContent` JSON 都不超过这个上限。summary 或 full 超过时逐级收窄并附 `notice`：先把对象类的属性列表换成 `data_property_count` / `logic_property_count`，仍超过则只返回导航壳。新增 `detail_level=brief`，只返回网络名称、说明、概念组与各类概念数量；MCP 使用说明改为以它开局。默认级别仍是 `summary`，返回未超限的网络输出不变。
+
+- `get_relation_types` 不传 `ids` 时列举关系类索引：按名称排序分页返回（默认 50 条，上限 200），带 `total_count` 与 `next_offset`，条目不含 `mapping_rules`，`comment` 只保留前 120 个字符；单页超过约 3 万字符时提前截断，从 `next_offset` 续页。传 `object_type_ids` 时只列起点或终点是这些对象类之一的关系类。两种模式都支持 `branch`。在 main 上按 `ids` 调用的行为不变。
+
+- `get_object_types` 不传 `ids` 列举时与 `get_relation_types` 一样限定单页大小：索引条目的 `comment` 只保留前 120 个字符（被截断时以「…」结尾）；单页超过约 3 万字符时提前截断，`next_offset` 指向被截掉的第一条，`notice` 说明原因。按 `ids` 取定义仍返回完整 `comment`，行为不变。
+
+- `search_schema` 带出属性所引用值类型的单位。引用了值类型的属性不能自己声明单位，完整模式下 `unit` 现在取自值类型（枚举与非枚举都适用），与直接声明单位的属性一致；精简模式及没有单位的值类型输出不变。值类型每次请求至多读一次，读取失败时保留 `value_type`、不补单位。
+
+- 增加可选 HTTP MCP 扩展，按同源路径转发认证、核验许可，并在完整及精简入口直接发布控制工具。支持接入 EE Eval 参评工具，不内嵌 Eval 业务逻辑；默认工具目录不变。 (#2570)
+
+- `search_schema` 展开枚举并输出别名（BKN 规范 3.0 阶段 2）。引用枚举值类型的属性带 `value_type` 与枚举项 `enum: [{value, display, deprecated}]`，停用项保留；超过展开上限（`concept_search_config.enum_expand_limit`，默认 50）的枚举以及精简模式下的所有枚举只给 `enum_count`，新参数 `enum_query` 按显示名或编码检索枚举项，命中超过上限时另给命中总数 `enum_match_count`。读取值类型受 `schema_read_timeout_ms` 限制。对象类、关系类、行动类在两种模式下都输出 `aliases`，数据属性的别名只在完整模式输出。`get_kn_detail`、`get_object_types`、`get_relation_types` 不输出别名。无值类型、无别名的网络输出与之前相同。 (#2282)
+
+- `search_schema` 输出 BKN 规范 3.0 的关系声明：`reverse_name`、`cardinality`、`required`、`characteristics`、`verification`、`importance`（primary 时不输出）与关系属性。主关系在 `fallback` 下带上替代路径及替代规则，替代路径不再单独出现：只召回到替代路径时补出它的主关系。对象类、关系类、行动类非 active 时带 `lifecycle`，按 ID 查到已弃用的定义（`get_object_types`、`get_relation_types`、指定 ID 的对象类）时可从中看到替代定义。无这些声明的网络输出与之前相同。 (#2285)
+
+- 在既有生命周期预算内为确认恢复保留时间，使用原幂等键重放 start，并冻结终态载荷与附件引用；不重复执行业务工具。 (#2539)
+
 ### 功能与改进
+
+- `search_schema` 在数据属性上输出 BKN 规范 3.0 阶段 1 的属性声明：完整模式输出 `semantic`、`required`、`unit`、`crs`、`timezone`，精简模式只输出 `semantic`；未声明的字段不输出，无声明网络的输出与之前相同。`get_kn_detail` 和 `get_object_types` 不输出这些字段。 (#2260)
+
+- 复用既有 Evidence 捕获开关，记录平台函数的实际执行身份与既有结构化结果，无需用户或样例额外声明证据，交给 Core 组装正式 Claim；发布前未生成快照不影响原回执完整性；一旦声明快照事件，其投递或确认失败仍可能使证据变为 partial。运行期捕获失败记录脱敏诊断；受管 finish 仍拒绝调用方提交 claims。 (#1332)
+
+- Interaction finish 使用独立、有界的终态提交／重放预算（默认 5 秒），有限重试保留完全相同的请求和幂等键。未确认提交返回 MCP 工具错误并指引 `retry_same_finish`；只有匹配的 Core 终态 ACK 才确认成功，不重新执行业务。 (#2340)
+
+- Kafka 证据发布保留规范业务引用、操作关联与因果事件 ID；工具 attempt 收尾遇到临时基础设施错误时在现有有界预算内恢复，不重新执行业务工具。 (#2425)
+
+- artifact 上传遇到明确的采集认证配置缺失时不再重复重试；区分 artifact 端点故障与生命周期 Core 故障，保留已提交的 start ID、采集权限拒绝和现有 Trace I/O 预算。 (#1691)
+
+- 可选地将答案可靠交给 Core managed finish，保留原 Trace 时间预算，避免同步等待答案 artifact 上传；业务完成与证据待补齐分别返回。默认旧路径不变，须在全部 Core worker 升级后启用。 (#1691)
 
 - `run_cypher`、`search_instance` 和 `get_logic_properties_values` 返回可操作的权限申请引导
   - 在 BKN Backend 与 Context Loader 之间保留明确的行过滤和属性脱敏影响信息

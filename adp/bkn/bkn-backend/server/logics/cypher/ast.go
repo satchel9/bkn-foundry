@@ -44,6 +44,108 @@ type Query struct {
 	OrderBy  []SortKey
 	Skip     *int64
 	Limit    *int64
+	// SkipParameter and LimitParameter are set for SKIP $name and LIMIT $name.
+	// bindRowCounts puts the supplied value in Skip or Limit before the query
+	// is planned, so everything after it reads one integer either way.
+	SkipParameter  *ParameterRef
+	LimitParameter *ParameterRef
+
+	// The fields below come from a WITH that aggregates, which the reader
+	// folds into this one query. GroupKeys are what the WITH grouped by,
+	// whether or not RETURN shows them; Having is the part of the WITH's
+	// WHERE that tests aggregates, applied to each group. Grouped says the
+	// query aggregates even when RETURN itself shows no aggregate.
+	Grouped   bool
+	GroupKeys []GroupKey
+	Having    Predicate
+
+	// Totals aggregate the groups a WITH made rather than the rows it
+	// grouped, as in
+	//
+	//	WITH m.code AS code, count(*) AS n WHERE n > 2 RETURN count(*) AS codes
+	//
+	// When they are set, Return is what each group yields -- the values the
+	// totals read, named as the WITH named them -- and the totals are what
+	// the query returns, computed over those rows.
+	Totals []Total
+
+	// Intersection, when set, is the whole query: two lists, each collected
+	// by a stage of its own, and the sizes RETURN asks of them. The other
+	// fields are then empty; see analyzeIntersection.
+	Intersection *Intersection
+
+	// Carried, when set, is a first stage whose WITH passes nodes on to the
+	// MATCH that follows; see analyzeCarried.
+	Carried *CarriedStage
+	// Union, when set, is the whole query: queries of their own whose rows
+	// are put together. Every other field is then empty; see Analyze.
+	Union *Union
+}
+
+// CarriedStage is the stage before a WITH that passes nodes on, as in
+//
+//	MATCH (p)<-[:R]-(g) WITH p, count(g) AS total
+//	MATCH (p)<-[:R]-(g2)-[:S]->(t) RETURN p, t, count(g2) AS n, total
+//
+// Stage is that stage with its WITH folded in: grouped as the WITH grouped,
+// filtered by its WHERE, and returning the values it named (Values, in
+// order). Nodes are the nodes it passes on, which the outer pattern reuses
+// and joins on by primary key.
+type CarriedStage struct {
+	Stage  *Query
+	Nodes  []string
+	Values []string
+}
+
+// CarriedValue is a value a carried stage named, read after it, as total
+// above.
+type CarriedValue struct {
+	Name string
+	Pos  Position
+}
+
+func (v CarriedValue) expressionPosition() Position { return v.Pos }
+
+// Intersection compares two lists of values, each collected by a stage:
+//
+//	MATCH ... WITH collect(x.p) AS a
+//	MATCH ... WITH a, collect(y.q) AS b
+//	RETURN size([v IN a WHERE v IN b]) AS common, size(a) AS n
+//
+// Each of Lists returns its property as one column named "value", once per
+// matched row; Distinct says the stage collected with DISTINCT.
+type Intersection struct {
+	Lists    [2]*Query
+	Distinct [2]bool
+	Items    []IntersectionItem
+}
+
+// IntersectionItem is one size RETURN asks for: of List itself, or, when
+// Common is set, of the elements of List the other list also holds.
+type IntersectionItem struct {
+	List   int
+	Common bool
+	Alias  string
+	Pos    Position
+}
+
+// Total is one aggregate over a WITH's groups. Of names the WITH's value it
+// aggregates, and is empty for count(*), which counts the groups.
+type Total struct {
+	Function string
+	Name     string
+	Distinct bool
+	Of       string
+	Alias    string
+	Pos      Position
+}
+
+// GroupKey is one thing a WITH grouped by: a property, or a node, which groups
+// by the object it is.
+type GroupKey struct {
+	Property *PropertyRef
+	Node     string
+	Pos      Position
 }
 
 // Pattern is what one MATCH describes: the nodes it names and the
@@ -92,6 +194,10 @@ type EdgeRef struct {
 	// query's WHERE -- a row that fails them keeps its place and loses the
 	// optional node, which is what OPTIONAL MATCH means.
 	Conditions []Predicate
+	// Variable names the relationship when the query binds it, as in
+	// -[e:WORKS_AT]->, so RETURN can return it as a relationship value. It is
+	// empty for an anonymous relationship.
+	Variable string
 	// Clause is which MATCH wrote this relationship. Several MATCH clauses
 	// describe one shape, but Cypher's rule that a pattern may not traverse
 	// the same relationship twice holds inside a single MATCH and not between
@@ -125,6 +231,17 @@ type Comparison struct {
 }
 
 func (c Comparison) predicatePosition() Position { return c.Pos }
+
+// PropertyComparison is one property against another, as in
+// o.shipped < o.ordered or a.code = b.code.
+type PropertyComparison struct {
+	Left     PropertyRef
+	Operator string
+	Right    PropertyRef
+	Pos      Position
+}
+
+func (c PropertyComparison) predicatePosition() Position { return c.Pos }
 
 // ExpressionComparison is a comparison where at least one side is computed,
 // as in o.amount * o.rate > $floor. A property against a value stays a
@@ -177,8 +294,10 @@ type Membership struct {
 	Property      PropertyRef
 	Values        []Operand
 	ListParameter *ParameterRef
-	Negated       bool
-	Pos           Position
+	// ListName is IN over a name a WITH introduced; see Operand.Name.
+	ListName *NameRef
+	Negated  bool
+	Pos      Position
 }
 
 func (m Membership) predicatePosition() Position { return m.Pos }
@@ -224,7 +343,11 @@ type Literal struct {
 	Integer int64
 	Float   float64
 	Boolean bool
-	Pos     Position
+	// Temporal names the function a date was written with, as in
+	// date('2026-08-13'). The value stays the text it was written as, and is
+	// compared only with a date or time property.
+	Temporal string
+	Pos      Position
 }
 
 func (l Literal) describe() string {
@@ -248,13 +371,25 @@ func (l Literal) describe() string {
 type Operand struct {
 	Literal   *Literal
 	Parameter *ParameterRef
+	// Name is a name a WITH introduced, as in p.code = code where code came
+	// from an earlier WITH. The reader resolves it before planning: to a
+	// constant, or to a semi-join on the values an earlier stage produced.
+	Name *NameRef
+}
+
+// NameRef is a bare name standing where a value is expected.
+type NameRef struct {
+	Name string
+	Pos  Position
 }
 
 // ParameterRef is $name, resolved against the request's parameters before the
 // statement is generated.
 type ParameterRef struct {
 	Name string
-	Pos  Position
+	// Temporal is set for date($name) and its kin; see Literal.Temporal.
+	Temporal string
+	Pos      Position
 }
 
 // Projection is one RETURN item: a property, an aggregate over one, or a value
@@ -268,8 +403,11 @@ type Projection struct {
 	// written on its own keeps its own field, so every stage that handled
 	// those before arithmetic existed still sees them the same way.
 	Expression Expression
-	Alias      string
-	Pos        Position
+	// Value is set for a graph value -- a node, a relationship, a constant, a
+	// map or collect -- instead of any of the fields above.
+	Value GraphExpression
+	Alias string
+	Pos   Position
 }
 
 // Aggregate is count, sum, avg, min or max. Property and Argument are both nil
@@ -282,6 +420,9 @@ type Aggregate struct {
 	Name     string
 	Distinct bool
 	Property *PropertyRef
+	// Variable is set for count(n) and count(DISTINCT n), which count the
+	// node n rather than a value of it.
+	Variable string
 	// Argument is set instead of Property when the aggregate is over a
 	// computed value, as in sum(o.price * o.quantity). ArgumentText is that
 	// value as it was written, for naming the column.
@@ -299,6 +440,8 @@ func (a Aggregate) String() string {
 		inner = a.Property.String()
 	case a.Argument != nil:
 		inner = a.ArgumentText
+	case a.Variable != "":
+		inner = a.Variable
 	}
 	if a.Distinct {
 		inner = "DISTINCT " + inner
@@ -353,3 +496,65 @@ type Negative struct {
 }
 
 func (n Negative) expressionPosition() Position { return n.Pos }
+
+// ConditionValue is a condition returned as a value, as in
+// RETURN o.region STARTS WITH 'E' AS east: true, false, or null when the
+// condition cannot be decided, which is what the same condition in WHERE
+// treats as not matching. It is only ever a whole RETURN item, never part of a
+// computation.
+type ConditionValue struct {
+	Predicate Predicate
+	Pos       Position
+}
+
+func (c ConditionValue) expressionPosition() Position { return c.Pos }
+
+// CaseValue is CASE: the result of the first branch whose condition holds,
+// else Else, else null. The simple form, CASE x WHEN v THEN ..., is read as
+// the searched one with the conditions x = v, so every later stage sees one
+// shape.
+type CaseValue struct {
+	Whens []CaseWhen
+	Else  Expression // nil when the query wrote no ELSE
+	Pos   Position
+}
+
+// CaseWhen is one WHEN ... THEN ... branch.
+type CaseWhen struct {
+	Condition Predicate
+	Result    Expression
+}
+
+func (c CaseValue) expressionPosition() Position { return c.Pos }
+
+// Coalesce is coalesce(a, b, ...): the first argument that is not null.
+type Coalesce struct {
+	Arguments []Expression
+	Pos       Position
+}
+
+func (c Coalesce) expressionPosition() Position { return c.Pos }
+
+// SemiJoin keeps the rows whose property is among the values an earlier stage
+// produced, as in
+//
+//	MATCH (b:BOM)-->(m:Material {code: '606'}) WITH DISTINCT b.product AS code
+//	MATCH (p:Product) WHERE p.number = code RETURN p.name
+//
+// Each row is kept once however often its value occurs in that stage, which
+// is what the WITH's DISTINCT or collect makes the query mean. Sub is the
+// earlier stage, returning the values as its only column.
+type SemiJoin struct {
+	Outer PropertyRef
+	Sub   *Query
+	Pos   Position
+}
+
+func (s SemiJoin) predicatePosition() Position { return s.Pos }
+
+// Union is UNION or UNION ALL over queries that each return the same columns.
+// All keeps every row; without it repeated rows are returned once.
+type Union struct {
+	Parts []*Query
+	All   bool
+}

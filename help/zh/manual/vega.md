@@ -93,6 +93,14 @@ openbkn resource find --name "customer_orders" --catalog-id <catalog_id>
 openbkn resource delete <resource_id>
 ```
 
+### 本地索引精确筛选的边界
+
+资源数据接口 `POST /api/vega-backend/v1/resources/<resource_id>/data`（`X-HTTP-Method-Override: GET`）走本地索引时，常量 `!=`／`not_eq` 和 `not_in` 只比较具有精确索引值的记录，排除 NULL 和缺失字段。
+
+string/text 的精确比较使用 keyword 字段或子字段。平台新增此类 keyword 特征的 `ignore_above` 默认是 **256 个 UTF-16 码元**，实际限制以索引 mapping 为准。超过限制的原始值仍保留在文档中，但没有 keyword 索引值，因此也被上述否定条件排除。例如上限为 256 时，300 个 ASCII 字符的正文不会命中 `body != "hello"` 或 `body not_in ["hello"]`，尽管查询常量很短。本地索引与源端 SQL 在此场景下可能返回不同结果；显式空值条件也不保证与这些比较条件覆盖全部原始值。
+
+这与**查询常量本身超限**不同：后者返回 HTTP 400 `VegaBackend.Resource.QueryValueExceedsKeywordLimit`；`not_in` 任一候选值超限同样报错。正文检索可使用具有全文特征的 `match`／`match_phrase`。需要完整原始值比较时，支持源查询的 table resource 可在请求体设置 `ignore_local_index: true`；服务不会自动回源，dataset 没有原始表查询通道。详见[资源数据 API](../../../docs/api/vega/resource-data.yaml)。
+
 ### 索引构建与数据集文档
 
 **构建本地索引**（全文与/或向量）**只对 `table` 类资源有效**：`BuildTaskService.Create` 的第一道校验就是 category，非 table 直接返回 `400 Resource category must be table`。`dataset` 类资源的文档是写入即进索引，不经过构建任务。
@@ -178,10 +186,10 @@ openbkn call /api/vega-backend/v1/resources/query -X POST -d '{
 
 **直连 SQL** — `openbkn vega sql`
 
-**简易模式**（不写 JSON body）：SQL 用 `--query` 传入（**请加引号**），方言用 `--input-dialect`。
+**简易模式**（不写 JSON body）：SQL 使用 MySQL SELECT 子集，通过 `--query` 传入（**请加引号**）。
 
 ```bash
-openbkn vega sql --input-dialect mysql \
+openbkn vega sql \
   --query "SELECT * FROM {{res_mysql_supplier}} LIMIT 5"
 ```
 
@@ -194,7 +202,7 @@ openbkn vega sql -d '<json>'
 openbkn vega help sql
 ```
 
-SQL 必须使用至少一个占位符 `{{.<资源ID>}}` 或 `{{<资源ID>}}`（资源 ID 为 Vega `resource_id`），后端会根据资源所属 Catalog 解析目标连接器并替换为物理表标识。不支持不带资源占位符的原生表名查询。
+SQL 必须使用至少一个占位符 `{{<资源ID>}}`（资源 ID 为 Vega `resource_id`），后端会根据资源所属 Catalog 解析目标连接器并替换为物理表标识。不支持不带资源占位符的原生表名查询。
 
 **三种查询方式对照**
 
@@ -226,7 +234,7 @@ openbkn vega connector-type get postgresql
 | 原用途 | 现行做法 |
 |--------|----------|
 | 浏览/查询视图数据 | 直接查资源：`openbkn vega resource query <resource_id> --limit N` |
-| 视图内自定义 SQL | `openbkn vega sql --input-dialect <方言> --query "..."`，用 `{{<resource_id>}}` 占位符引用资源 |
+| 视图内自定义 SQL | `openbkn vega sql --query "..."`，用 `{{<resource_id>}}` 占位符引用资源 |
 | 跨表 JOIN | `openbkn call /api/vega-backend/v1/resources/query -X POST`，同一 Catalog 内多表 JOIN |
 
 对象类若仍绑定在已废弃的 `data_view` 数据源上，查询会失败，需要改绑到 Vega 资源。
@@ -245,7 +253,7 @@ openbkn vega catalog resources cat_pg001 --category table
 
 # 3. 看数
 openbkn vega resource query res_orders_001 --limit 5 --need-total
-openbkn vega sql --input-dialect mysql \
+openbkn vega sql \
   --query "SELECT * FROM {{res_orders_001}} WHERE amount > 10000 ORDER BY amount DESC LIMIT 10"
 
 # 4. 建检索索引（全文 + 向量）
@@ -296,7 +304,6 @@ const connectors = await bkn.vega.connectorTypes();
 const sqlOut = await bkn.vega.sql({
   query: 'SELECT * FROM {{res-001}} LIMIT 5',
   query_format: 'sql',
-  input_dialect: 'mysql',
   paging: { mode: 'single', limit: 1 },
 });
 
@@ -394,7 +401,7 @@ curl -sk -X POST "https://<访问地址>/api/vega-backend/v1/resources/query" \
 curl -sk -X POST "https://<访问地址>/api/vega-backend/v1/resources/query" \
   -H "Authorization: Bearer $(openbkn auth token)" \
   -H "Content-Type: application/json" \
-  -d '{"query":"SELECT * FROM {{res_orders_001}} LIMIT 1","query_format":"sql","input_dialect":"mysql","paging":{"mode":"single","limit":1}}'
+  -d '{"query":"SELECT * FROM {{res_orders_001}} LIMIT 1","query_format":"sql","paging":{"mode":"single","limit":1}}'
 
 curl -sk "https://<访问地址>/api/vega-backend/v1/connector-types" \
   -H "Authorization: Bearer $(openbkn auth token)"

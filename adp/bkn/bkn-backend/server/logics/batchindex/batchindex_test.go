@@ -9,8 +9,8 @@ package batchindex
 import (
 	"testing"
 
-	"bkn-backend/interfaces"
-	"bkn-backend/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 func TestCollectKNFromPayload_nestedConceptGroup(t *testing.T) {
@@ -68,36 +68,6 @@ func TestCollectKNFromPayload_duplicateObjectTypeConflict(t *testing.T) {
 	}
 }
 
-func TestCollectKNFromPayload_metricsAndDuplicates(t *testing.T) {
-	kn := &interfaces.KN{
-		KNID:   "kn1",
-		Branch: interfaces.MAIN_BRANCH,
-		Metrics: []*interfaces.MetricDefinition{
-			{ID: "m1", Name: "a"},
-			{ID: "m2", Name: "b"},
-		},
-	}
-	idx, err := CollectKNFromPayload(kn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(idx.Metrics) != 2 {
-		t.Fatalf("metrics map size=%d", len(idx.Metrics))
-	}
-
-	dupKn := &interfaces.KN{
-		KNID:   "kn1",
-		Branch: interfaces.MAIN_BRANCH,
-		Metrics: []*interfaces.MetricDefinition{
-			{ID: "same", Name: "a"},
-			{ID: "same", Name: "b"},
-		},
-	}
-	if _, err := CollectKNFromPayload(dupKn); err == nil {
-		t.Fatal("expected conflicting metric definitions error")
-	}
-}
-
 func TestEnsureObjectTypePropertyMap(t *testing.T) {
 	ot := &interfaces.ObjectType{
 		ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
@@ -110,5 +80,20 @@ func TestEnsureObjectTypePropertyMap(t *testing.T) {
 	EnsureObjectTypePropertyMap(ot)
 	if ot.PropertyMap["p1"] != "P1" {
 		t.Fatalf("PropertyMap = %#v", ot.PropertyMap)
+	}
+}
+
+func TestRelationBatchRejectsConflictingEndpointDefinitions(t *testing.T) {
+	first := &interfaces.RelationType{RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "supply", SourceObjectTypeID: "orders", TargetObjectTypeID: "suppliers"}}
+	second := &interfaces.RelationType{RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "supply", SourceObjectTypeID: "orders", TargetObjectTypeID: "products"}}
+	index := NewBatchIDIndex("kn", "main")
+	if err := ingestRelationType(index, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := ingestRelationType(index, second); err == nil {
+		t.Fatal("conflicting relation must not replace action dependency schema")
+	}
+	if index.RelationTypes["supply"].TargetObjectTypeID != "suppliers" {
+		t.Fatal("existing dependency was overwritten")
 	}
 }

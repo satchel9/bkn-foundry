@@ -8,16 +8,18 @@ package discover_schedule
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
@@ -25,6 +27,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/factory"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/user_mgmt"
 )
 
@@ -36,6 +39,7 @@ var (
 type discoverScheduleService struct {
 	appSetting *common.AppSetting
 	cs         interfaces.CatalogService
+	cf         interfaces.ConnectorFactory
 	dsa        interfaces.DiscoverScheduleAccess
 	dts        interfaces.DiscoverTaskService
 	ums        interfaces.UserMgmtService
@@ -47,17 +51,13 @@ func NewDiscoverScheduleService(appSetting *common.AppSetting, dts interfaces.Di
 		dsService = &discoverScheduleService{
 			appSetting: appSetting,
 			cs:         catalog.NewCatalogService(appSetting),
+			cf:         factory.NewConnectorFactory(appSetting),
 			dsa:        logics.DSA,
 			dts:        dts,
 			ums:        user_mgmt.NewUserMgmtService(appSetting),
 		}
 	})
 	return dsService
-}
-
-func (dss *discoverScheduleService) UpdateRunMetadata(ctx context.Context,
-	id string, expectedUpdateTime, expectedNextRun, lastRun, nextRun int64) (int64, error) {
-	return dss.dsa.UpdateRunMetadata(ctx, id, expectedUpdateTime, expectedNextRun, lastRun, nextRun)
 }
 
 /**
@@ -77,7 +77,11 @@ func (dss *discoverScheduleService) Create(ctx context.Context, req *interfaces.
 		otellog.LogError(ctx, "Cron expression is required", nil)
 		return "", fmt.Errorf("cron_expr is required")
 	}
-	if err := dss.requireTaskManage(ctx, req.CatalogID); err != nil {
+	catalog, err := dss.requireTaskManage(ctx, req.CatalogID)
+	if err != nil {
+		return "", err
+	}
+	if err := dss.validateDiscoverCatalog(ctx, catalog); err != nil {
 		return "", err
 	}
 
@@ -107,6 +111,7 @@ func (dss *discoverScheduleService) Create(ctx context.Context, req *interfaces.
 		Strategy:  req.Strategy,
 		NextRun:   nextRun.UnixMilli(),
 
+		LastStatus: interfaces.ScheduleStatusNever,
 		Creator:    accountInfo,
 		CreateTime: now,
 		Updater:    accountInfo,
@@ -132,11 +137,11 @@ func (dss *discoverScheduleService) GetByID(ctx context.Context, id string) (*in
 	schedule, err := dss.dsa.GetByID(ctx, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get discover schedule failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_DiscoverSchedule_InternalError_GetFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_DiscoverSchedule_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if schedule != nil {
-		if err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
+		if _, err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
 			return nil, err
 		}
 		if err := dss.populateDiscoverScheduleReferences(ctx, []*interfaces.DiscoverSchedule{schedule}); err != nil {
@@ -179,7 +184,7 @@ func (dss *discoverScheduleService) List(ctx context.Context, params interfaces.
 	schedules, total, err := dss.dsa.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List discover schedules failed")
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_DiscoverSchedule_InternalError_GetFailed).
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_DiscoverSchedule_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if err := dss.populateDiscoverScheduleReferences(ctx, schedules); err != nil {
@@ -236,7 +241,11 @@ func (dss *discoverScheduleService) Update(ctx context.Context, schedule *interf
 		return fmt.Errorf("discover schedule not found")
 	}
 	// The handler has already resolved the schedule; use it for authorization.
-	if err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
+	catalog, err := dss.requireTaskManage(ctx, schedule.CatalogID)
+	if err != nil {
+		return err
+	}
+	if err := dss.validateDiscoverCatalog(ctx, catalog); err != nil {
 		return err
 	}
 
@@ -254,7 +263,7 @@ func (dss *discoverScheduleService) Update(ctx context.Context, schedule *interf
 	schedule.EndTime = req.EndTime
 	schedule.Strategy = req.Strategy
 	schedule.Updater = accountInfo
-	schedule.UpdateTime = now
+	schedule.UpdateTime = max(now, schedule.UpdateTime+1)
 	nextRun, err := calculateScheduleNextRun(schedule.CronExpr, nowTime, schedule.StartTime)
 	if err != nil {
 		return err
@@ -268,7 +277,7 @@ func (dss *discoverScheduleService) Update(ctx context.Context, schedule *interf
 		return err
 	}
 	if rowsAffected == 0 {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_DiscoverSchedule_UpdateConflict)
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_DiscoverSchedule_UpdateConflict)
 	}
 	logger.Infof("Updated discover schedule: id=%s", schedule.ID)
 	return nil
@@ -280,10 +289,10 @@ func (dss *discoverScheduleService) Delete(ctx context.Context, schedule *interf
 	defer span.End()
 
 	if schedule == nil {
-		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_DiscoverSchedule_NotFound)
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_DiscoverSchedule_NotFound)
 	}
 	// The handler has already resolved the schedule; use it for authorization.
-	if err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
+	if _, err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
 		return err
 	}
 	// Delete schedule
@@ -317,9 +326,18 @@ func (dss *discoverScheduleService) updateEnabled(ctx context.Context,
 	if schedule == nil {
 		return fmt.Errorf("discover schedule not found")
 	}
+	var catalog *interfaces.Catalog
+	var err error
 	if requirePermission {
-		// The handler has already resolved the schedule; use it for authorization.
-		if err := dss.requireTaskManage(ctx, schedule.CatalogID); err != nil {
+		catalog, err = dss.requireTaskManage(ctx, schedule.CatalogID)
+	} else if enabled {
+		catalog, err = dss.cs.InternalGetByID(ctx, schedule.CatalogID, false)
+	}
+	if err != nil {
+		return err
+	}
+	if enabled {
+		if err := dss.validateDiscoverCatalog(ctx, catalog); err != nil {
 			return err
 		}
 	}
@@ -337,26 +355,44 @@ func (dss *discoverScheduleService) updateEnabled(ctx context.Context,
 
 	accountInfo, _ := ctx.Value(interfaces.ACCOUNT_INFO_KEY).(interfaces.AccountInfo)
 	rowsAffected, err := dss.dsa.UpdateEnabled(
-		ctx, schedule.ID, enabled, nextRun, schedule.UpdateTime, nowTime.UnixMilli(), accountInfo)
+		ctx, schedule.ID, enabled, nextRun, schedule.UpdateTime,
+		max(nowTime.UnixMilli(), schedule.UpdateTime+1), accountInfo)
 	if err != nil {
 		otellog.LogError(ctx, "Failed to update discover schedule enabled state", err)
 		return err
 	}
 	if rowsAffected == 0 {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_DiscoverSchedule_UpdateConflict)
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_DiscoverSchedule_UpdateConflict)
 	}
 
 	return nil
 }
 
-func (dss *discoverScheduleService) requireTaskManage(ctx context.Context, catalogID string) error {
-	allowed, _, err := dss.cs.CheckCatalogPermission(ctx, catalogID,
+func (dss *discoverScheduleService) requireTaskManage(ctx context.Context, catalogID string) (*interfaces.Catalog, error) {
+	allowed, catalog, err := dss.cs.CheckCatalogPermission(ctx, catalogID,
 		[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
+	}
+	return catalog, nil
+}
+
+func (dss *discoverScheduleService) validateDiscoverCatalog(ctx context.Context, catalog *interfaces.Catalog) error {
+	if catalog == nil {
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Catalog_NotFound)
+	}
+	if catalog.Type == interfaces.CatalogTypeLogical {
+		return nil
+	}
+	supported, err := dss.cf.SupportDiscover(catalog.ConnectorType)
 	if err != nil {
 		return err
 	}
-	if !allowed {
-		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+	if !supported {
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).WithErrorDetails("connector does not support discovery")
 	}
 	return nil
 }
@@ -378,7 +414,7 @@ func calculateScheduleNextRun(cronExpr string, now time.Time, startTime int64) (
 
 // ExecuteSchedule is a method for executing plan discovery tasks
 // It takes a context and a planned discovery task as parameters and returns an error
-func (dss *discoverScheduleService) ExecuteSchedule(ctx context.Context, schedule *interfaces.DiscoverSchedule) error {
+func (dss *discoverScheduleService) ExecuteSchedule(ctx context.Context, schedule *interfaces.DiscoverSchedule) (interfaces.ScheduleRunResult, error) {
 	// Create a span to monitor and trace request execution.
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "DiscoverScheduleService.ExecuteSchedule")
 	defer span.End() // End the span when the function returns.
@@ -386,18 +422,26 @@ func (dss *discoverScheduleService) ExecuteSchedule(ctx context.Context, schedul
 	// Check whether the DiscoverTaskService has been set up
 	if dss.dts == nil {
 		otellog.LogError(ctx, "DiscoverTaskService not set", nil)
-		return fmt.Errorf("DiscoverTaskService not set")
+		return discoverScheduleFailure(ctx, fmt.Errorf("DiscoverTaskService not set"), "VegaBackend.Schedule.Result.DiscoverServiceUnavailable")
 	}
 
 	// The scheduler supplies the persisted schedule. Only the catalog's current state is rechecked.
 	catalogInfo, err := dss.cs.InternalGetByID(ctx, schedule.CatalogID, false)
 	if err != nil {
 		otellog.LogError(ctx, "Failed to get catalog before executing discover schedule", err)
-		return err
+		return discoverScheduleFailure(ctx, err, "VegaBackend.Schedule.Result.DiscoverCatalogReadFailed")
 	}
 	if catalogInfo == nil || !catalogInfo.Enabled {
 		logger.Infof("Skip discover schedule for missing or disabled catalog: id=%s, catalog_id=%s", schedule.ID, schedule.CatalogID)
-		return nil
+		message, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "VegaBackend.Schedule.Result.DiscoverCatalogUnavailable", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return interfaces.ScheduleRunResult{Status: interfaces.ScheduleStatusSkipped, Message: message}, nil
+	}
+
+	if err := dss.validateDiscoverCatalog(ctx, catalogInfo); err != nil {
+		return discoverScheduleFailure(ctx, err, "VegaBackend.Schedule.Result.DiscoverCatalogReadFailed")
 	}
 
 	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, schedule.Creator)
@@ -410,11 +454,15 @@ func (dss *discoverScheduleService) ExecuteSchedule(ctx context.Context, schedul
 	})
 	if err != nil {
 		otellog.LogError(ctx, "Failed to check running tasks", err)
-		return err
+		return discoverScheduleFailure(ctx, err, "VegaBackend.Schedule.Result.DiscoverActiveTasksCheckFailed")
 	}
 	if tasks > 0 {
 		logger.Warnf("There is already a running discover task for catalog %s, skipping execution", schedule.CatalogID)
-		return nil
+		message, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "VegaBackend.Schedule.Result.DiscoverTaskActive", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return interfaces.ScheduleRunResult{Status: interfaces.ScheduleStatusSkipped, Message: message}, nil
 	}
 
 	// Create a pending discover task; the local database-backed worker will pick it up.
@@ -426,9 +474,25 @@ func (dss *discoverScheduleService) ExecuteSchedule(ctx context.Context, schedul
 	})
 	if err != nil {
 		otellog.LogError(ctx, "Failed to create discover task", err)
-		return err
+		return discoverScheduleFailure(ctx, err, "VegaBackend.Schedule.Result.DiscoverCreateFailed")
 	}
 
 	logger.Infof("Executed discover schedule: id=%s, catalog_id=%s", schedule.ID, schedule.CatalogID)
-	return nil
+	return interfaces.ScheduleRunResult{Status: interfaces.ScheduleStatusSuccess}, nil
+}
+
+// discoverScheduleFailure 只保存公开错误分类，不暴露底层错误详情。
+func discoverScheduleFailure(ctx context.Context, err error, messageID string) (interfaces.ScheduleRunResult, error) {
+	var httpErr *httperrors.HTTPError
+	if errors.As(err, &httpErr) && httpErr.HTTPCode == http.StatusForbidden {
+		messageID = "VegaBackend.Schedule.Result.DiscoverPermissionDenied"
+	}
+	message, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), messageID, nil)
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return interfaces.ScheduleRunResult{
+		Status:  interfaces.ScheduleStatusFailed,
+		Message: message,
+	}, err
 }

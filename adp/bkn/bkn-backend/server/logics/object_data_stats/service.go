@@ -14,18 +14,18 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/interfaces/data_type"
-	"bkn-backend/logics"
-	"bkn-backend/logics/object_type"
-	"bkn-backend/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 type objectDataStatsService struct {
@@ -120,12 +120,12 @@ func (s *objectDataStatsService) sideStats(ctx context.Context,
 		return nil, err
 	}
 	if objectType == nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_KNDiff_ObjectTypeNotFound).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_KNDiff_ObjectTypeNotFound).
 			WithErrorDetails(fmt.Sprintf("object type %q not found in knowledge network %q branch %q",
 				ref.OTID, ref.KNID, branch))
 	}
 	if objectType.DataSource == nil || objectType.DataSource.ID == "" {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
 			WithErrorDetails(fmt.Sprintf("object type %q is not bound to a data resource", ref.OTID))
 	}
 
@@ -153,9 +153,8 @@ func (s *objectDataStatsService) sideStats(ctx context.Context,
 	}
 
 	response, err := s.vba.RawQuery(ctx, &interfaces.RawQueryRequest{
-		Query:        statement,
-		QueryFormat:  interfaces.VEGA_QUERY_FORMAT_SQL,
-		InputDialect: interfaces.VEGA_DIALECT_MYSQL,
+		Query:       statement,
+		QueryFormat: interfaces.VEGA_QUERY_FORMAT_SQL,
 		Paging: interfaces.ResourceDataPagingRequest{
 			Mode:  interfaces.VEGA_PAGING_MODE_SINGLE,
 			Limit: 1,
@@ -166,10 +165,10 @@ func (s *objectDataStatsService) sideStats(ctx context.Context,
 		// The statement names physical tables and columns and the dependency's message may quote
 		// it, so only the code travels back.
 		logger.Errorf("object data stats query failed: kn_id=%s ot_id=%s err=%s", ref.KNID, ref.OTID, err.Error())
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KNDiff_DataStatsQueryFailed)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KNDiff_DataStatsQueryFailed)
 	}
 	if len(response.Entries) == 0 {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KNDiff_DataStatsQueryFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KNDiff_DataStatsQueryFailed).
 			WithErrorDetails("the aggregate returned no row")
 	}
 
@@ -210,7 +209,7 @@ func primaryKeyColumns(ctx context.Context, objectType *interfaces.ObjectType) (
 	for _, key := range objectType.PrimaryKeys {
 		column, ok := columnByProperty[key]
 		if !ok || column == "" {
-			return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
+			return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
 				WithErrorDetails(fmt.Sprintf("primary key %q has no mapped column", key))
 		}
 		columns = append(columns, column)
@@ -236,6 +235,8 @@ const (
 // (NULL, a) would fold into one key; and either way a row without a key was left in the row count,
 // where it read as a duplicate. The rows with a complete key are counted separately so a missing
 // key and a repeated key come back as the two different faults they are.
+//
+//nolint:unused // Intentionally retained.
 func buildStatsSQL(ctx context.Context, resourceID string, keyColumns []string) (string, error) {
 	return buildStatsSQLWithWhere(ctx, resourceID, keyColumns, "")
 }
@@ -244,7 +245,7 @@ func buildStatsSQL(ctx context.Context, resourceID string, keyColumns []string) 
 // The policy expression is compiler-produced from bkn-safe's restricted
 // predicate grammar; it is never copied from a client request.
 func buildStatsSQLWithWhere(ctx context.Context, resourceID string, keyColumns []string, where string) (string, error) {
-	table := "{{." + resourceID + "}}"
+	table := "{{" + resourceID + "}}"
 	from := "FROM " + table
 	if where != "" {
 		from += " WHERE " + where
@@ -290,12 +291,12 @@ func (s *objectDataStatsService) statsRowFilter(ctx context.Context, knID string
 	}
 	if len(entries) != 1 || entries[0].ObjectTypeRef != ref ||
 		strings.TrimSpace(entries[0].EffectiveRowFilterDigest) == "" {
-		return "", rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return "", httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_KNDiff_DataStatsQueryFailed).WithErrorDetails("invalid row-filter decision")
 	}
 	where, err := compileStatsRowFilter(ctx, entries[0].Predicate, objectType)
 	if err != nil {
-		return "", rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return "", httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_KNDiff_DataStatsQueryFailed).WithErrorDetails("invalid row-filter predicate")
 	}
 	return where, nil
@@ -486,7 +487,7 @@ func statsRowFilterValueTypeAllowed(propertyType, valueType string) bool {
 // statement at the connector.
 func quoteIdentifier(ctx context.Context, name string) (string, error) {
 	if name == "" || strings.ContainsRune(name, 0) {
-		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
+		return "", httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNDiff_DataStatsUnavailable).
 			WithErrorDetails("a mapped column name is empty or contains a null byte")
 	}
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`", nil

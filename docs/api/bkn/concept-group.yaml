@@ -1,13 +1,17 @@
 ---
 openapi: 3.0.2
 info:
-  title: ConceptGroup
+  title: BKN 知识网络 · 概念组 API
   version: 0.1.0
   description: |
     Concept groups use `concept_group:{kn_id}/{group_id}`. Reads and lists
     require `view_detail`; updates use `modify`; deletion uses `delete`.
     Lists are filtered before total and pagination. See
     `../knowledge-network-authorization.md`.
+
+    Resource IDs use lowercase letters, digits, underscores, and hyphens, start
+    with a letter or digit, and contain at most 128 characters. Resource names
+    contain at most 128 Unicode characters.
 
     Strict validation of nested object, relation, and action types preserves each child's public
     dependency error contract: invalid bindings remain 400, user-scoped authorization remains
@@ -40,13 +44,28 @@ paths:
           schema:
             type: string
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
+            ETag:
+              $ref: "../_shared/kn-version.yaml#/components/headers/ETag"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ConceptGroupDetail"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: Get concept group details
     put:
       requestBody:
@@ -73,17 +92,31 @@ paths:
             type: boolean
             default: true
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
         "400":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadRequest"
         "403":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyForbidden"
+        "404":
+          description: Concept group not found on the requested branch (BknBackend.ConceptGroup.ConceptGroupNotFound)
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
         "502":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadGateway"
         "503":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyUnavailable"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Update a concept group
     delete:
       parameters:
@@ -99,9 +132,18 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Delete one concept group
     parameters:
       - name: kn_id
@@ -168,13 +210,26 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListConceptGroups"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: List concept groups
     post:
       parameters:
@@ -183,6 +238,16 @@ paths:
           schema:
             type: string
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases and property declarations), such as a 2.x package or an old JSON export, would clear them.
+            Without this parameter the request is refused with 409 BknBackend.ObjectType.DeclarationsWouldBeCleared,
+            whose details list the declarations; pass true to clear them.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: Import mode. Supported values are normal, ignore, and overwrite. Defaults to normal.
           schema:
@@ -213,6 +278,9 @@ paths:
         required: true
       responses:
         "201":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
@@ -262,9 +330,17 @@ paths:
             type: boolean
             default: true
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
       responses:
         "201":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: Addition succeeded
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Add an object type
     parameters:
       - name: kn_id
@@ -292,9 +368,18 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: Removal succeeded
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Remove an object type
     parameters:
       - name: kn_id
@@ -334,6 +419,16 @@ paths:
             type: boolean
             default: true
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases and property declarations), such as a 2.x package or an old JSON export, would clear them.
+            Without this parameter the request is refused with 409 BknBackend.ObjectType.DeclarationsWouldBeCleared,
+            whose details list the declarations; pass true to clear them.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: Matches the concept group creation API and validates conflicts with persisted concept group IDs or names using normal, ignore, or overwrite.
           schema:
@@ -391,9 +486,12 @@ components:
         id:
           description: ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -460,9 +558,12 @@ components:
         id:
           description: ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -601,6 +702,7 @@ components:
     ActionTypeDetail:
       description: Action type
       required:
+        - operation_config
         - action_source
         - action_type
         - affect
@@ -622,6 +724,8 @@ components:
         - updater
       type: object
       properties:
+        operation_config:
+          $ref: '#/components/schemas/ActionOperationConfig'
         id:
           description: Action typeID
           type: string
@@ -776,45 +880,61 @@ components:
             request (a nested `affect.object_type` is two levels down — go up to the action type).
           type: string
     ActionCondition:
-      description: Action condition
       type: object
+      required:
+      - operation
       properties:
         object_type_id:
-          description: Object type ID. Include it when filtering multiple object types; otherwise any matching property name can be filtered.
           type: string
         field:
-          description: Field name, which is the object type property name
           type: string
         operation:
-          description: Operator
-          enum:
-            - and
-            - or
-            - ==
-            - "!="
-            - ">"
-            - ">="
-            - <
-            - <=
-            - in
-            - not_in
-            - range
-            - out_range
-            - exist
-            - not_exist
           type: string
+          enum:
+          - and
+          - or
+          - ==
+          - '!='
+          - '>'
+          - '>='
+          - <
+          - <=
+          - in
+          - not_in
+          - empty
+          - not_empty
+          - 'true'
+          - 'false'
+          - range
+          - out_range
+          - before
+          - between
+          - exist
+          - not_exist
+          - like
+          - not_like
+          - prefix
+          - not_prefix
+          - 'null'
+          - not_null
+          - regex
+          - contain
+          - not_contain
+          - current
         sub_conditions:
-          description: Nested filter conditions
           type: array
           items:
-            $ref: "#/components/schemas/ActionCondition"
-        value:
-          description: Field value
+            $ref: '#/components/schemas/ActionCondition'
         value_from:
-          description: Field value source. Currently supports const only.
-          enum:
-            - const
           type: string
+          enum:
+          - const
+          - property
+          - input
+          default: const
+        value:
+          description: Literal value for const; same-endpoint property name for property; runtime parameter name for
+            input. Applicability does not supply target identities.
     Parameter:
       description: Tool parameters
       required:
@@ -837,10 +957,12 @@ components:
             - property
             - input
             - const
+            - source_identity
+            - target_identity
           type: string
         value:
-          description: Parameter value. For value_from=property, provide the object type data property name. For value_from=input, omit this field.
-          type: string
+          description: Literal constant, or an object property name for property. Omit for input
+            and endpoint identity sources.
     Schedule:
       description: Execution frequency configuration
       required:
@@ -972,9 +1094,6 @@ components:
             index:
               description: Associated index name
               type: string
-            index_available:
-              description: Whether the index is available
-              type: boolean
             doc_count:
               description: Document count in the index
               type: integer
@@ -1002,7 +1121,7 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, supports metric, objective, event, trace, log, and operator.
+          description: Property data type, matching the type of the mapped view field.
           type: string
         comment:
           description: Property description
@@ -1015,22 +1134,6 @@ components:
           type: array
           items:
             type: string
-    FulltextConfig:
-      description: Full-text index configuration
-      required:
-        - analyzer
-        - enabled
-      type: object
-      properties:
-        analyzer:
-          description: Analyzer ID. Available values come from fulltext_analyzers returned by GET /api/vega-backend/v1/index-capabilities and depend on the cluster capabilities.
-          type: string
-        enabled:
-          description: Whether enabled
-          type: boolean
-      example:
-        analyzer: standard
-        enabled: true
     KeywordConfig:
       title: Root Type for KeywordConfig
       description: Keyword search configuration
@@ -1046,21 +1149,6 @@ components:
       example:
         enabled: true
         ignore_above_len: 52
-    VectorConfig:
-      description: Vector index configuration
-      required:
-        - enabled
-      type: object
-      properties:
-        enabled:
-          description: Whether enabled
-          type: boolean
-        model_id:
-          description: Vector model ID
-          type: string
-      example:
-        enabled: true
-        model_id: some text
     ViewField:
       description: View field information
       required:
@@ -1091,14 +1179,11 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, supports metric, objective, event, trace, log, and operator.
+          description: Logic property type. Only tool is supported.
           type: string
         comment:
           description: Property description
           type: string
-        index:
-          description: Whether indexing is enabled. Defaults to true.
-          type: boolean
         data_source:
           $ref: "#/components/schemas/LogicSource"
           description: Logic source
@@ -1111,20 +1196,28 @@ components:
       description: Data source
       required:
         - type
-        - id
+        - box_id
+        - tool_id
       type: object
       properties:
         type:
           description: Data source type
-          enum:
-            - metric
-            - operator
+          enum: [tool]
           type: string
         id:
-          description: Data source ID
+          description: Optional external source ID.
+          type: string
+        box_id:
+          description: Toolbox ID. Required when type is tool.
+          type: string
+        tool_id:
+          description: Tool ID. Required when type is tool.
+          type: string
+        result_path:
+          description: Optional JSONPath for the tool response. Configurable when type is tool; the full response is returned when omitted.
           type: string
         name:
-          description: Name. Returned when viewing details.
+          description: Name. Returned when retrieving details.
           type: string
     RelationTypeDetail:
       description: Relation type
@@ -1309,6 +1402,7 @@ components:
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1333,9 +1427,12 @@ components:
         id:
           description: Concept group ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Concept group name
           type: string
+          maxLength: 128
     ConceptGroupDetail:
       description: Concept group details
       required:
@@ -1357,9 +1454,12 @@ components:
         id:
           description: ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -1415,3 +1515,42 @@ components:
           type: array
           items:
             type: string
+    ActionOperationConfig:
+      type: object
+      required:
+      - type
+      additionalProperties: false
+      description: Single-operation definition. Required by the new action runtime; migrate stored definitions before
+        switching services.
+      oneOf:
+        - properties:
+            type:
+              enum: [object, tool]
+          additionalProperties: false
+        - required: [relation_type_id, relation_operation]
+          properties:
+            type:
+              enum: [relation]
+      properties:
+        type:
+          type: string
+          enum:
+          - object
+          - relation
+          - tool
+        relation_type_id:
+          type: string
+          description: Required for relation operations; must connect the selected object type.
+        relation_operation:
+          type: string
+          enum:
+          - create
+          - delete
+        anchor_role:
+          type: string
+          enum:
+          - source
+          - target
+          description: Role of object_type_id in the relation. Self relations require an explicit role.
+        other_object_condition:
+          $ref: '#/components/schemas/ActionCondition'

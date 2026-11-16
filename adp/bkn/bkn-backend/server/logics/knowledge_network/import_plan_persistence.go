@@ -5,23 +5,24 @@ package knowledge_network
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/permission"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 const importPlanLookupBatchSize = 500
@@ -36,8 +37,24 @@ func (kns *knowledgeNetworkService) persistNormalizedImportPlan(ctx context.Cont
 		attr.Int("relation_type_count", len(plan.RelationTypes)),
 		attr.Int("action_type_count", len(plan.ActionTypes)),
 		attr.Int("risk_type_count", len(plan.RiskTypes)),
-		attr.Int("metric_count", len(plan.Metrics)),
+		attr.Int("value_type_count", len(plan.ValueTypes)),
+		attr.Int("object_metric_version_count", len(plan.ObjectMetrics)),
 	)
+	// An overwrite that would clear stored declarations is refused before anything is written: the
+	// writes below reach beyond the transaction, and the refusal lists every kind of definition.
+	if err := kns.refuseClearingDeclarations(ctx, plan, mode); err != nil {
+		return err
+	}
+	// Value types first: the object types of the same import name them.
+	if len(plan.ValueTypes) > 0 {
+		written, err := kns.vts.CreateValueTypes(ctx, tx, plan.ValueTypes, mode)
+		if err != nil {
+			logger.Errorf("CreateValueTypes error: %s", err.Error())
+			return logics.PreserveHTTPError(ctx, err, berrors.BknBackend_ValueType_InternalError)
+		}
+		// What was written is not committed yet; what ignore skipped stays as stored.
+		ctx = interfaces.WithPendingValueTypes(ctx, writtenValueTypes(plan.ValueTypes, written))
+	}
 	if len(plan.ConceptGroups) > 0 {
 		if _, err := kns.cgs.CreateConceptGroups(ctx, tx, plan.ConceptGroups, mode, strictMode); err != nil {
 			logger.Errorf("CreateConceptGroups error: %s", err.Error())
@@ -50,38 +67,73 @@ func (kns *knowledgeNetworkService) persistNormalizedImportPlan(ctx context.Cont
 	if err != nil {
 		return err
 	}
+	// The definitions the import writes are checked together once every kind is written: kind by
+	// kind, the network would mix new definitions of one kind with the stored ones of the next.
+	defCtx, written := logics.WithDeferredNetworkRelations(ctx)
 	if len(plan.ObjectTypes) > 0 {
-		if _, err = kns.ots.CreateObjectTypes(ctx, tx, plan.ObjectTypes, mode, false, strictMode); err != nil {
+		if _, err = kns.ots.CreateObjectTypes(defCtx, tx, plan.ObjectTypes, mode, false, strictMode); err != nil {
 			logger.Errorf("CreateObjectTypes error: %s", err.Error())
 			return logics.PreserveHTTPError(ctx, err,
 				berrors.BknBackend_KnowledgeNetwork_InternalError_CreateObjectTypesFailed)
 		}
 	}
 	if len(plan.RelationTypes) > 0 {
-		if _, err = kns.rts.CreateRelationTypes(ctx, tx, plan.RelationTypes, mode, strictMode); err != nil {
+		if _, err = kns.rts.CreateRelationTypes(defCtx, tx, plan.RelationTypes, mode, strictMode); err != nil {
 			logger.Errorf("CreateRelationTypes error: %s", err.Error())
 			return logics.PreserveHTTPError(ctx, err,
 				berrors.BknBackend_KnowledgeNetwork_InternalError_CreateRelationTypesFailed)
 		}
 	}
 	if len(plan.ActionTypes) > 0 {
-		if _, err = kns.ats.CreateActionTypes(ctx, tx, plan.ActionTypes, mode, strictMode); err != nil {
+		if _, err = kns.ats.CreateActionTypes(defCtx, tx, plan.ActionTypes, mode, strictMode); err != nil {
 			logger.Errorf("CreateActionTypes error: %s", err.Error())
 			return logics.PreserveHTTPError(ctx, err,
 				berrors.BknBackend_KnowledgeNetwork_InternalError_CreateActionTypesFailed)
 		}
 	}
+	if err = kns.nr.CheckRefusal(ctx, plan.KNID, plan.Branch, *written,
+		berrors.BknBackend_KnowledgeNetwork_InvalidParameter, berrors.BknBackend_KnowledgeNetwork_InternalError); err != nil {
+		return err
+	}
 	if len(plan.RiskTypes) > 0 {
 		if _, err = kns.riskTypeS.CreateRiskTypes(ctx, tx, plan.RiskTypes, mode); err != nil {
 			logger.Errorf("CreateRiskTypes error: %s", err.Error())
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RiskType_InternalError).WithErrorDetails(err.Error())
 		}
 	}
-	if len(plan.Metrics) > 0 {
-		if _, err = kns.ms.CreateMetrics(ctx, tx, plan.Metrics, strictMode, mode); err != nil {
-			logger.Errorf("CreateMetrics error: %s", err.Error())
-			return err
+	if plan.ObjectMetrics != nil && (len(plan.ObjectMetrics) > 0 || logics.OMA != nil) {
+		archive, ok := logics.OMA.(interfaces.ObjectMetricArchiveAccessV1)
+		if !ok {
+			return httperrors.NewHTTPError(ctx, http.StatusNotImplemented,
+				berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+				WithErrorDetails("object metric V1 archive access is unavailable")
+		}
+		if err := archive.ImportObjectMetricArchive(ctx, tx, plan.KNID, plan.Branch, plan.ObjectMetrics); err != nil {
+			logger.Errorf("Import object metric V1 archive failed: %v", err)
+			if errors.Is(err, interfaces.ErrObjectMetricArchiveConflict) {
+				return httperrors.NewHTTPError(ctx, http.StatusConflict,
+					berrors.BknBackend_KnowledgeNetwork_InvalidParameter).WithErrorDetails(err.Error())
+			}
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_KnowledgeNetwork_InternalError).
+				WithErrorDetails("object metric V1 archive import failed")
+		}
+		if len(plan.ObjectMetrics) > 0 {
+			ids := make(map[string]struct{}, len(plan.ObjectMetrics))
+			for _, record := range plan.ObjectMetrics {
+				ids[record.Definition.ID] = struct{}{}
+			}
+			metricIDs := make([]string, 0, len(ids))
+			for id := range ids {
+				metricIDs = append(metricIDs, id)
+			}
+			if err := kns.ps.UpsertResourceParents(ctx, interfaces.RESOURCE_TYPE_METRIC,
+				interfaces.RESOURCE_TYPE_KN, interfaces.KNChildResourceParents(plan.KNID, metricIDs)); err != nil {
+				return err
+			}
+			permission.TrackResourceParents(ctx, interfaces.RESOURCE_TYPE_METRIC,
+				interfaces.RESOURCE_TYPE_KN, interfaces.KNChildResourceParents(plan.KNID, metricIDs))
 		}
 	}
 	if err = kns.restoreImportGroupMembers(ctx, tx, plan, mode, validGroups, plan.validObjects); err != nil {
@@ -121,7 +173,7 @@ func (kns *knowledgeNetworkService) prepareNormalizedImportMembers(ctx context.C
 		existingMembers, err = kns.cga.GetConceptIDsGroupedByConceptGroupIDs(ctx,
 			plan.KNID, plan.Branch, groupIDs, interfaces.MODULE_TYPE_OBJECT_TYPE)
 		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_ConceptGroup_InternalError_GetConceptIDsByConceptGroupIDsFailed).
 				WithErrorDetails(err.Error())
 		}
@@ -157,7 +209,7 @@ func (kns *knowledgeNetworkService) prepareNormalizedImportMembers(ctx context.C
 		objects, err := kns.ota.GetObjectTypesByIDs(ctx, nil,
 			plan.KNID, plan.Branch, existingCandidates[start:end])
 		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_ObjectType_InternalError_GetObjectTypesByIDsFailed).
 				WithErrorDetails(err.Error())
 		}
@@ -239,7 +291,7 @@ func (kns *knowledgeNetworkService) filterValidImportGroupReferences(ctx context
 		groups, err := kns.cga.GetConceptGroupsByIDs(ctx, tx,
 			plan.KNID, plan.Branch, candidateIDs[start:end])
 		if err != nil {
-			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_ConceptGroup_InternalError).WithErrorDetails(err.Error())
 		}
 		for _, group := range groups {
@@ -318,7 +370,7 @@ func (kns *knowledgeNetworkService) restoreImportGroupMembers(ctx context.Contex
 					ConceptType: interfaces.MODULE_TYPE_OBJECT_TYPE, OTIDs: objectIDs,
 				})
 			if lookupErr != nil {
-				return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 					berrors.BknBackend_ConceptGroup_InternalError).WithErrorDetails(lookupErr.Error())
 			}
 			for _, objectType := range plan.ObjectTypes[start:end] {
@@ -358,7 +410,7 @@ func (kns *knowledgeNetworkService) restoreImportGroupMembers(ctx context.Contex
 	existingMembers, err := kns.cga.GetConceptIDsGroupedByConceptGroupIDs(ctx,
 		plan.KNID, plan.Branch, targetGroupIDs, interfaces.MODULE_TYPE_OBJECT_TYPE)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ConceptGroup_InternalError_GetConceptIDsByConceptGroupIDsFailed).
 			WithErrorDetails(err.Error())
 	}
@@ -379,7 +431,7 @@ func (kns *knowledgeNetworkService) restoreImportGroupMembers(ctx context.Contex
 				ConceptType: interfaces.MODULE_TYPE_OBJECT_TYPE, OTIDs: removed,
 			})
 			if err != nil {
-				return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 					berrors.BknBackend_ConceptGroup_InternalError).WithErrorDetails(err.Error())
 			}
 		}
@@ -407,7 +459,7 @@ func (kns *knowledgeNetworkService) restoreImportGroupMembers(ctx context.Contex
 		err = kns.cga.CreateConceptGroupRelations(ctx, tx, relations)
 	}
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ConceptGroup_InternalError_CreateConceptGroupRelationFailed).
 			WithErrorDetails(err.Error())
 	}
@@ -459,4 +511,56 @@ func logInvalidImportMembers(plan *NormalizedImportPlan, groupID string, objectI
 	}
 	logger.Warnf("Skip invalid import concept-group members: kn_id=%s branch=%s cg_id=%s invalid_count=%d object_ids=%s",
 		plan.KNID, plan.Branch, groupID, len(objectIDs), summary)
+}
+
+// writtenValueTypes keeps the value types whose IDs the import wrote.
+func writtenValueTypes(valueTypes []*interfaces.ValueType, ids []string) []*interfaces.ValueType {
+	written := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		written[id] = true
+	}
+	var result []*interfaces.ValueType
+	for _, vt := range valueTypes {
+		if written[vt.VTID] {
+			result = append(result, vt)
+		}
+	}
+	return result
+}
+
+// refuseClearingDeclarations answers an overwrite whose file does not carry declarations the stored
+// definitions have, unless the request confirmed clearing them. The refusal lists the declarations
+// of object types, relation types and action types together, and the problems the overwritten
+// network would still have: confirming does not make the import succeed while they remain.
+func (kns *knowledgeNetworkService) refuseClearingDeclarations(ctx context.Context,
+	plan *NormalizedImportPlan, mode string) error {
+	if mode != interfaces.ImportMode_Overwrite || interfaces.ClearDeclarationsConfirmed(ctx) {
+		return nil
+	}
+	ctx, cleared := interfaces.WithClearedDeclarationCollector(ctx)
+	ctx, written := logics.WithDeferredNetworkRelations(ctx)
+	if len(plan.ObjectTypes) > 0 {
+		if err := kns.ots.CheckOverwriteDeclarations(ctx, plan.KNID, plan.Branch, plan.ObjectTypes, mode); err != nil {
+			return err
+		}
+	}
+	if len(plan.RelationTypes) > 0 {
+		if err := kns.rts.CheckOverwriteDeclarations(ctx, plan.KNID, plan.Branch, plan.RelationTypes, mode); err != nil {
+			return err
+		}
+	}
+	if len(plan.ActionTypes) > 0 {
+		if err := kns.ats.CheckOverwriteDeclarations(ctx, plan.KNID, plan.Branch, plan.ActionTypes, mode); err != nil {
+			return err
+		}
+	}
+	if len(cleared.Cleared()) == 0 {
+		return nil
+	}
+	issues, err := kns.nr.CheckIssues(ctx, plan.KNID, plan.Branch, *written)
+	if err != nil {
+		return kns.nr.Refusal(ctx, issues, err,
+			berrors.BknBackend_KnowledgeNetwork_InvalidParameter, berrors.BknBackend_KnowledgeNetwork_InternalError)
+	}
+	return clearDeclarationsRefusal(ctx, cleared.Cleared(), logics.IssueMessages(issues))
 }

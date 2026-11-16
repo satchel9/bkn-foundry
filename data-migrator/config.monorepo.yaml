@@ -23,7 +23,7 @@ db_types:
 # Logical databases the migrator must pre-create.
 databases:
   - openbkn
-  - safe # bkn-safe（ISF 替代鉴权服务）库；schema 由 bkn-safe 启动时 GORM AutoMigrate 建表，但库本身需 migrator 预建，否则首装报 Unknown database 'safe'
+  - safe # bkn-safe（替代旧身份认证服务的鉴权服务）库；schema 由 bkn-safe 启动时 GORM AutoMigrate 建表，但库本身需 migrator 预建，否则首装报 Unknown database 'safe'
   # BKN Trace Core 持久化库；必须在 agent-observability 启动前创建。
   # 表结构由 agent-observability 内嵌的、带账本和 MariaDB 锁的迁移清单自管，
   # 因而有意不列入下面 services: 的 data-migrator SQL 规则范围。
@@ -48,6 +48,9 @@ services:
     path: migrations/bkn-backend-trace-outbox
   ontology-query-trace-outbox:
     path: migrations/ontology-query-trace-outbox
+  bkn-project:
+    path: migrations/bkn-project
+    # check_from: "1.0.0"  # 可选，从指定版本开始检测，不配置则检测所有版本
   vega-backend:
     path: migrations/vega-backend
     # check_from: "1.0.0"  # 可选，从指定版本开始检测，不配置则检测所有版本

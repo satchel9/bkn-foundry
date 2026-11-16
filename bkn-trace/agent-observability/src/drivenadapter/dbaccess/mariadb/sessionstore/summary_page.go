@@ -17,6 +17,9 @@ import (
 )
 
 func (s *Store) ListTraceSummaryIdentities(ctx context.Context, query isessionstore.SummaryPageQuery) (isessionstore.SummaryIdentityPage, error) {
+	if query.Tool != "" {
+		return s.listToolTraceIdentityPage(ctx, query)
+	}
 	where, args := summaryOwnerWhere("r", query)
 	where = append(where, usableSummaryReceiptPredicates("r")...)
 	if !query.From.IsZero() {
@@ -25,7 +28,15 @@ func (s *Store) ListTraceSummaryIdentities(ctx context.Context, query isessionst
 	if !query.To.IsZero() {
 		where, args = append(where, "r.issued_at<=?"), append(args, query.To.UTC())
 	}
+	if query.Service != "" {
+		predicate, serviceArgs := traceSummaryScopedServicePredicate(query)
+		where = append(where, predicate)
+		args = append(args, serviceArgs...)
+	}
 	clause := strings.Join(where, " AND ")
+	if query.Service != "" {
+		return s.listServiceTraceIdentityPage(ctx, query, clause, args)
+	}
 	var total int
 	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(DISTINCT r.trace_id) FROM bkn_trace_receipts r WHERE "+clause, args...).Scan(&total); err != nil {
 		return isessionstore.SummaryIdentityPage{}, fmt.Errorf("count trace summary identities: %w", err)
@@ -43,8 +54,17 @@ func (s *Store) ListTraceSummaryIdentities(ctx context.Context, query isessionst
 	}
 	limit := normalizeSummaryPageLimit(query.Limit)
 	pageArgs = append(pageArgs, limit+1, normalizeSummaryPageOffset(query.Offset))
+	receiptSource := "bkn_trace_receipts r"
+	if query.Scope.AccessProfile != nil && evidencevo.HasGlobalTraceAccess(*query.Scope.AccessProfile) &&
+		query.From.IsZero() && query.To.IsZero() {
+		// An unbounded global page visits nearly every receipt. The Trace-root
+		// index does not cover request_id, so a range scan causes a table lookup
+		// per receipt. Exclude only that index for this page read; keep COUNT's
+		// covering scan and the optimizer's choices for scoped/filtered queries.
+		receiptSource += " IGNORE INDEX (idx_bkn_trace_receipt_trace_root)"
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT r.trace_id, MIN(r.issued_at)
-		FROM bkn_trace_receipts r WHERE `+clause+`
+		FROM `+receiptSource+` WHERE `+clause+`
 		GROUP BY r.trace_id`+having+`
 		ORDER BY MIN(r.issued_at) DESC, r.trace_id ASC LIMIT ? OFFSET ?`, pageArgs...)
 	if err != nil {
@@ -56,6 +76,55 @@ func (s *Store) ListTraceSummaryIdentities(ctx context.Context, query isessionst
 		return isessionstore.SummaryIdentityPage{}, fmt.Errorf("scan trace summary identities: %w", err)
 	}
 	return isessionstore.SummaryIdentityPage{Entries: entries.values, Total: total, HasMore: entries.hasMore}, nil
+}
+
+// listServiceTraceIdentityPage computes the total before cursor filtering in one
+// statement. An empty page has no window row to carry total, so it uses the
+// original count predicate as a fallback.
+func (s *Store) listServiceTraceIdentityPage(ctx context.Context, q isessionstore.SummaryPageQuery, clause string, args []any) (isessionstore.SummaryIdentityPage, error) {
+	pageArgs := append([]any{}, args...)
+	cursor := ""
+	if q.AfterStartedAt != "" && q.AfterID != "" {
+		at, err := time.Parse(time.RFC3339Nano, q.AfterStartedAt)
+		if err != nil {
+			return isessionstore.SummaryIdentityPage{}, fmt.Errorf("parse trace summary cursor: %w", err)
+		}
+		cursor = " WHERE started_at<? OR (started_at=? AND trace_id>?)"
+		pageArgs = append(pageArgs, at.UTC(), at.UTC(), q.AfterID)
+	}
+	limit := normalizeSummaryPageLimit(q.Limit)
+	pageArgs = append(pageArgs, limit+1, normalizeSummaryPageOffset(q.Offset))
+	query := `SELECT trace_id,started_at,total FROM (SELECT r.trace_id,MIN(r.issued_at) AS started_at,COUNT(*) OVER() AS total FROM bkn_trace_receipts r WHERE ` + clause + ` GROUP BY r.trace_id) counted` + cursor + ` ORDER BY started_at DESC,trace_id ASC LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, query, pageArgs...)
+	if err != nil {
+		return isessionstore.SummaryIdentityPage{}, fmt.Errorf("list trace summary identities: %w", err)
+	}
+	result := isessionstore.SummaryIdentityPage{Entries: []isessionstore.SummaryIdentity{}}
+	for rows.Next() {
+		var id string
+		var at time.Time
+		if err := rows.Scan(&id, &at, &result.Total); err != nil {
+			_ = rows.Close()
+			return result, fmt.Errorf("scan trace summary identities: %w", err)
+		}
+		result.Entries = append(result.Entries, isessionstore.SummaryIdentity{ID: id, StartedAt: at.UTC().Format(time.RFC3339Nano)})
+	}
+	if err := rows.Close(); err != nil {
+		return result, fmt.Errorf("close trace summary identities: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return result, fmt.Errorf("scan trace summary identities: %w", err)
+	}
+	if len(result.Entries) == 0 {
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(DISTINCT r.trace_id) FROM bkn_trace_receipts r WHERE "+clause, args...).Scan(&result.Total); err != nil {
+			return result, fmt.Errorf("count trace summary identities: %w", err)
+		}
+	}
+	result.HasMore = len(result.Entries) > limit
+	if result.HasMore {
+		result.Entries = result.Entries[:limit]
+	}
+	return result, nil
 }
 
 func (s *Store) ListConversationSummaryIdentities(ctx context.Context, query isessionstore.SummaryPageQuery) (isessionstore.SummaryIdentityPage, error) {
@@ -283,4 +352,12 @@ func normalizeSummaryPageOffset(offset int) int {
 		return 0
 	}
 	return offset
+}
+
+// Legacy unscoped predicate retained for frozen capacity/baseline fixtures.
+// Production queries use traceSummaryScopedServicePredicate.
+func traceSummaryServicePredicate() string {
+	return `(SELECT f.source_module FROM bkn_trace_operation_call_facts f
+ WHERE f.trace_id=r.trace_id AND f.source_module<>''
+ ORDER BY f.started_at, f.operation_id, f.attempt_no LIMIT 1)=?`
 }

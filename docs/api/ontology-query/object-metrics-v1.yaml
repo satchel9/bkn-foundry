@@ -1,0 +1,25 @@
+openapi: 3.1.0
+info:
+  title: OpenBKN Object Metric Query V1
+  version: 1.0.0
+  description: Trial and query immutable, version-pinned object metrics.
+servers:
+  - url: /api/ontology-query
+security:
+  - bearerAuth: []
+paths:
+  /in/v1/object-metric-snapshots/metrics:
+    $ref: ../../../adp/bkn/ontology-query/docs/api/object-metrics-v1.openapi.yaml#/paths/~1in~1v1~1object-metric-snapshots~1metrics
+  /v1/knowledge-networks/{kn_id}/object-metrics/trial:
+    $ref: ../../../adp/bkn/ontology-query/docs/api/object-metrics-v1.openapi.yaml#/paths/~1v1~1knowledge-networks~1{kn_id}~1object-metrics~1trial
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/data:
+    $ref: ../../../adp/bkn/ontology-query/docs/api/object-metrics-v1.openapi.yaml#/paths/~1v1~1knowledge-networks~1{kn_id}~1object-metrics~1{metric_id}~1data
+  /v1/knowledge-networks/{kn_id}/object-metrics/{metric_id}/data/drill-through:
+    $ref: ../../../adp/bkn/ontology-query/docs/api/object-metrics-v1.openapi.yaml#/paths/~1v1~1knowledge-networks~1{kn_id}~1object-metrics~1{metric_id}~1data~1drill-through
+  /v1/knowledge-networks/{kn_id}/object-metrics/trial/drill-through:
+    $ref: ../../../adp/bkn/ontology-query/docs/api/object-metrics-v1.openapi.yaml#/paths/~1v1~1knowledge-networks~1{kn_id}~1object-metrics~1trial~1drill-through
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

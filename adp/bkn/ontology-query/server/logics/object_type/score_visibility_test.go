@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	cond "ontology-query/common/condition"
-	"ontology-query/interfaces"
-	"ontology-query/logics"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
 )
 
 func TestResourceQueryPreservesScoreMetadata(t *testing.T) {
@@ -41,7 +41,7 @@ func TestResourceQueryPreservesScoreMetadata(t *testing.T) {
 			query := &interfaces.ObjectQueryBaseOnObjectType{Properties: []string{"id"}, PageQuery: interfaces.PageQuery{Limit: 10}}
 			if tc.search {
 				query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationMatch,
-					ValueOptCfg: cond.ValueOptCfg{Value: "customer", ValueFrom: "const"}}
+					Value: "customer", ValueFrom: "const"}
 				if tc.operation != "" {
 					query.ActualCondition.Operation = tc.operation
 				}
@@ -66,7 +66,7 @@ func TestResourceQueryPreservesScoreMetadata(t *testing.T) {
 			}
 			vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{Entries: []map[string]any{row}}}
 			var result interfaces.Objects
-			if err := (&objectTypeService{vba: vega}).getObjectsFromResource(context.Background(), query, objectType, &result, plan.fieldPropertyMap(), plan); err != nil {
+			if err := (&objectTypeService{vba: vega}).getObjectsFromResource(context.Background(), query, objectType, &result, plan.fieldPropertyMap(), plan, false, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			if len(result.Datas) != 1 {
@@ -133,7 +133,7 @@ func TestScoreIsOnlyReturnedForExplicitFullPropertySearch(t *testing.T) {
 		ActualCondition: &cond.CondCfg{Name: "mobile", Operation: cond.OperationMatch},
 	}
 	_, err = buildPropertyAccessPlan(context.Background(), resolver, objectType, maskedSearch, true)
-	httpError, ok := err.(*rest.HTTPError)
+	httpError, ok := err.(*httperrors.HTTPError)
 	if !ok || httpError.HTTPCode != http.StatusBadRequest {
 		t.Fatalf("masked search property error = %#v", err)
 	}
@@ -197,7 +197,7 @@ func TestRequiredFullDependencyIsFetchedButNotAutomaticallyReturned(t *testing.T
 		"id": interfaces.PropertyAccessFull, "mobile": interfaces.PropertyAccessMasked,
 		"notes": interfaces.PropertyAccessSchema, "secret": interfaces.PropertyAccessNone,
 	}}, objectType, query, true)
-	httpError, ok := err.(*rest.HTTPError)
+	httpError, ok := err.(*httperrors.HTTPError)
 	if !ok || httpError.HTTPCode != http.StatusBadRequest {
 		t.Fatalf("masked internal dependency error = %#v", err)
 	}

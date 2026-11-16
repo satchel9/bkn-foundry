@@ -152,6 +152,7 @@ func documentGetInteraction() {}
 // @Security BearerAuth
 // @Produce json
 // @Param interaction_id path string true "Interaction ID"
+// @Param view query string false "Response view: full (default) or summary" Enums(full,summary)
 // @Success 200 {object} operationCallFactsResponse
 // @Failure 401,403,404,500,503 {object} lifecycleErrorEnvelope
 // @Router /interactions/{interaction_id}/operations [get]
@@ -160,7 +161,7 @@ func documentGetInteraction() {}
 func documentListInteractionOperations() {}
 
 // @Summary Finish one Interaction through the Agent-facing facade
-// @Description Derives the current lease and closure manifest from authoritative Operations and Receipts. Ordinary Agents do not submit concurrency or closure internals.
+// @Description Derives the current lease and closure manifest from authoritative Operations and Receipts. Ordinary Agents do not submit concurrency or closure internals. When durable answer handoff is enabled, optional answer_artifact uses the EvidenceArtifact contract (result type, at most 16 MiB) and is staged in the same SQL transaction as business completion. completed with evidence_status=assembling means evidence delivery is pending, not complete. Existing answer_artifact_ref requests remain supported.
 // @Tags lifecycle
 // @Security BearerAuth
 // @Accept json

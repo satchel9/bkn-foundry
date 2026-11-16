@@ -5,7 +5,7 @@
 // Package seed centrally initialises authorization data at bkn-safe startup:
 // roles, the resource-type/operation catalog, and role->permission grants.
 //
-// This replaces ISF's scattered initialisation (authorization service startup
+// This replaces the legacy service's scattered initialisation (authorization service startup
 // seed + each module's HTTP resource_type registration + DA InitPermission) with
 // one idempotent seed in one service — no cross-service registration, no boot
 // ordering. Role UUIDs are preserved (see data/roles.json).
@@ -15,11 +15,8 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"slices"
 	"strings"
 
 	"golang.org/x/crypto/bcrypt"
@@ -40,12 +37,6 @@ import (
 const (
 	adminUserID  = "266c6a42-6131-4d62-8f39-853e7093701c"
 	adminAccount = "admin"
-
-	// BusinessProvenanceOwnerID is the non-login application identity that owns
-	// the deployment-managed business provenance Agent in bkn-agent.
-	BusinessProvenanceOwnerID      = "bdd59f76-19c3-58b0-bf5f-082c4c3cbddb"
-	BusinessProvenanceOwnerAccount = "openbkn-business-provenance"
-	BusinessProvenanceOwnerName    = "OpenBKN Business Provenance Service"
 )
 
 var deprecatedSeedRoleIDs = []string{
@@ -57,6 +48,7 @@ var deprecatedSeedRoleIDs = []string{
 
 var withdrawnResourceTypes = []string{
 	"stream_data_pipeline",
+	"operator",
 }
 
 // modelResourceTypes are platform foundations rather than objects whose
@@ -155,9 +147,9 @@ func Apply(db *gorm.DB, enforcer *authz.Enforcer) error {
 	return ApplyWithAudit(db, enforcer, audit.New(db))
 }
 
-// ApplyWithAudit sends startup repairs through the same Audit transport as
-// ordinary administration. The legacy Apply entry point remains for tests.
-func ApplyWithAudit(db *gorm.DB, enforcer *authz.Enforcer, trail interface {
+// ApplyWithAudit retains the startup API without repairing existing grants.
+// New prerequisite declarations must not expand historical permissions.
+func ApplyWithAudit(db *gorm.DB, enforcer *authz.Enforcer, _ interface {
 	Record(context.Context, audit.Entry) error
 }) error {
 	if err := seedRoles(db); err != nil {
@@ -171,6 +163,9 @@ func ApplyWithAudit(db *gorm.DB, enforcer *authz.Enforcer, trail interface {
 	}
 	if err := seedCatalog(db); err != nil {
 		return fmt.Errorf("seed catalog: %w", err)
+	}
+	if err := enforcer.InitializeRegistry(context.Background()); err != nil {
+		return err
 	}
 	if err := reconcileDeprecatedSeedRoles(db, enforcer); err != nil {
 		return fmt.Errorf("reconcile deprecated seed roles: %w", err)
@@ -193,17 +188,14 @@ func ApplyWithAudit(db *gorm.DB, enforcer *authz.Enforcer, trail interface {
 	if err := seedDefaultModelAccess(enforcer); err != nil {
 		return fmt.Errorf("seed default model access: %w", err)
 	}
-	if err := backfillRequiredOperations(db, enforcer, trail); err != nil {
-		return fmt.Errorf("backfill required operations: %w", err)
-	}
 	if err := seedRoleBindings(enforcer); err != nil {
 		return fmt.Errorf("seed role bindings: %w", err)
 	}
 	if err := seedAdminUser(db); err != nil {
 		return fmt.Errorf("seed admin user: %w", err)
 	}
-	if err := seedBusinessProvenanceOwner(db); err != nil {
-		return fmt.Errorf("seed business provenance owner: %w", err)
+	if err := seedDatasetStorageAccount(db, enforcer); err != nil {
+		return fmt.Errorf("seed dataset storage account: %w", err)
 	}
 	if err := enforcer.PrimeDerivedRules(context.Background()); err != nil {
 		return fmt.Errorf("prime derived authorization rules: %w", err)
@@ -338,36 +330,6 @@ func ReconcileWithdrawnNormalUserRole(db *gorm.DB, enforcer *authz.Enforcer) err
 		)
 	}
 	return nil
-}
-
-func seedBusinessProvenanceOwner(db *gorm.DB) error {
-	var existing model.User
-	err := db.Where(
-		"id = ? OR account = ?", BusinessProvenanceOwnerID, BusinessProvenanceOwnerAccount,
-	).First(&existing).Error
-	if err == nil {
-		if existing.ID != BusinessProvenanceOwnerID ||
-			existing.Account != BusinessProvenanceOwnerAccount ||
-			existing.Name != BusinessProvenanceOwnerName ||
-			!existing.Enabled ||
-			existing.Source != model.SourceLocal ||
-			existing.AccountType != model.AccountTypeApp ||
-			existing.PasswordHash != "" {
-			return fmt.Errorf("fixed app principal %s conflicts with the deployment contract", BusinessProvenanceOwnerID)
-		}
-		return nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
-	}
-	return db.Create(&model.User{
-		ID:          BusinessProvenanceOwnerID,
-		Account:     BusinessProvenanceOwnerAccount,
-		Name:        BusinessProvenanceOwnerName,
-		Enabled:     true,
-		Source:      model.SourceLocal,
-		AccountType: model.AccountTypeApp,
-	}).Error
 }
 
 // seedAdminUser creates the built-in admin login the FIRST time only. If a row
@@ -535,278 +497,43 @@ func deleteUndeclaredOperations(db *gorm.DB, resourceTypeID string, declared []s
 	return q.Delete(&model.Operation{}).Error
 }
 
-// validateHierarchy checks the type-level hierarchy declared in authorization-registry.json:
-// every parent_type resolves to a declared type, every parent_operation resolves
-// to an operation the parent actually defines, an operation may not inherit from
-// a type with no parent, and the parent chain is acyclic. All four are authoring
-// mistakes in an embedded file, so failing the seed is the right response — the
-// alternative is a grant that quietly never applies.
+// catalogRows adapts the authoritative embedded declaration for the shared validators.
+func catalogRows(c catalog) ([]model.ResourceType, []model.Operation) {
+	types := make([]model.ResourceType, 0, len(c.ResourceTypes))
+	var ops []model.Operation
+	for _, rt := range c.ResourceTypes {
+		types = append(types, model.ResourceType{ID: rt.ID, Name: rt.Name, ParentTypeID: rt.ParentType})
+		for _, op := range rt.Operations {
+			ops = append(ops, model.Operation{ResourceTypeID: rt.ID, ID: op.ID, Name: op.Name,
+				Description: op.Description, Grantable: op.Grantable, ParentOperationID: op.ParentOperation,
+				DerivedToOperationID: op.DerivedToOperation, RequiredOperationIDs: strings.Join(op.Requires, ",")})
+		}
+	}
+	return types, ops
+}
+
 func validateHierarchy(c catalog) error {
-	ops := make(map[string]map[string]bool, len(c.ResourceTypes))
-	parent := make(map[string]string, len(c.ResourceTypes))
-	for _, rt := range c.ResourceTypes {
-		set := make(map[string]bool, len(rt.Operations))
-		for _, op := range rt.Operations {
-			set[op.ID] = true
-		}
-		ops[rt.ID] = set
-		parent[rt.ID] = rt.ParentType
-	}
-	for _, rt := range c.ResourceTypes {
-		if rt.ParentType != "" {
-			if _, ok := ops[rt.ParentType]; !ok {
-				return fmt.Errorf("resource type %q declares unknown parent_type %q", rt.ID, rt.ParentType)
-			}
-			if rt.ParentType == rt.ID {
-				return fmt.Errorf("resource type %q is its own parent_type", rt.ID)
-			}
-		}
-		for _, op := range rt.Operations {
-			if op.ParentOperation == "" {
-				continue
-			}
-			if rt.ParentType == "" {
-				return fmt.Errorf("operation %s/%s declares parent_operation %q but %s has no parent_type",
-					rt.ID, op.ID, op.ParentOperation, rt.ID)
-			}
-			if !ops[rt.ParentType][op.ParentOperation] {
-				return fmt.Errorf("operation %s/%s maps to %s/%s, which is not a registered operation",
-					rt.ID, op.ID, rt.ParentType, op.ParentOperation)
-			}
-		}
-	}
-	// Acyclic check: walk each chain with a step budget of the type count. A
-	// cycle would make the enforce-time fallback loop forever.
-	for id := range parent {
-		seen := map[string]bool{id: true}
-		for cur, steps := parent[id], 0; cur != ""; cur, steps = parent[cur], steps+1 {
-			if seen[cur] || steps > len(parent) {
-				return fmt.Errorf("resource type parent chain has a cycle at %q", cur)
-			}
-			seen[cur] = true
-		}
-	}
-	return nil
+	types, ops := catalogRows(c)
+	return authz.ValidateRegistryHierarchy(types, ops)
 }
-
-// validateDerivedOperations keeps child-to-parent derived operations explicit
-// and finite. Source-operation requirements are independent of the derived
-// effect and are validated by validateRequirements.
 func validateDerivedOperations(c catalog) error {
-	resourceTypes := make(map[string]catalogResourceType, len(c.ResourceTypes))
-	for _, rt := range c.ResourceTypes {
-		resourceTypes[rt.ID] = rt
-	}
-	for _, rt := range c.ResourceTypes {
-		for _, op := range rt.Operations {
-			if op.DerivedToOperation == "" {
-				continue
-			}
-			if rt.ParentType == "" {
-				return fmt.Errorf("operation %s/%s declares derived_to_operation %q but %s has no parent_type",
-					rt.ID, op.ID, op.DerivedToOperation, rt.ID)
-			}
-			parent, ok := resourceTypes[rt.ParentType]
-			if !ok {
-				return fmt.Errorf("operation %s/%s derives to unregistered parent type %s",
-					rt.ID, op.ID, rt.ParentType)
-			}
-			var target catalogOperation
-			for _, candidate := range parent.Operations {
-				if candidate.ID == op.DerivedToOperation {
-					target = candidate
-					break
-				}
-			}
-			if target.ID == "" {
-				return fmt.Errorf("operation %s/%s derives to %s/%s, which is not a registered operation",
-					rt.ID, op.ID, rt.ParentType, op.DerivedToOperation)
-			}
-			if target.Grantable == nil || *target.Grantable {
-				return fmt.Errorf("operation %s/%s derives to grantable operation %s/%s",
-					rt.ID, op.ID, rt.ParentType, target.ID)
-			}
-			if target.DerivedToOperation != "" {
-				return fmt.Errorf("operation %s/%s derives to %s/%s, which derives again",
-					rt.ID, op.ID, rt.ParentType, target.ID)
-			}
-		}
-	}
-	return nil
+	types, ops := catalogRows(c)
+	return authz.ValidateRegistryDerivations(types, ops)
 }
-
-// validateRequirements checks the same-type prerequisites declared in
-// authorization-registry.json: every requirement is declared on the same type, is not the
-// target itself, and does not itself declare requirements. The last rule keeps
-// the first implementation strictly one layer instead of silently calculating
-// only part of a dependency graph.
-//
-// The failure this guards against is silent. A requirement naming an operation
-// the type does not declare would expand a grant into an op no check ever asks
-// about, while a multi-level declaration would make a one-layer runtime result
-// incomplete. Both are authoring mistakes in an embedded file, so refusing to
-// boot is the honest response.
 func validateRequirements(c catalog) error {
+	// Preserve embedded-file validation before serializing the edges to the
+	// legacy comma-separated column, where an empty edge would disappear.
 	for _, rt := range c.ResourceTypes {
-		declared := make(map[string]bool, len(rt.Operations))
-		requires := make(map[string][]string, len(rt.Operations))
-		for _, op := range rt.Operations {
-			declared[op.ID] = true
-			requires[op.ID] = op.Requires
-		}
 		for _, op := range rt.Operations {
 			for _, required := range op.Requires {
-				if required == op.ID {
-					return fmt.Errorf("operation %s/%s requires itself", rt.ID, op.ID)
-				}
-				if !declared[required] {
-					return fmt.Errorf("operation %s/%s requires %q, which %s does not declare",
-						rt.ID, op.ID, required, rt.ID)
-				}
-				if len(requires[required]) > 0 {
-					return fmt.Errorf("operation %s/%s requires %s/%s, which itself declares requires",
-						rt.ID, op.ID, rt.ID, required)
+				if required == "" || strings.TrimSpace(required) != required {
+					return fmt.Errorf("operation %s/%s requires %q, which its resource type does not declare", rt.ID, op.ID, required)
 				}
 			}
 		}
 	}
-	return nil
-}
-
-// backfillRequiredOperations repairs grants written before a prerequisite was
-// declared: every eligible allow holding an operation gains its direct required
-// operations. Legacy and logical bundles keep their compatibility contracts;
-// runtime requires still prevents either from bypassing a later deny.
-//
-// The requirement is normalized when a grant is written, so without this the fix
-// would reach new grants only. For catalog.resource_manage that would leave the
-// reported defect standing for everyone who had already been granted it — the
-// grant reaches nothing on its own, and nothing tells the administrator to
-// re-save it. Runs after seedGrants so the rebuilt role matrix is in place, and
-// it is idempotent, so a start with nothing to repair costs one filtered read
-// per declared requirement.
-//
-// Deliberately NOT symmetric with revocation: this only ever adds. A row that
-// an administrator has since narrowed on purpose is repaired back to a usable
-// shape rather than left as a permission that answers 403 everywhere.
-func backfillRequiredOperations(db *gorm.DB, enforcer *authz.Enforcer, trail interface {
-	Record(context.Context, audit.Entry) error
-}) error {
-	var c catalog
-	if err := json.Unmarshal(catalogJSON, &c); err != nil {
-		return err
-	}
-	// Role ids up front: the audit vocabulary for a role's permission differs
-	// from an object grant's, and telling them apart per repaired row would be a
-	// query each.
-	roleNames, err := roleNameByID(db)
-	if err != nil {
-		return err
-	}
-	for _, rt := range c.ResourceTypes {
-		for _, op := range rt.Operations {
-			for _, required := range op.Requires {
-				added, err := enforcer.BackfillRequiredOperation(rt.ID, op.ID, required)
-				if err != nil {
-					return err
-				}
-				if len(added) == 0 {
-					continue
-				}
-				slog.Info("backfilled a direct operation requirement",
-					"resource_type", rt.ID, "operation", op.ID, "required", required, "rows", len(added))
-				// Model policies are deliberately removed and rebuilt on every
-				// startup by reconcileModelAuthorizationPolicies. Their derived
-				// display grants are therefore not new administrative changes;
-				// recording them would create four false Audit events per restart.
-				if !slices.Contains(modelResourceTypes, rt.ID) {
-					recordBackfillAudit(trail, roleNames, rt.ID, op.ID, required, added)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// recordBackfillAudit writes one audit row per repaired grant, under the same
-// resource/action the console shows for an operator-issued object grant. A
-// permission that appears without anyone having clicked anything is exactly the
-// change an auditor asking "why does this account see this catalog" needs to
-// find, and a line in the pod log is not somewhere they can look.
-//
-// Failures are logged and swallowed: auditing must never be the reason a
-// deployment fails to start.
-func recordBackfillAudit(trail interface {
-	Record(context.Context, audit.Entry) error
-}, roleNames map[string]string,
-	resourceType, operation, required string, grants []authz.BackfilledGrant) {
-
-	for _, g := range grants {
-		detail, err := json.Marshal(map[string]any{
-			"accessor_id": g.AccessorID,
-			"resource":    map[string]string{"type": resourceType, "id": g.ResourceID},
-			"operations":  []string{required},
-			"_reason":     "required by " + operation,
-		})
-		if err != nil {
-			slog.Error("seed: could not encode backfill audit detail", "err", err)
-			continue
-		}
-		entry := audit.Entry{
-			ActorID: "system:seed",
-			Method:  "SYSTEM",
-			Detail:  string(detail),
-			Status:  http.StatusOK,
-		}
-		applyBackfillAuditTarget(&entry, roleNames, g)
-		if err := trail.Record(context.Background(), entry); err != nil {
-			slog.Error("seed: backfill audit record failed",
-				"resource_type", resourceType, "resource_id", g.ResourceID, "err", err)
-		}
-	}
-}
-
-// applyBackfillAuditTarget labels one repaired row with the vocabulary of the
-// surface that can actually show it. Getting this wrong is not cosmetic: an
-// audit row naming a surface where the grant is absent sends the auditor
-// looking in a list that will never contain it.
-//
-//   - a role subject is a role permission, which the console records as
-//     roles/grant_permission against the ROLE, not the resource;
-//   - a concrete grant to a real account is an object grant, and lands next to
-//     the operator-issued grant of the same object;
-//   - everything else — the public accessor, and type-wide "type:*" rows — is
-//     excluded from the object-grant list by construction, so it is labelled as
-//     what it is: a raw policy row, visible through GET /admin/policies.
-func applyBackfillAuditTarget(entry *audit.Entry, roleNames map[string]string, g authz.BackfilledGrant) {
-	if name, isRole := roleNames[g.AccessorID]; isRole {
-		entry.Resource = "roles"
-		entry.Action = "grant_permission"
-		entry.TargetID = g.AccessorID
-		entry.TargetName = name
-		return
-	}
-	entry.TargetID = g.ResourceID
-	entry.Action = "grant"
-	if g.ResourceID == "*" || g.AccessorID == authz.PublicAccessorID {
-		entry.Resource = "policies"
-		return
-	}
-	entry.Resource = "object-grants"
-}
-
-// roleNameByID loads the role id -> name map used to tell a role subject from
-// an accessor. Roles are few and this runs once per start.
-func roleNameByID(db *gorm.DB) (map[string]string, error) {
-	var roles []model.Role
-	if err := db.Find(&roles).Error; err != nil {
-		return nil, err
-	}
-	out := make(map[string]string, len(roles))
-	for _, r := range roles {
-		out[r.ID] = r.Name
-	}
-	return out, nil
+	types, ops := catalogRows(c)
+	return authz.ValidateRegistryRequirements(types, ops)
 }
 
 func seedGrants(enforcer *authz.Enforcer) error {
@@ -836,7 +563,7 @@ func seedGrants(enforcer *authz.Enforcer) error {
 // seedRoleBindings binds accessors (users/apps) to roles via Casbin's grouping
 // policy. Notably binds the admin UUID — backend services' tokenless S2S
 // fallback identity to the super administrator, so internal /in/v1 calls pass FilterResources
-// (replicates ISF's super-admin grant). AssignRole is idempotent.
+// (replicates the legacy service's super-admin grant). AssignRole is idempotent.
 func seedRoleBindings(enforcer *authz.Enforcer) error {
 	var rb roleBindingsFile
 	if err := json.Unmarshal(roleBindingsJSON, &rb); err != nil {

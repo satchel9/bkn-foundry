@@ -19,8 +19,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -63,6 +63,7 @@ func bindingSelectColumns() []string {
 		"f_updater",
 		"f_updater_type",
 		"f_update_time",
+		"f_revision",
 	}
 }
 
@@ -86,6 +87,7 @@ func scanBindingFromRow(scanner interface {
 		&binding.Updater.ID,
 		&binding.Updater.Type,
 		&binding.UpdateTime,
+		&binding.Revision,
 	)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -175,6 +177,7 @@ func (ca *capabilityBindingAccess) CreateBindings(ctx context.Context, tx *sql.T
 			binding.Updater.ID,
 			binding.Updater.Type,
 			binding.UpdateTime,
+			interfaces.NewDefinitionRevision(),
 		)
 	}
 	sqlStr, vals, err := builder.ToSql()

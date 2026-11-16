@@ -8,11 +8,12 @@ import (
 	"errors"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/trace"
 
-	"bkn-backend/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
 )
 
 // replyDependencyValidationError keeps validate-only endpoints machine
@@ -22,7 +23,7 @@ func replyDependencyValidationError(c *gin.Context, span trace.Span, err error) 
 	if !logics.IsDependencyHTTPError(err) {
 		return false
 	}
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
 		return false
 	}

@@ -15,7 +15,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -73,10 +73,37 @@ func TestCatalogHealthCheckScheduleHandlerGet(t *testing.T) {
 		assert.Contains(t, w.Body.String(), "only supported for physical catalogs")
 	})
 
+	t.Run("returns existing schedule for API catalog", func(t *testing.T) {
+		engine, cs, hcss := setupCatalogHealthCheckScheduleHandlerTest(t)
+		cs.EXPECT().GetByID(gomock.Any(), "api", false).Return(&interfaces.Catalog{
+			ID: "api", Type: interfaces.CatalogTypePhysical, ConnectorType: "http",
+		}, nil)
+		hcss.EXPECT().GetByCatalogID(gomock.Any(), "api").Return(&interfaces.CatalogHealthCheckSchedule{
+			CatalogID: "api", Mode: interfaces.CatalogHealthCheckScheduleModeInherit,
+		}, nil)
+		req := httptest.NewRequest(http.MethodGet, "/api/vega-backend/in/v1/catalogs/api/health-check-schedule", nil)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code)
+		assert.Contains(t, w.Body.String(), `"catalog_id":"api"`)
+		assert.Contains(t, w.Body.String(), `"mode":"inherit"`)
+	})
+
+	t.Run("preserves authorization refusal before reading API schedule", func(t *testing.T) {
+		engine, cs, _ := setupCatalogHealthCheckScheduleHandlerTest(t)
+		cs.EXPECT().GetByID(gomock.Any(), "api", false).Return(nil,
+			httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden))
+		req := httptest.NewRequest(http.MethodGet, "/api/vega-backend/in/v1/catalogs/api/health-check-schedule", nil)
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		require.Equal(t, http.StatusForbidden, w.Code)
+		assert.Contains(t, w.Body.String(), httperrors.PublicError_Forbidden)
+	})
+
 	t.Run("preserves catalog not found error", func(t *testing.T) {
 		engine, cs, _ := setupCatalogHealthCheckScheduleHandlerTest(t)
 		cs.EXPECT().GetByID(gomock.Any(), "missing", false).Return(nil,
-			rest.NewHTTPError(context.Background(), http.StatusNotFound, verrors.VegaBackend_Catalog_NotFound))
+			httperrors.NewHTTPError(context.Background(), http.StatusNotFound, verrors.VegaBackend_Catalog_NotFound))
 
 		req := httptest.NewRequest(http.MethodGet, "/api/vega-backend/in/v1/catalogs/missing/health-check-schedule", nil)
 		w := httptest.NewRecorder()
@@ -139,7 +166,7 @@ func TestCatalogHealthCheckScheduleHandlerUpdate(t *testing.T) {
 	t.Run("returns validation error from service", func(t *testing.T) {
 		engine, _, hcss := setupCatalogHealthCheckScheduleHandlerTest(t)
 		hcss.EXPECT().Update(gomock.Any(), "catalog-1", gomock.Any()).Return(nil,
-			rest.NewHTTPError(context.Background(), http.StatusBadRequest, verrors.VegaBackend_CatalogHealthCheckSchedule_InvalidParameter).WithErrorDetails("cron_expr is required"))
+			httperrors.NewHTTPError(context.Background(), http.StatusBadRequest, verrors.VegaBackend_CatalogHealthCheckSchedule_InvalidParameter).WithErrorDetails("cron_expr is required"))
 
 		req := httptest.NewRequest(http.MethodPut, "/api/vega-backend/in/v1/catalogs/catalog-1/health-check-schedule", strings.NewReader(`{"mode":"enabled","expected_update_time":1}`))
 		req.Header.Set("Content-Type", "application/json")

@@ -15,16 +15,46 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/common"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
 )
+
+func TestCallerRuntimeCredentialFromRequestIncludesManagedInteraction(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/action-types/at-1/execute", nil)
+	request.Header.Set("Authorization", "Bearer caller-token")
+	request.Header.Set(common.HeaderBKNConversationID, "conv_1")
+	request.Header.Set(common.HeaderBKNInteractionID, "int_1")
+	request.Header.Set(common.HeaderBKNParentOperationID, "op_registered")
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = request
+	credential := callerRuntimeCredentialFromRequest(ctx)
+	if credential.Authorization != "Bearer caller-token" || credential.ConversationID != "conv_1" ||
+		credential.InteractionID != "int_1" || credential.ParentOperationID != "op_registered" {
+		t.Fatalf("managed interaction was not captured: %+v", credential)
+	}
+}
+
+func TestActionCallerRuntimeCredentialUsesVerifiedVisitor(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/action-types/at-1/execute", nil)
+	request.Header.Set("X-BKN-Application-Principal-ID", "untrusted-header")
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = request
+	credential := actionCallerRuntimeCredential(ctx, hydra.Visitor{ID: "user-1", ClientID: "app-1"})
+	if credential.ApplicationPrincipalID != "app-1" {
+		t.Fatalf("principal = %q, want verified client", credential.ApplicationPrincipalID)
+	}
+	credential = actionCallerRuntimeCredential(ctx, hydra.Visitor{ID: "user-1"})
+	if credential.ApplicationPrincipalID != "user-1" {
+		t.Fatalf("principal = %q, want verified account fallback", credential.ApplicationPrincipalID)
+	}
+}
 
 func Test_RestHandler_GetObjectsInObjectTypeByIn(t *testing.T) {
 	Convey("Test RestHandler GetObjectsInObjectTypeByIn", t, func() {
@@ -89,7 +119,7 @@ func Test_RestHandler_GetObjectsInObjectTypeByIn(t *testing.T) {
 		})
 
 		Convey("失败 - Service返回错误", func() {
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
 
 			reqParamByte, _ := sonic.Marshal(objectQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))
@@ -107,7 +137,7 @@ func Test_RestHandler_GetObjectsInObjectTypeByIn(t *testing.T) {
 			qas := omock.NewMockQueryAuthorizationService(mockCtrl)
 			handler.qas = qas
 			qas.EXPECT().AuthorizeObjectTypeQuery(gomock.Any(), knID, interfaces.MAIN_BRANCH, otID).
-				Return(rest.NewHTTPError(context.Background(), http.StatusForbidden, rest.PublicError_Forbidden))
+				Return(httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden))
 
 			reqParamByte, _ := sonic.Marshal(objectQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))
@@ -245,7 +275,7 @@ func Test_RestHandler_GetObjectsInObjectTypeByEx(t *testing.T) {
 		})
 
 		Convey("失败 - Token验证失败", func() {
-			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, rest.NewHTTPError(context.TODO(), http.StatusUnauthorized, rest.PublicError_Unauthorized))
+			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, httperrors.NewHTTPError(context.TODO(), http.StatusUnauthorized, httperrors.PublicError_Unauthorized))
 
 			reqParamByte, _ := sonic.Marshal(objectQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))
@@ -365,7 +395,7 @@ func Test_RestHandler_GetObjectsInObjectType(t *testing.T) {
 		})
 
 		Convey("失败 - Service返回错误", func() {
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
 
 			reqParamByte, _ := sonic.Marshal(objectQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))
@@ -532,7 +562,7 @@ func Test_RestHandler_GetObjectsPropertiesByEx(t *testing.T) {
 		})
 
 		Convey("失败 - Token验证失败", func() {
-			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, rest.NewHTTPError(context.TODO(), http.StatusUnauthorized, rest.PublicError_Unauthorized))
+			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, httperrors.NewHTTPError(context.TODO(), http.StatusUnauthorized, httperrors.PublicError_Unauthorized))
 
 			reqParamByte, _ := sonic.Marshal(propertyQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))
@@ -626,7 +656,7 @@ func Test_RestHandler_GetObjectsProperties(t *testing.T) {
 		})
 
 		Convey("失败 - Service返回错误", func() {
-			ots.EXPECT().GetObjectPropertyValue(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
+			ots.EXPECT().GetObjectPropertyValue(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(context.TODO(), http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed))
 
 			reqParamByte, _ := sonic.Marshal(propertyQuery)
 			req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(reqParamByte))

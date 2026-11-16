@@ -6,7 +6,11 @@
 
 package bkn
 
-import "bkn-backend/common/maskrule"
+import (
+	"encoding/json"
+
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/maskrule"
+)
 
 // RelationType mapping types.
 const (
@@ -30,6 +34,11 @@ type BknNetworkFrontmatter struct {
 	Version string `yaml:"version,omitempty"`
 	Branch  string `yaml:"branch,omitempty"`
 
+	// BknSpec is the BKN specification version the package is written in, normalized to
+	// major.minor ("3.0"). Empty means a package written before the field existed; such packages
+	// are read by the 2.x rules, exactly as before. See spec.go.
+	BknSpec string `yaml:"bkn_spec,omitempty"`
+
 	// Capabilities declares which Skills and ToolBox tools this network depends on. It is a
 	// dependency declaration, not a payload: the capabilities themselves travel through their own
 	// channels (a skill's package, a tool box's import/export), the way package.json names
@@ -39,9 +48,24 @@ type BknNetworkFrontmatter struct {
 
 // BknCapabilities is the capability dependency section of a network.
 type BknCapabilities struct {
-	Skills    []*BknCapabilitySkill    `yaml:"skills,omitempty"`
-	Functions []*BknCapabilityFunction `yaml:"functions,omitempty"`
-	MCPTools  []*BknCapabilityMCPTool  `yaml:"mcp_tools,omitempty"`
+	Skills         []*BknCapabilitySkill         `yaml:"skills,omitempty"`
+	Functions      []*BknCapabilityFunction      `yaml:"functions,omitempty"`
+	MCPTools       []*BknCapabilityMCPTool       `yaml:"mcp_tools,omitempty"`
+	KnowledgeBases []*BknCapabilityKnowledgeBase `yaml:"knowledge_bases,omitempty"`
+}
+
+// IsEmpty reports whether the section declares nothing, in which case it is not written and a
+// read of it is nil.
+func (c *BknCapabilities) IsEmpty() bool {
+	return c == nil || (len(c.Skills) == 0 && len(c.Functions) == 0 && len(c.MCPTools) == 0 &&
+		len(c.KnowledgeBases) == 0)
+}
+
+// BknCapabilityKnowledgeBase names one Enterprise knowledge base dependency by id and name, like
+// a skill: the id is environment-local, the name is what an import elsewhere resolves.
+type BknCapabilityKnowledgeBase struct {
+	ID   string `yaml:"id,omitempty"`
+	Name string `yaml:"name,omitempty"`
 }
 
 // BknCapabilitySkill names one skill dependency by both id and name.
@@ -88,7 +112,11 @@ type BknNetwork struct {
 	ActionTypes   []*BknActionType
 	RiskTypes     []*BknRiskType
 	ConceptGroups []*BknConceptGroup
-	Metrics       []*BknMetric
+	ObjectMetrics []json.RawMessage
+
+	// ValueTypes are the 3.0 value types of value_types/ (SPECIFICATION.md §16). A 2.x package never
+	// sets them.
+	ValueTypes []*BknValueType
 }
 
 // BknObjectTypeFrontmatter is YAML frontmatter metadata for a .bkn file.
@@ -97,6 +125,22 @@ type BknObjectTypeFrontmatter struct {
 	ID   string   `yaml:"id"`
 	Name string   `yaml:"name"`
 	Tags []string `yaml:"tags"`
+
+	// Aliases are other names of the object type, for concept search and understanding (3.0,
+	// SPECIFICATION.md §6.8). A 2.x package never sets them.
+	Aliases []string `yaml:"aliases,omitempty"`
+
+	// Lifecycle is the 3.0 lifecycle (SPECIFICATION.md §4.3); nil is active.
+	Lifecycle *Lifecycle `yaml:"lifecycle,omitempty"`
+}
+
+// Lifecycle says whether a definition is still in use (SPECIFICATION.md §4.3). A definition without
+// one is active; an active lifecycle is held as nil, so writing status: active and leaving it out
+// read the same.
+type Lifecycle struct {
+	Status     string `yaml:"status"`
+	Reason     string `yaml:"reason,omitempty"`
+	ReplacedBy string `yaml:"replaced_by,omitempty"`
 }
 
 // BknObjectType represents an object type definition.
@@ -122,113 +166,10 @@ type BknObjectType struct {
 	HasKeysSection           bool
 }
 
-// MetricAttributes is parsed from the body section ### Metric attributes
-// (Markdown table: Metric Type | Unit Type | Unit), analogous to Endpoint on BknRelationType.
-// These fields are not part of YAML frontmatter.
-type MetricAttributes struct {
-	MetricType string // DTO metric_type; should match Formula.Kind when set
-	UnitType   string
-	Unit       string
-}
-
-// BknMetricFrontmatter is YAML frontmatter for a type: metric file.
-type BknMetricFrontmatter struct {
-	Type string   `yaml:"type"`
-	ID   string   `yaml:"id"`
-	Name string   `yaml:"name"`
-	Tags []string `yaml:"tags"`
-}
-
-// BknMetric is a network-level metric definition (metrics/*.bkn).
-type BknMetric struct {
-	BknMetricFrontmatter
-
-	MetricAttributes MetricAttributes
-
-	Summary     string
-	Description string
-	RawContent  string
-
-	ScopeType string
-	ScopeRef  string
-
-	Formula *MetricFormula
-
-	// Optional tables (parsed from body)
-	TimeDimensions     []MetricTimeDimRow
-	AnalysisDimensions []MetricAnalysisDimRow
-
-	HasScopeSection              bool
-	HasMetricAttributesSection   bool
-	HasCalculationFormulaSection bool
-	HasTimeDimensionSection      bool
-	HasAnalysisDimensionsSection bool
-}
-
-// MetricFormula is the in-memory shape of the Calculation Formula YAML.
-type MetricFormula struct {
-	Kind   string        `yaml:"kind"`
-	Atomic *MetricAtomic `yaml:"atomic,omitempty"`
-}
-
-// MetricAtomic is the atomic metric calculation subtree.
-type MetricAtomic struct {
-	Condition   *MetricCondition   `yaml:"condition,omitempty"`
-	Aggregation *MetricAggregation `yaml:"aggregation,omitempty"`
-	GroupBy     []MetricGroupBy    `yaml:"group_by,omitempty"`
-	OrderBy     []MetricOrderBy    `yaml:"order_by,omitempty"`
-	Having      *MetricHaving      `yaml:"having,omitempty"`
-}
-
-// MetricCondition is a row-level filter (no object_type_id).
-type MetricCondition struct {
-	Field     string             `yaml:"field,omitempty"`
-	Operation string             `yaml:"operation"`
-	SubConds  []*MetricCondition `yaml:"sub_conds,omitempty"`
-	Value     any                `yaml:"value,omitempty"`
-}
-
-// MetricAggregation is required for atomic metrics.
-type MetricAggregation struct {
-	Property string `yaml:"property"`
-	Aggr     string `yaml:"aggr"`
-}
-
-// MetricGroupBy is a grouping dimension.
-type MetricGroupBy struct {
-	Property    string `yaml:"property"`
-	Description string `yaml:"description,omitempty"`
-}
-
-// MetricOrderBy orders grouped or aggregated rows.
-type MetricOrderBy struct {
-	Property  string `yaml:"property"`
-	Direction string `yaml:"direction,omitempty"`
-}
-
-// MetricHaving filters on aggregated values.
-type MetricHaving struct {
-	Field     string `yaml:"field"`
-	Operation string `yaml:"operation"`
-	Value     any    `yaml:"value,omitempty"`
-}
-
-// MetricTimeDimRow is one row under ### Time Dimension.
-type MetricTimeDimRow struct {
-	Property string
-	Policy   string
-}
-
-// MetricAnalysisDimRow is one row under ### Analysis Dimensions.
-type MetricAnalysisDimRow struct {
-	Name        string
-	DisplayName string
-}
-
 // ResourceInfo represents a data source reference.
 //
-// A logic property of type tool is addressed by BoxID + ToolID instead of ID, and may pick one
-// field out of the tool result with ResultPath. The other source types only use Type/ID/Name.
+// A logic property source is a tool addressed by BoxID + ToolID and may pick one
+// field out of the tool result with ResultPath.
 type ResourceInfo struct {
 	Type string
 	ID   string
@@ -240,6 +181,10 @@ type ResourceInfo struct {
 }
 
 // DataProperty is a ### Data Properties table row.
+//
+// Semantic, Required, Aliases and Constraints are 3.0 declarations (SPECIFICATION.md §6.8). They
+// describe what the data should be, for understanding and display; nothing checks the source data
+// against them. A 2.x package never sets them.
 type DataProperty struct {
 	Name        string
 	DisplayName string
@@ -247,6 +192,38 @@ type DataProperty struct {
 	Description string
 	MappedField string
 	MaskRule    *maskrule.Rule
+
+	Semantic    string
+	Required    bool
+	Aliases     []string
+	Constraints *PropertyConstraints
+}
+
+// PropertyConstraints is one property's entry in ### Property Constraints. A nil field is not
+// declared. A property that references a value type takes its value rules from it, so ValueType
+// goes with none of Range, Length, Pattern and Unit.
+type PropertyConstraints struct {
+	ValueType string
+	Range     *ValueRange
+	Length    *LengthRange
+	Pattern   string
+	Unit      string
+	Unique    bool
+	CRS       string
+	Timezone  string
+}
+
+// ValueRange is a closed interval. Min and Max hold a number for a numeric property and the ISO
+// 8601 text for a date or time property, as written; either may be absent.
+type ValueRange struct {
+	Min any
+	Max any
+}
+
+// LengthRange is a closed interval on the number of characters.
+type LengthRange struct {
+	Min *int
+	Max *int
 }
 
 // LogicProperty represents a logic property definition.
@@ -286,6 +263,16 @@ type BknRelationTypeFrontmatter struct {
 	ID   string   `yaml:"id"`
 	Name string   `yaml:"name"`
 	Tags []string `yaml:"tags"`
+
+	// The 3.0 relation declarations (SPECIFICATION.md §4.3, §7.6). A 2.x package never sets them.
+	// Importance is empty for primary, the default, so writing primary and leaving it out read the
+	// same.
+	ReverseName  string     `yaml:"reverse_name,omitempty"`
+	Aliases      []string   `yaml:"aliases,omitempty"`
+	Importance   string     `yaml:"importance,omitempty"`
+	FallbackFor  string     `yaml:"fallback_for,omitempty"`
+	Verification string     `yaml:"verification,omitempty"`
+	Lifecycle    *Lifecycle `yaml:"lifecycle,omitempty"`
 }
 
 // BknRelationType represents a relation type definition.
@@ -300,12 +287,21 @@ type BknRelationType struct {
 	// Endpoint
 	Endpoint     Endpoint
 	MappingRules any
+
+	// ### Relation Constraints and the relation properties of an indirect relation (3.0,
+	// SPECIFICATION.md §7.6). A 2.x package never sets them.
+	RequiredEnds    []string
+	Characteristics []string
+	DataProperties  []*DataProperty
 }
 
 type Endpoint struct {
 	Source string
 	Target string
 	Type   string // direct | indirect | filtered_cross_join
+
+	// Cardinality is the 3.0 Cardinality column (SPECIFICATION.md §7.6); empty is not declared.
+	Cardinality string
 }
 
 // MappingRule represents a property mapping between source and target.
@@ -348,10 +344,18 @@ type BknActionTypeFrontmatter struct {
 	// ActionType is deprecated in favor of ActionIntent; both may appear for compatibility.
 	ActionType   string `yaml:"action_type"`
 	ActionIntent string `yaml:"action_intent"`
+
+	// Aliases are other names of the action type (3.0, SPECIFICATION.md §8.2). A 2.x package never
+	// sets them.
+	Aliases []string `yaml:"aliases,omitempty"`
+
+	// Lifecycle is the 3.0 lifecycle (SPECIFICATION.md §4.3); nil is active.
+	Lifecycle *Lifecycle `yaml:"lifecycle,omitempty"`
 }
 
 // BknActionType represents an action type definition.
 type BknActionType struct {
+	OperationConfig *ActionOperationConfig
 	BknActionTypeFrontmatter
 
 	Summary     string
@@ -465,4 +469,49 @@ type BknConceptGroup struct {
 	RawContent string
 
 	ObjectTypes []string
+}
+
+// BknValueTypeFrontmatter is YAML frontmatter metadata for a value type file.
+type BknValueTypeFrontmatter struct {
+	Type string   `yaml:"type"`
+	ID   string   `yaml:"id"`
+	Name string   `yaml:"name"`
+	Tags []string `yaml:"tags"`
+}
+
+// BknValueType is a 3.0 value type (SPECIFICATION.md §16): a base type with a set of value rules,
+// named so that several properties can share it. A nil or empty field is not declared; Enum goes
+// with none of Range, Length and Pattern.
+type BknValueType struct {
+	BknValueTypeFrontmatter
+
+	Summary     string
+	Description string
+
+	RawContent string
+
+	BaseType string
+	Enum     []*ValueTypeEnumItem
+	Range    *ValueRange
+	Length   *LengthRange
+	Pattern  string
+	Unit     string
+}
+
+// ValueTypeEnumItem is one enum item of a value type. Value is the value as written; the value
+// type's BaseType says whether it is a number, a date or text.
+type ValueTypeEnumItem struct {
+	Value       string
+	Display     string
+	Deprecated  bool
+	Description string
+}
+
+// ActionOperationConfig preserves single-operation execution semantics in BKN packages.
+type ActionOperationConfig struct {
+	Type                 string         `yaml:"type"`
+	RelationTypeID       string         `yaml:"relation_type_id,omitempty"`
+	RelationOperation    string         `yaml:"relation_operation,omitempty"`
+	AnchorRole           string         `yaml:"anchor_role,omitempty"`
+	OtherObjectCondition *ActionCondCfg `yaml:"other_object_condition,omitempty"`
 }

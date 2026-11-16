@@ -14,16 +14,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	// "sort" // Catalog 任务恢复时启用。
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
@@ -45,6 +45,7 @@ var (
 const semanticTaskWakeupBuffer = 1
 
 type semanticUnderstandingTaskService struct {
+	db         *sql.DB
 	appSetting *common.AppSetting
 	cs         interfaces.CatalogService
 	rs         interfaces.ResourceService
@@ -59,6 +60,7 @@ func NewSemanticUnderstandingTaskService(appSetting *common.AppSetting) interfac
 	sutServiceOnce.Do(func() {
 		sutService = &semanticUnderstandingTaskService{
 			appSetting: appSetting,
+			db:         logics.DB,
 			cs:         catalog.NewCatalogService(appSetting),
 			rs:         resourcelogic.NewResourceService(appSetting, dataset.NewDatasetService(appSetting)),
 			rds:        resource_data.NewResourceDataService(appSetting),
@@ -88,19 +90,19 @@ func (suts *semanticUnderstandingTaskService) CreateResourceTask(ctx context.Con
 
 	if resourceID == "" {
 		span.SetStatus(codes.Error, "Resource id is required")
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("resource_id is required")
 	}
 
 	resource, err := suts.rs.InternalGetByID(ctx, nil, resourceID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get resource failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 	if resource == nil {
 		span.SetStatus(codes.Error, "Resource not found")
-		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
 
 	// InternalGetByID above deliberately skips authorization, so this is the only
@@ -114,16 +116,16 @@ func (suts *semanticUnderstandingTaskService) CreateResourceTask(ctx context.Con
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
-	task, err := normalizeResourceSemanticUnderstandingRequest(resource, req)
+	task, err := normalizeResourceSemanticUnderstandingRequest(ctx, resource, req)
 	if err != nil {
 		span.SetStatus(codes.Error, "Invalid semantic understanding task request")
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
 			WithErrorDetails(err.Error())
 	}
-	if req.IncludeSampleRows {
+	if req != nil && req.IncludeSampleRows {
 		// Sample rows are the table's actual contents, sent unmasked to the
 		// semantic service and then kept in the task's input snapshot. Asking for
 		// them is a data read, so it needs query_data on top of task_manage —
@@ -145,7 +147,7 @@ func (suts *semanticUnderstandingTaskService) CreateResourceTask(ctx context.Con
 
 func (suts *semanticUnderstandingTaskService) CreateCatalogTask(ctx context.Context, catalogID string, req *interfaces.CreateSemanticUnderstandingTaskRequest) (*interfaces.SemanticUnderstandingTask, error) {
 	// Catalog 任务生成的 Logic View 尚未适配 derived 契约，暂时拒绝创建。
-	return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
+	return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
 		WithErrorDetails("catalog semantic understanding tasks are temporarily unavailable")
 }
 
@@ -157,7 +159,7 @@ func (suts *semanticUnderstandingTaskService) createCatalogTask(ctx context.Cont
 
 	if catalogID == "" {
 		span.SetStatus(codes.Error, "Catalog id is required")
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("catalog_id is required")
 	}
 
@@ -169,7 +171,7 @@ func (suts *semanticUnderstandingTaskService) createCatalogTask(ctx context.Cont
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden).
 			WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]",
 				interfaces.OPERATION_TYPE_TASK_MANAGE))
 	}
@@ -177,14 +179,14 @@ func (suts *semanticUnderstandingTaskService) createCatalogTask(ctx context.Cont
 	resources, err := suts.rs.InternalGetByCatalogID(ctx, catalogID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get catalog resources failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 
 	task, err := normalizeCatalogSemanticUnderstandingRequest(catalog, resources, req)
 	if err != nil {
 		span.SetStatus(codes.Error, "Invalid semantic understanding task request")
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
 			WithErrorDetails(err.Error())
 	}
 	return suts.createTask(ctx, task)
@@ -194,7 +196,7 @@ func (suts *semanticUnderstandingTaskService) createCatalogTask(ctx context.Cont
 func (suts *semanticUnderstandingTaskService) createTask(ctx context.Context, task *interfaces.SemanticUnderstandingTask) (*interfaces.SemanticUnderstandingTask, error) {
 	activeTask, err := suts.suta.FindActiveByInputHash(ctx, task.Scope, task.InputHash)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 	if activeTask != nil {
@@ -213,7 +215,7 @@ func (suts *semanticUnderstandingTaskService) createTask(ctx context.Context, ta
 	task.Creator = accountInfo
 	task.CreateTime = now
 	if err := suts.suta.Create(ctx, task); err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_CreateResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_CreateResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 	suts.RequestDispatch()
@@ -225,15 +227,15 @@ func (suts *semanticUnderstandingTaskService) GetByID(ctx context.Context, id st
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "SemanticUnderstandingTaskService.GetByID")
 	defer span.End()
 
-	task, err := suts.suta.GetByID(ctx, id)
+	task, err := suts.suta.GetByID(ctx, nil, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get semantic understanding task failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 	if task == nil {
 		span.SetStatus(codes.Error, "Semantic understanding task not found")
-		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_SemanticUnderstandingTask_NotFound)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_SemanticUnderstandingTask_NotFound)
 	}
 
 	allowed, _, err := suts.cs.CheckCatalogPermission(ctx, task.CatalogID,
@@ -244,7 +246,7 @@ func (suts *semanticUnderstandingTaskService) GetByID(ctx context.Context, id st
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
 	if task.Input != "" {
@@ -277,10 +279,10 @@ func (suts *semanticUnderstandingTaskService) InternalGetByID(ctx context.Contex
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "SemanticUnderstandingTaskService.InternalGetByID")
 	defer span.End()
 
-	task, err := suts.suta.GetByID(ctx, id)
+	task, err := suts.suta.GetByID(ctx, nil, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get semantic understanding task failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 	return task, nil
@@ -317,7 +319,7 @@ func (suts *semanticUnderstandingTaskService) List(ctx context.Context, params i
 	tasks, total, err := suts.suta.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List semantic understanding tasks failed")
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_SemanticUnderstandingTask_InternalError_GetFailed).
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_SemanticUnderstandingTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -444,7 +446,7 @@ func (suts *semanticUnderstandingTaskService) DeleteByIDs(ctx context.Context, i
 	tasksByID, err := suts.suta.GetByIDs(ctx, ids)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get semantic understanding tasks failed")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -467,7 +469,7 @@ func (suts *semanticUnderstandingTaskService) DeleteByIDs(ctx context.Context, i
 		}
 		if !allowed {
 			span.SetStatus(codes.Error, "Permission denied")
-			return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+			return httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 		}
 		checkedCatalogIDs[task.CatalogID] = struct{}{}
 	}
@@ -488,7 +490,7 @@ func (suts *semanticUnderstandingTaskService) DeleteByIDs(ctx context.Context, i
 
 	if len(runningIDs) > 0 {
 		span.SetStatus(codes.Error, "Some semantic understanding tasks are pending or running")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_SemanticUnderstandingTask_HasRunningExecution).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_SemanticUnderstandingTask_HasRunningExecution).
 			WithErrorDetails(map[string]any{"running_ids": runningIDs})
 	}
 	if !ignoreMissing && len(tasksByID) != len(ids) {
@@ -500,14 +502,14 @@ func (suts *semanticUnderstandingTaskService) DeleteByIDs(ctx context.Context, i
 		}
 		if len(missingIDs) > 0 {
 			span.SetStatus(codes.Error, "Some semantic understanding tasks not found")
-			return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_SemanticUnderstandingTask_NotFound).
+			return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_SemanticUnderstandingTask_NotFound).
 				WithErrorDetails(map[string]any{"missing_ids": missingIDs})
 		}
 	}
 
 	if _, err := suts.suta.DeleteByIDs(ctx, toDelete); err != nil {
 		span.SetStatus(codes.Error, "Delete semantic understanding tasks failed")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_SemanticUnderstandingTask_InternalError_DeleteFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_SemanticUnderstandingTask_InternalError_DeleteFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -527,7 +529,7 @@ func (suts *semanticUnderstandingTaskService) InternalSetAgentTaskID(ctx context
 	defer span.End()
 
 	if agentTaskID == "" {
-		return false, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
+		return false, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
 			WithErrorDetails("agent_task_id is required")
 	}
 	return suts.suta.SetAgentTaskID(ctx, id, agentTaskID)
@@ -538,7 +540,7 @@ func (suts *semanticUnderstandingTaskService) InternalMarkCompleted(ctx context.
 	defer span.End()
 
 	if confidence < 0 || confidence > 1 {
-		return false, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
+		return false, httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_Format).
 			WithErrorDetails("confidence must be between 0 and 1")
 	}
 	return suts.suta.MarkCompleted(ctx, tx, id, resultJSON, confidence, confidenceDetailJSON, time.Now().UnixMilli())
@@ -558,7 +560,7 @@ func (suts *semanticUnderstandingTaskService) InternalMarkCancelled(ctx context.
 	return suts.suta.MarkCancelled(ctx, id, failureDetail, time.Now().UnixMilli())
 }
 
-func normalizeResourceSemanticUnderstandingRequest(resource *interfaces.Resource, req *interfaces.CreateSemanticUnderstandingTaskRequest) (*interfaces.SemanticUnderstandingTask, error) {
+func normalizeResourceSemanticUnderstandingRequest(ctx context.Context, resource *interfaces.Resource, req *interfaces.CreateSemanticUnderstandingTaskRequest) (*interfaces.SemanticUnderstandingTask, error) {
 	normalized := defaultSemanticUnderstandingRequest()
 	if req != nil {
 		*normalized = *req
@@ -569,6 +571,9 @@ func normalizeResourceSemanticUnderstandingRequest(resource *interfaces.Resource
 			defaultThreshold := interfaces.DefaultSemanticUnderstandingConfidenceThreshold
 			normalized.ConfidenceThreshold = &defaultThreshold
 		}
+	}
+	if normalized.Language == "" {
+		normalized.Language = string(i18n.GetLanguageByCtx(ctx))
 	}
 	if err := validateSemanticUnderstandingRequest(normalized); err != nil {
 		return nil, err
@@ -605,7 +610,7 @@ func (suts *semanticUnderstandingTaskService) attachUnmaskedSampleRows(ctx conte
 		return fmt.Errorf("resource data service is unavailable")
 	}
 	var input interfaces.SemanticUnderstandingResourceAgentInput
-	if err := sonic.Unmarshal([]byte(task.Input), &input); err != nil {
+	if err := common.UnmarshalPreciseJSON([]byte(task.Input), &input); err != nil {
 		return fmt.Errorf("unmarshal semantic understanding input: %w", err)
 	}
 	if input.Options.SamplePolicy == nil || input.Options.SamplePolicy.Masked {
@@ -794,6 +799,9 @@ func normalizeCatalogSemanticUnderstandingRequest(catalog *interfaces.Catalog, r
 */
 
 func validateSemanticUnderstandingRequest(req *interfaces.CreateSemanticUnderstandingTaskRequest) error {
+	if req.Language != string(i18n.AmericanEnglish) && req.Language != string(i18n.SimplifiedChinese) {
+		return fmt.Errorf("language must be en-US or zh-CN")
+	}
 	switch req.ApplyMode {
 	case interfaces.SemanticUnderstandingApplyModeDryRun,
 		interfaces.SemanticUnderstandingApplyModeFillEmpty,
@@ -821,7 +829,7 @@ func buildResourceSemanticUnderstandingInput(resource *interfaces.Resource, req 
 		SampleRows:    []map[string]any{},
 		SampleContext: buildSemanticUnderstandingSampleContext(resource, req.IncludeSampleRows),
 		Options: interfaces.SemanticUnderstandingResourceAgentInputOptions{
-			Language:            interfaces.DefaultSemanticUnderstandingLanguage,
+			Language:            req.Language,
 			ApplyMode:           req.ApplyMode,
 			ConfidenceThreshold: *req.ConfidenceThreshold,
 			IncludeSampleRows:   req.IncludeSampleRows,
@@ -878,7 +886,7 @@ func buildCatalogSemanticUnderstandingInput(catalog *interfaces.Catalog, resourc
 		Resources:          []interfaces.SemanticUnderstandingCatalogAgentInputResource{},
 		ExistingLogicalViews: []interfaces.SemanticUnderstandingCatalogAgentInputExistingView{},
 		Options: interfaces.SemanticUnderstandingCatalogAgentInputOptions{
-			Language:            interfaces.DefaultSemanticUnderstandingLanguage,
+			Language:            req.Language,
 			ApplyMode:           req.ApplyMode,
 			ConfidenceThreshold: *req.ConfidenceThreshold,
 		},
@@ -1011,6 +1019,7 @@ func buildResourceAgentInputProperties(properties []*interfaces.Property) []inte
 			continue
 		}
 		result = append(result, interfaces.SemanticUnderstandingResourceAgentInputProperty{
+			Attributes:          property.Attributes,
 			Name:                property.Name,
 			Type:                property.Type,
 			OriginalName:        property.OriginalName,

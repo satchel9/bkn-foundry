@@ -3,7 +3,7 @@
 # Licensed under the OpenBKN License, a modified Apache 2.0 with Additional
 # Conditions. See LICENSE-OPENBKN.txt in the repository root for the full text.
 
-FROM golang:1.25.14 AS builder
+FROM golang:1.26.9 AS builder
 
 WORKDIR /workspace
 
@@ -25,7 +25,6 @@ WORKDIR /app
 COPY --from=builder /out/agent-observability /app/agent-observability
 COPY --from=builder /out/historical-data-validate /app/historical-data-validate
 COPY --from=builder /workspace/docs/swagger /app/docs/swagger
-COPY --from=builder /workspace/locale /app/locale
 
 EXPOSE 8080
 

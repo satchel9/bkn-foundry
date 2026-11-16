@@ -23,8 +23,8 @@ import (
 	"github.com/opensearch-project/opensearch-go/v2/opensearchapi"
 	attr "go.opentelemetry.io/otel/attribute"
 
-	"ontology-query/common"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 var (
@@ -87,6 +87,35 @@ func (o *openSearchAccess) CreateIndex(ctx context.Context, indexName string, bo
 		return fmt.Errorf("create index %s failed: %s, %s", indexName, res.Status(), res.String())
 	}
 
+	return nil
+}
+
+// PutMapping adds fields to the mapping of an existing index. body is the mapping, for
+// example {"properties": {"field": {"type": "keyword"}}}.
+func (o *openSearchAccess) PutMapping(ctx context.Context, indexName string, body any) error {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "PutMapping")
+	defer span.End()
+
+	span.SetAttributes(attr.Key("index_name").String(indexName))
+
+	bodyBytes, err := sonic.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("failed to marshal mapping body: %w", err)
+	}
+
+	req := opensearchapi.IndicesPutMappingRequest{
+		Index: []string{indexName},
+		Body:  bytes.NewBuffer(bodyBytes),
+	}
+	res, err := req.Do(ctx, o.client)
+	if err != nil {
+		return fmt.Errorf("failed to put mapping of index %s: %w", indexName, err)
+	}
+	defer func() { _ = res.Body.Close() }()
+
+	if res.IsError() {
+		return fmt.Errorf("put mapping of index %s failed: %s, %s", indexName, res.Status(), res.String())
+	}
 	return nil
 }
 

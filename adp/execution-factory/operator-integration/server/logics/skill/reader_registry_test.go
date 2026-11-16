@@ -277,7 +277,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 			So(resp.URL, ShouldEqual, "https://download/f1")
 		})
 
-		Convey("DeleteSkill rejects invalid status", func() {
+		Convey("DeleteSkill rejects a missing skill", func() {
 			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
 			mockAuthService := mocks.NewMockIAuthorizationService(ctrl)
 			registry := &skillRegistry{
@@ -286,10 +286,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 				Logger:      logger.DefaultLogger(),
 			}
 			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
-			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-4", interfaces.AuthResourceTypeSkill).Return(nil)
-			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-4").Return(&model.SkillRepositoryDB{
-				SkillID: "skill-4", Status: interfaces.BizStatusPublished.String(), IsDeleted: true,
-			}, nil)
+			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-4").Return(nil, nil)
 
 			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
 				UserID:  "user-1",
@@ -544,12 +541,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 					return nil
 				},
 			)
-			mockIndexSync.EXPECT().UpdateSkill(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, skill *model.SkillRepositoryDB) error {
-				So(skill.SkillID, ShouldEqual, "skill-pkg-1")
-				So(skill.Version, ShouldNotEqual, "old-v")
-				So(skill.Status, ShouldEqual, interfaces.BizStatusEditing.String())
-				return nil
-			})
+			mockIndexSync.EXPECT().UpdateSkill(gomock.Any(), gomock.Any()).Times(0)
 
 			resp, err := registry.UpdateSkillPackage(context.Background(), &interfaces.UpdateSkillPackageReq{
 				UserID:   "user-1",
@@ -682,11 +674,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 					return nil
 				},
 			)
-			mockIndexSync.EXPECT().UpsertSkill(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, skill *model.SkillRepositoryDB) error {
-				callOrder = append(callOrder, "index-sync")
-				So(skill.Version, ShouldEqual, "hist-v1")
-				return nil
-			})
+			mockIndexSync.EXPECT().UpsertSkill(gomock.Any(), gomock.Any()).Times(0)
 
 			resp, err := registry.PublishSkillHistory(context.Background(), &interfaces.PublishSkillHistoryReq{
 				UserID:  "user-1",
@@ -699,7 +687,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 			So(resp.SkillID, ShouldEqual, "skill-publish-h1")
 			So(resp.Version, ShouldEqual, "hist-v1")
 			So(resp.Status, ShouldEqual, interfaces.BizStatusPublished)
-			So(callOrder, ShouldResemble, []string{"update-skill", "insert-release", "index-sync", "commit"})
+			So(callOrder, ShouldResemble, []string{"update-skill", "insert-release", "commit"})
 		})
 
 		Convey("QuerySkillList omits instructions and files from list payload", func() {
@@ -1382,7 +1370,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 			So(err.Error(), ShouldContainSubstring, "skill not found")
 		})
 
-		Convey("DeleteSkill marks deleting before cleanup and hard deletes repository on success", func() {
+		Convey("DeleteSkill persists a tombstone before cleanup and retains it on success", func() {
 			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
 			mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
 			mockAssetStore := mocks.NewMockskillAssetStore(ctrl)
@@ -1401,29 +1389,31 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 				Logger:             logger.DefaultLogger(),
 			}
 
-			tx, cleanup := beginTestTx(t)
-			defer cleanup()
+			markTx, cleanupMark := beginTestTx(t)
+			defer cleanupMark()
+			cleanupTx, cleanupRecords := beginTestTx(t)
+			defer cleanupRecords()
 
 			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-8").Return(&model.SkillRepositoryDB{
 				SkillID: "skill-8", Status: interfaces.BizStatusOffline.String(),
 			}, nil)
 			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
 			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-8", interfaces.AuthResourceTypeSkill).Return(nil)
-			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(tx, nil)
-			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), tx, "skill-8", true, "user-1").Return(nil)
-			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), tx, "skill-8", gomock.Any()).Return([]*model.SkillFileIndexDB{
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(markTx, nil)
+			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), markTx, "skill-8", true, "user-1").Return(nil)
+			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), gomock.Nil(), "skill-8", gomock.Any()).Return([]*model.SkillFileIndexDB{
 				{SkillID: "skill-8", StorageKey: "/tmp/object-1"},
 			}, nil)
 			mockAssetStore.EXPECT().Delete(gomock.Any(), &interfaces.OssObject{StorageKey: "/tmp/object-1"}).Return(nil)
-			mockFileRepo.EXPECT().DeleteSkillFileBySkillID(gomock.Any(), tx, "skill-8", gomock.Any()).Return(nil)
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(cleanupTx, nil)
+			mockFileRepo.EXPECT().DeleteSkillFileBySkillID(gomock.Any(), cleanupTx, "skill-8", gomock.Any()).Return(nil)
 			releaseHistoryRepo.deleteBySkillID = func(ctx context.Context, txArg *sql.Tx, skillID string) error {
-				So(txArg, ShouldEqual, tx)
+				So(txArg, ShouldEqual, cleanupTx)
 				So(skillID, ShouldEqual, "skill-8")
 				return nil
 			}
-			mockSkillRepo.EXPECT().DeleteSkillByID(gomock.Any(), tx, "skill-8").Return(nil)
-			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-8"}, interfaces.AuthResourceTypeSkill).Return(nil)
 			mockIndexSync.EXPECT().DeleteSkill(gomock.Any(), "skill-8").Return(nil)
+			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-8"}, interfaces.AuthResourceTypeSkill).Return(nil)
 
 			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
 				UserID:  "user-1",
@@ -1433,7 +1423,7 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 			So(err, ShouldBeNil)
 		})
 
-		Convey("DeleteSkill keeps succeeding when dataset cleanup fails", func() {
+		Convey("DeleteSkill retains its tombstone when index cleanup fails after Safe cleanup", func() {
 			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
 			mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
 			mockAssetStore := mocks.NewMockskillAssetStore(ctrl)
@@ -1452,25 +1442,27 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 				Logger:             logger.DefaultLogger(),
 			}
 
-			tx, cleanup := beginTestTx(t)
-			defer cleanup()
+			markTx, cleanupMark := beginTestTx(t)
+			defer cleanupMark()
+			cleanupTx, cleanupRecords := beginTestTx(t)
+			defer cleanupRecords()
 
 			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-8b").Return(&model.SkillRepositoryDB{
 				SkillID: "skill-8b", Status: interfaces.BizStatusOffline.String(),
 			}, nil)
 			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
 			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-8b", interfaces.AuthResourceTypeSkill).Return(nil)
-			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(tx, nil)
-			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), tx, "skill-8b", true, "user-1").Return(nil)
-			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), tx, "skill-8b", gomock.Any()).Return(nil, nil)
-			mockFileRepo.EXPECT().DeleteSkillFileBySkillID(gomock.Any(), tx, "skill-8b", gomock.Any()).Return(nil)
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(markTx, nil)
+			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), markTx, "skill-8b", true, "user-1").Return(nil)
+			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-8b"}, interfaces.AuthResourceTypeSkill).Return(nil)
+			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), gomock.Nil(), "skill-8b", gomock.Any()).Return(nil, nil)
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(cleanupTx, nil)
+			mockFileRepo.EXPECT().DeleteSkillFileBySkillID(gomock.Any(), cleanupTx, "skill-8b", gomock.Any()).Return(nil)
 			releaseHistoryRepo.deleteBySkillID = func(ctx context.Context, txArg *sql.Tx, skillID string) error {
-				So(txArg, ShouldEqual, tx)
+				So(txArg, ShouldEqual, cleanupTx)
 				So(skillID, ShouldEqual, "skill-8b")
 				return nil
 			}
-			mockSkillRepo.EXPECT().DeleteSkillByID(gomock.Any(), tx, "skill-8b").Return(nil)
-			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-8b"}, interfaces.AuthResourceTypeSkill).Return(nil)
 			mockIndexSync.EXPECT().DeleteSkill(gomock.Any(), "skill-8b").Return(errors.New("dataset delete failed"))
 
 			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
@@ -1478,10 +1470,11 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 				SkillID: "skill-8b",
 			})
 
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "dataset delete failed")
 		})
 
-		Convey("DeleteSkill keeps deleting status when asset cleanup fails", func() {
+		Convey("DeleteSkill keeps the committed tombstone when asset cleanup fails", func() {
 			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
 			mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
 			mockAssetStore := mocks.NewMockskillAssetStore(ctrl)
@@ -1496,37 +1489,101 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 				Logger:      logger.DefaultLogger(),
 			}
 
-			db, sqlMock, err := sqlmock.New()
-			So(err, ShouldBeNil)
-			sqlMock.ExpectBegin()
-			tx, err := db.Begin()
-			So(err, ShouldBeNil)
-			sqlMock.ExpectRollback()
-			sqlMock.ExpectClose()
-			defer func() {
-				So(db.Close(), ShouldBeNil)
-				So(sqlMock.ExpectationsWereMet(), ShouldBeNil)
-			}()
+			markTx, cleanupMark := beginTestTx(t)
+			defer cleanupMark()
 
 			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-9").Return(&model.SkillRepositoryDB{
 				SkillID: "skill-9", Status: interfaces.BizStatusOffline.String(),
 			}, nil)
 			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
 			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-9", interfaces.AuthResourceTypeSkill).Return(nil)
-			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(tx, nil)
-			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), tx, "skill-9", true, "user-1").Return(nil)
-			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), tx, "skill-9", gomock.Any()).Return([]*model.SkillFileIndexDB{
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(markTx, nil)
+			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), markTx, "skill-9", true, "user-1").Return(nil)
+			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-9"}, interfaces.AuthResourceTypeSkill).Return(nil)
+			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), gomock.Nil(), "skill-9", gomock.Any()).Return([]*model.SkillFileIndexDB{
 				{SkillID: "skill-9", StorageKey: "/tmp/object-2"},
 			}, nil)
 			mockAssetStore.EXPECT().Delete(gomock.Any(), &interfaces.OssObject{StorageKey: "/tmp/object-2"}).Return(errors.New("delete failed"))
 
-			err = registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
+			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
 				UserID:  "user-1",
 				SkillID: "skill-9",
 			})
 
 			So(err, ShouldNotBeNil)
 			So(err.Error(), ShouldContainSubstring, "delete failed")
+		})
+
+		Convey("DeleteSkill does not remove assets while Safe reports active proxy sources", func() {
+			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
+			mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
+			mockAssetStore := mocks.NewMockskillAssetStore(ctrl)
+			mockDBTx := mocks.NewMockDBTx(ctrl)
+			mockAuthService := mocks.NewMockIAuthorizationService(ctrl)
+			registry := &skillRegistry{
+				skillRepo:   mockSkillRepo,
+				fileRepo:    mockFileRepo,
+				assetStore:  mockAssetStore,
+				dbTx:        mockDBTx,
+				AuthService: mockAuthService,
+				Logger:      logger.DefaultLogger(),
+			}
+
+			markTx, cleanupMark := beginTestTx(t)
+			defer cleanupMark()
+			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
+			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-proxied").Return(&model.SkillRepositoryDB{
+				SkillID: "skill-proxied", Version: "v1", Status: interfaces.BizStatusOffline.String(),
+			}, nil)
+			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-proxied",
+				interfaces.AuthResourceTypeSkill).Return(nil)
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(markTx, nil)
+			mockSkillRepo.EXPECT().UpdateSkillDeleted(gomock.Any(), markTx, "skill-proxied", true, "user-1").Return(nil)
+			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-proxied"},
+				interfaces.AuthResourceTypeSkill).Return(errors.New("resource has active proxy grant sources"))
+
+			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
+				UserID: "user-1", SkillID: "skill-proxied",
+			})
+
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "active proxy grant sources")
+		})
+
+		Convey("DeleteSkill resumes cleanup from a persisted tombstone", func() {
+			mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
+			mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
+			mockDBTx := mocks.NewMockDBTx(ctrl)
+			mockAuthService := mocks.NewMockIAuthorizationService(ctrl)
+			mockIndexSync := mocks.NewMockSkillIndexSyncService(ctrl)
+			releaseHistoryRepo := &stubSkillReleaseHistoryRepo{}
+			registry := &skillRegistry{
+				skillRepo:          mockSkillRepo,
+				fileRepo:           mockFileRepo,
+				releaseHistoryRepo: releaseHistoryRepo,
+				dbTx:               mockDBTx,
+				AuthService:        mockAuthService,
+				indexSync:          mockIndexSync,
+				Logger:             logger.DefaultLogger(),
+			}
+
+			cleanupTx, cleanupRecords := beginTestTx(t)
+			defer cleanupRecords()
+			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
+			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-9a").Return(&model.SkillRepositoryDB{
+				SkillID: "skill-9a", Version: "v1", IsDeleted: true, UpdateUser: "user-1",
+			}, nil)
+			mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), gomock.Nil(), "skill-9a", "v1").Return(nil, nil)
+			mockDBTx.EXPECT().GetTx(gomock.Any()).Return(cleanupTx, nil)
+			mockFileRepo.EXPECT().DeleteSkillFileBySkillID(gomock.Any(), cleanupTx, "skill-9a", "v1").Return(nil)
+			mockIndexSync.EXPECT().DeleteSkill(gomock.Any(), "skill-9a").Return(nil)
+			mockAuthService.EXPECT().DeletePolicy(gomock.Any(), []string{"skill-9a"}, interfaces.AuthResourceTypeSkill).Return(nil)
+
+			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
+				UserID: "user-1", SkillID: "skill-9a",
+			})
+
+			So(err, ShouldBeNil)
 		})
 
 		Convey("DeleteSkill checks delete permission before cleanup", func() {
@@ -1539,6 +1596,9 @@ func TestSkillReaderAndRegistry(t *testing.T) {
 			}
 
 			mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
+			mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "skill-9b").Return(&model.SkillRepositoryDB{
+				SkillID: "skill-9b", Status: interfaces.BizStatusOffline.String(),
+			}, nil)
 			mockAuthService.EXPECT().CheckDeletePermission(gomock.Any(), gomock.Any(), "skill-9b", interfaces.AuthResourceTypeSkill).Return(errors.New("delete forbidden"))
 
 			err := registry.DeleteSkill(context.Background(), &interfaces.DeleteSkillReq{
@@ -2273,9 +2333,15 @@ func TestExecuteSkillUploadsBeforeShellExecution(t *testing.T) {
 				RelPath:    "refs/guide.md",
 				StorageKey: "obj-1",
 			},
+			{
+				SkillID:    "skill-exec-1",
+				RelPath:    "scripts/run.py",
+				StorageKey: "obj-py",
+			},
 		}, nil)
 		mockAssetStore.EXPECT().Download(gomock.Any(), &interfaces.OssObject{StorageKey: "obj-skill-md"}).Return([]byte(validSkillMarkdown()), nil)
 		mockAssetStore.EXPECT().Download(gomock.Any(), &interfaces.OssObject{StorageKey: "obj-1"}).Return([]byte("guide body"), nil)
+		mockAssetStore.EXPECT().Download(gomock.Any(), &interfaces.OssObject{StorageKey: "obj-py"}).Return([]byte("print('ok')"), nil)
 
 		mockSandbox.EXPECT().UploadSkillArchive(gomock.Any(), "sess_aoi_0", gomock.Any()).DoAndReturn(
 			func(_ context.Context, sessionID string, req *interfaces.UploadSkillArchiveReq) (*interfaces.UploadSkillArchiveResp, error) {
@@ -2311,7 +2377,7 @@ func TestExecuteSkillUploadsBeforeShellExecution(t *testing.T) {
 				callOrder = append(callOrder, "exec")
 				So(sessionID, ShouldEqual, "sess_aoi_0")
 				So(req.WorkDir, ShouldEqual, "skills/skill-exec-1")
-				So(req.Command, ShouldEqual, "bash run.sh")
+				So(req.Command, ShouldEqual, `python3 'scripts/run.py' '--name' 'a b' 'it'\''s'`)
 				So(req.Timeout, ShouldEqual, 15)
 				return &interfaces.ExecuteShellResp{
 					SessionID:     sessionID,
@@ -2328,7 +2394,8 @@ func TestExecuteSkillUploadsBeforeShellExecution(t *testing.T) {
 		resp, err := registry.ExecuteSkill(context.Background(), &interfaces.ExecuteSkillReq{
 			UserID:     "user-1",
 			SkillID:    "skill-exec-1",
-			EntryShell: "bash run.sh",
+			EntryPoint: "scripts/run.py",
+			Arguments:  []string{"--name", "a b", "it's"},
 			Timeout:    15,
 		})
 
@@ -2337,7 +2404,7 @@ func TestExecuteSkillUploadsBeforeShellExecution(t *testing.T) {
 		So(resp.SessionID, ShouldEqual, "sess_aoi_0")
 		So(resp.WorkDir, ShouldEqual, "skills/skill-exec-1")
 		So(resp.UploadedPath, ShouldEqual, "skills/skill-exec-1")
-		So(resp.Command, ShouldEqual, "bash run.sh")
+		So(resp.Command, ShouldEqual, `python3 'scripts/run.py' '--name' 'a b' 'it'\''s'`)
 		So(resp.Stdout, ShouldEqual, "ok")
 		So(callOrder, ShouldResemble, []string{"acquire", "upload", "exec", "release"})
 	})
@@ -2362,10 +2429,45 @@ func TestExecuteSkillRequiresExecutePermission(t *testing.T) {
 		resp, err := registry.ExecuteSkill(context.Background(), &interfaces.ExecuteSkillReq{
 			UserID:     "user-1",
 			SkillID:    "skill-exec-1",
-			EntryShell: "bash run.sh",
+			EntryPoint: "scripts/run.py",
 		})
 
 		So(resp, ShouldBeNil)
 		So(err, ShouldEqual, permissionErr)
+	})
+}
+
+func TestExecuteSkillRejectsBashBeforeUsingASession(t *testing.T) {
+	Convey("a bash entry is refused before any session is acquired or archive uploaded", t, func() {
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+		mockSkillRepo := mocks.NewMockISkillRepository(ctrl)
+		mockFileRepo := mocks.NewMockISkillFileIndex(ctrl)
+		mockAuthService := mocks.NewMockIAuthorizationService(ctrl)
+		acquired := false
+		registry := &skillRegistry{
+			skillRepo: mockSkillRepo,
+			fileRepo:  mockFileRepo,
+			sessionPool: &fakeSessionPool{acquireFunc: func(context.Context) (string, error) {
+				acquired = true
+				return "sess", nil
+			}},
+			AuthService: mockAuthService,
+			Logger:      logger.DefaultLogger(),
+		}
+		mockAuthService.EXPECT().GetAccessor(gomock.Any(), "user-1").Return(&interfaces.AuthAccessor{ID: "user-1"}, nil)
+		mockAuthService.EXPECT().CheckExecutePermission(gomock.Any(), gomock.Any(), "s1", interfaces.AuthResourceTypeSkill).Return(nil)
+		mockSkillRepo.EXPECT().SelectSkillByID(gomock.Any(), gomock.Nil(), "s1").Return(&model.SkillRepositoryDB{SkillID: "s1", Version: "v1"}, nil)
+		mockFileRepo.EXPECT().SelectSkillFileBySkillID(gomock.Any(), gomock.Nil(), "s1", "v1").Return([]*model.SkillFileIndexDB{
+			{SkillID: "s1", RelPath: "run.sh", StorageKey: "k"},
+		}, nil)
+
+		resp, err := registry.ExecuteSkill(context.Background(), &interfaces.ExecuteSkillReq{
+			UserID: "user-1", SkillID: "s1", EntryShell: "bash run.sh",
+		})
+
+		So(resp, ShouldBeNil)
+		So(err, ShouldNotBeNil)
+		So(acquired, ShouldBeFalse)
 	})
 }

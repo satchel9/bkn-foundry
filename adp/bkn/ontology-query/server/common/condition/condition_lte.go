@@ -10,7 +10,7 @@ import (
 	"context"
 	"fmt"
 
-	"ontology-query/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
 )
 
 type LteCond struct {
@@ -68,8 +68,9 @@ func rewriteLteCond(ctx context.Context, cfg *CondCfg) (*CondCfg, error) {
 		return nil, validationError(ctx, "OperatorFieldNotFound", map[string]any{"operation": "<=", "field": cfg.Name})
 	}
 	return &CondCfg{
-		Name:        cfg.NameField.MappedField.Name,
-		Operation:   cfg.Operation,
-		ValueOptCfg: cfg.ValueOptCfg,
+		Name:      cfg.NameField.MappedField.Name,
+		Operation: cfg.Operation,
+		ValueFrom: cfg.ValueFrom,
+		Value:     cfg.Value,
 	}, nil
 }

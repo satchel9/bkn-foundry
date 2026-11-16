@@ -7,21 +7,18 @@ project:
   pod_id: "POD_ID"
   machine_id: ""
   debug: false
-operator:
-  import_file_size_limit: 100000000
-  import_operator_max_count: 10
-  operator_description_length_limit: 500
 mcp:
   conn_timeout: 10 # Unit: second.
   max_instances: 200
   instance_ttl: 1800 # Unit: second.
   cleanup_interval: 60 # Unit: second.
 category:
-  init_switch: true # Whether to initialize operator classification.
+  init_switch: true # Whether to initialize built-in categories.
 
 proxy_module:
-  default_timeout: 30 # Unit: second.
-  max_timeout: 120 # Unit: second.
+  default_timeout: 300 # Unit: second. Same as the Helm chart.
+  max_timeout: 300 # Unit: second.
+  platform_function_grace: 5 # Unit: second.
   min_timeout: 1 # Unit: second.
   max_clients: 100
   client_lifetime: 300 # Unit: second.
@@ -69,9 +66,17 @@ sandbox-control-plane:
     timeout: 3600 # Unit: second.
   max_sessions: 3
   active_sessions: 1
+  # 0 or unset means the default 2. To turn spreading off, set it to a value not less than
+  # max_concurrent_tasks.
+  spread_threshold: 2
+  sync_poll_deadline: 300
   max_concurrent_tasks: 100
 vega-backend:
   private_host: "vega-backend-svc.openbkn"
+  private_port: 13014
+  private_protocol: "http"
+bkn-backend:
+  private_host: "bkn-backend-svc.openbkn"
   private_port: 13014
   private_protocol: "http"
 

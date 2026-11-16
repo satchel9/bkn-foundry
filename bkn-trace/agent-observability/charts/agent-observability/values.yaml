@@ -151,22 +151,6 @@ enterpriseBusinessProvenance:
     # Includes the Agent's normal turn and its schema-constrained extraction.
     # Keep this above the Agent package's 60s execution budget.
     timeout: 90s
-  bootstrap:
-    enabled: true
-    ownerID: bdd59f76-19c3-58b0-bf5f-082c4c3cbddb
-    bknSafeURL: http://bkn-safe:3000/api/safe/v1
-    bknAgentURL: http://bkn-agent:30800/api/bkn-agent/v1
-    auth:
-      existingSecret: bkn-agent-provenance-bootstrap
-      secretKey: token
-    image:
-      # Registry inherits the release-wide private/offline override. The tag is
-      # explicitly the bkn-agent release version; it must not inherit an
-      # agent-observability-only hotfix tag.
-      registry: ""
-      repository: bkn-agent
-      tag: "__VERSION__"
-      pullPolicy: IfNotPresent
 
 observability:
   # Configure the same Secret on every replica so signed pagination cursors
@@ -182,6 +166,20 @@ observability:
     ossGatewayURL: ""
     storageID: ""
     prefix: observability-archive
+    logLimits:
+      maxCandidates: 10000
+      maxPayloadBytes: 10485760
+      # Optional owner-managed ConfigMap containing limits.json. Mount the
+      # directory (not subPath) so updates reach the next archive batch.
+      existingConfigMap: ""
+  # Optional cluster-internal endpoint for one Safe publisher instance.
+  # Example: http://safe-instance:3000/internal/audit/publish-status
+  # New Safe version required; do not expose this endpoint through ingress.
+  # Background polling is fixed at 30s with a 3s request/deadline and 64KiB
+  # response bound. Status becomes unknown after 90s without fresh evidence.
+  # This diagnoses the observed instance, never all replicas/the whole pipeline.
+  # Empty keeps collection health unknown; it never certifies collection.
+  auditProducerStatusEndpoint: ""
   sourceCoverage:
     # Optional independent health probe. It is disabled unless the installation
     # uses the persistent MariaDB Core store and provides a cluster-internal
@@ -208,6 +206,8 @@ core:
   # MariaDB explicitly only after its Secret and database are ready.
   store: memory
   autoMigrate: true
+  # Enable only after all Core replicas have upgraded; requires MariaDB and projection.
+  durableAnswerEnabled: false
   abandonInterval: 30s
   oneShotIdleTTL: 15m
   capacity:
@@ -229,6 +229,11 @@ core:
   capturePolicySnapshotTTL: 15m
   projection:
     enabled: false
+    # Answer task budgets must fit strictly inside the outbox lease, with 1s margin.
+    lockDuration: 30s
+    leaseIOTimeout: 2s
+    answerTaskIOTimeout: 10s
+    answerAckIOTimeout: 2s
     # Single runtime authority for signed historical-provenance projection.
     # The EE image must register its handler when this is enabled.
     historicalProvenance:

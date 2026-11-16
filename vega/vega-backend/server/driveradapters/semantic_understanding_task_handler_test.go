@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -66,8 +67,10 @@ func Test_SemanticUnderstandingTaskRestHandler_CreateTask(t *testing.T) {
 	t.Run("creates resource task", func(t *testing.T) {
 		engine, suts := setupSemanticUnderstandingTaskHandlerTest(t)
 		suts.EXPECT().CreateResourceTask(gomock.Any(), "res-1", gomock.Any()).
-			DoAndReturn(func(_ context.Context, resourceID string, req *interfaces.CreateSemanticUnderstandingTaskRequest) (*interfaces.SemanticUnderstandingTask, error) {
+			DoAndReturn(func(ctx context.Context, resourceID string, req *interfaces.CreateSemanticUnderstandingTaskRequest) (*interfaces.SemanticUnderstandingTask, error) {
 				assert.Equal(t, "res-1", resourceID)
+				assert.Equal(t, "zh-CN", req.Language)
+				assert.Equal(t, i18n.AmericanEnglish, i18n.GetLanguageByCtx(ctx))
 				assert.Equal(t, interfaces.SemanticUnderstandingApplyModeDryRun, req.ApplyMode)
 				require.NotNil(t, req.ConfidenceThreshold)
 				assert.Equal(t, 0.9, *req.ConfidenceThreshold)
@@ -82,9 +85,10 @@ func Test_SemanticUnderstandingTaskRestHandler_CreateTask(t *testing.T) {
 				}, nil
 			})
 
-		body := `{"scope":"resource","resource_id":"res-1","apply_mode":"dry_run","confidence_threshold":0.9}`
+		body := `{"scope":"resource","resource_id":"res-1","language":"zh-CN","apply_mode":"dry_run","confidence_threshold":0.9}`
 		req := httptest.NewRequest(http.MethodPost, semanticUnderstandingTaskURL, strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept-Language", "en-US")
 		w := httptest.NewRecorder()
 
 		engine.ServeHTTP(w, req)
@@ -355,4 +359,33 @@ func Test_SemanticUnderstandingTaskRestHandler_DeleteTasks(t *testing.T) {
 
 		require.Equal(t, http.StatusNoContent, w.Result().StatusCode)
 	})
+}
+
+func TestSemanticUnderstandingTaskRestHandlerApply(t *testing.T) {
+	restoreGinMode := setGinMode()
+	defer restoreGinMode()
+	for _, mode := range []string{"fill_empty", "force"} {
+		t.Run("applies saved result using "+mode, func(t *testing.T) {
+			engine, service := setupSemanticUnderstandingTaskHandlerTest(t)
+			service.EXPECT().Apply(gomock.Any(), "task-1", &interfaces.ApplySemanticUnderstandingTaskRequest{ApplyMode: mode}).
+				Return(&interfaces.SemanticUnderstandingTask{ID: "task-1", ApplyMode: "dry_run", Applied: true}, true, nil)
+			req := httptest.NewRequest(http.MethodPost, semanticUnderstandingTaskURL+"/task-1/apply", strings.NewReader(`{"apply_mode":"`+mode+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, req)
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Contains(t, response.Body.String(), `"apply_mode":"dry_run"`)
+			assert.Contains(t, response.Body.String(), `"applied":true`)
+		})
+	}
+	for _, body := range []string{`{}`, `{"apply_mode":"dry_run"}`, `{"apply_mode":"other"}`, `invalid`} {
+		t.Run("rejects invalid apply request "+body, func(t *testing.T) {
+			engine, _ := setupSemanticUnderstandingTaskHandlerTest(t)
+			req := httptest.NewRequest(http.MethodPost, semanticUnderstandingTaskURL+"/task-1/apply", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			engine.ServeHTTP(response, req)
+			assert.Equal(t, http.StatusBadRequest, response.Code)
+		})
+	}
 }

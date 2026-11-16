@@ -53,7 +53,7 @@ func NewKnLogicPropertyResolverHandler() KnLogicPropertyResolverHandler {
 
 // ResolveLogicProperties resolves logic properties.
 // @Summary Resolve logic properties
-// @Description Generates dynamic_params from the query and context, then retrieves logic-property values (metrics and tools) through ontology-query.
+// @Description Generates dynamic_params from the query and context, then retrieves tool-backed logic-property values through ontology-query.
 // @Tags kn-context-loader
 // @Accept json
 // @Produce json
@@ -63,8 +63,8 @@ func NewKnLogicPropertyResolverHandler() KnLogicPropertyResolverHandler {
 // @Param body body interfaces.ResolveLogicPropertiesRequest true "Request payload"
 // @Success 200 {object} interfaces.ResolveLogicPropertiesResponse "Success response"
 // @Failure 400 {object} interfaces.MissingParamsError "Missing parameter error"
-// @Failure 404 {object} interfaces.KnBaseError "Object type not found"
-// @Failure 500 {object} interfaces.KnBaseError "Internal server error"
+// @Failure 404 {object} github.com/openbkn-ai/bkn-foundry/comm-go/httperrors.BaseError "Object type not found"
+// @Failure 500 {object} github.com/openbkn-ai/bkn-foundry/comm-go/httperrors.BaseError "Internal server error"
 // @Router /api/kn/logic-property-resolver [post]
 func (k *knLogicPropertyResolverHandle) ResolveLogicProperties(c *gin.Context) {
 	var err error

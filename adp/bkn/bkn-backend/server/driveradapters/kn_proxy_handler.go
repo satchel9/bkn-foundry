@@ -7,13 +7,17 @@ package driveradapters
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"bkn-backend/common/visitor"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/visitor"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func proxyRequestContext(c *gin.Context) (context.Context, string) {
@@ -23,19 +27,19 @@ func proxyRequestContext(c *gin.Context) (context.Context, string) {
 }
 
 func (r *restHandler) proxyOAuthRequestContext(c *gin.Context) (context.Context, string, bool) {
-	actor, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	actor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return nil, "", false
 	}
 	account := interfaces.AccountInfo{ID: actor.ID, Type: string(actor.Type)}
-	return context.WithValue(rest.GetLanguageCtx(c), interfaces.ACCOUNT_INFO_KEY, account), actor.ID, true
+	return context.WithValue(i18n.GetLanguageCtx(c), interfaces.ACCOUNT_INFO_KEY, account), actor.ID, true
 }
 
 func (r *restHandler) GetKNProxy(c *gin.Context) {
 	ctx, _ := proxyRequestContext(c)
 	mapping, err := r.kns.GetKNProxy(ctx, c.Param("kn_id"))
 	if err != nil {
-		rest.ReplyError(c, err.(*rest.HTTPError))
+		rest.ReplyError(c, err.(*httperrors.HTTPError))
 		return
 	}
 	rest.ReplyOK(c, http.StatusOK, mapping)
@@ -71,13 +75,16 @@ func (r *restHandler) ResolveKNProxyBinding(c *gin.Context) {
 	ctx, _ := proxyRequestContext(c)
 	var binding interfaces.KNProxyBinding
 	if err := c.ShouldBindJSON(&binding); err != nil {
-		rest.ReplyError(c, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		rest.ReplyError(c, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_KnowledgeNetwork_InvalidParameter).WithErrorDetails("invalid proxy binding request"))
+		return
+	}
+	if !r.proxyBranchReadable(ctx, c, c.Param("kn_id")) {
 		return
 	}
 	mapping, err := r.kns.ResolveKNProxyBinding(ctx, c.Param("kn_id"), binding)
 	if err != nil {
-		rest.ReplyError(c, err.(*rest.HTTPError))
+		rest.ReplyError(c, err.(*httperrors.HTTPError))
 		return
 	}
 	rest.ReplyOK(c, http.StatusOK, mapping)
@@ -134,7 +141,7 @@ func (r *restHandler) planKNProxySync(c *gin.Context, ctx context.Context) {
 func (r *restHandler) FinalizeKNProxyDeletion(c *gin.Context) {
 	ctx, _ := proxyRequestContext(c)
 	if err := r.kns.FinalizeKNProxyDeletion(ctx, c.Param("kn_id")); err != nil {
-		rest.ReplyError(c, err.(*rest.HTTPError))
+		rest.ReplyError(c, err.(*httperrors.HTTPError))
 		return
 	}
 	c.Status(http.StatusNoContent)
@@ -164,4 +171,26 @@ func (r *restHandler) reconcileKNProxies(c *gin.Context, ctx context.Context, re
 		return
 	}
 	rest.ReplyOK(c, http.StatusOK, report)
+}
+
+// proxyBranchReadable checks the branch a proxy read is for: main, or a version that has not
+// been purged. A query pins the running version when it starts, and that version may become a
+// history version before the query asks, so history versions are accepted too. The draft is read
+// as the caller only.
+func (r *restHandler) proxyBranchReadable(ctx context.Context, c *gin.Context, knID string) bool {
+	branch := c.Query("branch")
+	if branch == "" || branch == interfaces.MAIN_BRANCH {
+		return true
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(branch, "v"))
+	if !strings.HasPrefix(branch, "v") || err != nil || n <= 0 || r.kvs == nil {
+		replyKNVersionError(c, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KNVersion_InvalidVersion).
+			WithErrorDetails("a proxy read is for main or a version branch v<N>"))
+		return false
+	}
+	if _, err := r.kvs.ResolveBranch(ctx, knID, interfaces.KNBranchRequest{KNVersion: strconv.Itoa(n)}); err != nil {
+		replyKNVersionError(c, err)
+		return false
+	}
+	return true
 }

@@ -4,7 +4,7 @@
 
 openapi: 3.0.3
 info:
-  title: bkn-safe internal authorization API
+  title: 身份与授权 · 授权校验 API
   version: 0.5.0
   description: |
     Internal service-to-service authorization contract used by BKN,
@@ -42,10 +42,11 @@ paths:
   /registry:
     get:
       operationId: getAuthorizationRegistry
-      summary: Get the persisted authorization registry
+      summary: Get the startup authorization registry snapshot
       description: |
-        Returns the resource types and operations currently registered in
-        bkn-safe. This is a tokenless service-to-service endpoint on the
+        Returns the resource types and operations loaded and validated at startup.
+        The snapshot is shared with authorization checks and writes, and changes
+        to persisted definitions take effect after restart. This is a tokenless service-to-service endpoint on the
         platform-internal `/api/safe/v1/authz` network surface; it must not be
         exposed through an Ingress or called directly by browsers. Browser
         clients use the bearer-token-protected
@@ -311,15 +312,16 @@ paths:
         must target a concrete `{kn_id}/{action_type_id}`.
 
         BKN creation uses two server-recognized lifecycle shapes. A newly
-        created knowledge network sends `[full_business_access, authorize]`;
-        bkn-safe atomically stores the logical Community bundle and a
-        system-derived `authorize` grant. A newly created Action Type sends
+        created authorization root (a knowledge network, a catalog, or a
+        knowledge base) sends `[full_business_access, authorize]`; bkn-safe
+        atomically stores the logical Community bundle and a system-derived
+        `authorize` grant. A newly created Action Type sends
         `[execute]`, stored as system-derived direct execution authority.
         Policy and authority sources are selected by bkn-safe and are never
         accepted from the request body. Other requests that pass the wildcard
-        guards retain the compatibility policy writer, except that a knowledge
-        network request containing `full_business_access` must match the exact
-        lifecycle shape above or it is rejected with `400`.
+        guards retain the compatibility policy writer, except that a request on
+        one of those roots containing `full_business_access` must match the
+        exact lifecycle shape above or it is rejected with `400`.
       requestBody:
         required: true
         content:
@@ -603,7 +605,7 @@ components:
           description: Compatible operation on `parent_type` used for parent-resource inheritance; omitted when none is declared.
         requires:
           type: array
-          description: Direct same-resource prerequisite operations. Empty when the operation has no prerequisites.
+          description: Complete same-resource prerequisite set, expanded transitively from the acyclic registry graph. Authorization writes include these prerequisites; existing grants and read-time decisions are unchanged. Empty when the operation has no prerequisites.
           items:
             type: string
     CheckRequest:
@@ -780,8 +782,8 @@ components:
         object_type_ref:
           type: string
           minLength: 3
-          maxLength: 81
-          pattern: '^[a-z0-9][a-z0-9_-]{0,39}/[a-z0-9][a-z0-9_-]{0,39}$'
+          maxLength: 257
+          pattern: '^[a-z0-9][a-z0-9_-]{0,127}/[a-z0-9][a-z0-9_-]{0,127}$'
           description: Canonical resource ID part `<kn_id>/<ot_id>` without an `object_type:` prefix.
         properties:
           type: array
@@ -867,8 +869,8 @@ components:
     RowFilterObjectTypeRef:
       type: string
       minLength: 3
-      maxLength: 81
-      pattern: '^[a-z0-9][a-z0-9_-]{0,39}/[a-z0-9][a-z0-9_-]{0,39}$'
+      maxLength: 257
+      pattern: '^[a-z0-9][a-z0-9_-]{0,127}/[a-z0-9][a-z0-9_-]{0,127}$'
     RowFilterPropertyName:
       type: string
       pattern: '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,39}$'

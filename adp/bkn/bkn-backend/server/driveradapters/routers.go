@@ -11,34 +11,39 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	libCommon "github.com/openbkn-ai/bkn-foundry/comm-go/common"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/middleware"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"bkn-backend/common"
-	"bkn-backend/common/bkntrace"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics/action_schedule"
-	"bkn-backend/logics/action_type"
-	"bkn-backend/logics/auth"
-	"bkn-backend/logics/bkn"
-	"bkn-backend/logics/capability_binding"
-	"bkn-backend/logics/concept_group"
-	"bkn-backend/logics/cypher"
-	"bkn-backend/logics/knowledge_network"
-	metriclogics "bkn-backend/logics/metric"
-	"bkn-backend/logics/object_data_stats"
-	"bkn-backend/logics/object_type"
-	"bkn-backend/logics/relation_type"
-	"bkn-backend/logics/risk_type"
-	"bkn-backend/version"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/bkntrace"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/action_schedule"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/action_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/auth"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/capability_binding"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/concept_group"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/cypher"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/kn_version"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/knowledge_network"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/object_data_stats"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/relation_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/risk_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/value_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/version"
 )
 
 type RestHandler interface {
@@ -60,7 +65,11 @@ type restHandler struct {
 	ots                     interfaces.ObjectTypeService
 	rts                     interfaces.RelationTypeService
 	rtsRisk                 interfaces.RiskTypeService
-	ms                      interfaces.MetricService
+	vts                     interfaces.ValueTypeService
+	oms                     interfaces.ObjectMetricServiceV1
+	kes                     interfaces.KnEventServiceV1
+	kvs                     interfaces.KNVersionService
+	kvsOnce                 sync.Once
 	bs                      interfaces.BKNService
 	projectionGrantVerifier *bkntrace.ProjectionGrantVerifier
 	cqs                     interfaces.CypherQueryService
@@ -99,8 +108,9 @@ func NewRestHandler(appSetting *common.AppSetting, recorder operationAuditRecord
 		ots:                     object_type.NewObjectTypeService(appSetting),
 		rts:                     relation_type.NewRelationTypeService(appSetting),
 		rtsRisk:                 risk_type.NewRiskTypeService(appSetting),
-		ms:                      metriclogics.NewMetricService(appSetting),
+		vts:                     value_type.NewValueTypeService(appSetting),
 		bs:                      bkn.NewBKNService(appSetting),
+		kvs:                     kn_version.NewKNVersionService(appSetting, knService),
 		projectionGrantVerifier: projectionVerifier,
 		cqs:                     cypher.NewCypherQueryService(appSetting),
 		odss:                    object_data_stats.NewObjectDataStatsService(appSetting),
@@ -113,6 +123,8 @@ func projectionGrantVerifierEnabled() bool {
 }
 
 func (r *restHandler) RegisterPublic(c *gin.Engine) {
+	// Before anything reads the query.
+	c.Use(defaultBranchAlias())
 	c.Use(r.AccessLog())
 	c.Use(middleware.TracingMiddleware())
 	c.Use(r.LanguageMiddleware())
@@ -120,208 +132,197 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 
 	c.GET("/api/bkn-backend/v1/health", r.HealthCheck)
 
-	bknApiV1 := c.Group("/api/bkn-backend/v1")
-	otlApiV1 := c.Group("/api/ontology-manager/v1")
-	bknApiV1.Use(rest.PrivateNoCacheMiddleware())
-	otlApiV1.Use(rest.PrivateNoCacheMiddleware())
-	bknApiV1.GET("/proxy-accounts", r.ListKNProxiesByEx)
-	bknApiV1.GET("/knowledge-networks/:kn_id/proxy-account", r.GetKNProxyByEx)
-	bknApiV1.GET("/knowledge-networks/:kn_id/proxy-account/plan", r.PlanKNProxySyncByEx)
-	bknApiV1.POST("/knowledge-networks/:kn_id/proxy-account/sync", r.RetryKNProxySyncByEx)
-	bknApiV1.POST("/proxy-accounts/reconcile", r.ReconcileKNProxiesByEx)
+	apiV1 := c.Group("/api/bkn-backend/v1")
+	bknApiV2 := c.Group("/api/bkn-backend/v2")
+	apiV1.Use(rest.PrivateNoCacheMiddleware(), confirmClearDeclarations(), r.consistentReads(), r.finishDirectWrites())
+	bknApiV2.Use(rest.PrivateNoCacheMiddleware(), confirmClearDeclarations(), r.consistentReads(), r.finishDirectWrites())
+	apiV1.GET("/proxy-accounts", r.ListKNProxiesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/proxy-account", r.GetKNProxyByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/proxy-account/plan", r.PlanKNProxySyncByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/proxy-account/sync", r.RetryKNProxySyncByEx)
+	apiV1.POST("/proxy-accounts/reconcile", r.ReconcileKNProxiesByEx)
 
-	for _, apiV1 := range []*gin.RouterGroup{bknApiV1, otlApiV1} {
-		// Knowledge networks.
-		apiV1.POST("/knowledge-networks", r.verifyJsonContentType(), r.CreateKNByEx)
-		// Resolve names by ID in batch for object-level authorization views; the names segment does not conflict with :kn_id.
-		apiV1.POST("/knowledge-networks/names", r.verifyJsonContentType(), r.QueryKNNamesByIDs)
-		apiV1.DELETE("/knowledge-networks/:kn_id", r.DeleteKN)
-		apiV1.PUT("/knowledge-networks/:kn_id", r.verifyJsonContentType(), r.UpdateKNByEx)
-		apiV1.GET("/knowledge-networks", r.ListKNsByEx)
-		apiV1.GET("/knowledge-networks/:kn_id", r.GetKNByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/overview-graph", r.ListOverviewGraphByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/validation", r.verifyJsonContentType(), r.ValidateKNByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/relation-type-paths", r.GetRelationTypePathsByEx)
+	// Knowledge networks.
+	apiV1.POST("/knowledge-networks", r.verifyJsonContentType(), r.CreateKNByEx)
+	// Resolve names by ID in batch for object-level authorization views; the names segment does not conflict with :kn_id.
+	apiV1.POST("/knowledge-networks/names", r.verifyJsonContentType(), r.QueryKNNamesByIDs)
+	apiV1.DELETE("/knowledge-networks/:kn_id", r.DeleteKN)
+	apiV1.PUT("/knowledge-networks/:kn_id", r.verifyJsonContentType(), r.UpdateKNByEx)
+	apiV1.GET("/knowledge-networks", r.ListKNsByEx)
+	apiV1.GET("/knowledge-networks/:kn_id", r.GetKNByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/overview-graph", r.ListOverviewGraphByEx)
+	r.registerKNVersionRoutes(apiV1)
+	apiV1.POST("/knowledge-networks/:kn_id/validation", r.verifyJsonContentType(), r.ValidateKNByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/relation-type-paths", r.GetRelationTypePathsByEx)
 
-		// Concept groups.
-		apiV1.POST("/knowledge-networks/:kn_id/concept-groups", r.verifyJsonContentType(), r.CreateConceptGroupByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/concept-groups/validation", r.verifyJsonContentType(), r.ValidateConceptGroupsByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.DeleteConceptGroup) // Batch deletion is not supported.
-		apiV1.PUT("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.verifyJsonContentType(), r.UpdateConceptGroupByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/concept-groups", r.ListConceptGroupsByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.GetConceptGroupByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types", r.AddObjectTypesToConceptGroupByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types/:ot_ids", r.DeleteObjectTypesFromGroupByEx)
+	// Concept groups.
+	apiV1.POST("/knowledge-networks/:kn_id/concept-groups", r.verifyJsonContentType(), r.CreateConceptGroupByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/concept-groups/validation", r.verifyJsonContentType(), r.ValidateConceptGroupsByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.DeleteConceptGroup) // Batch deletion is not supported.
+	apiV1.PUT("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.verifyJsonContentType(), r.UpdateConceptGroupByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/concept-groups", r.ListConceptGroupsByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.GetConceptGroupByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types", r.AddObjectTypesToConceptGroupByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types/:ot_ids", r.DeleteObjectTypesFromGroupByEx)
 
-		// Object types.
-		apiV1.POST("/knowledge-networks/:kn_id/object-types", r.verifyJsonContentType(), r.HandleObjectTypeGetOverrideByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/object-types/validation", r.verifyJsonContentType(), r.ValidateObjectTypesByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/object-types/:ot_ids", r.DeleteObjectTypes) // The path uses the plural parameter name but accepts one ID only.
-		apiV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id", r.verifyJsonContentType(), r.UpdateObjectTypeByEx)
-		apiV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id/data_properties/:property_names", r.verifyJsonContentType(), r.UpdateDataProperties)
-		apiV1.GET("/knowledge-networks/:kn_id/object-types", r.ListObjectTypesByEx) // The path uses the plural parameter name but accepts one ID only.
-		apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids/sample-data", r.GetObjectTypeSampleDataByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids", r.GetObjectTypesByEx) // The path uses the plural parameter name but accepts one ID only.
+	// Object types.
+	apiV1.POST("/knowledge-networks/:kn_id/object-types", r.verifyJsonContentType(), r.HandleObjectTypeGetOverrideByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/object-types/validation", r.verifyJsonContentType(), r.ValidateObjectTypesByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/object-types/:ot_ids", r.DeleteObjectTypes) // The path uses the plural parameter name but accepts one ID only.
+	apiV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id", r.verifyJsonContentType(), r.UpdateObjectTypeByEx)
+	apiV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id/data_properties/:property_names", r.verifyJsonContentType(), r.UpdateDataProperties)
+	apiV1.GET("/knowledge-networks/:kn_id/object-types", r.ListObjectTypesByEx) // The path uses the plural parameter name but accepts one ID only.
+	apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids/sample-data", r.GetObjectTypeSampleDataByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids", r.GetObjectTypesByEx) // The path uses the plural parameter name but accepts one ID only.
 
-		// Relation types.
-		apiV1.POST("/knowledge-networks/:kn_id/relation-types", r.verifyJsonContentType(), r.HandleRelationTypeGetOverrideByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/relation-types/validation", r.verifyJsonContentType(), r.ValidateRelationTypesByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.DeleteRelationTypes)
-		apiV1.PUT("/knowledge-networks/:kn_id/relation-types/:rt_id", r.verifyJsonContentType(), r.UpdateRelationTypeByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/relation-types", r.ListRelationTypesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.GetRelationTypesByEx)
+	// Relation types.
+	apiV1.POST("/knowledge-networks/:kn_id/relation-types", r.verifyJsonContentType(), r.HandleRelationTypeGetOverrideByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/relation-types/validation", r.verifyJsonContentType(), r.ValidateRelationTypesByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.DeleteRelationTypes)
+	apiV1.PUT("/knowledge-networks/:kn_id/relation-types/:rt_id", r.verifyJsonContentType(), r.UpdateRelationTypeByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/relation-types", r.ListRelationTypesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.GetRelationTypesByEx)
 
-		// Action types.
-		apiV1.POST("/knowledge-networks/:kn_id/action-types", r.verifyJsonContentType(), r.HandleActionTypeGetOverrideByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/action-types/validation", r.verifyJsonContentType(), r.ValidateActionTypesByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/action-types/:at_ids", r.DeleteActionTypes)
-		apiV1.PUT("/knowledge-networks/:kn_id/action-types/:at_id", r.verifyJsonContentType(), r.UpdateActionTypeByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/action-types", r.ListActionTypesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/action-types/:at_ids", r.GetActionTypesByEx)
+	// Action types.
+	apiV1.POST("/knowledge-networks/:kn_id/action-types", r.verifyJsonContentType(), r.HandleActionTypeGetOverrideByEx)
+	apiV1.POST("/knowledge-networks/:kn_id/action-types/validation", r.verifyJsonContentType(), r.ValidateActionTypesByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/action-types/:at_ids", r.DeleteActionTypes)
+	apiV1.PUT("/knowledge-networks/:kn_id/action-types/:at_id", r.verifyJsonContentType(), r.UpdateActionTypeByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/action-types", r.ListActionTypesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/action-types/:at_ids", r.GetActionTypesByEx)
 
-		// Metrics.
-		apiV1.POST("/knowledge-networks/:kn_id/metrics", r.verifyJsonContentType(), r.HandleMetricGetOverrideByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/metrics/validation", r.verifyJsonContentType(), r.ValidateMetricsByEx)
-		// SDK/CLI compatibility alias (@openbkn/bkn-sdk uses /metrics/validate)
-		apiV1.POST("/knowledge-networks/:kn_id/metrics/validate", r.verifyJsonContentType(), r.ValidateMetricsByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/metrics/:metric_ids", r.DeleteMetricsByIDsByEx)
-		apiV1.PUT("/knowledge-networks/:kn_id/metrics/:metric_ids", r.verifyJsonContentType(), r.UpdateMetricByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/metrics", r.ListMetricsByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/metrics/dependency-properties/:ot_id", r.GetMetricDependencyPropertiesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/metrics/:metric_ids", r.GetMetricsByIDsByEx)
+	// Capability bindings: which Skills and ToolBox tools belong to this knowledge network.
+	apiV1.POST("/knowledge-networks/:kn_id/capabilities", r.verifyJsonContentType(), r.AttachCapabilitiesByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/capabilities/:binding_ids", r.DetachCapabilitiesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/capabilities", r.ListCapabilitiesByEx)
 
-		// Capability bindings: which Skills and ToolBox tools belong to this knowledge network.
-		apiV1.POST("/knowledge-networks/:kn_id/capabilities", r.verifyJsonContentType(), r.AttachCapabilitiesByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/capabilities/:binding_ids", r.DetachCapabilitiesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/capabilities", r.ListCapabilitiesByEx)
+	// Risk types.
+	apiV1.POST("/knowledge-networks/:kn_id/risk-types", r.verifyJsonContentType(), r.HandleRiskTypeGetOverrideByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.DeleteRiskTypes)
+	apiV1.PUT("/knowledge-networks/:kn_id/risk-types/:rt_id", r.verifyJsonContentType(), r.UpdateRiskTypeByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/risk-types", r.ListRiskTypesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.GetRiskTypesByEx)
 
-		// Risk types.
-		apiV1.POST("/knowledge-networks/:kn_id/risk-types", r.verifyJsonContentType(), r.HandleRiskTypeGetOverrideByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.DeleteRiskTypes)
-		apiV1.PUT("/knowledge-networks/:kn_id/risk-types/:rt_id", r.verifyJsonContentType(), r.UpdateRiskTypeByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/risk-types", r.ListRiskTypesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.GetRiskTypesByEx)
+	// Value types.
+	apiV1.POST("/knowledge-networks/:kn_id/value-types", r.verifyJsonContentType(), r.CreateValueTypesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/value-types", r.ListValueTypesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/value-types/:vt_id", r.GetValueTypeByEx)
+	apiV1.PUT("/knowledge-networks/:kn_id/value-types/:vt_id", r.verifyJsonContentType(), r.UpdateValueTypeByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/value-types/:vt_id", r.DeleteValueTypeByEx)
 
-		// Action schedule management.
-		apiV1.POST("/knowledge-networks/:kn_id/action-schedules", r.verifyJsonContentType(), r.CreateActionScheduleByEx)
-		apiV1.DELETE("/knowledge-networks/:kn_id/action-schedules/:schedule_ids", r.DeleteActionSchedulesByEx)
-		apiV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.verifyJsonContentType(), r.UpdateActionScheduleByEx)
-		apiV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id/status", r.verifyJsonContentType(), r.UpdateActionScheduleStatusByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/action-schedules", r.ListActionSchedulesByEx)
-		apiV1.GET("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.GetActionScheduleByEx)
+	// Action schedule management.
+	apiV1.POST("/knowledge-networks/:kn_id/action-schedules", r.verifyJsonContentType(), r.CreateActionScheduleByEx)
+	apiV1.DELETE("/knowledge-networks/:kn_id/action-schedules/:schedule_ids", r.DeleteActionSchedulesByEx)
+	apiV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.verifyJsonContentType(), r.UpdateActionScheduleByEx)
+	apiV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id/status", r.verifyJsonContentType(), r.UpdateActionScheduleStatusByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/action-schedules", r.ListActionSchedulesByEx)
+	apiV1.GET("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.GetActionScheduleByEx)
 
-		// Cypher queries over instance data.
-		apiV1.POST("/knowledge-networks/:kn_id/cypher-queries", r.verifyJsonContentType(), r.RunCypherQueryByEx)
+	// Cypher queries over instance data.
+	apiV1.POST("/knowledge-networks/:kn_id/cypher-queries", r.verifyJsonContentType(), r.RunCypherQueryByEx)
 
-		// Knowledge network resource example list.
-		apiV1.GET("/resources", r.ListResources)
+	// Knowledge network resource example list.
+	apiV1.GET("/resources", r.ListResources)
 
-		// BKN import and export (RESTful design).
-		apiV1.POST("/bkns", r.UploadBKN)         // Upload a BKN tar archive for import.
-		apiV1.GET("/bkns/:kn_id", r.DownloadBKN) // Download a BKN tar archive for export.
+	// BKN import and export (RESTful design).
+	apiV1.POST("/bkns", r.UploadBKN)         // Upload a BKN tar archive for import.
+	apiV1.GET("/bkns/:kn_id", r.DownloadBKN) // Download a BKN tar archive for export.
+	// Check the definitions of a network: read-only, any specification.
+	apiV1.GET("/bkns/:kn_id/check", r.CheckBKN)
 
-		// Compare two knowledge network branches. The two networks are named in the body rather
-		// than in the path: neither of them is the resource being addressed, and putting one in
-		// the path would suggest the comparison belongs to it.
-		apiV1.POST("/bkns/diff", r.verifyJsonContentType(), r.DiffKNsByEx)
+	// Compare two knowledge network branches. The two networks are named in the body rather
+	// than in the path: neither of them is the resource being addressed, and putting one in
+	// the path would suggest the comparison belongs to it.
+	apiV1.POST("/bkns/diff", r.verifyJsonContentType(), r.DiffKNsByEx)
 
-		// Count the data behind one object type on each side of a comparison. It is a separate
-		// call because it queries the customer's own database: a comparison opens without paying
-		// for it, and pays only for the object type someone actually opens.
-		apiV1.POST("/bkns/diff/object-data-stats", r.verifyJsonContentType(), r.ObjectDataStatsByEx)
-	}
+	// Count the data behind one object type on each side of a comparison. It is a separate
+	// call because it queries the customer's own database: a comparison opens without paying
+	// for it, and pays only for the object type someone actually opens.
+	apiV1.POST("/bkns/diff/object-data-stats", r.verifyJsonContentType(), r.ObjectDataStatsByEx)
 
-	bknApiInV1 := c.Group("/api/bkn-backend/in/v1")
-	otlApiInV1 := c.Group("/api/ontology-manager/in/v1")
-	bknApiInV1.Use(rest.PrivateNoCacheMiddleware())
-	otlApiInV1.Use(rest.PrivateNoCacheMiddleware())
-	bknApiInV1.GET("/trace/projection/knowledge-networks/:kn_id", r.GetKNByProjectionGrant)
-	bknApiInV1.GET("/knowledge-networks/:kn_id/proxy-account", r.GetKNProxy)
-	bknApiInV1.POST("/knowledge-networks/:kn_id/proxy-account/resolve", r.verifyJsonContentType(), r.ResolveKNProxyBinding)
-	bknApiInV1.GET("/knowledge-networks/:kn_id/proxy-account/plan", r.PlanKNProxySync)
-	bknApiInV1.POST("/knowledge-networks/:kn_id/proxy-account/sync", r.RetryKNProxySync)
-	bknApiInV1.POST("/knowledge-networks/:kn_id/proxy-account/deletion/finalize", r.FinalizeKNProxyDeletion)
-	bknApiInV1.POST("/proxy-accounts/reconcile", r.ReconcileKNProxies)
-	bknApiInV1.GET("/authorization-resources", r.ListAuthorizationResources)
+	apiInV1 := c.Group("/api/bkn-backend/in/v1")
+	apiInV1.Use(rest.PrivateNoCacheMiddleware(), confirmClearDeclarations(), r.consistentReads(), r.finishDirectWrites())
+	apiInV1.GET("/trace/projection/knowledge-networks/:kn_id", r.GetKNByProjectionGrant)
+	apiInV1.GET("/knowledge-networks/:kn_id/proxy-account", r.GetKNProxy)
+	apiInV1.POST("/knowledge-networks/:kn_id/proxy-account/resolve", r.verifyJsonContentType(), r.ResolveKNProxyBinding)
+	apiInV1.GET("/knowledge-networks/:kn_id/proxy-account/plan", r.PlanKNProxySync)
+	apiInV1.POST("/knowledge-networks/:kn_id/proxy-account/sync", r.RetryKNProxySync)
+	apiInV1.POST("/knowledge-networks/:kn_id/proxy-account/deletion/finalize", r.FinalizeKNProxyDeletion)
+	apiInV1.POST("/proxy-accounts/reconcile", r.ReconcileKNProxies)
+	apiInV1.GET("/authorization-resources", r.ListAuthorizationResources)
+	apiInV1.POST("/knowledge-networks/:kn_id/versioning/disable", knEventInternal(r.disableKNVersioning))
+	apiInV1.POST("/knowledge-networks/:kn_id/concept-index/rebuild", knEventInternal(r.rebuildKNConceptIndex))
 
-	for _, apiInV1 := range []*gin.RouterGroup{bknApiInV1, otlApiInV1} {
-		// Knowledge networks.
-		apiInV1.POST("/knowledge-networks", r.verifyJsonContentType(), r.CreateKNByIn)
-		// Resolve names by ID in batch for object-level authorization views; the names segment does not conflict with :kn_id.
-		apiInV1.POST("/knowledge-networks/names", r.verifyJsonContentType(), r.QueryKNNamesByIDs)
-		apiInV1.PUT("/knowledge-networks/:kn_id", r.verifyJsonContentType(), r.UpdateKNByIn)
-		apiInV1.GET("/knowledge-networks", r.ListKNsByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id", r.GetKNByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/overview-graph", r.ListOverviewGraphByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/validation", r.verifyJsonContentType(), r.ValidateKNByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/relation-type-paths", r.GetRelationTypePathsByIn)
+	// Knowledge networks.
+	apiInV1.POST("/knowledge-networks", r.verifyJsonContentType(), r.CreateKNByIn)
+	// Resolve names by ID in batch for object-level authorization views; the names segment does not conflict with :kn_id.
+	apiInV1.POST("/knowledge-networks/names", r.verifyJsonContentType(), r.QueryKNNamesByIDs)
+	apiInV1.PUT("/knowledge-networks/:kn_id", r.verifyJsonContentType(), r.UpdateKNByIn)
+	apiInV1.GET("/knowledge-networks", r.ListKNsByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id", r.GetKNByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/overview-graph", r.ListOverviewGraphByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/validation", r.verifyJsonContentType(), r.ValidateKNByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/relation-type-paths", r.GetRelationTypePathsByIn)
 
-		// Concept groups.
-		apiInV1.POST("/knowledge-networks/:kn_id/concept-groups", r.verifyJsonContentType(), r.CreateConceptGroupByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/concept-groups/validation", r.verifyJsonContentType(), r.ValidateConceptGroupsByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.verifyJsonContentType(), r.UpdateConceptGroupByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/concept-groups", r.ListConceptGroupsByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.GetConceptGroupByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types", r.AddObjectTypesToConceptGroupByIn)
-		apiInV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types/:ot_ids", r.DeleteObjectTypesFromGroupByIn)
+	// Concept groups.
+	apiInV1.POST("/knowledge-networks/:kn_id/concept-groups", r.verifyJsonContentType(), r.CreateConceptGroupByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/concept-groups/validation", r.verifyJsonContentType(), r.ValidateConceptGroupsByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.verifyJsonContentType(), r.UpdateConceptGroupByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/concept-groups", r.ListConceptGroupsByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/concept-groups/:cg_id", r.GetConceptGroupByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types", r.AddObjectTypesToConceptGroupByIn)
+	apiInV1.DELETE("/knowledge-networks/:kn_id/concept-groups/:cg_id/object-types/:ot_ids", r.DeleteObjectTypesFromGroupByIn)
 
-		// Object types.
-		apiInV1.POST("/knowledge-networks/:kn_id/object-types", r.verifyJsonContentType(), r.HandleObjectTypeGetOverrideByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/object-types/validation", r.verifyJsonContentType(), r.ValidateObjectTypesByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id", r.verifyJsonContentType(), r.UpdateObjectTypeByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/object-types", r.ListObjectTypesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids/sample-data", r.GetObjectTypeSampleDataByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids", r.GetObjectTypesByIn) // The path uses the plural parameter name but accepts one ID only.
+	// Object types.
+	apiInV1.POST("/knowledge-networks/:kn_id/object-types", r.verifyJsonContentType(), r.HandleObjectTypeGetOverrideByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/object-types/validation", r.verifyJsonContentType(), r.ValidateObjectTypesByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/object-types/:ot_id", r.verifyJsonContentType(), r.UpdateObjectTypeByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/object-types", r.ListObjectTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids/sample-data", r.GetObjectTypeSampleDataByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/object-types/:ot_ids", r.GetObjectTypesByIn) // The path uses the plural parameter name but accepts one ID only.
 
-		// Relation types.
-		apiInV1.POST("/knowledge-networks/:kn_id/relation-types", r.verifyJsonContentType(), r.HandleRelationTypeGetOverrideByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/relation-types/validation", r.verifyJsonContentType(), r.ValidateRelationTypesByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/relation-types/:rt_id", r.verifyJsonContentType(), r.UpdateRelationTypeByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/relation-types", r.ListRelationTypesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.GetRelationTypesByIn)
+	// Relation types.
+	apiInV1.POST("/knowledge-networks/:kn_id/relation-types", r.verifyJsonContentType(), r.HandleRelationTypeGetOverrideByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/relation-types/validation", r.verifyJsonContentType(), r.ValidateRelationTypesByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/relation-types/:rt_id", r.verifyJsonContentType(), r.UpdateRelationTypeByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/relation-types", r.ListRelationTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/relation-types/:rt_ids", r.GetRelationTypesByIn)
 
-		// Action types.
-		apiInV1.POST("/knowledge-networks/:kn_id/action-types", r.verifyJsonContentType(), r.HandleActionTypeGetOverrideByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/action-types/validation", r.verifyJsonContentType(), r.ValidateActionTypesByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/action-types/:at_id", r.verifyJsonContentType(), r.UpdateActionTypeByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/action-types", r.ListActionTypesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/action-types/:at_ids", r.GetActionTypesByIn)
+	// Action types.
+	apiInV1.POST("/knowledge-networks/:kn_id/action-types", r.verifyJsonContentType(), r.HandleActionTypeGetOverrideByIn)
+	apiInV1.POST("/knowledge-networks/:kn_id/action-types/validation", r.verifyJsonContentType(), r.ValidateActionTypesByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/action-types/:at_id", r.verifyJsonContentType(), r.UpdateActionTypeByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/action-types", r.ListActionTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/action-types/:at_ids", r.GetActionTypesByIn)
 
-		// Metrics (internal).
-		apiInV1.POST("/knowledge-networks/:kn_id/metrics", r.verifyJsonContentType(), r.HandleMetricGetOverrideByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/metrics/validation", r.verifyJsonContentType(), r.ValidateMetricsByIn)
-		// SDK/CLI compatibility alias (@openbkn/bkn-sdk uses /metrics/validate)
-		apiInV1.POST("/knowledge-networks/:kn_id/metrics/validate", r.verifyJsonContentType(), r.ValidateMetricsByIn)
-		apiInV1.DELETE("/knowledge-networks/:kn_id/metrics/:metric_ids", r.DeleteMetricsByIDsByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/metrics/:metric_ids", r.verifyJsonContentType(), r.UpdateMetricByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/metrics", r.ListMetricsByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/metrics/dependency-properties/:ot_id", r.GetMetricDependencyPropertiesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/metrics/:metric_ids/execution-context", r.GetMetricExecutionContextByIn)
+	// Capability bindings: Context Loader resolves the references of one branch here.
+	apiInV1.POST("/knowledge-networks/:kn_id/capabilities", r.verifyJsonContentType(), r.AttachCapabilitiesByIn)
+	apiInV1.DELETE("/knowledge-networks/:kn_id/capabilities/:binding_ids", r.DetachCapabilitiesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/capabilities", r.ListCapabilitiesByIn)
+	// Risk types (internal); GetRiskTypesByIn supports the risk_type_ids query parameter.
+	apiInV1.POST("/knowledge-networks/:kn_id/risk-types", r.verifyJsonContentType(), r.HandleRiskTypeGetOverrideByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/risk-types/:rt_id", r.verifyJsonContentType(), r.UpdateRiskTypeByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/risk-types", r.GetRiskTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.GetRiskTypesByInWithPath)
+	apiInV1.DELETE("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.DeleteRiskTypes)
 
-		// Capability bindings: Context Loader resolves the references of one branch here.
-		apiInV1.POST("/knowledge-networks/:kn_id/capabilities", r.verifyJsonContentType(), r.AttachCapabilitiesByIn)
-		apiInV1.DELETE("/knowledge-networks/:kn_id/capabilities/:binding_ids", r.DetachCapabilitiesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/capabilities", r.ListCapabilitiesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/metrics/:metric_ids", r.GetMetricsByIDsByIn)
+	// Value types (internal).
+	apiInV1.POST("/knowledge-networks/:kn_id/value-types", r.verifyJsonContentType(), r.CreateValueTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/value-types", r.ListValueTypesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/value-types/:vt_id", r.GetValueTypeByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/value-types/:vt_id", r.verifyJsonContentType(), r.UpdateValueTypeByIn)
+	apiInV1.DELETE("/knowledge-networks/:kn_id/value-types/:vt_id", r.DeleteValueTypeByIn)
 
-		// Risk types (internal); GetRiskTypesByIn supports the risk_type_ids query parameter.
-		apiInV1.POST("/knowledge-networks/:kn_id/risk-types", r.verifyJsonContentType(), r.HandleRiskTypeGetOverrideByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/risk-types/:rt_id", r.verifyJsonContentType(), r.UpdateRiskTypeByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/risk-types", r.GetRiskTypesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.GetRiskTypesByInWithPath)
-		apiInV1.DELETE("/knowledge-networks/:kn_id/risk-types/:rt_ids", r.DeleteRiskTypes)
+	// Action schedule management.
+	apiInV1.POST("/knowledge-networks/:kn_id/action-schedules", r.verifyJsonContentType(), r.CreateActionScheduleByIn)
+	apiInV1.DELETE("/knowledge-networks/:kn_id/action-schedules/:schedule_ids", r.DeleteActionSchedulesByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.verifyJsonContentType(), r.UpdateActionScheduleByIn)
+	apiInV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id/status", r.verifyJsonContentType(), r.UpdateActionScheduleStatusByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/action-schedules", r.ListActionSchedulesByIn)
+	apiInV1.GET("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.GetActionScheduleByIn)
 
-		// Action schedule management.
-		apiInV1.POST("/knowledge-networks/:kn_id/action-schedules", r.verifyJsonContentType(), r.CreateActionScheduleByIn)
-		apiInV1.DELETE("/knowledge-networks/:kn_id/action-schedules/:schedule_ids", r.DeleteActionSchedulesByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.verifyJsonContentType(), r.UpdateActionScheduleByIn)
-		apiInV1.PUT("/knowledge-networks/:kn_id/action-schedules/:schedule_id/status", r.verifyJsonContentType(), r.UpdateActionScheduleStatusByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/action-schedules", r.ListActionSchedulesByIn)
-		apiInV1.GET("/knowledge-networks/:kn_id/action-schedules/:schedule_id", r.GetActionScheduleByIn)
-
-		// Cypher queries over instance data.
-		apiInV1.POST("/knowledge-networks/:kn_id/cypher-queries", r.verifyJsonContentType(), r.RunCypherQueryByIn)
-	}
+	// Cypher queries over instance data.
+	apiInV1.POST("/knowledge-networks/:kn_id/cypher-queries", r.verifyJsonContentType(), r.RunCypherQueryByIn)
 
 	logger.Info("RestHandler RegisterPublic")
 }
@@ -343,8 +344,12 @@ func (r *restHandler) verifyJsonContentType() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Reject requests whose Content-Type is not application/json.
 		if c.ContentType() != interfaces.CONTENT_TYPE_JSON {
-			httpErr := rest.NewHTTPError(c, http.StatusNotAcceptable, berrors.BknBackend_InvalidRequestHeader_ContentType).
-				WithErrorDetails(commonValidationDetail(c.Request.Context(), "ContentTypeUnsupported", map[string]any{"contentType": c.ContentType()}))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(c.Request.Context()), "BknBackend.Validation.Detail.ContentTypeUnsupported", map[string]any{"contentType": c.ContentType()})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(c, http.StatusNotAcceptable, berrors.BknBackend_InvalidRequestHeader_ContentType).
+				WithErrorDetails(localizedText)
 			rest.ReplyError(c, httpErr)
 
 			c.Abort()
@@ -384,12 +389,29 @@ func (r *restHandler) AccessLog() gin.HandlerFunc {
 func (r *restHandler) verifyOAuth(ctx context.Context, c *gin.Context) (hydra.Visitor, error) {
 	visitor, err := r.as.VerifyToken(ctx, c)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusUnauthorized, rest.PublicError_Unauthorized).
-			WithErrorDetails(commonValidationDetail(ctx, "AuthenticationFailed", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.AuthenticationFailed", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusUnauthorized, httperrors.PublicError_Unauthorized).
+			WithErrorDetails(localizedText)
 		rest.ReplyError(c, httpErr)
 		return visitor, err
 	}
 	c.Set(operationAuditVisitorKey, visitor)
 
 	return visitor, nil
+}
+
+// confirmClearDeclarations carries the confirm_clear_declarations=true query parameter into the
+// request context. An overwrite that would clear stored property declarations is refused without
+// it, whichever import endpoint the request came in through, so the parameter is read once here
+// rather than by each of them.
+func confirmClearDeclarations() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if confirmed, _ := strconv.ParseBool(c.Query(interfaces.QueryParam_ConfirmClearDeclarations)); confirmed {
+			c.Request = c.Request.WithContext(interfaces.WithClearDeclarationsConfirmed(c.Request.Context()))
+		}
+		c.Next()
+	}
 }

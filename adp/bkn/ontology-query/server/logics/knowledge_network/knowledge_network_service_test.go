@@ -13,21 +13,84 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/common"
-	cond "ontology-query/common/condition"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
-	"ontology-query/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/data_type"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
 )
 
 type knowledgeNetworkProxyResolverStub struct {
 	bindings []interfaces.TrustedProxyBinding
 	err      error
+}
+
+func TestFilteredCrossJoinLikeUsesVegaResults(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	objects := omock.NewMockObjectTypeService(ctrl)
+	service := &knowledgeNetworkService{ots: objects}
+	objectType := &interfaces.ObjectType{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "products", PrimaryKeys: []string{"id"}}}
+	input := []interfaces.LevelObject{
+		{ObjectID: "id-1", ObjectUK: map[string]any{"id": "1"}, ObjectData: map[string]any{"name": "Apple"}, ObjectType: objectType},
+		{ObjectID: "id-2", ObjectUK: map[string]any{"id": "2"}, ObjectData: map[string]any{"name": "banana"}, ObjectType: objectType},
+	}
+	objects.EXPECT().ScanObjectsByObjectTypeID(gomock.Any(), gomock.Any(), 2).DoAndReturn(
+		func(_ context.Context, query *interfaces.ObjectQueryBaseOnObjectType, limit int) (interfaces.Objects, error) {
+			if query.KNID != "kn" || query.ObjectTypeID != "products" || !query.IgnoreLocalIndex || query.ActualCondition.Operation != cond.OperationAnd ||
+				len(query.ActualCondition.SubConds) != 2 || query.ActualCondition.SubConds[1].Value != "apple" {
+				t.Fatalf("wrong Vega query: %#v", query)
+			}
+			return interfaces.Objects{Datas: []map[string]any{{interfaces.SYSTEM_PROPERTY_INSTANCE_ID: "id-1"}}}, nil
+		})
+	filtered, err := service.filterLevelObjectsByCondition(context.Background(), "kn", "main", true, input,
+		&cond.CondCfg{Name: "name", Operation: cond.OperationLike, Value: "apple"}, false)
+	if err != nil || len(filtered) != 1 || filtered[0].ObjectID != "id-1" {
+		t.Fatalf("filtered = %#v, err = %v", filtered, err)
+	}
+}
+
+func TestFilteredCrossJoinExpandPreservesSourceFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	objects := omock.NewMockObjectTypeService(ctrl)
+	service := &knowledgeNetworkService{ots: objects, appSetting: &common.AppSetting{}}
+	sourceErr := httperrors.NewHTTPError(context.Background(), http.StatusServiceUnavailable, oerrors.OntologyQuery_InternalError)
+	objects.EXPECT().ScanObjectsByObjectTypeID(gomock.Any(), gomock.Any(), 1).
+		Return(interfaces.Objects{}, sourceErr)
+	_, err := service.expandFilteredCrossJoin(context.Background(),
+		&interfaces.SubGraphQueryBaseOnSource{KNID: "kn", Branch: "main"},
+		[]interfaces.LevelObject{{ObjectID: "source-1", ObjectUK: map[string]any{"id": "1"},
+			ObjectType: &interfaces.ObjectType{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "source"}}}},
+		&interfaces.TypeEdge{}, interfaces.ObjectTypeWithKeyField{}, true,
+		&interfaces.FilteredCrossJoinMapping{SourceCondition: &cond.CondCfg{Name: "name", Operation: cond.OperationLike, Value: "%test%"}})
+	if err != sourceErr {
+		t.Fatalf("expand error = %v, want source error %v", err, sourceErr)
+	}
+}
+
+func TestFilteredCrossJoinMatchSkipsInvalidInstance(t *testing.T) {
+	service := &knowledgeNetworkService{appSetting: &common.AppSetting{}}
+	objectType := &interfaces.ObjectType{}
+	source := []interfaces.LevelObject{
+		{ObjectID: "invalid", ObjectData: map[string]any{"date": "not-a-date"}, ObjectType: objectType},
+		{ObjectID: "valid", ObjectData: map[string]any{"date": "2025-01-01T00:00:00Z"}, ObjectType: objectType},
+	}
+	target := []interfaces.LevelObject{{ObjectID: "target", ObjectType: objectType}}
+	edge := &interfaces.TypeEdge{RelationTypeId: "relation", RelationType: interfaces.RelationType{
+		RTName: "relation", MappingRules: &interfaces.FilteredCrossJoinMapping{
+			SourceCondition: &cond.CondCfg{Name: "date", Operation: cond.OperationBefore, Value: "2026-01-01T00:00:00Z"},
+		},
+	}}
+	relations, err := service.matchFilteredCrossJoinRelations(context.Background(),
+		&interfaces.SubGraphQueryBaseOnObjects{KNID: "kn", Branch: "main"}, source, target, edge)
+	if err != nil || len(relations) != 1 || relations[0].SourceObjectId != "valid" || relations[0].TargetObjectId != "target" {
+		t.Fatalf("relations = %#v, err = %v", relations, err)
+	}
 }
 
 func (s *knowledgeNetworkProxyResolverStub) Resolve(ctx context.Context,
@@ -100,7 +163,7 @@ func Test_knowledgeNetworkService_SearchSubgraph(t *testing.T) {
 				},
 			}
 
-			omAccess.EXPECT().GetRelationTypePathsBaseOnSource(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			omAccess.EXPECT().GetRelationTypePathsBaseOnSource(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.SearchSubgraph(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -223,7 +286,7 @@ func Test_knowledgeNetworkService_SearchSubgraph(t *testing.T) {
 			}
 
 			omAccess.EXPECT().GetRelationTypePathsBaseOnSource(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(typePaths, nil)
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.SearchSubgraph(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -319,9 +382,9 @@ func Test_knowledgeNetworkService_SearchSubgraph(t *testing.T) {
 					return startObjects, nil
 				case "ot2":
 					// Get next-layer objects in buildObjectSubgraph -> getNextObjectsBatchByRelation and return an error.
-					return interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError)
+					return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError)
 				}
-				return interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError)
+				return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError)
 			}).AnyTimes()
 
 			result, err := service.SearchSubgraph(ctx, query)
@@ -428,7 +491,7 @@ func Test_knowledgeNetworkService_SearchSubgraphByTypePath(t *testing.T) {
 
 			result, err := service.SearchSubgraphByTypePath(ctx, query)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusNotFound)
 			So(result.Entries, ShouldBeNil)
@@ -451,7 +514,7 @@ func Test_knowledgeNetworkService_SearchSubgraphByTypePath(t *testing.T) {
 				},
 			}
 
-			omAccess.EXPECT().GetRelationType(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(interfaces.RelationType{}, false, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			omAccess.EXPECT().GetRelationType(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(interfaces.RelationType{}, false, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.SearchSubgraphByTypePath(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -489,7 +552,7 @@ func Test_knowledgeNetworkService_SearchSubgraphByTypePath(t *testing.T) {
 			}
 
 			omAccess.EXPECT().GetRelationType(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(relationType, true, nil)
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.SearchSubgraphByTypePath(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -583,10 +646,10 @@ func Test_knowledgeNetworkService_SearchSubgraphByTypePath(t *testing.T) {
 
 			result, err := service.SearchSubgraphByTypePath(ctx, query)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_KnowledgeNetwork_InvalidParameter_TypePath)
+			So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_KnowledgeNetwork_InvalidParameter_TypePath)
 			So(result.Entries, ShouldBeNil)
 		})
 	})
@@ -918,6 +981,7 @@ func Test_knowledgeNetworkService_buildObjectSubgraph(t *testing.T) {
 							RelationTypeId:     "rt1",
 							SourceObjectTypeId: sourceObjectTypeID,
 							TargetObjectTypeId: "ot2",
+							Direction:          interfaces.DIRECTION_FORWARD,
 							RelationType: interfaces.RelationType{
 								MappingRules: []interfaces.Mapping{
 									{
@@ -1021,6 +1085,7 @@ func Test_knowledgeNetworkService_buildObjectSubgraph(t *testing.T) {
 							RelationTypeId:     "rt1",
 							SourceObjectTypeId: sourceObjectTypeID,
 							TargetObjectTypeId: "ot2",
+							Direction:          interfaces.DIRECTION_FORWARD,
 							RelationType: interfaces.RelationType{
 								MappingRules: []interfaces.Mapping{
 									{
@@ -1050,7 +1115,7 @@ func Test_knowledgeNetworkService_buildObjectSubgraph(t *testing.T) {
 				},
 			}
 
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.buildObjectSubgraph(ctx, query, typePaths, startObjects)
 			So(err, ShouldNotBeNil)
@@ -1192,9 +1257,9 @@ func Test_knowledgeNetworkService_expandObjectPathsBatch(t *testing.T) {
 				}
 			}
 			activeOnly := &cond.CondCfg{
-				Name:        "status",
-				Operation:   cond.OperationEq,
-				ValueOptCfg: cond.ValueOptCfg{ValueFrom: "const", Value: "active"},
+				Name:      "status",
+				Operation: cond.OperationEq,
+				ValueFrom: "const", Value: "active",
 			}
 			typePath := interfaces.RelationTypePath{
 				ID: 1,
@@ -1436,6 +1501,102 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 			So(len(result), ShouldEqual, 1)
 		})
 
+		Convey("成功 - 复合键候选在limit前按记录分组", func() {
+			query := &interfaces.SubGraphQueryBaseOnSource{
+				KNID:   knID,
+				Branch: branch,
+				PageQuery: interfaces.PageQuery{
+					Limit: 1,
+				},
+			}
+			batch := []interfaces.LevelObject{
+				{
+					ObjectID: "employee-E01",
+					ObjectData: map[string]any{
+						"employee_code": "U001",
+						"org_code":      "A",
+					},
+				},
+			}
+			mappingRules := compositeEmployeeProjectMappingRules()
+			edge := &interfaces.TypeEdge{
+				RelationTypeId:     "employee-project",
+				SourceObjectTypeId: "employee",
+				TargetObjectTypeId: "project",
+				Direction:          interfaces.DIRECTION_FORWARD,
+				RelationType: interfaces.RelationType{
+					RTID:               "employee-project",
+					SourceObjectTypeID: "employee",
+					TargetObjectTypeID: "project",
+					MappingRules:       mappingRules,
+				},
+			}
+			service.proxy = &knowledgeNetworkProxyResolverStub{}
+			service.vba = &vegaStubForKNQuery{
+				resp: &interfaces.DatasetQueryResponse{
+					Entries: []map[string]any{
+						{
+							"membership_employee_code": "U001",
+							"membership_employee_org":  "A",
+							"membership_project_code":  "PR001",
+							"membership_project_org":   "A",
+						},
+						{
+							"membership_employee_code": "U001",
+							"membership_employee_org":  "A",
+							"membership_project_code":  "PR002",
+							"membership_project_org":   "B",
+						},
+					},
+				},
+			}
+
+			candidates := []map[string]any{
+				{"project_code": "PR001", "org_code": "B"},
+				{"project_code": "PR001", "org_code": "A"},
+				{"project_code": "PR002", "org_code": "B"},
+			}
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, q *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+					So(q.Limit, ShouldEqual, 1)
+					So(matchesTestCondition(q.ActualCondition, candidates[0]), ShouldBeFalse)
+					So(matchesTestCondition(q.ActualCondition, candidates[1]), ShouldBeTrue)
+					So(matchesTestCondition(q.ActualCondition, candidates[2]), ShouldBeTrue)
+
+					var hits []map[string]any
+					for _, candidate := range candidates {
+						if matchesTestCondition(q.ActualCondition, candidate) {
+							hits = append(hits, candidate)
+						}
+						if len(hits) == q.Limit {
+							break
+						}
+					}
+					return interfaces.Objects{
+						Datas: hits,
+						ObjectType: &interfaces.ObjectType{
+							ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+								OTID:        "project",
+								PrimaryKeys: []string{"project_code", "org_code"},
+							},
+						},
+					}, nil
+				})
+
+			result, err := service.getNextObjectsBatchByRelation(
+				ctx,
+				query,
+				batch,
+				edge,
+				interfaces.ObjectTypeWithKeyField{OTID: "project"},
+			)
+			So(err, ShouldBeNil)
+			So(result, ShouldContainKey, "employee-E01")
+			So(result["employee-E01"].Datas, ShouldResemble, []map[string]any{
+				{"project_code": "PR001", "org_code": "A"},
+			})
+		})
+
 		Convey("成功 - 反向关系获取下一层对象-1", func() {
 			query := &interfaces.SubGraphQueryBaseOnSource{
 				KNID:   knID,
@@ -1449,7 +1610,7 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 				{
 					ObjectID: "obj1",
 					ObjectData: map[string]any{
-						"id": "123",
+						"target_id": "123",
 					},
 				},
 			}
@@ -1560,7 +1721,7 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 				OTID: "ot2",
 			}
 
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
+			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError))
 
 			result, err := service.getNextObjectsBatchByRelation(ctx, query, batch, edge, objectType)
 			So(err, ShouldNotBeNil)
@@ -1577,7 +1738,7 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 				{
 					ObjectID: "obj1",
 					ObjectData: map[string]any{
-						"id": "123",
+						"target_id": "123",
 					},
 				},
 			}
@@ -1605,7 +1766,7 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 
 			nextObjects := interfaces.Objects{
 				Datas: []map[string]any{
-					{"target_id": "123"},
+					{"id": "123"},
 				},
 				TotalCount: 1,
 				ObjectType: &interfaces.ObjectType{
@@ -1666,9 +1827,7 @@ func Test_knowledgeNetworkService_getNextObjectsBatchByRelation(t *testing.T) {
 				ActualCondition: &cond.CondCfg{
 					Name:      "status",
 					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "active",
-					},
+					Value:     "active",
 				},
 				PageQuery: interfaces.PageQuery{
 					Sort: []*interfaces.SortParams{
@@ -1887,7 +2046,7 @@ func Test_knowledgeNetworkService_buildIndirectBatchConditions(t *testing.T) {
 
 			conditions, viewDataMap, err := service.buildIndirectBatchConditions(ctx, query, currentLevelObjects, edge, true)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 			So(conditions, ShouldBeNil)
@@ -1983,7 +2142,7 @@ func Test_knowledgeNetworkService_buildIndirectBatchConditions(t *testing.T) {
 			}
 
 			service.vba = &vegaStubForKNQuery{
-				err: rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError),
+				err: httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError),
 			}
 
 			conditions, viewDataMap, err := service.buildIndirectBatchConditions(ctx, query, currentLevelObjects, edge, true)
@@ -2151,6 +2310,229 @@ func Test_knowledgeNetworkService_buildIndirectBatchConditions(t *testing.T) {
 			So(conditions[0].Operation, ShouldEqual, "in")
 			So(viewDataMap, ShouldNotBeNil)
 		})
+
+		Convey("成功 - 复合键按中间表记录生成OR包含AND", func() {
+			query := &interfaces.SubGraphQueryBaseOnSource{KNID: knID}
+			currentLevelObjects := []interfaces.LevelObject{
+				{
+					ObjectID: "employee-E01",
+					ObjectData: map[string]any{
+						"employee_code": "U001",
+						"org_code":      "A",
+					},
+				},
+			}
+			edge := &interfaces.TypeEdge{
+				RelationType: interfaces.RelationType{
+					RTName:       "employee-project",
+					MappingRules: compositeEmployeeProjectMappingRules(),
+				},
+			}
+			service.vba = &vegaStubForKNQuery{
+				resp: &interfaces.DatasetQueryResponse{
+					Entries: []map[string]any{
+						{
+							"membership_employee_code": "U001",
+							"membership_employee_org":  "A",
+							"membership_project_code":  "PR001",
+							"membership_project_org":   "A",
+						},
+						{
+							"membership_employee_code": "U001",
+							"membership_employee_org":  "A",
+							"membership_project_code":  "PR002",
+							"membership_project_org":   "B",
+						},
+					},
+				},
+			}
+
+			conditions, viewDataMap, err := service.buildIndirectBatchConditions(
+				ctx,
+				query,
+				currentLevelObjects,
+				edge,
+				true,
+			)
+			So(err, ShouldBeNil)
+			So(viewDataMap["employee-E01"], ShouldHaveLength, 2)
+			So(conditions, ShouldHaveLength, 1)
+			So(conditions[0].Operation, ShouldEqual, cond.OperationOr)
+			So(conditions[0].SubConds, ShouldHaveLength, 2)
+			So(conditions[0].SubConds[0].Operation, ShouldEqual, cond.OperationAnd)
+			So(conditions[0].SubConds[1].Operation, ShouldEqual, cond.OperationAnd)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR001",
+				"org_code":     "A",
+			}), ShouldBeTrue)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR002",
+				"org_code":     "B",
+			}), ShouldBeTrue)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR001",
+				"org_code":     "B",
+			}), ShouldBeFalse)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR999",
+				"org_code":     "A",
+			}), ShouldBeFalse)
+		})
+
+		Convey("成功 - 复合键条件去重并按子条件上限分组", func() {
+			uniqueTargetCount := cond.MaxSubCondition + 1
+			entries := make([]map[string]any, 0, uniqueTargetCount+1)
+			for i := 0; i < uniqueTargetCount; i++ {
+				entries = append(entries, map[string]any{
+					"membership_employee_code": "U001",
+					"membership_employee_org":  "A",
+					"membership_project_code":  fmt.Sprintf("PR%03d", i),
+					"membership_project_org":   fmt.Sprintf("ORG%03d", i),
+				})
+			}
+			entries = append(entries, map[string]any{
+				"membership_employee_code": "U001",
+				"membership_employee_org":  "A",
+				"membership_project_code":  "PR000",
+				"membership_project_org":   "ORG000",
+			})
+
+			service.vba = &vegaStubForKNQuery{
+				resp: &interfaces.DatasetQueryResponse{Entries: entries},
+			}
+			conditions, viewDataMap, err := service.buildIndirectBatchConditions(
+				ctx,
+				&interfaces.SubGraphQueryBaseOnSource{KNID: knID},
+				[]interfaces.LevelObject{
+					{
+						ObjectID: "employee-E01",
+						ObjectData: map[string]any{
+							"employee_code": "U001",
+							"org_code":      "A",
+						},
+					},
+				},
+				&interfaces.TypeEdge{
+					RelationType: interfaces.RelationType{
+						RTName:       "employee-project",
+						MappingRules: compositeEmployeeProjectMappingRules(),
+					},
+				},
+				true,
+			)
+			So(err, ShouldBeNil)
+			So(viewDataMap["employee-E01"], ShouldHaveLength, uniqueTargetCount+1)
+			So(conditions, ShouldHaveLength, 1)
+			So(maxConditionFanOut(conditions[0]), ShouldBeLessThanOrEqualTo, cond.MaxSubCondition)
+			So(countConditionOperations(conditions[0], cond.OperationAnd), ShouldEqual, uniqueTargetCount)
+
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR000",
+				"org_code":     "ORG000",
+			}), ShouldBeTrue)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": fmt.Sprintf("PR%03d", uniqueTargetCount-1),
+				"org_code":     fmt.Sprintf("ORG%03d", uniqueTargetCount-1),
+			}), ShouldBeTrue)
+			So(matchesTestCondition(conditions[0], map[string]any{
+				"project_code": "PR000",
+				"org_code":     "ORG001",
+			}), ShouldBeFalse)
+
+			fieldsMap := map[string]*cond.DataProperty{
+				"project_code": {
+					Name:        "project_code",
+					Type:        dtype.DATATYPE_STRING,
+					MappedField: cond.Field{Name: "project_code"},
+				},
+				"org_code": {
+					Name:        "org_code",
+					Type:        dtype.DATATYPE_STRING,
+					MappedField: cond.Field{Name: "org_code"},
+				},
+			}
+			_, err = cond.RewriteCondition(ctx, conditions[0], fieldsMap, nil)
+			So(err, ShouldBeNil)
+		})
+	})
+}
+
+func Test_knowledgeNetworkService_compositeIndirectRelationFixture(t *testing.T) {
+	Convey("Test composite indirect relation fixture", t, func() {
+		service := &knowledgeNetworkService{
+			appSetting: &common.AppSetting{},
+			proxy:      &knowledgeNetworkProxyResolverStub{},
+		}
+		service.vba = &vegaStubForKNQuery{
+			resp: &interfaces.DatasetQueryResponse{
+				Entries: []map[string]any{
+					{"membership_id": "M01", "membership_employee_code": "U001", "membership_employee_org": "A", "membership_project_code": "PR001", "membership_project_org": "A"},
+					{"membership_id": "M02", "membership_employee_code": "U001", "membership_employee_org": "A", "membership_project_code": "PR002", "membership_project_org": "A"},
+					{"membership_id": "M03", "membership_employee_code": "U001", "membership_employee_org": "B", "membership_project_code": "PR001", "membership_project_org": "B"},
+					{"membership_id": "M04", "membership_employee_code": "U002", "membership_employee_org": "A", "membership_project_code": "PR001", "membership_project_org": "A"},
+					{"membership_id": "M05", "membership_employee_code": "U001", "membership_employee_org": "Z", "membership_project_code": "PR003", "membership_project_org": "C"},
+					{"membership_id": "M06", "membership_employee_code": "U999", "membership_employee_org": "A", "membership_project_code": "PR003", "membership_project_org": "C"},
+					{"membership_id": "M07", "membership_employee_code": "U001", "membership_employee_org": "A", "membership_project_code": "PR003", "membership_project_org": "Z"},
+					{"membership_id": "M08", "membership_employee_code": "U001", "membership_employee_org": "A", "membership_project_code": "PR999", "membership_project_org": "C"},
+					{"membership_id": "M09", "membership_employee_code": "U999", "membership_employee_org": "Z", "membership_project_code": "PR999", "membership_project_org": "Z"},
+					{"membership_id": "M10", "membership_employee_code": "U003", "membership_employee_org": "C", "membership_project_code": "PR003", "membership_project_org": "C"},
+					{"membership_id": "M11", "membership_employee_code": "U001", "membership_employee_org": "B", "membership_project_code": "PR003", "membership_project_org": "C"},
+					{"membership_id": "M12", "membership_employee_code": "U002", "membership_employee_org": "A", "membership_project_code": "PR001", "membership_project_org": "B"},
+				},
+			},
+		}
+		currentLevelObjects := []interfaces.LevelObject{
+			{ObjectID: "E01", ObjectData: map[string]any{"employee_code": "U001", "org_code": "A"}},
+			{ObjectID: "E02", ObjectData: map[string]any{"employee_code": "U001", "org_code": "B"}},
+			{ObjectID: "E03", ObjectData: map[string]any{"employee_code": "U002", "org_code": "A"}},
+			{ObjectID: "E04", ObjectData: map[string]any{"employee_code": "U003", "org_code": "C"}},
+		}
+		edge := &interfaces.TypeEdge{
+			RelationType: interfaces.RelationType{
+				RTName:       "employee-project",
+				MappingRules: compositeEmployeeProjectMappingRules(),
+			},
+		}
+
+		conditions, viewDataMap, err := service.buildIndirectBatchConditions(
+			context.Background(),
+			&interfaces.SubGraphQueryBaseOnSource{KNID: "kn1"},
+			currentLevelObjects,
+			edge,
+			true,
+		)
+		So(err, ShouldBeNil)
+		So(conditions, ShouldHaveLength, 4)
+		So(conditions[3].Operation, ShouldEqual, cond.OperationAnd)
+		So(conditions[3].SubConds, ShouldHaveLength, 2)
+		So(viewDataMap["E01"], ShouldHaveLength, 4)
+		So(viewDataMap["E02"], ShouldHaveLength, 2)
+		So(viewDataMap["E03"], ShouldHaveLength, 2)
+		So(viewDataMap["E04"], ShouldHaveLength, 1)
+
+		nextObjects := interfaces.Objects{
+			Datas: []map[string]any{
+				{"project_uid": "P01", "project_code": "PR001", "org_code": "A"},
+				{"project_uid": "P02", "project_code": "PR001", "org_code": "B"},
+				{"project_uid": "P03", "project_code": "PR002", "org_code": "A"},
+				{"project_uid": "P04", "project_code": "PR003", "org_code": "C"},
+			},
+		}
+		result := make(map[string]interfaces.Objects)
+		service.mapResultsToObjects(currentLevelObjects, nextObjects, result, edge, true, viewDataMap)
+
+		projectIDs := func(objects interfaces.Objects) []string {
+			ids := make([]string, 0, len(objects.Datas))
+			for _, project := range objects.Datas {
+				ids = append(ids, project["project_uid"].(string))
+			}
+			return ids
+		}
+		So(projectIDs(result["E01"]), ShouldResemble, []string{"P01", "P03"})
+		So(projectIDs(result["E02"]), ShouldResemble, []string{"P02", "P04"})
+		So(projectIDs(result["E03"]), ShouldResemble, []string{"P01", "P02"})
+		So(projectIDs(result["E04"]), ShouldResemble, []string{"P04"})
+		So(result["E01"].TotalCount+result["E02"].TotalCount+result["E03"].TotalCount+result["E04"].TotalCount, ShouldEqual, int64(7))
 	})
 }
 
@@ -2269,7 +2651,7 @@ func Test_knowledgeNetworkService_batchGetViewData(t *testing.T) {
 			}
 
 			service.vba = &vegaStubForKNQuery{
-				err: rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError),
+				err: httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError),
 			}
 
 			result, err := service.batchGetViewData(ctx, query, edge, currentLevelObjects, mappingRules, true)
@@ -2397,9 +2779,7 @@ func Test_knowledgeNetworkService_mapViewDataToObjects(t *testing.T) {
 				{
 					Name:      "view_id",
 					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "123",
-					},
+					Value:     "123",
 				},
 			}
 
@@ -2447,9 +2827,7 @@ func Test_knowledgeNetworkService_mapViewDataToObjects(t *testing.T) {
 				{
 					Name:      "view_id",
 					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "123",
-					},
+					Value:     "123",
 				},
 			}
 
@@ -2486,9 +2864,7 @@ func Test_knowledgeNetworkService_mapViewDataToObjects(t *testing.T) {
 				{
 					Name:      "id", // The condition field name should correspond to SourceProp.Name.
 					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "123",
-					},
+					Value:     "123",
 				},
 			}
 
@@ -2537,6 +2913,61 @@ func resourceBacking(id string) *interfaces.ResourceInfo {
 		Type: interfaces.DATA_SOURCE_TYPE_RESOURCE,
 		ID:   id,
 	}
+}
+
+func compositeEmployeeProjectMappingRules() *interfaces.InDirectMapping {
+	return &interfaces.InDirectMapping{
+		BackingDataSource: resourceBacking("membership-resource"),
+		SourceMappingRules: []interfaces.Mapping{
+			{
+				SourceProp: interfaces.SimpleProperty{Name: "employee_code"},
+				TargetProp: interfaces.SimpleProperty{Name: "membership_employee_code"},
+			},
+			{
+				SourceProp: interfaces.SimpleProperty{Name: "org_code"},
+				TargetProp: interfaces.SimpleProperty{Name: "membership_employee_org"},
+			},
+		},
+		TargetMappingRules: []interfaces.Mapping{
+			{
+				SourceProp: interfaces.SimpleProperty{Name: "membership_project_code"},
+				TargetProp: interfaces.SimpleProperty{Name: "project_code"},
+			},
+			{
+				SourceProp: interfaces.SimpleProperty{Name: "membership_project_org"},
+				TargetProp: interfaces.SimpleProperty{Name: "org_code"},
+			},
+		},
+	}
+}
+
+func maxConditionFanOut(condition *cond.CondCfg) int {
+	if condition == nil {
+		return 0
+	}
+
+	maxFanOut := len(condition.SubConds)
+	for _, subCondition := range condition.SubConds {
+		if subFanOut := maxConditionFanOut(subCondition); subFanOut > maxFanOut {
+			maxFanOut = subFanOut
+		}
+	}
+	return maxFanOut
+}
+
+func countConditionOperations(condition *cond.CondCfg, operation string) int {
+	if condition == nil {
+		return 0
+	}
+
+	count := 0
+	if condition.Operation == operation {
+		count++
+	}
+	for _, subCondition := range condition.SubConds {
+		count += countConditionOperations(subCondition, operation)
+	}
+	return count
 }
 
 // matchesTestCondition evaluates the and/or/==/in subset of conditions the

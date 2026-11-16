@@ -16,13 +16,14 @@ import (
 	"testing"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	rmock "github.com/openbkn-ai/bkn-foundry/comm-go/rest/mock"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/common"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 // newTestOntologyManagerAccess creates an ontologyManagerAccess for tests and allows injecting a mock HTTP client.
@@ -171,7 +172,7 @@ func Test_ontologyManagerAccess_GetObjectType(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 
-			baseError := rest.BaseError{
+			baseError := httperrors.BaseError{
 				ErrorCode:   "ERROR_CODE",
 				Description: "Error description",
 			}
@@ -184,7 +185,7 @@ func Test_ontologyManagerAccess_GetObjectType(t *testing.T) {
 			result, exists, err := oma.GetObjectType(ctx, knID, branch, otID)
 
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusForbidden)
 			So(exists, ShouldBeFalse)
@@ -300,53 +301,6 @@ func Test_ontologyManagerAccess_GetObjectType(t *testing.T) {
 	})
 }
 
-func TestOntologyManagerAccessGetMetricExecutionContext(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	httpClient := rmock.NewMockHTTPClient(ctrl)
-	access := newTestOntologyManagerAccess(&common.AppSetting{BKNBackendUrl: "http://test-om"}, httpClient)
-	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
-		interfaces.AccountInfo{ID: "metric-reader", Type: "user"})
-
-	t.Run("decodes trusted execution context", func(t *testing.T) {
-		body, err := sonic.Marshal(interfaces.MetricExecutionContext{
-			Definition: &interfaces.MetricDefinition{ID: "metric-1", KnID: "kn-1", ScopeRef: "orders"},
-			ObjectType: &interfaces.ObjectType{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-				OTID: "orders", DataSource: &interfaces.ResourceInfo{Type: "resource", ID: "resource-1"},
-			}},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		httpClient.EXPECT().GetNoUnmarshal(gomock.Any(),
-			"http://test-om/kn-1/metrics/metric-1/execution-context?branch=main", nil,
-			map[string]string{
-				interfaces.CONTENT_TYPE_NAME:        interfaces.CONTENT_TYPE_JSON,
-				interfaces.HTTP_HEADER_ACCOUNT_ID:   "metric-reader",
-				interfaces.HTTP_HEADER_ACCOUNT_TYPE: "user",
-			}).Return(http.StatusOK, body, nil)
-
-		result, err := access.GetMetricExecutionContext(ctx, "kn-1", "main", "metric-1")
-		if err != nil || result.Definition.ID != "metric-1" || result.ObjectType.DataSource.ID != "resource-1" {
-			t.Fatalf("GetMetricExecutionContext() = (%#v, %v)", result, err)
-		}
-	})
-
-	t.Run("preserves authorization status", func(t *testing.T) {
-		body, err := sonic.Marshal(rest.BaseError{ErrorCode: rest.PublicError_Forbidden})
-		if err != nil {
-			t.Fatal(err)
-		}
-		httpClient.EXPECT().GetNoUnmarshal(gomock.Any(), gomock.Any(), nil, gomock.Any()).
-			Return(http.StatusForbidden, body, nil)
-
-		_, err = access.GetMetricExecutionContext(ctx, "kn-1", "main", "metric-1")
-		httpErr, ok := err.(*rest.HTTPError)
-		if !ok || httpErr.HTTPCode != http.StatusForbidden {
-			t.Fatalf("GetMetricExecutionContext() error = %#v, want HTTP 403", err)
-		}
-	})
-}
-
 func Test_ontologyManagerAccess_GetRelationType(t *testing.T) {
 	Convey("Test ontologyManagerAccess GetRelationType", t, func() {
 		mockCtrl := gomock.NewController(t)
@@ -442,7 +396,7 @@ func Test_ontologyManagerAccess_GetRelationType(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 
-			baseError := rest.BaseError{
+			baseError := httperrors.BaseError{
 				ErrorCode:   "ERROR_CODE",
 				Description: "Error description",
 			}
@@ -570,7 +524,7 @@ func Test_ontologyManagerAccess_GetActionType(t *testing.T) {
 			ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 
 			actionType := interfaces.ActionType{
-				ATID: atID,
+				ATID: atID, Comment: "Restart the selected pod",
 			}
 			response := struct {
 				ActionTypes []interfaces.ActionType `json:"entries"`
@@ -588,8 +542,23 @@ func Test_ontologyManagerAccess_GetActionType(t *testing.T) {
 			So(err, ShouldBeNil)
 			So(exists, ShouldBeTrue)
 			So(result.ATID, ShouldEqual, atID)
+			So(result.Comment, ShouldEqual, "Restart the selected pod")
 			So(rawSnapshot, ShouldNotBeNil)
 			So(rawSnapshot["id"], ShouldEqual, atID)
+		})
+
+		Convey("preserves large integer constants in the action snapshot", func() {
+			mockHTTPClient.EXPECT().
+				GetNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Return(http.StatusOK, []byte(`{"entries":[{"id":"at1","parameters":[{"name":"payload.large_integer","type":"integer","source":"body","value_from":"const","value":9007199254740993}]}]}`), nil)
+
+			result, snapshot, exists, err := oma.GetActionType(ctx, knID, branch, atID)
+			So(err, ShouldBeNil)
+			So(exists, ShouldBeTrue)
+			So(result.Parameters[0].Value, ShouldEqual, json.Number("9007199254740993"))
+			parameters := snapshot["parameters"].([]any)
+			value := parameters[0].(map[string]any)["value"]
+			So(value, ShouldEqual, json.Number("9007199254740993"))
 		})
 
 		Convey("失败 - HTTP 请求错误", func() {
@@ -637,7 +606,7 @@ func Test_ontologyManagerAccess_GetActionType(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 
-			baseError := rest.BaseError{
+			baseError := httperrors.BaseError{
 				ErrorCode:   "ERROR_CODE",
 				Description: "Error description",
 			}
@@ -855,7 +824,7 @@ func Test_ontologyManagerAccess_GetRelationTypePathsBaseOnSource(t *testing.T) {
 			}
 			ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
 
-			baseError := rest.BaseError{
+			baseError := httperrors.BaseError{
 				ErrorCode:   "ERROR_CODE",
 				Description: "Error description",
 			}
@@ -932,9 +901,9 @@ func Test_ontologyManagerAccess_GetRelationTypePathsBaseOnSource(t *testing.T) {
 
 func assertOntologyManagerHTTPStatus(t *testing.T, err error, expected int) {
 	t.Helper()
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		t.Fatalf("error = %T %v, want a wrapped *rest.HTTPError", err, err)
+		t.Fatalf("error = %T %v, want a wrapped *httperrors.HTTPError", err, err)
 	}
 	if httpErr.HTTPCode != expected {
 		t.Fatalf("HTTP status = %d, want %d", httpErr.HTTPCode, expected)

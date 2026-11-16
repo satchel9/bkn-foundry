@@ -15,13 +15,15 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"ontology-query/common"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 var (
@@ -40,7 +42,7 @@ func NewOntologyManagerAccess(appSetting *common.AppSetting) interfaces.Ontology
 		omAccess = &ontologyManagerAccess{
 			appSetting:         appSetting,
 			ontologyManagerUrl: appSetting.BKNBackendUrl,
-			httpClient:         common.NewHTTPClient(),
+			httpClient:         newVersionAwareHTTPClient(),
 		}
 	})
 	return omAccess
@@ -49,7 +51,7 @@ func NewOntologyManagerAccess(appSetting *common.AppSetting) interfaces.Ontology
 // Get object type information.
 func (oma *ontologyManagerAccess) GetObjectType(ctx context.Context, knID string, branch string, otID string) (interfaces.ObjectType, bool, error) {
 
-	httpUrl := fmt.Sprintf("%s/%s/object-types/%s?branch=%s", oma.ontologyManagerUrl, knID, otID, branch)
+	httpUrl := fmt.Sprintf("%s/%s/object-types/%s?branch=%s", oma.ontologyManagerUrl, knID, otID, branch) + versionQuery(ctx)
 	// When the HTTP client sends a request, RoundTrip uses transport; at this point the transport is otelhttp.NewTransport.
 	// otelhttp.NewTransport injects the propagator during RoundTrip, that is, t.propagators.Inject.
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 ontology-manager 获取对象类信息")
@@ -86,10 +88,13 @@ func (oma *ontologyManagerAccess) GetObjectType(ctx context.Context, knID string
 		// Log the exception.
 		otellog.LogError(ctx, fmt.Sprintf("Get object type request failed: %v", err), err)
 
-		return emptyObjectType, false, fmt.Errorf("get request method failed: %v", err)
+		return emptyObjectType, false, fmt.Errorf("get request method failed: %w", err)
 	}
 
 	if respCode == http.StatusNotFound {
+		if versionErr := versionRefusal(ctx, result); versionErr != nil {
+			return emptyObjectType, false, versionErr
+		}
 		logger.Errorf("object type %s not exists", otID)
 
 		// Add trace attributes for the exception.
@@ -102,7 +107,7 @@ func (oma *ontologyManagerAccess) GetObjectType(ctx context.Context, knID string
 
 	if respCode != http.StatusOK {
 
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 
 			// Add trace attributes for the exception.
@@ -112,7 +117,7 @@ func (oma *ontologyManagerAccess) GetObjectType(ctx context.Context, knID string
 
 			return emptyObjectType, false, err
 		}
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed, baseError)
 
 		// Add trace attributes for the exception.
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
@@ -159,97 +164,15 @@ func (oma *ontologyManagerAccess) GetObjectType(ctx context.Context, knID string
 	return response.ObjectTypes[0], true, nil
 }
 
-// GetMetricDefinition gets metric details using the same bkn-backend base URL and auth headers as GetObjectType.
-func (oma *ontologyManagerAccess) GetMetricDefinition(ctx context.Context, knID string, branch string,
-	metricID string) (*interfaces.MetricDefinition, bool, error) {
+// GetObjectMetricExecutionContext loads one immutable object-metric version
+// together with its complete, version-pinned dependency closure. The internal
+// bkn-backend endpoint performs metric query_data authorization for the caller.
+func (oma *ontologyManagerAccess) GetObjectMetricExecutionContext(ctx context.Context, knID string, branch string,
+	metricID string, version int) (*interfaces.ObjectMetricExecutionContextV1, error) {
 
-	httpURL := fmt.Sprintf("%s/%s/metrics/%s?branch=%s", oma.ontologyManagerUrl, knID, metricID, branch)
-
-	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 bkn-backend 获取指标定义")
-	oteltrace.AddAttrs4InternalHttp(span, oteltrace.TraceAttrs{
-		HttpUrl:         httpURL,
-		HttpMethod:      http.MethodGet,
-		HttpContentType: rest.ContentTypeJson,
-	})
-	defer span.End()
-
-	var (
-		respCode int
-		result   []byte
-		err      error
-	)
-
-	accountInfo := interfaces.AccountInfo{}
-	if ctx.Value(interfaces.ACCOUNT_INFO_KEY) != nil {
-		accountInfo = ctx.Value(interfaces.ACCOUNT_INFO_KEY).(interfaces.AccountInfo)
-	}
-
-	headers := map[string]string{
-		interfaces.CONTENT_TYPE_NAME:        interfaces.CONTENT_TYPE_JSON,
-		interfaces.HTTP_HEADER_ACCOUNT_ID:   accountInfo.ID,
-		interfaces.HTTP_HEADER_ACCOUNT_TYPE: accountInfo.Type,
-	}
-
-	respCode, result, err = oma.httpClient.GetNoUnmarshal(ctx, httpURL, nil, headers)
-
-	if err != nil {
-		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http Get Failed")
-		otellog.LogError(ctx, fmt.Sprintf("Get metric definition request failed: %v", err), err)
-		return nil, false, fmt.Errorf("get metric definition request failed: %v", err)
-	}
-
-	if respCode == http.StatusNotFound {
-		oteltrace.AddHttpAttrs4Ok(span, respCode)
-		otellog.LogWarn(ctx, fmt.Sprintf("metric %s not found", metricID))
-		return nil, false, nil
-	}
-
-	if respCode != http.StatusOK {
-		var baseError rest.BaseError
-		if err = sonic.Unmarshal(result, &baseError); err != nil {
-			oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal BaseError failed")
-			otellog.LogError(ctx, fmt.Sprintf("Unmarshal BaseError failed: %v", err), err)
-			return nil, false, err
-		}
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
-		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
-		otellog.LogError(ctx, fmt.Sprintf("Get metric definition failed: %v", httpErr), httpErr)
-		return nil, false, httpErr
-	}
-
-	if result == nil {
-		oteltrace.AddHttpAttrs4Ok(span, respCode)
-		otellog.LogWarn(ctx, "Http response body is null")
-		return nil, false, nil
-	}
-
-	var response struct {
-		Entries []*interfaces.MetricDefinition `json:"entries"`
-	}
-	if err = sonic.Unmarshal(result, &response); err != nil {
-		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal metric definition failed")
-		otellog.LogError(ctx, fmt.Sprintf("Unmarshal metric definition failed: %v", err), err)
-		return nil, false, err
-	}
-
-	if len(response.Entries) == 0 {
-		return nil, false, nil
-	}
-
-	oteltrace.AddHttpAttrs4Ok(span, respCode)
-	return response.Entries[0], true, nil
-}
-
-// GetMetricExecutionContext loads the minimal published object schema that the
-// metric captured. bkn-backend authorizes this endpoint against metric
-// query_data, so ontology-query does not perform a second caller-scoped object
-// type read.
-func (oma *ontologyManagerAccess) GetMetricExecutionContext(ctx context.Context, knID string, branch string,
-	metricID string) (*interfaces.MetricExecutionContext, error) {
-
-	httpURL := fmt.Sprintf("%s/%s/metrics/%s/execution-context?branch=%s",
-		oma.ontologyManagerUrl, knID, metricID, branch)
-	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Get metric execution context")
+	httpURL := fmt.Sprintf("%s/%s/object-metrics/%s/execution-context?branch=%s&version=%d",
+		oma.ontologyManagerUrl, knID, metricID, branch, version) + versionQuery(ctx)
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Get object metric execution context")
 	oteltrace.AddAttrs4InternalHttp(span, oteltrace.TraceAttrs{
 		HttpUrl: httpURL, HttpMethod: http.MethodGet, HttpContentType: rest.ContentTypeJson,
 	})
@@ -267,28 +190,29 @@ func (oma *ontologyManagerAccess) GetMetricExecutionContext(ctx context.Context,
 	respCode, result, err := oma.httpClient.GetNoUnmarshal(ctx, httpURL, nil, headers)
 	if err != nil {
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "HTTP GET failed")
-		return nil, fmt.Errorf("get metric execution context: %w", err)
+		return nil, fmt.Errorf("get object metric execution context: %w", err)
 	}
 	if respCode != http.StatusOK {
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err := sonic.Unmarshal(result, &baseError); err != nil {
 			oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal BaseError failed")
 			return nil, err
 		}
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_Metric_InternalError_QueryFailed, baseError)
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "HTTP status is not 200")
 		return nil, httpErr
 	}
 	if len(result) == 0 {
-		return nil, fmt.Errorf("metric execution context response is empty")
+		return nil, fmt.Errorf("object metric execution context response is empty")
 	}
-	var executionContext interfaces.MetricExecutionContext
-	if err := sonic.Unmarshal(result, &executionContext); err != nil {
+	var executionContext interfaces.ObjectMetricExecutionContextV1
+	if err := common.UnmarshalPreciseJSON(result, &executionContext); err != nil {
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal execution context failed")
 		return nil, err
 	}
-	if executionContext.Definition == nil || executionContext.ObjectType == nil {
-		return nil, fmt.Errorf("metric execution context is incomplete")
+	if executionContext.Root == nil || executionContext.Root.Definition.ID != metricID ||
+		executionContext.Root.Definition.Version != version {
+		return nil, fmt.Errorf("object metric execution context does not match requested version")
 	}
 	oteltrace.AddHttpAttrs4Ok(span, respCode)
 	return &executionContext, nil
@@ -297,7 +221,7 @@ func (oma *ontologyManagerAccess) GetMetricExecutionContext(ctx context.Context,
 func (oma *ontologyManagerAccess) GetRelationTypePathsBaseOnSource(ctx context.Context, knID string,
 	branch string, query interfaces.PathsQueryBaseOnSource) ([]interfaces.RelationTypePath, error) {
 
-	url := fmt.Sprintf("%s/%s/relation-type-paths?branch=%s", oma.ontologyManagerUrl, knID, branch)
+	url := fmt.Sprintf("%s/%s/relation-type-paths?branch=%s", oma.ontologyManagerUrl, knID, branch) + versionQuery(ctx)
 
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 ontology-manager 获取关系类路径信息")
 	oteltrace.AddAttrs4InternalHttp(span, oteltrace.TraceAttrs{
@@ -330,12 +254,12 @@ func (oma *ontologyManagerAccess) GetRelationTypePathsBaseOnSource(ctx context.C
 		// Log the exception.
 		otellog.LogError(ctx, fmt.Sprintf("Get relation type paths request failed: %v", err), err)
 
-		return nil, fmt.Errorf("get request method failed: %v", err)
+		return nil, fmt.Errorf("get request method failed: %w", err)
 	}
 
 	if respCode != http.StatusOK {
 
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 
 			// Add trace attributes for the exception.
@@ -346,7 +270,7 @@ func (oma *ontologyManagerAccess) GetRelationTypePathsBaseOnSource(ctx context.C
 			return nil, err
 		}
 
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_KnowledgeNetwork_InternalError_GetRelationTypeFailed, baseError)
 
 		// Add trace attributes for the exception.
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
@@ -451,7 +375,7 @@ func decodeRelationTypeMappingRules(relationType *interfaces.RelationType) error
 func (oma *ontologyManagerAccess) GetRelationType(ctx context.Context, knID string,
 	branch string, rtID string) (interfaces.RelationType, bool, error) {
 
-	httpUrl := fmt.Sprintf("%s/%s/relation-types/%s?branch=%s", oma.ontologyManagerUrl, knID, rtID, branch)
+	httpUrl := fmt.Sprintf("%s/%s/relation-types/%s?branch=%s", oma.ontologyManagerUrl, knID, rtID, branch) + versionQuery(ctx)
 	// When the HTTP client sends a request, RoundTrip uses transport; at this point the transport is otelhttp.NewTransport.
 	// otelhttp.NewTransport injects the propagator during RoundTrip, that is, t.propagators.Inject.
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 ontology-manager 获取关系类信息")
@@ -488,10 +412,13 @@ func (oma *ontologyManagerAccess) GetRelationType(ctx context.Context, knID stri
 		// Log the exception.
 		otellog.LogError(ctx, fmt.Sprintf("Get relation type request failed: %v", err), err)
 
-		return emptyRelationType, false, fmt.Errorf("get request method failed: %v", err)
+		return emptyRelationType, false, fmt.Errorf("get request method failed: %w", err)
 	}
 
 	if respCode == http.StatusNotFound {
+		if versionErr := versionRefusal(ctx, result); versionErr != nil {
+			return emptyRelationType, false, versionErr
+		}
 		logger.Errorf("relation type %s not exists", rtID)
 
 		// Add trace attributes for the exception.
@@ -504,7 +431,7 @@ func (oma *ontologyManagerAccess) GetRelationType(ctx context.Context, knID stri
 
 	if respCode != http.StatusOK {
 
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 
 			// Add trace attributes for the exception.
@@ -515,7 +442,7 @@ func (oma *ontologyManagerAccess) GetRelationType(ctx context.Context, knID stri
 			return emptyRelationType, false, err
 		}
 
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_KnowledgeNetwork_InternalError_GetRelationTypeFailed, baseError)
 
 		// Add trace attributes for the exception.
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
@@ -566,7 +493,7 @@ func (oma *ontologyManagerAccess) GetRelationType(ctx context.Context, knID stri
 func (oma *ontologyManagerAccess) ListRelationTypes(ctx context.Context, knID string,
 	branch string, query interfaces.RelationTypesQuery) ([]interfaces.RelationType, error) {
 
-	httpUrl := fmt.Sprintf("%s/%s/relation-types?branch=%s&limit=-1", oma.ontologyManagerUrl, knID, branch)
+	httpUrl := fmt.Sprintf("%s/%s/relation-types?branch=%s&limit=-1", oma.ontologyManagerUrl, knID, branch) + versionQuery(ctx)
 
 	// Support querying multiple object type IDs.
 	if len(query.SourceObjectTypeIDs) > 0 {
@@ -613,19 +540,19 @@ func (oma *ontologyManagerAccess) ListRelationTypes(ctx context.Context, knID st
 	if err != nil {
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http Get Failed")
 		otellog.LogError(ctx, fmt.Sprintf("List relation types request failed: %v", err), err)
-		return nil, fmt.Errorf("get request method failed: %v", err)
+		return nil, fmt.Errorf("get request method failed: %w", err)
 	}
 
 	if respCode != http.StatusOK {
 
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 			oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmalshal BaseError failed")
 			otellog.LogError(ctx, fmt.Sprintf("Unmalshal BaseError failed: %v", err), err)
 			return nil, err
 		}
 
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_KnowledgeNetwork_InternalError_GetRelationTypeFailed, baseError)
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
 		otellog.LogError(ctx, fmt.Sprintf("List relation types failed: %v", httpErr), httpErr)
 		return nil, fmt.Errorf("list relation types failed: %w", httpErr)
@@ -664,7 +591,7 @@ func (oma *ontologyManagerAccess) ListRelationTypes(ctx context.Context, knID st
 func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string,
 	branch string, atID string) (interfaces.ActionType, map[string]any, bool, error) {
 
-	httpUrl := fmt.Sprintf("%s/%s/action-types/%s?branch=%s", oma.ontologyManagerUrl, knID, atID, branch)
+	httpUrl := fmt.Sprintf("%s/%s/action-types/%s?branch=%s", oma.ontologyManagerUrl, knID, atID, branch) + versionQuery(ctx)
 	// When the HTTP client sends a request, RoundTrip uses transport; at this point the transport is otelhttp.NewTransport.
 	// otelhttp.NewTransport injects the propagator during RoundTrip, that is, t.propagators.Inject.
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 ontology-manager 获取行动类信息")
@@ -701,10 +628,13 @@ func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string
 		// Log the exception.
 		otellog.LogError(ctx, fmt.Sprintf("Get action type request failed: %v", err), err)
 
-		return emptyActionType, nil, false, fmt.Errorf("get request method failed: %v", err)
+		return emptyActionType, nil, false, fmt.Errorf("get request method failed: %w", err)
 	}
 
 	if respCode == http.StatusNotFound {
+		if versionErr := versionRefusal(ctx, result); versionErr != nil {
+			return emptyActionType, nil, false, versionErr
+		}
 		logger.Errorf("action type %s not exists", atID)
 
 		// Add trace attributes for the exception.
@@ -717,7 +647,7 @@ func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string
 
 	if respCode != http.StatusOK {
 
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 
 			// Add trace attributes for the exception.
@@ -728,7 +658,7 @@ func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string
 			return emptyActionType, nil, false, err
 		}
 
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_ActionType_InternalError_GetActionTypesByIDFailed, baseError)
 
 		// Add trace attributes for the exception.
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
@@ -751,7 +681,7 @@ func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string
 	var response struct {
 		ActionTypes []interfaces.ActionType `json:"entries"`
 	}
-	if err = sonic.Unmarshal(result, &response); err != nil {
+	if err = common.UnmarshalPreciseJSON(result, &response); err != nil {
 
 		// Add trace attributes for the exception.
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmalshal action type info failed")
@@ -769,7 +699,7 @@ func (oma *ontologyManagerAccess) GetActionType(ctx context.Context, knID string
 	var rawResponse struct {
 		Entries []map[string]any `json:"entries"`
 	}
-	if err = sonic.Unmarshal(result, &rawResponse); err != nil {
+	if err = common.UnmarshalPreciseJSON(result, &rawResponse); err != nil {
 		logger.Errorf("unmalshal raw action type info failed: %v\n", err)
 		// Still return the parsed struct, but leave raw data as nil.
 		oteltrace.AddHttpAttrs4Ok(span, respCode)
@@ -794,7 +724,7 @@ func (oma *ontologyManagerAccess) GetRiskTypesByIDs(ctx context.Context, knID st
 	}
 
 	idsStr := strings.Join(riskTypeIDs, ",")
-	httpUrl := fmt.Sprintf("%s/%s/risk-types?risk_type_ids=%s&branch=%s", oma.ontologyManagerUrl, knID, idsStr, branch)
+	httpUrl := fmt.Sprintf("%s/%s/risk-types?risk_type_ids=%s&branch=%s", oma.ontologyManagerUrl, knID, idsStr, branch) + versionQuery(ctx)
 
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "请求 bkn-backend 获取风险类")
 	oteltrace.AddAttrs4InternalHttp(span, oteltrace.TraceAttrs{
@@ -824,11 +754,11 @@ func (oma *ontologyManagerAccess) GetRiskTypesByIDs(ctx context.Context, knID st
 
 	if respCode != http.StatusOK {
 		logger.Errorf("GetRiskTypesByIDs failed: %v", result)
-		var baseError rest.BaseError
+		var baseError httperrors.BaseError
 		if err = sonic.Unmarshal(result, &baseError); err != nil {
 			return nil, fmt.Errorf("decode risk types error response: %w", err)
 		}
-		httpErr := &rest.HTTPError{HTTPCode: respCode, BaseError: baseError}
+		httpErr := newOntologyManagerError(ctx, respCode, oerrors.OntologyQuery_RiskType_InternalError_GetRiskTypesByIDsFailed, baseError)
 		return nil, fmt.Errorf("get risk types failed: %w", httpErr)
 	}
 
@@ -842,4 +772,30 @@ func (oma *ontologyManagerAccess) GetRiskTypesByIDs(ctx context.Context, knID st
 
 	oteltrace.AddHttpAttrs4Ok(span, respCode)
 	return response.Entries, nil
+}
+
+// newOntologyManagerError keeps dependency details under a locally owned error.
+// Authentication and permission refusals must not use an internal-failure message.
+// versionRefusal returns bkn-backend's refusal when a 404 is about the requested version (it does
+// not exist) rather than about the definition, so the caller is not told the definition is missing.
+func versionRefusal(ctx context.Context, body []byte) *httperrors.HTTPError {
+	var baseError httperrors.BaseError
+	if len(body) == 0 || sonic.Unmarshal(body, &baseError) != nil || !oerrors.IsPassThroughKNVersionError(baseError.ErrorCode) {
+		return nil
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusNotFound, baseError.ErrorCode)
+}
+
+func newOntologyManagerError(ctx context.Context, status int, code string, source httperrors.BaseError) *httperrors.HTTPError {
+	// A refusal about the requested version keeps bkn-backend's code, so the caller sees why.
+	if oerrors.IsPassThroughKNVersionError(source.ErrorCode) {
+		return httperrors.NewHTTPError(ctx, status, source.ErrorCode)
+	}
+	switch status {
+	case http.StatusUnauthorized:
+		code = httperrors.PublicError_Unauthorized
+	case http.StatusForbidden:
+		code = httperrors.PublicError_Forbidden
+	}
+	return httperrors.NewHTTPError(ctx, status, code).WithErrorDetails(source)
 }

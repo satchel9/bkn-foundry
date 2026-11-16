@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -23,6 +24,7 @@ import (
 const (
 	ManagerBKN               = "bkn"
 	ResourceKnowledgeNetwork = "knowledge_network"
+	maxManagedProxyNameRunes = 255
 
 	StatusActive    = "active"
 	StatusDisabling = "disabling"
@@ -50,6 +52,11 @@ type Account struct {
 	LoginEnabled              bool   `json:"login_enabled"`
 	CredentialIssuanceEnabled bool   `json:"credential_issuance_enabled"`
 	Version                   uint64 `json:"version"`
+	// GrantSyncGeneration and GrantSnapshotVersion expose the grant-sync fence.
+	// The account is reused when a network id is reused, so BKN needs them to
+	// start its own generation counter above the fence instead of at zero.
+	GrantSyncGeneration  uint64 `json:"grant_sync_generation"`
+	GrantSnapshotVersion string `json:"grant_snapshot_version"`
 }
 
 // CreateRequest identifies the environment-local resource that owns the app.
@@ -75,7 +82,8 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Account, bool
 	req.ManagedResourceID = strings.TrimSpace(req.ManagedResourceID)
 	req.Name = strings.TrimSpace(req.Name)
 	if req.ManagedResourceType != ResourceKnowledgeNetwork || req.ManagedResourceID == "" ||
-		len(req.ManagedResourceID) > 128 || len(req.Name) > 255 {
+		len(req.ManagedResourceID) > 128 || !utf8.ValidString(req.Name) ||
+		utf8.RuneCountInString(req.Name) > maxManagedProxyNameRunes {
 		return nil, false, ErrInvalidManagedResource
 	}
 
@@ -91,9 +99,6 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Account, bool
 	}
 	if req.Name == "" {
 		req.Name = "BKN proxy " + req.ManagedResourceID
-		if len(req.Name) > 255 {
-			req.Name = req.Name[:255]
-		}
 	}
 	user := model.User{
 		ID: proxyID, Account: "bkn-proxy-" + proxyID, Name: req.Name,
@@ -129,7 +134,7 @@ func (s *Service) Create(ctx context.Context, req CreateRequest) (*Account, bool
 }
 
 func (s *Service) Get(ctx context.Context, proxyAccountID string) (*Account, error) {
-	return s.get(ctx, "proxy_account_id = ?", strings.TrimSpace(proxyAccountID))
+	return s.get(ctx, "proxy_account_id = ? AND managed_by = ? AND managed_resource_type = ?", strings.TrimSpace(proxyAccountID), ManagerBKN, ResourceKnowledgeNetwork)
 }
 
 // Restore reactivates an archived identity for an idempotent retry of the same
@@ -143,7 +148,7 @@ func (s *Service) Restore(ctx context.Context, proxyAccountID string) (*Account,
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var mapping model.ManagedProxyAccount
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&mapping,
-			"proxy_account_id = ?", proxyAccountID).Error; err != nil {
+			"proxy_account_id = ? AND managed_by = ? AND managed_resource_type = ?", proxyAccountID, ManagerBKN, ResourceKnowledgeNetwork).Error; err != nil {
 			return err
 		}
 		var user model.User
@@ -235,7 +240,7 @@ func (s *Service) transition(ctx context.Context, proxyAccountID, target string)
 	}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var mapping model.ManagedProxyAccount
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&mapping, "proxy_account_id = ?", proxyAccountID).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&mapping, "proxy_account_id = ? AND managed_by = ? AND managed_resource_type = ?", proxyAccountID, ManagerBKN, ResourceKnowledgeNetwork).Error; err != nil {
 			return err
 		}
 		var user model.User
@@ -281,7 +286,8 @@ func render(user model.User, mapping model.ManagedProxyAccount) *Account {
 		ManagedBy: mapping.ManagedBy, ManagedResourceType: mapping.ManagedResourceType,
 		ManagedResourceID: mapping.ManagedResourceID, LifecycleStatus: mapping.LifecycleStatus,
 		Enabled: user.Enabled, LoginEnabled: false, CredentialIssuanceEnabled: false,
-		Version: mapping.Version,
+		Version: mapping.Version, GrantSyncGeneration: mapping.GrantSyncGeneration,
+		GrantSnapshotVersion: mapping.GrantSnapshotVersion,
 	}
 }
 

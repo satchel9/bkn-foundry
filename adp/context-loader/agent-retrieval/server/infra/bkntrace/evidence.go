@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -92,6 +93,7 @@ type evidenceOutcome struct {
 	failureCode  string
 	failureStage string
 	businessRefs []BusinessRef
+	knVersion    string
 }
 
 var artifactHTTPClient = &http.Client{}
@@ -114,6 +116,7 @@ type eventContext struct {
 	claimID           string
 	attempt           int
 	observedAt        string
+	businessRefs      []BusinessRef
 }
 
 // HashValue is ConfigStd, not the default sonic config, and the difference is not cosmetic: the
@@ -169,47 +172,45 @@ func EvidenceEnabled() bool {
 
 func artifactEnabled() bool { return strings.TrimSpace(os.Getenv(envArtifactEndpoint)) != "" }
 
-func RecordInteractionArtifact(
-	ctx context.Context,
-	conversationID string,
-	interactionID string,
-	artifactType InteractionArtifactType,
-	content any,
-) (string, error) {
-	if CaptureDisabled() || !artifactEnabled() {
-		return "", nil
+// DurableAnswerEnabled is an explicit rollout gate. Enable only after every
+// Core instance can commit answer artifacts with its managed-finish transaction.
+func DurableAnswerEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("BKN_TRACE_DURABLE_ANSWER_ENABLED")), "true")
+}
+
+// BuildInteractionArtifact constructs the existing governed artifact envelope.
+// It performs no upload or publication and makes no durability acknowledgement.
+func BuildInteractionArtifact(ctx context.Context, conversationID, interactionID string, artifactType InteractionArtifactType, content any) (map[string]any, error) {
+	if CaptureDisabled() {
+		return nil, &CoreHTTPError{StatusCode: 409, Code: "CAPTURE_DISABLED", Message: "Evidence capture is disabled"}
 	}
+	artifact, _, err := buildInteractionArtifact(ctx, conversationID, interactionID, artifactType, content)
+	return artifact, err
+}
+
+func buildInteractionArtifact(ctx context.Context, conversationID, interactionID string, artifactType InteractionArtifactType, content any) (map[string]any, eventContext, error) {
 	ec, ok := baseEventContext(ctx)
 	if !ok {
-		return "", errors.New("current request, trace and trusted account context are required")
+		return nil, eventContext{}, errors.New("current request, trace and trusted account context are required")
 	}
 	ec.conversationID = strings.TrimSpace(conversationID)
 	ec.interactionID = strings.TrimSpace(interactionID)
 	ec.operationID = ""
 	ec.attempt = 1
 	if ec.conversationID == "" || ec.interactionID == "" {
-		return "", errors.New("conversation_id and interaction_id are required")
+		return nil, eventContext{}, errors.New("conversation_id and interaction_id are required")
 	}
-	eventType := ""
-	artifactField := ""
 	switch artifactType {
-	case InteractionArtifactQuestion:
-		eventType = "agent.interaction.started"
-		artifactField = "question_artifact_ref"
-	case InteractionArtifactResult:
-		eventType = "claim.created"
-		artifactField = "result_artifact_ref"
+	case InteractionArtifactQuestion, InteractionArtifactResult:
 	default:
-		return "", fmt.Errorf("unsupported interaction artifact type %q", artifactType)
+		return nil, eventContext{}, fmt.Errorf("unsupported interaction artifact type %q", artifactType)
 	}
 	contentHash, err := hashArtifactContent(content)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize interaction artifact: %w", err)
+		return nil, eventContext{}, fmt.Errorf("canonicalize interaction artifact: %w", err)
 	}
 	idHash := sha256.Sum256([]byte(ec.interactionID + "|" + string(artifactType) + "|" + contentHash))
 	artifactID := "art_" + string(artifactType) + "_" + hex.EncodeToString(idHash[:16])
-	artifactRef := "artifact:" + artifactID
-	traceBlock := traceBlockFromEventContext(ec)
 	artifact := map[string]any{
 		"artifact_id":              artifactID,
 		"artifact_type":            string(artifactType),
@@ -228,6 +229,24 @@ func RecordInteractionArtifact(
 		"initiator":                "account:" + ec.accountID,
 		"agent_or_app":             agentOrApp(ec),
 	}
+	return artifact, ec, nil
+}
+
+func RecordInteractionArtifact(ctx context.Context, conversationID, interactionID string, artifactType InteractionArtifactType, content any) (string, error) {
+	if CaptureDisabled() || !artifactEnabled() {
+		return "", nil
+	}
+	artifact, ec, err := buildInteractionArtifact(ctx, conversationID, interactionID, artifactType, content)
+	if err != nil {
+		return "", err
+	}
+	artifactRef := "artifact:" + artifact["artifact_id"].(string)
+	contentHash := artifact["content_hash"].(string)
+	eventType, artifactField := "agent.interaction.started", "question_artifact_ref"
+	if artifactType == InteractionArtifactResult {
+		eventType, artifactField = "claim.created", "result_artifact_ref"
+	}
+	traceBlock := traceBlockFromEventContext(ec)
 	eventPayload := map[string]any{artifactField: artifactRef, "content_hash": contentHash}
 	if ec.applicationName != "" {
 		eventPayload["app_ref"] = ec.applicationName
@@ -297,7 +316,8 @@ func postArtifactWithRetry(
 		cancel()
 		err = requestErr
 		var coreErr *CoreHTTPError
-		if errors.As(err, &coreErr) && !coreErr.Retryable() {
+		// A missing ingest credential cannot recover by retrying the same request.
+		if errors.As(err, &coreErr) && (!coreErr.Retryable() || coreErr.Code == "INGEST_AUTH_NOT_CONFIGURED") {
 			return err
 		}
 		if attempt < 2 {
@@ -355,14 +375,6 @@ func EmitExploreSubgraphEvents(ctx context.Context, logger interfaces.Logger, re
 	return submitAndReturnFirstEventID(ctx, logger, req, BuildExploreSubgraphEvents(ctx, req, resp))
 }
 
-func EmitRunSQLEvents(ctx context.Context, logger interfaces.Logger, sql string, resourceIDs []string, resp *interfaces.VegaRawQueryResp) string {
-	retainRunSQLTargets(ctx, resourceIDs)
-	if !EvidenceEnabled() {
-		return ""
-	}
-	return submitAndReturnFirstEventID(ctx, logger, nil, BuildRunSQLEvents(ctx, sql, resourceIDs, resp))
-}
-
 // EmitRunCypherEvents records one compiled Cypher query as observed data
 // access. The generated SQL and the resources it touched stay inside
 // bkn-backend, so the evidence names the knowledge network the query ran
@@ -392,21 +404,6 @@ func EmitRunCypherFailure(ctx context.Context, logger interfaces.Logger, knID, q
 	return submitAndReturnFirstEventID(ctx, logger, nil, BuildRunCypherFailureEvents(ctx, knID, query, failure))
 }
 
-type RunSQLFailure struct {
-	Stage   string
-	Code    string
-	Summary string
-}
-
-func EmitRunSQLFailure(ctx context.Context, logger interfaces.Logger, sql string, resourceIDs []string, failure RunSQLFailure) string {
-	RecordToolFailure(ctx, failure.Code, failure.Stage)
-	retainRunSQLTargets(ctx, resourceIDs)
-	if !EvidenceEnabled() {
-		return ""
-	}
-	return submitAndReturnFirstEventID(ctx, logger, nil, BuildRunSQLFailureEvents(ctx, sql, resourceIDs, failure))
-}
-
 func EmitSchemaDefinitionEvents(ctx context.Context, logger interfaces.Logger, kind, knID string, ids []string, matched int) string {
 	if !EvidenceEnabled() {
 		return ""
@@ -415,6 +412,7 @@ func EmitSchemaDefinitionEvents(ctx context.Context, logger interfaces.Logger, k
 }
 
 func EmitSchemaSnapshotEvents(ctx context.Context, logger interfaces.Logger, kind, knID string, ids []string, definition any, complete bool) string {
+	retainSchemaSnapshotTargets(ctx, kind, knID, ids)
 	if !EvidenceEnabled() {
 		return ""
 	}
@@ -512,34 +510,39 @@ func BuildQueryMetricEvents(ctx context.Context, req *interfaces.QueryMetricReq,
 		return nil
 	}
 	rows := []map[string]any{}
+	status := ""
 	if resp != nil {
-		for _, series := range resp.Datas {
-			if series == nil {
-				continue
+		status = resp.Status
+		for _, entry := range resp.Entries {
+			row := map[string]any{"dimension_cells": entry.DimensionCells, "value": entry.Value, "status": entry.Status}
+			if entry.Time != nil {
+				row["time"] = *entry.Time
 			}
-			for index, value := range series.Values {
-				row := map[string]any{"dimensions": series.Labels, "value": value}
-				if index < len(series.Times) {
-					row["time"] = series.Times[index]
-				}
-				if index < len(series.TimeStrs) {
-					row["time_text"] = series.TimeStrs[index]
-				}
-				rows = append(rows, row)
-			}
+			rows = append(rows, row)
 		}
 	}
-	metricRef := "metric:" + strings.TrimSpace(req.KnID) + ":" + strings.TrimSpace(req.MetricID)
+	metricRef := fmt.Sprintf("metric:%s:%s:v%d", strings.TrimSpace(req.KnID), strings.TrimSpace(req.MetricID), req.Version)
+	truncated := resp != nil && (resp.NextCursor != "" || resp.Status == "partial")
 	payload := map[string]any{
 		"metric_ref": metricRef, "network_ref": "kn:" + strings.TrimSpace(req.KnID),
-		"dimensions": append([]string(nil), req.AnalysisDimensions...), "conditions": req.Cond,
-		"time": req.Time, "having": req.Having, "order_by": req.OrderBy,
+		"branch": req.Branch, "version": req.Version, "group_by": req.Query.GroupBy, "conditions": req.Query.Filter,
+		"having": req.Query.Having, "order_by": req.Query.OrderBy,
+		"page_size": req.Query.PageSize, "cursor": req.Query.Cursor,
+		"time": req.Query.Time, "status": status,
 		"aggregation_definition": "defined_by_metric", "rows": rows, "row_count": len(rows),
-		"complete": resp != nil, "cardinality": "metric_series_rows",
+		"complete": resp != nil && !truncated, "truncated": truncated, "cardinality": "object_metric_entries",
 		"source_refs": []map[string]any{
 			controlledRef("kn:"+strings.TrimSpace(req.KnID), "knowledge_network"),
 			controlledRef(metricRef, "metric"),
 		},
+	}
+	if resp != nil {
+		payload["total_count"] = resp.TotalCount
+		payload["empty_reason"] = resp.EmptyReason
+		payload["next_cursor"] = resp.NextCursor
+	}
+	if req.Query.BucketSelection != nil {
+		payload["bucket_selection"] = req.Query.BucketSelection
 	}
 	event := buildEvent(ec, "metric.query.completed", "context.query_metric", payload, "", ec.causationEventID)
 	event["bkn.trace.schema.version"] = "2.2.0"
@@ -566,69 +569,6 @@ func BuildExploreSubgraphEvents(ctx context.Context, req *interfaces.ExploreSubg
 		candidateCount = len(resp.Objects) + len(resp.IsolatedObjects)
 	}
 	return buildRetrievalEvents(ec, "context.explore_subgraph", exploreSubgraphHash(req), candidateCount, refsTruncated, refs)
-}
-
-func BuildRunSQLEvents(ctx context.Context, sql string, resourceIDs []string, resp *interfaces.VegaRawQueryResp) []Event {
-	ec, ok := contextFromRequest(ctx, nil)
-	if !ok {
-		return nil
-	}
-	refs := make([]map[string]any, 0, len(resourceIDs))
-	seen := map[string]struct{}{}
-	for _, resourceID := range resourceIDs {
-		resourceID = strings.TrimSpace(resourceID)
-		if resourceID == "" {
-			continue
-		}
-		key := "data_resource\x00resource:" + resourceID
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		refs = append(refs, map[string]any{
-			"ref_id":         "resource:" + resourceID,
-			"ref_type":       "data_resource",
-			"source_system":  "vega",
-			"validity":       "observed",
-			"version_status": "unversioned",
-			"visibility":     "visible",
-		})
-	}
-	resultSummary := runSQLResultSummary(resp)
-	event := buildEvent(ec, "data.query.observed", "context.run_sql", map[string]any{
-		"query_hash":     HashValue(strings.TrimSpace(sql)),
-		"query_type":     "sql",
-		"row_count":      resultSummary["row_count"],
-		"truncated":      resultSummary["truncated"],
-		"version_status": "unversioned",
-		"resource_refs":  refs,
-		"field_refs":     []map[string]any{},
-	}, "", ec.causationEventID)
-	event["bkn.trace.schema.version"] = "2.2.0"
-	return []Event{event}
-}
-
-func BuildRunSQLFailureEvents(ctx context.Context, sql string, resourceIDs []string, failure RunSQLFailure) []Event {
-	ec, ok := contextFromRequest(ctx, nil)
-	if !ok {
-		return nil
-	}
-	refs := runSQLResourceRefs(resourceIDs)
-	event := buildEvent(ec, "data.query.observed", "context.run_sql", map[string]any{
-		"query_hash":         HashValue(strings.TrimSpace(sql)),
-		"query_type":         "sql",
-		"row_count":          0,
-		"truncated":          false,
-		"version_status":     "unversioned",
-		"resource_refs":      refs,
-		"field_refs":         []map[string]any{},
-		"status":             "error",
-		"error_stage":        failure.Stage,
-		"error_code":         failure.Code,
-		"safe_error_summary": failure.Summary,
-	}, "", ec.causationEventID)
-	event["bkn.trace.schema.version"] = "2.2.0"
-	return []Event{event}
 }
 
 // BuildRunCypherEvents builds the observed-data event for one Cypher query.
@@ -675,7 +615,7 @@ func buildRunCypherEvent(ctx context.Context, knID, query string, extra map[stri
 		refs = append(refs, map[string]any{
 			"ref_id": "kn:" + knID, "ref_type": "knowledge_network",
 			"source_system": ModuleName, "validity": "observed",
-			"version_status": "unversioned", "visibility": "visible",
+			"version_status": knVersionStatus(ctx), "visibility": "visible",
 		})
 	}
 	payload := map[string]any{
@@ -772,44 +712,6 @@ func objectArray(value any) []map[string]any {
 	return result
 }
 
-func runSQLResultSummary(resp *interfaces.VegaRawQueryResp) map[string]any {
-	count := 0
-	truncated := false
-	if resp != nil {
-		count = len(resp.Entries)
-		truncated = resp.Paging != nil && resp.Paging.NextCursor != nil
-		if resp.TotalCount != nil && *resp.TotalCount > int64(count) {
-			truncated = true
-		}
-	}
-	return map[string]any{"row_count": count, "truncated": truncated}
-}
-
-func runSQLResourceRefs(resourceIDs []string) []map[string]any {
-	refs := make([]map[string]any, 0, len(resourceIDs))
-	seen := map[string]struct{}{}
-	for _, resourceID := range resourceIDs {
-		resourceID = strings.TrimSpace(resourceID)
-		if resourceID == "" {
-			continue
-		}
-		key := "data_resource\x00resource:" + resourceID
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		refs = append(refs, map[string]any{
-			"ref_id":         "resource:" + resourceID,
-			"ref_type":       "data_resource",
-			"source_system":  "vega",
-			"validity":       "observed",
-			"version_status": "unversioned",
-			"visibility":     "visible",
-		})
-	}
-	return refs
-}
-
 func BuildSchemaDefinitionEvents(ctx context.Context, kind, knID string, ids []string, matched int) []Event {
 	ec, ok := contextFromRequest(ctx, nil)
 	if !ok || strings.TrimSpace(knID) == "" {
@@ -827,7 +729,7 @@ func BuildSchemaDefinitionEvents(ctx context.Context, kind, knID string, ids []s
 	refs := []map[string]any{{
 		"ref_id": "kn:" + knID, "ref_type": "knowledge_network",
 		"source_system": ModuleName, "validity": "observed",
-		"version_status": "unversioned", "visibility": "visible",
+		"version_status": knVersionStatus(ctx), "visibility": "visible",
 	}}
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
@@ -837,7 +739,7 @@ func BuildSchemaDefinitionEvents(ctx context.Context, kind, knID string, ids []s
 		refs = append(refs, map[string]any{
 			"ref_id": kind + ":" + knID + ":" + id, "ref_type": refType,
 			"source_system": ModuleName, "validity": "observed",
-			"version_status": "unversioned", "visibility": "visible",
+			"version_status": knVersionStatus(ctx), "visibility": "visible",
 		})
 	}
 	return buildRetrievalEvents(ec, "context.get_"+kind+"_types", HashValue(strings.Join(ids, "\x00")), matched, false, refs)
@@ -1184,7 +1086,7 @@ func trace30BusinessRefs(event Event, derivedRefs []BusinessRef) []trace30Busine
 	for _, item := range items {
 		refID := stringValue(item["ref_id"])
 		refType := trace30RefType(stringValue(item["ref_type"]))
-		if refID == "" || refType == "" {
+		if !trace30CanonicalRefID(refType, refID) {
 			continue
 		}
 		version := strings.TrimSpace(derivedVersions[refType+"\x00"+refID])
@@ -1207,7 +1109,7 @@ func trace30BusinessRefs(event Event, derivedRefs []BusinessRef) []trace30Busine
 	for _, ref := range derivedRefs {
 		refType := trace30RefType(ref.RefType)
 		refID := strings.TrimSpace(ref.RefID)
-		if refType == "" || refID == "" {
+		if !trace30CanonicalRefID(refType, refID) {
 			continue
 		}
 		key := refType + "\x00" + refID
@@ -1225,6 +1127,47 @@ func trace30BusinessRefs(event Event, derivedRefs []BusinessRef) []trace30Busine
 		})
 	}
 	return refs
+}
+
+// Match Trace Core's BusinessRefType.MatchesCanonicalRefID contract. Invalid
+// optional refs remain in the original envelope, but must not cause the Ledger
+// to reject an otherwise valid event after semantic metadata is promoted.
+func trace30CanonicalRefID(refType, refID string) bool {
+	prefix, ok := businessRefPrefixes[refType]
+	if !ok {
+		return false
+	}
+	count := 3
+	switch refType {
+	case "knowledge_network", "data_resource":
+		count = 2
+	case "object_instance", "action_instance", "property", "logic":
+		count = 4
+	}
+	parts := strings.Split(refID, ":")
+	if refType == "object_instance" || refType == "action_instance" {
+		// Instance keys may themselves contain colons.
+		parts = strings.SplitN(refID, ":", count)
+	}
+	if refType == "metric" && len(parts) == 4 {
+		if len(parts[3]) < 2 || parts[3][0] != 'v' {
+			return false
+		}
+		version, err := strconv.Atoi(parts[3][1:])
+		if err != nil || version <= 0 {
+			return false
+		}
+		parts = parts[:3]
+	}
+	if len(parts) != count || parts[0] != prefix {
+		return false
+	}
+	for _, part := range parts[1:] {
+		if part == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func trace30RefType(value string) string {
@@ -1423,6 +1366,7 @@ func baseEventContext(ctx context.Context) (eventContext, bool) {
 		claimID:           strings.TrimSpace(traceContext.ClaimID),
 		attempt:           traceContext.Attempt,
 		observedAt:        observedAt,
+		businessRefs:      stampKnVersion(requestDerivedBusinessRefsFromContext(ctx), knVersionLabel(ctx)),
 	}, true
 }
 
@@ -1489,7 +1433,7 @@ func schemaEvidenceRefs(knID string, resp *interfaces.SearchSchemaResp) []map[st
 	refs = append(refs, conceptRefs("object", "object", knID, resp.ObjectTypes)...)
 	refs = append(refs, conceptRefs("relation", "relation", knID, resp.RelationTypes)...)
 	refs = append(refs, conceptRefs("action_type", "action", knID, resp.ActionTypes)...)
-	refs = append(refs, conceptRefs("metric", "metric", knID, resp.MetricTypes)...)
+	refs = append(refs, metricConceptRefs(knID, resp.MetricTypes)...)
 	return refs
 }
 
@@ -1511,6 +1455,32 @@ func conceptRefs(kind, refType, knID string, items []any) []map[string]any {
 			"summary_hash":   HashValue(safeConceptSummary(kind, itemMap)),
 			"validity":       "observed",
 			"version_status": "unversioned",
+			"visibility":     "visible",
+		})
+	}
+	return refs
+}
+
+func metricConceptRefs(knID string, items []any) []map[string]any {
+	refs := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		itemMap, ok := asMap(item)
+		if !ok {
+			continue
+		}
+		id := firstString(itemMap, "concept_id", "id")
+		version := intValue(itemMap["version"], 0)
+		if id == "" || version < 1 {
+			continue
+		}
+		versionStatus := fmt.Sprintf("v%d", version)
+		refs = append(refs, map[string]any{
+			"ref_id":         "metric:" + knID + ":" + id + ":" + versionStatus,
+			"ref_type":       "metric",
+			"source_system":  ModuleName,
+			"summary_hash":   HashValue(safeConceptSummary("metric", itemMap)),
+			"validity":       "observed",
+			"version_status": versionStatus,
 			"visibility":     "visible",
 		})
 	}

@@ -1,16 +1,24 @@
 ---
 openapi: 3.1.1
 info:
-  title: Resource Data
+  title: VEGA 引擎 · 资源数据 API
   description: |
     Vega Backend Resource 数据子资源（`/resources/{id}/data`）相关 API。
+
+    large_integer 字段通过十进制字符串无损传输。Doris 源端比较、range、out_range、between、
+    分组、排序和 MIN/MAX 使用数值语义；SUM/AVG 暂不支持。
+    托管本地索引将其作为 string/keyword 存储和查询，复用既有字符串操作规则，
+    不支持 large_integer 数值范围或聚合语义；例如 "0100" 不匹配存储文本 "100"。
+    Dataset 不允许声明 large_integer 字段。
+    输入推荐使用整数字符串（可含正负号及前导零）；非法及越界常量遵循源端 CAST 设置。
+    区间不重排边界，range/between 为闭区间，out_range 为两端严格外部区间；NULL 边界拒绝。
 
     本规范覆盖两类语义：
 
     1. **通用资源数据查询**：`POST /resources/{id}/data` + `X-HTTP-Method-Override: GET`，
        对任意 category 的 Resource 执行数据查询（filter + 分页）。
     2. **dataset documents 的写/删/访问**：`POST` 的 `Override: POST` 创建一条文档，
-       `PUT` 完整替换一条文档，`GET` / `DELETE` 支持按逗号分隔的文档 ID 批量操作；
+       `PUT /resources/{id}/data` 批量完整替换文档，单条 `PUT` 完整替换一条文档，`GET` / `DELETE` 支持按逗号分隔的文档 ID 批量操作；
        它们以及 `POST` 的 `Override: DELETE` 分支，仅对 `Resource.category=dataset` 生效。
 
     **dataset 不顶层化**：dataset 在系统中只是 `Resource.category=dataset` 的特化形态，
@@ -20,7 +28,8 @@ info:
     `X-HTTP-Method-Override` 头多分发，是为了兼容现有 query 语义并在同一条路径上
     暴露 create / delete-by-filter，避免在仓库内引入新的"动作端点"形态。
 
-    **错误码复用 Resource 系列**：本规范不引入 `Dataset.*` 专属错误码；单条文档不存在
+    **错误码**：常规操作复用 Resource 系列；条件删除部分完成使用
+    `VegaBackend.Dataset.DeleteIncomplete`。单条文档不存在
     与 resource 不存在共用 `VegaBackend.Resource.NotFound`，靠 `error_details` 区分。
 
     cursor 可通过 `DELETE /resources/cursors/{cursor}` 提前关闭，详见
@@ -60,15 +69,39 @@ paths:
         授权版本不足返回 403 `Public.Forbidden`。
         HANA 源表无 SELECT 权限时返回 403
         `VegaBackend.Resource.SourceReadForbidden`，不暴露驱动原始错误。
+        已保存的衍生逻辑视图因源字段删除、绑定/类型不匹配、输出 Feature 变化，
+        或固定过滤条件非法（包括缺值、非法范围、不支持的算子）、无法按当前 schema/index 配置构造时，
+        返回 400 `VegaBackend.LogicalView.DefinitionInvalid`。
+        `description` 包含可识别的相关字段及编辑视图的修复提示；`error_details` 包含
+        `fields`（源字段名数组；输出绑定使用 original_name，过滤条件使用 field 名称）及 `reason`
+        （`source_field_mismatch`、`source_feature_mismatch`、`filter_field_missing` 或 `filter_incompatible`）。
+        普通查询条件非法仍返回 400 查询参数错误；不因条件来自已保存定义而改为 500。
+        本地索引精确查询值超过 keyword `ignore_above` 时，返回 HTTP 400
+        `VegaBackend.Resource.QueryValueExceedsKeywordLimit`。`metadata.field` 为请求字段名，
+        `metadata.limit` 为正整数长度上限，单位为 UTF-16 code units。
+        客户端按 `error_code` 判断错误类型，使用 metadata 生成本地化提示，不解析 `error_details`。
+        此错误不会自动回源或降级为空结果；调用方可缩短值，或主动设置 `ignore_local_index=true`
+        （仅支持源查询的资源）。旧版后端的通用 InvalidParameter 错误仍按通用错误处理。
+        非过滤条件的视图存储结构损坏、源读取及模型服务故障仍按原有错误处理。
         已保存的复合逻辑视图在首次查询和 cursor 续页时也暂时返回 501。
 
         **`Override: POST` 响应**：201 + `{ id }`。后端生成文档 ID；携带 `_id` 的 body 返回 400。
 
-        **`Override: DELETE` 响应**：204。空 `filter_condition` 拒绝 400 避免误删全表。
+        **`Override: DELETE` 响应**：成功默认返回 204；`?return_result=true` 时返回
+        200 和 `DeleteByQueryResult`。部分失败、版本冲突或超时返回 500
+        `VegaBackend.Dataset.DeleteIncomplete`，`error_details` 包含删除数量及失败结果。
+        失败时已删除的文档不会回滚，重试前应核验业务状态。
+        空 `filter_condition` 返回 400。
 
         非 dataset category 的 resource 调 Override=POST/DELETE → 400
         `VegaBackend.Resource.InternalError.InvalidCategory`。
       parameters:
+        - name: return_result
+          in: query
+          description: 仅 Override=DELETE 生效；true 时成功返回 200 和实际结果，默认保持 204。
+          schema:
+            type: boolean
+            default: false
         - name: X-HTTP-Method-Override
           description: 必填；值为 GET / POST / DELETE 之一
           in: header
@@ -89,11 +122,13 @@ paths:
                 - $ref: "#/components/schemas/Document"
       responses:
         "200":
-          description: Override=GET 查询成功
+          description: Override=GET 查询成功，或 Override=DELETE 且 return_result=true 时删除完成
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ListResponse"
+                oneOf:
+                  - $ref: "#/components/schemas/ListResponse"
+                  - $ref: "#/components/schemas/DeleteByQueryResult"
         "201":
           description: Override=POST 创建成功
           content:
@@ -126,6 +161,62 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           $ref: "#/components/responses/NotImplemented"
+    put:
+      summary: 按指定 ID 批量完整替换 Dataset 文档（upsert）
+      operationId: bulkReplaceDatasetDocuments
+      description: |
+        仅支持 Dataset。按 entry 的 `_id` 创建或完整替换文档，未提供的旧字段不保留。
+        每次提交 1–1000 条，请求体不超过 32 MiB。
+
+        `_id` 必须是非空白的有效 UTF-8 字符串，最多 512 字节，同批不能重复。
+        ID 校验失败时整批返回 400；任一文档校验或向量生成失败时整批返回错误，不写入文档。
+
+        写入结果按输入顺序返回，可能部分成功，请逐条检查 `status`、`error_code` 和 `retryable`。
+        `outcome_unknown` 表示可能已经写入，重试前应核验结果，并避免旧数据覆盖新数据。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entries]
+              properties:
+                entries:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items:
+                    allOf:
+                      - $ref: "#/components/schemas/Document"
+                      - type: object
+                        required: [_id]
+                        properties:
+                          _id:
+                            type: string
+                            description: 文档 ID，UTF-8 最多 512 字节，不能全为空白。
+      responses:
+        "200":
+          description: 请求处理完成，含逐条成功或失败结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [entries]
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DocumentWriteResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /resources/{id}/data/{docid}:
     parameters:
       - name: id
@@ -241,10 +332,13 @@ components:
   responses:
     BadRequest:
       description: |
-        请求参数 / 请求体非法。常见 errcode：
+        请求参数 / 请求体非法，或衍生逻辑视图定义已失效。常见 errcode：
         - `VegaBackend.InvalidParameter.OverrideMethod`：POST 缺/错 Override 头
         - `VegaBackend.InvalidParameter.RequestBody`：body schema / 必填字段不合法
         - `VegaBackend.InvalidParameter.FilterCondition`：filter_condition 解析失败
+        - `VegaBackend.Resource.QueryValueExceedsKeywordLimit`：精确查询值超过索引长度上限，metadata 包含 field 和 limit
+        - `VegaBackend.Resource.QueryTimeOutOfRange`：相对时间边界超出当前索引字段支持范围，metadata 包含 field、field_type、interval 和 unit；固定条件与追加条件均返回 400
+        - `VegaBackend.LogicalView.DefinitionInvalid`：已保存视图与当前源字段不匹配；请编辑视图重新配置输出字段或固定过滤条件
         - `VegaBackend.Resource.InternalError.InvalidCategory`：写/删/单条 GET 操作针对非 dataset resource
       content:
         application/json:
@@ -305,11 +399,47 @@ components:
           schema:
             $ref: "../_shared/errors.yaml#/components/schemas/Error"
   schemas:
+    DocumentWriteResult:
+      type: object
+      required: [status, retryable]
+      properties:
+        id:
+          type: string
+          description: 文档 ID；条件删除 failures 不提供源端 ID。
+        status:
+          type: integer
+          description: 单条 HTTP 风格状态码，2xx 表示成功。
+        error_code:
+          type: string
+          description: 仅失败时返回；稳定分类，不含底层错误文案。
+          enum: [invalid_document, version_conflict, write_unavailable, write_rejected, outcome_unknown]
+        retryable:
+          type: boolean
+          description: 可在核验业务状态后重试；outcome_unknown 不能推断未写入。
+    DeleteByQueryResult:
+      type: object
+      required: [deleted, version_conflicts, timed_out, failures]
+      properties:
+        deleted:
+          type: integer
+          format: int64
+          minimum: 0
+        version_conflicts:
+          type: integer
+          format: int64
+          minimum: 0
+        timed_out:
+          type: boolean
+        failures:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentWriteResult"
     Document:
       description: |
         文档对象。content 字段集开放，由具体 dataset schema 决定。
         - `POST /resources/{id}/data`（Override=POST）创建一条文档；不得携带 `_id`。
         - `PUT /resources/{id}/data/{docid}` 如携带 `_id`，以 path 为准。
+        - `PUT /resources/{id}/data` 的 entries 直接包含文档，每条必须通过 `_id` 指定文档 ID。
       type: object
       additionalProperties: true
       properties:
@@ -333,7 +463,65 @@ components:
       properties:
         filter_condition:
           description: |
-            过滤条件，结构由 `FilterCondCfg` 决定。Override=DELETE 时必填且非空。
+            过滤条件树。叶节点使用 field、operation、value 和 value_from（const/field）；
+            and/or 通过 sub_conditions 嵌套。Override=DELETE 时必填且非空。
+
+            OpenSearch multi_match 要求至少一个已绑定的具体物理字段。fields=["*"] 由 Vega
+            按当前查询 Schema／视图发布范围解析后下推；最终物理字段名为空或包含 `*`、`^` 时返回 400，
+            避免 OpenSearch 将其重新解释为通配或权重表达式，也不允许空列表回退到默认字段。
+            这些字符不能通过添加反斜杠按字面转义；此限制不改变 match／match_phrase 的字段名语义。
+
+            like/not_like 使用完整字符串的 SQL LIKE 模式，不自动补充前后 `%`。
+            `%` 匹配任意长度字符串，`_` 匹配一个字符；反斜杠转义下一个字符，
+            因此 `\%`、`\_`、`\\` 分别匹配字面百分号、下划线和反斜杠。
+            这些示例表示 JSON 解码后的模式文本；在 JSON 字符串中传递时，反斜杠还需按 JSON 规则转义。
+            孤立的结尾反斜杠返回 400；正则 `.*` 和索引通配符 `*`、`?` 在此作为字面字符。
+            例如 `foo` 仅匹配完整值，`%foo%` 表示包含，`foo%` 表示前缀。
+            大小写与排序规则沿用实际连接器。not_like 不匹配 NULL 或缺失精确索引值的记录；
+            TEXT 仍要求 keyword Feature，不因使用 not_like 而绕过此要求。
+
+            时间常量：date 为 YYYY-MM-DD；time 为 HH:mm:ss[.fraction]；
+            datetime 支持 RFC3339、YYYY-MM-DD HH:mm:ss[.fraction] 或 int64 整数毫秒时间戳
+            （JSON 整数或数字字符串）。小数秒支持 1–9 位；无时区 datetime 按服务器 TZ 解释，默认 UTC。
+            date/datetime 的 before 使用 `[正整数间隔, 单位]`，单位为
+            year/quarter/month/week/day/hour/minute/second/microsecond 中实际连接器支持的子集，
+            PostgreSQL 还接受其已有的复数单位别名。间隔必须是 int64 范围内的正整数，
+            日期字符串、未知或空单位均返回 400，不再接受索引旧 `[小时数, RFC3339 参考时刻]` 格式。
+            索引支持 year/month/week/day/hour/minute/second，间隔数量上限为 2147483647，
+            还须满足实际索引字段的时间值域。date_nanos 的边界须位于
+            1970-01-01T00:00:00Z 至 2262-04-11T23:47:16.854775807Z；
+            普通 date 使用毫秒值域，不共用 date_nanos 的间隔限制。
+            超限时保存或执行均明确拒绝，返回 400 VegaBackend.Resource.QueryTimeOutOfRange，
+            不将条件截断或改写为空结果。索引 before 在服务器时区计算截止时刻，
+            年/月截断到目标月末，日/周使用 Go 标准库日历运算，小时/分钟按经过时间计算；
+            时区转换由标准库处理。值域校验和查询使用同一纳秒精度的绝对截止时刻。
+
+            可用操作取决于字段类型和查询通道。索引字段比较的日期族两侧均须为 date/datetime/timestamp。
+            索引 TEXT 的精确及模式匹配要求 keyword Feature。
+            本地索引常量 !=/not_eq 和 not_in 仅比较具有精确索引值的记录，
+            NULL 或缺失字段不命中；约束位于各自的条件分支内，显式 OR null 仍按该分支求值。
+            对 string/text 使用 keyword 字段或子字段；原始字符串超过该字段 ignore_above 时，
+            原值仍保留在 _source，但不写入 keyword 索引和 doc_values，因此也不会命中上述否定条件，
+            即使查询常量本身未超限。平台新增 string/text keyword 特征的默认上限为 256，
+            长度单位为 UTF-16 code units，实际限制以索引 mapping 为准。
+            例如上限 256 时，300 个 ASCII 字符的 body 不会命中 body != "hello" 或
+            body not_in ["hello"]。这项限制可能使本地索引与源端 SQL 的结果不同；
+            显式 null/not_null/exist/not_exist 按各自字段的索引存在性求值，
+            不保证与上述比较条件覆盖全部原始值。
+            查询常量自身超限则返回 400 VegaBackend.Resource.QueryValueExceedsKeywordLimit，
+            not_in 任一候选值超限也按此处理，与已存储长值不参与比较的行为不同。
+            日期类 not_in 的存在性约束也计入既有的 1024 条查询子句上限。
+            需要完整原始值比较时，对支持源查询的 table resource 可设置 ignore_local_index=true；
+            不会自动回源，dataset 没有原始表查询通道。正文检索可使用已配置全文特征的 match/match_phrase。
+            contain 在源查询中匹配逗号分隔值的全部给定项，
+            在索引查询中匹配任一项；索引 not_contain 排除全部给定项。
+            knn_vector 在索引维度已知时要求输入向量维度匹配。
+
+            非法输入或超限返回 HTTP 400，服务端配置或执行故障返回相应 5xx。
+            已保存的派生视图固定条件非法时返回 VegaBackend.LogicalView.DefinitionInvalid。
+            索引 datetime 集合最多 1024 个不同时刻；含范围条件的过滤树最多 1024 个查询子句；
+            time 集合展开后最多 65536 项，并受引擎配置限制。
+            [能力与兼容说明](https://github.com/openbkn-ai/bkn-docs/blob/main/docs/studio/data-resource-network/logic-view-workflow/design/issue-329-filter-capabilities.md)。
           type: object
           additionalProperties: true
         paging:
@@ -342,12 +530,30 @@ components:
           description: |
             排序字段。派生逻辑视图的非聚合查询支持保留元字段 `_score`，无需在视图 Schema
             中发布；索引通道按真实相关性分数排序，source 表查询忽略该项并保留其余排序项。
+            聚合查询中，`__value` 代表实际聚合结果列，即使 aggregation.alias 使用自定义名称。
+            省略 aggregation 且使用 HAVING count(*) 时，隐式计数输出同样为 `__value`，可用于排序。
+            索引分组仅支持按 group_by 字段、实际聚合结果别名或其 `__value` 引用排序。
+            对 Schema 中存在但不属于这些输出的普通字段排序，返回 HTTP 400 参数错误，
+            不再像旧 terms 分组路径一样静默忽略；即使该字段是聚合输入，也不能据此排序。
+            分组查询保留用户指定的排序优先级和方向，再按 group_by 顺序追加尚未排序的分组键升序，
+            以保证并列结果在 offset/limit 分页时具有确定顺序；未指定排序时按全部分组键升序。
+            分组查询的显式排序统一为升序 NULL 在前、降序 NULL 在后；PostgreSQL 源库
+            与索引路径采用相同规则。普通明细查询保留各连接器已有的 NULL 排序语义。
           type: array
           items:
             $ref: "#/components/schemas/SortField"
         output_fields:
           description: |
-            指定输出字段列表。派生逻辑视图的非聚合查询可指定 `_score`；索引通道返回真实
+            指定输出字段列表。显式指定的字段必须全部合法；任一字段不存在时整单拒绝，返回
+            HTTP 400 `VegaBackend.Query.InvalidParameter.OutputField`，不静默删除字段。
+            字段存在但当前查询通道不支持读取时返回 HTTP 400
+            `VegaBackend.Query.UnsupportedOutputField`；默认投影没有可查询字段时返回
+            HTTP 400 `VegaBackend.Query.NoQueryableFields`。真实源连接、执行故障不归入这些错误。
+            省略或传空列表使用默认投影。本地索引通道对 Binary/Other 字段保留 unavailable
+            展示语义，显式请求与默认投影一致；该占位表示索引中无法读取原值。
+            聚合查询只能指定分组字段和实际聚合结果别名（未指定 alias 时为 `__value`）；
+            其他源字段不能作为聚合输出。显式选择仅裁剪结果列，不改变分组、排序、分页、行数或 total。
+            派生逻辑视图的非聚合查询可指定 `_score`；索引通道返回真实
             相关性分数，source 表查询不返回该元字段，不补零或伪造分数。
           type: array
           items:
@@ -372,6 +578,29 @@ components:
         aggregation:
           $ref: "#/components/schemas/Aggregation"
         group_by:
+          description: |
+            索引分组使用同一 PIT 的 composite 分页，保留 NULL/缺失键及多维 NULL 组合，
+            输出真正的 JSON null；空字符串、0、-1 和字符串 "NULL" 保持独立。
+            所有索引分组都要求源端支持 OpenSearch PIT 创建、搜索及关闭 API，
+            包括省略 aggregation，以及 count_distinct 默认或显式允许近似的查询。
+            PIT API 从 OpenSearch 2.4 引入，因此低于 2.4 的版本不支持此分组路径；
+            版本达到 2.4 仍须满足所用 API、参数和读取权限要求，不代表各版本均已验收。
+            当前不适配 Elasticsearch 的 /_pit API，不能因其支持 PIT 就视为兼容索引分组。
+            创建 PIT 时源端返回 400/404，转换为 HTTP 400 参数错误；401/403 转换为
+            源端读取权限错误。不回退到 terms 或自动切换查询通道。
+            日历分组仅返回存在文档的日期，不补齐缺口。COUNT/COUNT_DISTINCT 忽略空值，
+            已有分组内度量全为空时计数为 0，SUM/AVG/MIN/MAX 为 null。
+            SUM/MIN/MAX 的 Decimal 结果先按字段有效 scale 做 HALF_UP 归一化；
+            输出、HAVING、排序及分页使用同一个归一化值，AVG 保留既有结果精度。
+            HAVING 在聚合值归一化之后执行，再进行全局排序与 offset/limit 截取。
+            源库及索引未指定排序时按 group_by 顺序对分组键升序排序，NULL 在前；
+            显式排序并列时以尚未排序的分组键升序打破并列。索引路径由此替代旧 terms 的默认桶顺序。
+            每页 1000 桶，单页响应最多 8 MiB，保留分组状态计费预算 16 MiB，
+            整次执行最多 30 秒（更短请求超时优先），与精确去重共享每进程 4 个扫描槽位。
+            超预算返回 HTTP 422 VegaBackend.Query.ExecutionBudgetExceeded；
+            用户 limit 只截取完整计算后的结果，较小 limit 不减少扫描范围，也不绕过预算。
+            旧 terms 曾返回 top-N 的高基数查询，现在可能因完整扫描超预算而返回 422。
+            超时、分片失败或扫描不完整不返回部分结果。内部 composite 续页不开放公开聚合 cursor。
           type: array
           items:
             $ref: "#/components/schemas/GroupByItem"
@@ -392,11 +621,43 @@ components:
       type: object
       required: [property, aggr]
       properties:
-        property: { type: string }
+        property:
+          type: string
+          description: 聚合字段名；`*` 仅支持 aggr=count，表示统计所有行。
         aggr:
           type: string
           enum: [count, count_distinct, sum, max, min, avg]
-        alias: { type: string }
+        allow_approximate:
+          type: boolean
+          default: true
+          description: |
+            仅用于 count_distinct。省略或 true 允许近似，也允许精确结果。
+            OpenSearch 使用 cardinality，precision_threshold=40000，所有此类结果均标记近似。
+            false 要求精确；支持源库查询的 table（包括派生视图的底层 table）优先走源库，
+            即使本地索引可用或 ignore_local_index=false，也执行源库 COUNT(DISTINCT ...)。
+            源库失败不自动切回索引；仅有索引查询能力时使用 PIT + composite 完整枚举。
+            外部 index 创建 PIT 时，源端返回 400/404 将转换为 HTTP 400 参数错误，
+            提示无法保证精确去重，可设置 allow_approximate=true；
+            源端返回 401/403 将转换为 HTTP 403 VegaBackend.Resource.SourceReadForbidden。
+            搜索阶段错误和其他源端执行失败不作为不支持 PIT 处理，也不自动降级。
+            若字段配置 ignore_above 等可能导致值被忽略或改写的策略，无法保证精确时，
+            false 返回 HTTP 400 参数错误，不返回近似结果，
+            也不额外扫描原文判断策略是否实际触发；允许近似时保持原查询方式。
+            外部 index 的 date_nanos 用于去重或未指定 calendar_interval 的分组时，
+            false 同样返回 HTTP 400，因为聚合仅保留毫秒精度；显式日历分组仍可使用该字段，
+            但去重字段本身仍须满足精确要求。
+            精确枚举默认每页 1000 桶、单页响应 8 MiB、分组状态计费预算 16 MiB、
+            整次执行 30 秒（包含等待）、每进程最多同时执行 4 次；更短的已有超时优先。
+            超出预算返回 HTTP 422 VegaBackend.Query.ExecutionBudgetExceeded，metadata.budget 指明预算类型。
+            超时、分片失败或枚举不完整不返回部分计数。
+            count_distinct 的日历分组仅返回存在文档的日期，不补齐日期缺口；
+            已有分组内计数字段全为空时仍返回 0；其他聚合同样只返回已有日期分组。
+        alias:
+          type: string
+          description: |
+            聚合结果列别名，省略时使用 `__value`。源表查询允许与未输出的源字段同名，
+            但不得与同时输出的 group_by 字段同名，否则返回参数错误；
+            HAVING count(*) 生成的隐式 `__value` 列也遵守该规则。
     GroupByItem:
       type: object
       required: [property]
@@ -416,7 +677,15 @@ components:
         operation:
           type: string
           enum: ["==", "!=", ">", ">=", "<", "<=", in, not_in, range, out_range]
-        value: {}
+        value:
+          description: |
+            不允许 null。比较运算符 ==/!=/>/>=/</<= 要求单个标量值，不接受数组或对象。
+            in/not_in 要求至少包含一个元素的数组；
+            range/out_range 要求恰好包含两个元素的数组。
+            不符合值结构的请求返回 HTTP 400，错误码 VegaBackend.InvalidParameter.Having。
+            min/max 时间聚合的值遵循 filter_condition 的时间输入契约；count(*) 保持数值语义。
+            OpenSearch 时间聚合按引擎的毫秒数值及 double 精度比较，不保证纳秒级区分；
+            普通 date_nanos 字段过滤仍保留纳秒输入精度。
     ListResponse:
       description: |
         查询响应。`total_count` 仅在请求 `need_total=true` 时返回。
@@ -424,19 +693,39 @@ components:
       required:
         - entries
       properties:
+        is_approximate:
+          type: boolean
+          description: 本次实际是否使用近似聚合；false 不代表源库与索引处于同一数据时点。
         query_source:
           description: 本次查询实际使用的数据路径。`local_index` 表示 table 的本地索引；`source` 表示未使用该本地索引。
           type: string
           enum: [local_index, source]
         entries:
           description: |
-            文档条目。Binary 或无法索引的字段可返回 `ResourceValue`：`unavailable` 表示该字段
-            不在本地索引中；`metadata` / `content` 分别表示 Binary 长度或 Base64 内容。
+            文档条目。table、index 等外部数据源已声明的 `json` 字段以普通字符串返回，
+            包括 table 本地索引查询。字段类型元数据仍为 `json`。
+            表源明细查询中的顶层 JSON null 与 SQL NULL 统一返回 null，预览均显示 NULL；
+            JSON 字符串 "null" 与空字符串属于实际内容，不归一化为空值。
+            上述统一空值约定不覆盖 GROUP BY、HAVING 或聚合查询；其结果遵循连接器的类型转换规则。
+            除上述空值归一化外，源端 JSON 文本不转换为对象、数组或数值。
+            本地索引构建使用结构化 JSON 值；查询时序列化非文本值、保留字符串内容。
+            查询不承诺完整还原源端 JSON 类型，源端 IS NULL 筛选仍遵循数据库语义。
+            外部数据源原先返回的 JSON 对象或数组改为字符串，调用方需要结构化值时自行解析。
+            Dataset 是 Vega 管理的文档资源，其 `json` 字段保留文档原有类型（如对象、数组、数值）；
+            列表查询和按文档 ID 获取均遵循此约定，不执行上述字符串转换。
+            Binary 或无法提供内容的字段可返回 `ResourceValue`：`unavailable` 表示
+            当前查询无法提供该字段内容（例如该字段不在本地索引中）。
+            它不表示源值为 NULL；真实空值返回 null，缺失字段仅表示本次未返回。
+            `metadata` / `content` 分别表示 Binary 长度或 Base64 内容。
+            外部数据源查询中 Other 的值按源端返回，JSON 按上述字符串约定返回，均不按 ResourceValue 包装或解读。
           type: array
           items:
             $ref: "#/components/schemas/Document"
         total_count:
-          description: 总条数（仅 need_total=true 时返回）
+          description: |
+            仅 need_total=true 时返回。SQL 表源查询返回分页前的结果行数：
+            明细查询为匹配行数，聚合查询为 GROUP BY、HAVING 后的结果行数。
+            OpenSearch 查询（包括 local_index 路径）当前仍返回匹配文档数。
           type: integer
           format: int64
         paging:
@@ -447,13 +736,19 @@ components:
           items:
             type: string
     ResourceValue:
-      description: Binary 或无法索引字段的特殊值表示。
+      description: |
+        Binary 字段的特殊值表示；本地索引中未存储的 Binary/Other 也可返回 unavailable。
+        源查询中 Other 字段直接返回源值，不使用该包装。真实空值返回 null；缺失字段不能解释为 NULL。
       type: object
       required: [mode]
       properties:
         mode:
           type: string
           enum: [unavailable, metadata, content]
+        reason:
+          description: 内部查询未请求 Binary 内容时为 not_requested；可缺省，客户端应容忍未知原因。
+          type: string
+          examples: [not_requested]
         byte_length:
           description: Binary 字段的字节长度。
           type: integer

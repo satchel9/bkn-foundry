@@ -35,7 +35,7 @@ type Config struct {
 	OAuth                OAuthConfig            `yaml:"oauth"`
 	BknBackend           PrivateBaseConfig      `yaml:"bkn_backend"`
 	OntologyQuery        PrivateBaseConfig      `yaml:"ontology_query"`
-	Vega                 PrivateBaseConfig      `yaml:"vega"`                 // Vega data-catalog backend (run_sql / resource query)
+	Vega                 PrivateBaseConfig      `yaml:"vega"`                 // Vega data-catalog backend; no caller left since run_sql and the resource tools were removed
 	OperatorIntegration  PrivateBaseConfig      `yaml:"operator_integration"` // Operator integration service configuration
 	BknSafe              PrivateBaseConfig      `yaml:"bkn_safe"`             // bkn-safe auth service (AppKey verification)
 	Auth                 AuthorizationConfig    `yaml:"auth"`                 // KN retrieval authorization configuration
@@ -178,8 +178,13 @@ type KnConceptSearchConfig struct {
 	KnnKValue         int `yaml:"knn_k"`               // knn k value
 	// SchemaReadTimeoutMS bounds each selected object type's schema read in
 	// search_schema. A read that has not answered by then keeps its object type
-	// without properties instead of holding the whole search (#1906).
+	// without properties instead of holding the whole search (#1906). It also
+	// bounds the one read of the network's value types; when that has not
+	// answered, properties keep value_type and enums are not expanded.
 	SchemaReadTimeoutMS int `yaml:"schema_read_timeout_ms" env:"CONTEXT_LOADER_SCHEMA_READ_TIMEOUT_MS" default:"5000"`
+	// EnumExpandLimit is the most enum items search_schema lists on a property. A larger enum
+	// gives its value type and item count, and enum_query looks items up in it.
+	EnumExpandLimit int `yaml:"enum_expand_limit" default:"50"`
 }
 
 // KnInstanceSearchConfig holds the deployment-calibrated knobs of semantic instance retrieval.

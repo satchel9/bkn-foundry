@@ -450,7 +450,7 @@ func (s *Service) CheckMany(ctx context.Context, req BatchCheckRequest) (BatchCh
 			}
 		}
 		if actorEligible {
-			if err := validateRegisteredOperations(tx.DB(), needsActor); err != nil {
+			if err := validateRegisteredOperations(ctx, tx.Registry(), needsActor); err != nil {
 				return err
 			}
 			resourceSet := map[authz.ResourceRef]bool{}
@@ -767,7 +767,7 @@ func (s *Service) SyncDelta(ctx context.Context, req DeltaSyncRequest) (SyncResu
 			needsActor = append(needsActor, spec)
 		}
 		if len(needsActor) > 0 {
-			if err := validateRegisteredOperations(tx.DB(), needsActor); err != nil {
+			if err := validateRegisteredOperations(ctx, tx.Registry(), needsActor); err != nil {
 				return err
 			}
 			permissions, err := transactionActorPermissions(ctx, tx, req.ProxyAccountID, req.GrantorID, needsActor)
@@ -1275,7 +1275,7 @@ func (s *Service) readOnlyActorPermissions(ctx context.Context, proxyID, grantor
 		}
 		return nil, false, err
 	}
-	if err := validateRegisteredOperations(s.db.WithContext(ctx), specs); err != nil {
+	if err := validateRegisteredOperations(ctx, s.enforcer.Registry(), specs); err != nil {
 		return nil, false, err
 	}
 	resources, operations := deltaPermissionInputs(specs)
@@ -1337,7 +1337,7 @@ func filteredPermissionSet(proxyID string, filtered []authz.FilteredResource) ma
 }
 
 // normalizeRequiredSources expands each explicitly requested source with one
-// source for every direct operation prerequisite. Keeping the same source
+// source for every transitive operation prerequisite. Keeping the same source
 // identity and binding makes provenance validation, Sync replacement and
 // Reconcile operate on the normalized permissions exactly like explicit ones.
 // The returned reverse index lets CheckMany report a denied explicit source
@@ -1350,7 +1350,7 @@ func (s *Service) normalizeRequiredSources(ctx context.Context,
 	}
 	requirementsByType := make(map[string]map[string][]string, len(operationsByType))
 	for resourceType, operations := range operationsByType {
-		requirements, err := s.enforcer.DirectRequirements(ctx, resourceType, operations)
+		requirements, err := s.enforcer.Requirements(ctx, resourceType, operations)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -1409,20 +1409,23 @@ func normalizeSpec(spec SourceSpec) (SourceSpec, error) {
 		spec.BindingType == "" || spec.BindingID == "" || spec.ResourceID == "" ||
 		strings.Contains(spec.ResourceType, ":") || strings.Contains(spec.ResourceType, "*") ||
 		strings.Contains(spec.ResourceID, "*") || strings.Contains(spec.Operation, "*") ||
-		len(spec.ResourceType) > 64 || len(spec.ResourceID) > 128 || len(spec.Operation) > 64 ||
+		len(spec.ResourceType) > 64 || len(spec.ResourceID) > 257 || len(spec.Operation) > 64 ||
 		len(spec.SourceID) > 128 || len(spec.KNID) > 128 || len(spec.BindingType) > 64 || len(spec.BindingID) > 128 {
 		return SourceSpec{}, ErrInvalidRequest
 	}
 	// A Skill mounted on a network is read as the network's proxy. The
 	// execution factory accepts execute as a read grant on a Skill, and Context
 	// Loader only reads as the proxy; view is not accepted because a delegator
-	// allowed to run a built-in Skill often lacks it.
+	// allowed to run a built-in Skill often lacks it. A knowledge base bound to a
+	// network is read through kb-api's read API, which checks query_data only;
+	// its required view_detail is derived like any other requirement (#2576).
 	allowed := map[string]map[string]bool{
-		"resource": {"view_detail": true, "query_data": true},
-		"tool_box": {"execute": true},
-		"function": {"execute": true},
-		"mcp":      {"execute": true},
-		"skill":    {"execute": true},
+		"resource":       {"view_detail": true, "query_data": true},
+		"tool_box":       {"execute": true},
+		"function":       {"execute": true},
+		"mcp":            {"execute": true},
+		"skill":          {"execute": true},
+		"knowledge_base": {"query_data": true},
 	}
 	if !allowed[spec.ResourceType][spec.Operation] {
 		return SourceSpec{}, ErrInvalidRequest
@@ -1534,7 +1537,7 @@ func validateDelegatorOperation(tx *authz.PolicyTransaction, delegatorID string,
 	if err := validateGrantorIdentity(tx.DB(), delegatorID); err != nil {
 		return err
 	}
-	if err := validateRegisteredOperation(tx.DB(), spec); err != nil {
+	if err := validateRegisteredOperation(tx.DB().Statement.Context, tx.Registry(), spec); err != nil {
 		return err
 	}
 	operation, err := tx.Check(delegatorID, spec.ResourceType, spec.ResourceID, spec.Operation)
@@ -1551,7 +1554,7 @@ func validateAdministrativeAuthority(tx *authz.PolicyTransaction, grantorID stri
 	if err := validateGrantorIdentity(tx.DB(), grantorID); err != nil {
 		return err
 	}
-	if err := validateRegisteredOperation(tx.DB(), spec); err != nil {
+	if err := validateRegisteredOperation(tx.DB().Statement.Context, tx.Registry(), spec); err != nil {
 		return err
 	}
 	authorize, err := tx.Check(grantorID, spec.ResourceType, spec.ResourceID, "authorize")
@@ -1568,10 +1571,9 @@ func validateAdministrativeAuthority(tx *authz.PolicyTransaction, grantorID stri
 	return nil
 }
 
-func validateRegisteredOperation(db *gorm.DB, spec SourceSpec) error {
-	var operation model.Operation
-	if err := db.Where("resource_type_id = ? AND id = ?", spec.ResourceType, spec.Operation).
-		First(&operation).Error; err != nil {
+func validateRegisteredOperation(ctx context.Context, registry *authz.Registry, spec SourceSpec) error {
+	operation, err := registry.Operation(ctx, spec.ResourceType, spec.Operation)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrInvalidRequest
 		}
@@ -1583,24 +1585,9 @@ func validateRegisteredOperation(db *gorm.DB, spec SourceSpec) error {
 	return nil
 }
 
-func validateRegisteredOperations(db *gorm.DB, specs []SourceSpec) error {
-	resourceTypes := map[string]bool{}
-	operationIDs := map[string]bool{}
-	for _, spec := range specs {
-		resourceTypes[spec.ResourceType] = true
-		operationIDs[spec.Operation] = true
-	}
-	resourceTypeValues := make([]string, 0, len(resourceTypes))
-	for value := range resourceTypes {
-		resourceTypeValues = append(resourceTypeValues, value)
-	}
-	operationValues := make([]string, 0, len(operationIDs))
-	for value := range operationIDs {
-		operationValues = append(operationValues, value)
-	}
-	var registered []model.Operation
-	if err := db.Where("resource_type_id IN ? AND id IN ?", resourceTypeValues, operationValues).
-		Find(&registered).Error; err != nil {
+func validateRegisteredOperations(ctx context.Context, registry *authz.Registry, specs []SourceSpec) error {
+	registered, err := registry.Operations(ctx, "")
+	if err != nil {
 		return err
 	}
 	available := map[string]bool{}
@@ -1781,7 +1768,7 @@ func (s *Service) revokeWithRequirements(ctx context.Context, tx *authz.PolicyTr
 	for _, source := range activeFamily {
 		operations = append(operations, source.Operation)
 	}
-	requirements, err := tx.DirectRequirements(ctx, target.ResourceType, operations)
+	requirements, err := tx.Requirements(ctx, target.ResourceType, operations)
 	if err != nil {
 		return target, false, nil, err
 	}
@@ -1805,6 +1792,13 @@ func (s *Service) revokeWithRequirements(ctx context.Context, tx *authz.PolicyTr
 		return target, false, nil, err
 	}
 
+	// Synthesized members of the target's dependency chain are candidates for
+	// removal together. Only retained roots may keep their prerequisites alive;
+	// otherwise a departing intermediate node would retain the chain's leaves.
+	departingRequirements := make(map[string]bool, len(requirements[target.Operation]))
+	for _, required := range requirements[target.Operation] {
+		departingRequirements[required] = true
+	}
 	stillRequired := make(map[string]bool)
 	activeByOperation := make(map[string]model.ProxyGrantSource, len(activeFamily))
 	for _, source := range activeFamily {
@@ -1812,6 +1806,9 @@ func (s *Service) revokeWithRequirements(ctx context.Context, tx *authz.PolicyTr
 			continue
 		}
 		activeByOperation[source.Operation] = source
+		if source.RequirementDerived && departingRequirements[source.Operation] {
+			continue
+		}
 		for _, required := range requirements[source.Operation] {
 			stillRequired[required] = true
 		}

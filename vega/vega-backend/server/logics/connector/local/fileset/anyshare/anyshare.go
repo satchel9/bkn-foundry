@@ -10,6 +10,7 @@ package anyshare
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,9 +19,10 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
-	"github.com/mitchellh/mapstructure"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/fileset"
 )
 
 const (
@@ -131,14 +133,19 @@ func NewAnyShareConnector() interfaces.FilesetConnector {
 	return &AnyShareConnector{}
 }
 
+// ValidateBuildSchema 当前无额外源类型限制，通用构建规则由调用方校验。
+func (c *AnyShareConnector) ValidateBuildSchema(_ *interfaces.Resource) error {
+	return nil
+}
+
 // GetType returns the data source type.
 func (c *AnyShareConnector) GetType() string {
-	return interfaces.ConnectorTypeAnyShare
+	return "anyshare"
 }
 
 // GetName returns the connector name.
 func (c *AnyShareConnector) GetName() string {
-	return interfaces.ConnectorTypeAnyShare
+	return "anyshare"
 }
 
 // GetMode returns the connector mode.
@@ -149,6 +156,11 @@ func (c *AnyShareConnector) GetMode() string {
 // GetCategory returns the connector category.
 func (c *AnyShareConnector) GetCategory() string {
 	return interfaces.ConnectorCategoryFileset
+}
+
+// SupportDiscover reports the connector's existing discovery capability.
+func (c *AnyShareConnector) SupportDiscover() bool {
+	return true
 }
 
 // GetEnabled returns the enabled status.
@@ -162,37 +174,30 @@ func (c *AnyShareConnector) SetEnabled(enabled bool) {
 }
 
 // GetSensitiveFields returns sensitive field names.
-func (c *AnyShareConnector) GetSensitiveFields() []string {
-	return []string{"token", "app_secret"}
+func (c *AnyShareConnector) GetSensitiveFields(_ interfaces.ConnectorConfig) ([]string, error) {
+	return []string{"token", "app_secret"}, nil
 }
 
 // GetFieldConfig returns connector form fields.
 func (c *AnyShareConnector) GetFieldConfig() map[string]interfaces.ConnectorFieldConfig {
 	return map[string]interfaces.ConnectorFieldConfig{
-		"protocol":     {Name: "协议", Type: "string", Description: "http 或 https", Required: true, Encrypted: false},
-		"host":         {Name: "主机地址", Type: "string", Description: "AnyShare 服务主机", Required: true, Encrypted: false},
-		"port":         {Name: "端口", Type: "integer", Description: "服务端口", Required: true, Encrypted: false},
-		"auth_type":    {Name: "认证方式", Type: "integer", Description: "1=访问令牌 Token，2=AppID/AppSecret", Required: true, Encrypted: false},
-		"token":        {Name: "访问令牌", Type: "string", Description: "auth_type=1 时必填", Required: false, Encrypted: true},
-		"app_id":       {Name: "应用账户 ID", Type: "string", Description: "auth_type=2 时必填", Required: false, Encrypted: false},
-		"app_secret":   {Name: "应用密钥", Type: "string", Description: "auth_type=2 时必填", Required: false, Encrypted: true},
-		"doc_lib_type": {Name: "文档库类型", Type: "integer", Description: "1=知识库，2=文档库", Required: true, Encrypted: false},
-		"paths":        {Name: "路径列表", Type: "array", Description: "可选；按文档库名称路径解析起点，空则按文档库类型枚举", Required: false, Encrypted: false},
+		"protocol":     {Name: "Protocol", Type: "string", Description: "http or https", Required: true, Encrypted: false},
+		"host":         {Name: "Host", Type: "string", Description: "AnyShare server host", Required: true, Encrypted: false},
+		"port":         {Name: "Port", Type: "integer", Description: "Server port", Required: true, Encrypted: false},
+		"auth_type":    {Name: "Authentication type", Type: "integer", Description: "1=access token, 2=AppID/AppSecret", Required: true, Encrypted: false},
+		"token":        {Name: "Access token", Type: "string", Description: "Required when auth_type=1", Required: false, Encrypted: true},
+		"app_id":       {Name: "Application account ID", Type: "string", Description: "Required when auth_type=2", Required: false, Encrypted: false},
+		"app_secret":   {Name: "Application secret", Type: "string", Description: "Required when auth_type=2", Required: false, Encrypted: true},
+		"doc_lib_type": {Name: "Library type", Type: "integer", Description: "1=knowledge library, 2=document library", Required: true, Encrypted: false},
+		"paths":        {Name: "Paths", Type: "array", Description: "Optional starting paths resolved by library name; leave empty to enumerate libraries of the selected type", Required: false, Encrypted: false},
 	}
 }
 
 // New creates a configured connector instance.
 func (c *AnyShareConnector) New(cfg interfaces.ConnectorConfig) (interfaces.Connector, error) {
 	var ac anyshareConfig
-	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-		Result:           &ac,
-		WeaklyTypedInput: true,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("decode anyshare config: %w", err)
-	}
-	if err := dec.Decode(cfg); err != nil {
-		return nil, fmt.Errorf("decode anyshare config: %w", err)
+	if err := common.DecodeMapToStruct(cfg, &ac); err != nil {
+		return nil, errors.New("decode anyshare config failed")
 	}
 	if ac.Protocol != "http" && ac.Protocol != "https" {
 		return nil, fmt.Errorf("anyshare protocol must be http or https")
@@ -292,27 +297,27 @@ func (c *AnyShareConnector) fetchOAuthToken(ctx context.Context) (string, error)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", err
+		return "", connectionError(ctx, "oauth2 token request failed", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.SetBasicAuth(c.config.AppID, c.config.AppSecret)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("oauth2 token request: %w", err)
+		return "", connectionError(ctx, "oauth2 token request failed", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", connectionError(ctx, "oauth2 token request failed", err)
 	}
 	var tr tokenResponse
 	if err := sonic.Unmarshal(body, &tr); err != nil {
-		return "", fmt.Errorf("oauth2 token decode: %w", err)
+		return "", errors.New("oauth2 token response decode failed")
 	}
 	if tr.Error != "" || tr.AccessToken == "" {
-		return "", fmt.Errorf("oauth2 token error: %s (status=%d body=%s)", tr.Error, resp.StatusCode, truncateForLog(body))
+		return "", fmt.Errorf("oauth2 token request rejected: HTTP %d", resp.StatusCode)
 	}
 	return tr.AccessToken, nil
 }
@@ -347,7 +352,7 @@ func (c *AnyShareConnector) TestConnection(ctx context.Context) error {
 		for _, p := range c.config.Paths {
 			docInfo, err := c.getDocIDByPath(ctx, p)
 			if err != nil {
-				return fmt.Errorf("failed to validate path %q: %w", p, err)
+				return connectionError(ctx, "failed to validate configured path", err)
 			}
 			// Check if the path points to the file (size!) = -1 indicates file
 			if docInfo.Size != -1 {
@@ -357,19 +362,19 @@ func (c *AnyShareConnector) TestConnection(ctx context.Context) error {
 			// Obtain detailed document information and determine the path type
 			detail, err := c.getDocItemDetail(ctx, docInfo.DocID, "doc_lib")
 			if err != nil {
-				return fmt.Errorf("failed to get doc item detail for path %q: %w", p, err)
+				return connectionError(ctx, "failed to get configured path detail", err)
 			}
 
 			// Determine whether the path type is consistent with the configuration
 			if err := c.validateDocLibType(detail.DocLib); err != nil {
-				return fmt.Errorf("path %q validation failed: %w", p, err)
+				return errors.New("configured path library type validation failed")
 			}
 		}
 		return nil
 	}
 	// When no paths are configured, it is judged through getEntryDocLib
 	_, err := c.getEntryDocLib(ctx)
-	return err
+	return connectionError(ctx, "anyshare connection test failed", err)
 }
 
 // validateDocLibType verifies whether the document library type is consistent with the configuration
@@ -406,11 +411,62 @@ func (c *AnyShareConnector) GetMetadata(ctx context.Context) (map[string]any, er
 		return nil, err
 	}
 	return map[string]any{
-		"connector":        interfaces.ConnectorTypeAnyShare,
+		"connector":        "anyshare",
 		"host":             c.config.Host,
 		"port":             c.config.Port,
 		"doc_lib_type":     c.config.DocLibType,
 		"protocol":         c.config.Protocol,
 		"paths_configured": len(c.config.Paths) > 0,
 	}, nil
+}
+
+// ValidateFilterability 按可信源列校验文件集字段，不从 Schema 构造缺失源列，不访问源端或修改资源。
+func (c *AnyShareConnector) ValidateFilterability(resource *interfaces.Resource) error {
+	enabled := false
+	for _, property := range resource.SchemaDefinition {
+		if property.Filterable != nil && *property.Filterable {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return nil
+	}
+	columns, err := fileset.ColumnMetadata(resource)
+	if err != nil {
+		return err
+	}
+	for _, property := range resource.SchemaDefinition {
+		if property.Filterable == nil || !*property.Filterable {
+			continue
+		}
+		name := property.OriginalName
+		if name == "" {
+			name = property.Name
+		}
+		column, exists := columns[name]
+		if !exists || column.Type == "" {
+			return interfaces.NewConditionBuildError("cannot confirm filterability for field %q without source type metadata", property.Name)
+		}
+		if !c.IsFilterable(&column) {
+			return interfaces.NewConditionBuildError("field %q does not support filterable=true", property.Name)
+		}
+	}
+	return nil
+}
+
+// connectionError keeps cancellation semantics without exposing untrusted response contents.
+func connectionError(ctx context.Context, operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s: %w", operation, ctx.Err())
+	}
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cause) {
+			return fmt.Errorf("%s: %w", operation, cause)
+		}
+	}
+	return errors.New(operation)
 }

@@ -16,19 +16,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
-	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/locale"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/bkn_agent"
-	// "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog" // Catalog 任务恢复时启用。
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/dataset"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/semantic_understanding_task"
@@ -461,16 +457,10 @@ func (sutw *SemanticUnderstandingTaskWorker) applyAndMark(ctx context.Context, t
 	if err != nil {
 		return fmt.Errorf("begin semantic understanding apply transaction: %w", err)
 	}
-	ctx, parentTracker, trackerOwner := resource.WithResourceParentTracker(ctx)
 	committed := false
 	defer func() {
 		if !committed {
 			_ = tx.Rollback()
-			if trackerOwner {
-				if cleanupErr := parentTracker.Cleanup(ctx); cleanupErr != nil {
-					logger.Errorf("Clean up resource parents after semantic understanding transaction failure: %v", cleanupErr)
-				}
-			}
 		}
 	}()
 
@@ -592,7 +582,7 @@ func reconcileResourceSemanticSampleWarnings(ctx context.Context,
 	if len(omissions) == 0 {
 		return resultJSON, confidenceDetailJSON, nil
 	}
-	ctx = rest.WithLanguage(ctx, input.Options.Language)
+	ctx = i18n.WithLanguage(ctx, i18n.ResolveLanguage(input.Options.Language))
 	allFieldsOmittedByPolicy := input.SampleContext.Status == interfaces.SemanticUnderstandingSampleStatusAllFieldsOmittedByPolicy
 
 	resultJSON, err := reconcileResourceSemanticSampleWarningPayload(
@@ -748,8 +738,16 @@ func formatSemanticUnderstandingMissingSampleWarning(ctx context.Context, fieldN
 	if len(fieldNames) > 1 {
 		messageName = "SemanticUnderstandingInsufficientSampleDataPlural"
 	}
-	separator := locale.ValidationDetail(ctx, "SemanticUnderstandingFieldSeparator", nil)
-	return locale.ValidationDetail(ctx, messageName, map[string]interface{}{"fields": strings.Join(fieldNames, separator)})
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "VegaBackend.Validation.Detail.SemanticUnderstandingFieldSeparator", nil)
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	separator := localizedText
+	localizedText, renderErr = i18n.Render(i18n.GetLanguageByCtx(ctx), "VegaBackend.Validation.Detail."+messageName, map[string]interface{}{"fields": strings.Join(fieldNames, separator)})
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return localizedText
 }
 
 func isSemanticUnderstandingOmittedField(field interfaces.SemanticUnderstandingResourceAgentInputProperty,
@@ -770,7 +768,11 @@ func equalSemanticUnderstandingFieldName(left, right string) bool {
 }
 
 func semanticUnderstandingWarningClaimsMissingSample(ctx context.Context, warning string) bool {
-	pattern, err := regexp.Compile(locale.ValidationDetail(ctx, "SemanticUnderstandingMissingSamplePattern", nil))
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "VegaBackend.Validation.Detail.SemanticUnderstandingMissingSamplePattern", nil)
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	pattern, err := regexp.Compile(localizedText)
 	return err == nil && pattern.MatchString(warning)
 }
 
@@ -852,7 +854,7 @@ func assessResourceSemanticResultQuality(resultJSON, inputJSON, confidenceDetail
 		if !ok {
 			continue
 		}
-		displayNameEffective := !isTechnicalFieldName(field.Name, field.DisplayName) && field.DisplayName != inputField.DisplayName
+		displayNameEffective := !semantic_understanding_task.IsTechnicalFieldName(field.Name, field.DisplayName) && field.DisplayName != inputField.DisplayName
 		descriptionEffective := strings.TrimSpace(field.Description) != "" && field.Description != inputField.Description
 		if displayNameEffective || descriptionEffective {
 			quality.FieldEffective++
@@ -997,21 +999,6 @@ func skippedApplyResult(detail interfaces.SemanticUnderstandingSkippedApplyDetai
 
 func (sutw *SemanticUnderstandingTaskWorker) applyResourceResult(ctx context.Context, tx *sql.Tx,
 	task *interfaces.SemanticUnderstandingTask, resultJSON string) (*interfaces.SemanticUnderstandingApplyResult, error) {
-	if task.ResourceID == "" {
-		return nil, fmt.Errorf("resource_id is required for resource semantic understanding task")
-	}
-
-	var result interfaces.SemanticUnderstandingResourceResult
-	if err := sonic.Unmarshal([]byte(resultJSON), &result); err != nil {
-		return nil, fmt.Errorf("unmarshal resource semantic understanding result failed: %w", err)
-	}
-	if err := validateConfidence(result.Resource.Confidence, "resource.confidence"); err != nil {
-		return nil, err
-	}
-	if utf8.RuneCountInString(result.Resource.DisplayName) > interfaces.NAME_MAX_LENGTH {
-		return nil, fmt.Errorf("resource display_name exceeds max length")
-	}
-
 	resourceInfo, err := sutw.rs.GetByID(ctx, task.ResourceID)
 	if err != nil {
 		return nil, err
@@ -1019,461 +1006,5 @@ func (sutw *SemanticUnderstandingTaskWorker) applyResourceResult(ctx context.Con
 	if resourceInfo == nil {
 		return nil, fmt.Errorf("resource %s not found", task.ResourceID)
 	}
-
-	fieldByName := make(map[string]*interfaces.Property, len(resourceInfo.SchemaDefinition))
-	for _, property := range resourceInfo.SchemaDefinition {
-		if property != nil {
-			fieldByName[property.Name] = property
-		}
-	}
-	displayNameCandidates, acceptedDisplayNames := planSemanticDisplayNameUpdates(task, result.Fields, resourceInfo.SchemaDefinition, fieldByName)
-
-	seenFields := make(map[string]struct{}, len(result.Fields))
-	updatedFields := make([]string, 0)
-	skippedFields := make([]string, 0)
-	fieldDetails := make([]interfaces.SemanticUnderstandingFieldApplyDetail, 0, len(result.Fields))
-	for _, field := range result.Fields {
-		if field.Name == "" {
-			skippedFields = append(skippedFields, "<empty>: missing name")
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"missing name"}})
-			continue
-		}
-		if _, ok := seenFields[field.Name]; ok {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: duplicate", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"duplicate"}})
-			continue
-		}
-		seenFields[field.Name] = struct{}{}
-
-		property, ok := fieldByName[field.Name]
-		if !ok {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: not found", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"not found"}})
-			continue
-		}
-		displayName := strings.TrimSpace(field.DisplayName)
-		if utf8.RuneCountInString(displayName) > interfaces.MaxLength_PropertyDisplayName {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: display_name exceeds max length", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"display_name exceeds max length"}})
-			continue
-		}
-		// Only a missing display name is absent. Whitespace-only and
-		// punctuation-only values are present but not meaningful semantic names,
-		// so they must be rejected even in force mode rather than being allowed
-		// to overwrite an existing display name.
-		missingDisplayName := field.DisplayName == ""
-		invalidDisplayName := !missingDisplayName && isTechnicalFieldName(field.Name, field.DisplayName)
-		reasons := make([]string, 0, 1)
-		if invalidDisplayName {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: display_name equals technical field name", field.Name))
-			reasons = append(reasons, "display_name equals technical field name")
-		}
-		if utf8.RuneCountInString(field.Description) > interfaces.MaxLength_PropertyDescription {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: description exceeds max length", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"description exceeds max length"}})
-			continue
-		}
-		if err := validateConfidence(field.Confidence, fmt.Sprintf("fields[%s].confidence", field.Name)); err != nil {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: invalid confidence", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"invalid confidence"}})
-			continue
-		}
-		if field.Confidence != nil && *field.Confidence < task.ConfidenceThreshold {
-			skippedFields = append(skippedFields, fmt.Sprintf("%s: confidence below threshold", field.Name))
-			fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: "skipped", Reasons: []string{"confidence below threshold"}})
-			continue
-		}
-
-		updated := make([]string, 0, 2)
-		if candidateDisplayName, hasCandidate := displayNameCandidates[field.Name]; hasCandidate {
-			if !acceptedDisplayNames[field.Name] {
-				skippedFields = append(skippedFields, fmt.Sprintf("%s: display_name duplicates another field", field.Name))
-				reasons = append(reasons, "display_name duplicates another field")
-			} else {
-				property.DisplayName = candidateDisplayName
-				updated = append(updated, "display_name")
-			}
-		}
-		if applyStringByMode(task.ApplyMode, &property.Description, field.Description, property.Description == property.OriginalDescription) {
-			updated = append(updated, "description")
-		}
-		status := "unchanged"
-		if len(updated) > 0 {
-			status = "updated"
-			if len(reasons) > 0 {
-				status = "partial"
-			}
-			updatedFields = append(updatedFields, field.Name)
-		}
-		fieldDetails = append(fieldDetails, interfaces.SemanticUnderstandingFieldApplyDetail{Name: field.Name, Status: status, Updated: updated, Reasons: reasons})
-	}
-
-	updatedResource := make([]string, 0, 2)
-	if applyStringByMode(task.ApplyMode, &resourceInfo.Name, result.Resource.DisplayName,
-		isDefaultResourceName(resourceInfo)) {
-		updatedResource = append(updatedResource, "name")
-	}
-	if applyStringByMode(task.ApplyMode, &resourceInfo.Description, result.Resource.Description,
-		resourceInfo.Description == sourceOriginalDescription(resourceInfo.SourceMetadata)) {
-		updatedResource = append(updatedResource, "description")
-	}
-	resourceUpdated := len(updatedResource) > 0
-	if !resourceUpdated && len(updatedFields) == 0 {
-		if len(skippedFields) > 0 {
-			detailStr, err := sonic.MarshalString(
-				interfaces.SemanticUnderstandingResourceApplyDetail{
-					SkippedFields: skippedFields,
-					FieldDetails:  fieldDetails,
-				})
-			if err != nil {
-				return nil, fmt.Errorf("marshal resource semantic understanding apply detail failed: %w", err)
-			}
-			return &interfaces.SemanticUnderstandingApplyResult{
-				Applied:    false,
-				DetailJSON: detailStr,
-			}, nil
-		}
-		return skippedApplyResult(interfaces.SemanticUnderstandingSkippedApplyDetail{
-			Reason:    "no_resource_changes",
-			ApplyMode: task.ApplyMode,
-			Scope:     task.Scope,
-		})
-	}
-
-	expectedUpdateTime := resourceInfo.UpdateTime
-	resourceInfo.Updater = task.Creator
-	resourceInfo.UpdateTime = time.Now().UnixMilli()
-	err = sutw.rs.InternalUpdateSemanticMetadata(ctx, tx, resourceInfo, expectedUpdateTime)
-	if err != nil {
-		return nil, err
-	}
-
-	detailStr, err := sonic.MarshalString(interfaces.SemanticUnderstandingResourceApplyDetail{
-		ResourceUpdated: resourceUpdated,
-		UpdatedResource: updatedResource,
-		UpdatedFields:   updatedFields,
-		SkippedFields:   skippedFields,
-		FieldDetails:    fieldDetails,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal resource semantic understanding apply detail failed: %w", err)
-	}
-
-	return &interfaces.SemanticUnderstandingApplyResult{
-		Applied:    true,
-		DetailJSON: detailStr,
-	}, nil
+	return semantic_understanding_task.ApplyResourceSemanticResult(ctx, tx, sutw.rs, task, resultJSON, resourceInfo)
 }
-
-// planSemanticDisplayNameUpdates checks the names that would exist after the whole
-// result is applied, so a rename can reuse a name freed by another field.
-func planSemanticDisplayNameUpdates(task *interfaces.SemanticUnderstandingTask,
-	fields []interfaces.SemanticUnderstandingResourceResultField, schema []*interfaces.Property,
-	fieldByName map[string]*interfaces.Property) (map[string]string, map[string]bool) {
-	candidates := make(map[string]string, len(fields))
-	accepted := make(map[string]bool, len(fields))
-	order := make([]string, 0, len(fields))
-	seen := make(map[string]struct{}, len(fields))
-	for _, field := range fields {
-		if field.Name == "" {
-			continue
-		}
-		if _, duplicate := seen[field.Name]; duplicate {
-			continue
-		}
-		seen[field.Name] = struct{}{}
-		property := fieldByName[field.Name]
-		displayName := strings.TrimSpace(field.DisplayName)
-		if property == nil || utf8.RuneCountInString(displayName) > interfaces.MaxLength_PropertyDisplayName ||
-			(field.DisplayName != "" && isTechnicalFieldName(field.Name, field.DisplayName)) ||
-			utf8.RuneCountInString(field.Description) > interfaces.MaxLength_PropertyDescription ||
-			validateConfidence(field.Confidence, "") != nil ||
-			(field.Confidence != nil && *field.Confidence < task.ConfidenceThreshold) {
-			continue
-		}
-		candidate := property.DisplayName
-		if !applyStringByMode(task.ApplyMode, &candidate, displayName, property.DisplayName == property.Name) {
-			continue
-		}
-		candidates[field.Name] = candidate
-		accepted[field.Name] = true
-		order = append(order, field.Name)
-	}
-
-	counts := make(map[string]int, len(schema))
-	for _, property := range schema {
-		if property == nil {
-			continue
-		}
-		counts[strings.TrimSpace(property.DisplayName)]++
-	}
-	for _, name := range order {
-		counts[strings.TrimSpace(fieldByName[name].DisplayName)]--
-		counts[strings.TrimSpace(candidates[name])]++
-	}
-	// Reject later suggestions first when several final names collide. Repeat
-	// because rejecting one rename may restore a name needed by another.
-	for changed := true; changed; {
-		changed = false
-		for i := len(order) - 1; i >= 0; i-- {
-			name := order[i]
-			candidateKey := strings.TrimSpace(candidates[name])
-			if !accepted[name] || counts[candidateKey] <= 1 {
-				continue
-			}
-			accepted[name] = false
-			counts[candidateKey]--
-			counts[strings.TrimSpace(fieldByName[name].DisplayName)]++
-			changed = true
-		}
-	}
-	return candidates, accepted
-}
-
-func applyStringByMode(mode string, current *string, next string, treatCurrentAsEmpty bool) bool {
-	if next == "" {
-		return false
-	}
-	switch mode {
-	case interfaces.SemanticUnderstandingApplyModeFillEmpty:
-		if *current != "" && !treatCurrentAsEmpty {
-			return false
-		}
-	case interfaces.SemanticUnderstandingApplyModeForce:
-	default:
-		return false
-	}
-	if *current == next {
-		return false
-	}
-	*current = next
-	return true
-}
-
-// isTechnicalFieldName reports whether displayName is empty or merely a formatting
-// variation of the technical field name. Such a value is not a semantic enhancement
-// and must never overwrite a business display name, including in force mode.
-func isTechnicalFieldName(name, displayName string) bool {
-	normalizedDisplayName := normalizeSemanticFieldName(displayName)
-	return normalizedDisplayName == "" || normalizedDisplayName == normalizeSemanticFieldName(name)
-}
-
-func normalizeSemanticFieldName(value string) string {
-	return strings.Map(func(r rune) rune {
-		if unicode.IsLetter(r) || unicode.IsDigit(r) {
-			return unicode.ToLower(r)
-		}
-		return -1
-	}, value)
-}
-
-// isDefaultResourceName 识别发现生成的默认名称，保留人工设置的业务名称。
-func isDefaultResourceName(resource *interfaces.Resource) bool {
-	if resource.Name == resource.SourceIdentifier {
-		return true
-	}
-	for _, key := range []string{"name", "original_name"} {
-		original, _ := resource.SourceMetadata[key].(string)
-		if original != "" && resource.Name == original {
-			return true
-		}
-	}
-	// 旧表名包含 namespace；刷新后 original_name 已被完整 TableMeta 替代。
-	if resource.Category == interfaces.ResourceCategoryTable {
-		name, _ := resource.SourceMetadata["name"].(string)
-		namespace, _ := resource.SourceMetadata["schema"].(string)
-		if namespace == "" {
-			namespace, _ = resource.SourceMetadata["database"].(string)
-		}
-		if name != "" && namespace != "" {
-			unqualified, qualified := strings.CutPrefix(resource.Name, namespace+".")
-			return qualified && unqualified == name
-		}
-	}
-	return false
-}
-
-func sourceOriginalDescription(metadata map[string]any) string {
-	if metadata == nil {
-		return ""
-	}
-	if description, ok := metadata["description"].(string); ok {
-		return description
-	}
-	// 文件集等资源仍使用 original_description。
-	description, _ := metadata["original_description"].(string)
-	return description
-}
-
-func validateConfidence(confidence *float64, path string) error {
-	if confidence == nil {
-		return nil
-	}
-	if *confidence < 0 || *confidence > 1 {
-		return fmt.Errorf("%s must be between 0 and 1", path)
-	}
-	return nil
-}
-
-/* Catalog 任务暂不支持；保留旧 Logic View 写入和校验实现。
-func (sutw *SemanticUnderstandingTaskWorker) applyCatalogResult(ctx context.Context, tx *sql.Tx,
-	task *interfaces.SemanticUnderstandingTask, resultJSON string) (*interfaces.SemanticUnderstandingApplyResult, error) {
-
-	if task.CatalogID == "" {
-		return nil, fmt.Errorf("catalog_id is required for catalog semantic understanding task")
-	}
-
-	var result interfaces.SemanticUnderstandingCatalogResult
-	if err := sonic.Unmarshal([]byte(resultJSON), &result); err != nil {
-		return nil, fmt.Errorf("unmarshal catalog semantic understanding result failed: %w", err)
-	}
-	catalog, err := sutw.cs.InternalGetByID(ctx, task.CatalogID, false)
-	if err != nil {
-		return nil, err
-	}
-	if catalog == nil {
-		return nil, fmt.Errorf("catalog %s not found", task.CatalogID)
-	}
-
-	resources, err := sutw.rs.InternalGetByCatalogID(ctx, task.CatalogID)
-	if err != nil {
-		return nil, err
-	}
-	resourceByID := make(map[string]*interfaces.Resource, len(resources))
-	logicalViewByID := make(map[string]*interfaces.Resource)
-	sourceIdentifiers := make(map[string]struct{}, len(resources))
-	for _, res := range resources {
-		if res == nil {
-			continue
-		}
-		resourceByID[res.ID] = res
-		if res.SourceIdentifier != "" {
-			sourceIdentifiers[res.SourceIdentifier] = struct{}{}
-		}
-		if res.Category == interfaces.ResourceCategoryLogicalView {
-			logicalViewByID[res.ID] = res
-		}
-	}
-
-	detail := interfaces.SemanticUnderstandingCatalogApplyDetail{}
-	for i, view := range result.LogicalViews {
-		if err := validateConfidence(view.Confidence, fmt.Sprintf("logical_views[%d].confidence", i)); err != nil {
-			return nil, err
-		}
-		if err := validateCatalogLogicalViewOutput(view, resourceByID, logicalViewByID, sourceIdentifiers); err != nil {
-			return nil, err
-		}
-
-		switch view.Action {
-		case "create":
-			sourceIdentifiers[view.SourceIdentifier] = struct{}{}
-			req := &interfaces.ResourceRequest{
-				CatalogID:        task.CatalogID,
-				Builtin:          &catalog.Builtin,
-				Name:             view.Name,
-				SourceIdentifier: view.SourceIdentifier,
-				Description:      view.Description,
-				Category:         interfaces.ResourceCategoryLogicalView,
-				Enabled:          true,
-				Status:           interfaces.ResourceStatusActive,
-				LogicDefinition:  view.LogicDefinition,
-			}
-			created, err := sutw.rs.InternalCreate(ctx, tx, req)
-			if err != nil {
-				return nil, err
-			}
-			if created != nil {
-				detail.CreatedResourceIDs = append(detail.CreatedResourceIDs, created.ID)
-			}
-		case "update":
-			current := logicalViewByID[view.TargetResourceID]
-			expectedUpdateTime := current.UpdateTime
-			nextDescription := current.Description
-			applyStringByMode(task.ApplyMode, &nextDescription, view.Description, false)
-			nextLogicDefinition := current.LogicDefinition
-			if task.ApplyMode == interfaces.SemanticUnderstandingApplyModeForce {
-				nextLogicDefinition = view.LogicDefinition
-			}
-			current.Description = nextDescription
-			current.LogicDefinition = nextLogicDefinition
-			current.Updater = task.Creator
-			current.UpdateTime = time.Now().UnixMilli()
-			err = sutw.rs.InternalUpdateSemanticMetadata(ctx, tx, current, expectedUpdateTime)
-			if err != nil {
-				return nil, err
-			}
-			detail.UpdatedResourceIDs = append(detail.UpdatedResourceIDs, current.ID)
-		}
-	}
-
-	for i, obsolete := range result.ObsoleteLogicalViews {
-		if err := validateConfidence(obsolete.Confidence, fmt.Sprintf("obsolete_logical_views[%d].confidence", i)); err != nil {
-			return nil, err
-		}
-		if obsolete.TargetResourceID == "" {
-			return nil, fmt.Errorf("obsolete_logical_views[%d].target_resource_id is required", i)
-		}
-		if _, ok := logicalViewByID[obsolete.TargetResourceID]; !ok {
-			return nil, fmt.Errorf("obsolete logical view %s does not exist in catalog input", obsolete.TargetResourceID)
-		}
-		err = sutw.rs.InternalUpdateStatus(ctx, tx, obsolete.TargetResourceID, interfaces.ResourceStatusStale, obsolete.Reason)
-		if err != nil {
-			return nil, err
-		}
-		detail.StaledResourceIDs = append(detail.StaledResourceIDs, obsolete.TargetResourceID)
-	}
-
-	if len(detail.CreatedResourceIDs) == 0 && len(detail.UpdatedResourceIDs) == 0 && len(detail.StaledResourceIDs) == 0 {
-		return skippedApplyResult(interfaces.SemanticUnderstandingSkippedApplyDetail{
-			Reason:    "no_catalog_changes",
-			ApplyMode: task.ApplyMode,
-			Scope:     task.Scope,
-		})
-	}
-
-	detailStr, err := sonic.MarshalString(detail)
-	if err != nil {
-		return nil, fmt.Errorf("marshal catalog semantic understanding apply detail failed: %w", err)
-	}
-	return &interfaces.SemanticUnderstandingApplyResult{
-		Applied:    true,
-		DetailJSON: detailStr,
-	}, nil
-}
-
-func validateCatalogLogicalViewOutput(view interfaces.SemanticUnderstandingCatalogLogicalView, resourceByID map[string]*interfaces.Resource, logicalViewByID map[string]*interfaces.Resource, sourceIdentifiers map[string]struct{}) error {
-	switch view.Action {
-	case "create":
-		if view.TargetResourceID != "" {
-			return fmt.Errorf("target_resource_id must be empty when creating logical view")
-		}
-		if view.Name == "" {
-			return fmt.Errorf("logical view name is required when creating logical view")
-		}
-		if !semanticUnderstandingSourceIdentifierPattern.MatchString(view.SourceIdentifier) {
-			return fmt.Errorf("source_identifier must be lower snake_case when creating logical view")
-		}
-		if _, exists := sourceIdentifiers[view.SourceIdentifier]; exists {
-			return fmt.Errorf("source_identifier %s already exists in catalog input", view.SourceIdentifier)
-		}
-	case "update":
-		if view.TargetResourceID == "" {
-			return fmt.Errorf("target_resource_id is required when updating logical view")
-		}
-		if _, ok := logicalViewByID[view.TargetResourceID]; !ok {
-			return fmt.Errorf("logical view %s does not exist in catalog input", view.TargetResourceID)
-		}
-	default:
-		return fmt.Errorf("unsupported logical view action: %s", view.Action)
-	}
-	if len(interfaces.LegacyLogicDefinitionNodes(view.LogicDefinition)) == 0 {
-		return fmt.Errorf("logic_definition is required for logical view action %s", view.Action)
-	}
-	for _, sourceResourceID := range view.SourceResources {
-		if _, ok := resourceByID[sourceResourceID]; !ok {
-			return fmt.Errorf("source resource %s does not exist in catalog input", sourceResourceID)
-		}
-	}
-	return nil
-}
-*/

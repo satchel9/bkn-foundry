@@ -16,7 +16,7 @@ type DatasetService interface {
 	Update(ctx context.Context, res *Resource) error
 	Delete(ctx context.Context, res *Resource) error
 
-	ListDocuments(ctx context.Context, res *Resource, params *ResourceDataQueryParams) ([]map[string]any, int64, error)
+	ListDocuments(ctx context.Context, res *Resource, params *ResourceDataQueryParams) (*ResourceDataQueryResult, error)
 	CountDocuments(ctx context.Context, res *Resource) (int64, error)
 	// GetDocuments retrieves documents by unique IDs supplied by the caller.
 	GetDocuments(ctx context.Context, res *Resource, docIDs []string, ignoreMissing bool) ([]map[string]any, error)
@@ -24,5 +24,7 @@ type DatasetService interface {
 	ReplaceDocument(ctx context.Context, res *Resource, docID string, document map[string]any) error
 	// DeleteDocuments deletes documents by unique IDs supplied by the caller.
 	DeleteDocuments(ctx context.Context, res *Resource, docIDs []string, ignoreMissing bool) error
-	DeleteDocumentsByQuery(ctx context.Context, res *Resource, params *ResourceDataQueryParams) error
+	// BulkReplaceDocuments 接收调用方已完成 data_write 鉴权的 Dataset。
+	BulkReplaceDocuments(ctx context.Context, res *Resource, documents []map[string]any) ([]DocumentWriteResult, error)
+	DeleteDocumentsByQuery(ctx context.Context, res *Resource, params *ResourceDataQueryParams) (*DeleteByQueryResult, error)
 }

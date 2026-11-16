@@ -1,0 +1,40 @@
+{
+  "_comment": "run_cypher rules checked by tools/check_cypher_docs.py: each pattern is searched case-insensitively, with . matching newlines, in every place of its language. Anchor a pattern on the rule's own wording and bound any gap, as in .{0,60}, so unrelated text elsewhere cannot complete it.",
+  "facts": [
+    {
+      "name": "default and largest LIMIT",
+      "zh": "(?<!\\d)1000(?!\\d)\\D{0,120}LIMIT[^\\d,，]{0,25}10000(?!\\d)",
+      "en": "(?<!\\d)1000(?!\\d)\\D{0,120}LIMIT[^\\d,，]{0,25}10000(?!\\d)"
+    },
+    {
+      "name": "!= is read as <>",
+      "zh": "!=\\W{0,3}\\s*也接受",
+      "en": "!=\\W{0,3}\\s*is read as"
+    },
+    {
+      "name": "datasets and indexes take the basic forms only",
+      "zh": "基础写法",
+      "en": "basic forms"
+    },
+    {
+      "name": "explain does not see dataset-only refusals",
+      "zh": "explain[^。]{0,60}照样通过",
+      "en": "passes (?:explain|the plan)"
+    },
+    {
+      "name": "two unconnected parts without conditions are refused",
+      "zh": "两部分.{0,40}(没有任何条件|都没有条件)",
+      "en": "two (?:of (?:them|its parts)|parts)[^.]{0,80}(?:no condition|narrowed by any condition)"
+    },
+    {
+      "name": "limited marks a result cut at the default",
+      "zh": "\\blimited:\\s*(?:true|type:\\s*boolean)",
+      "en": "\\blimited:\\s*(?:true|type:\\s*boolean)"
+    },
+    {
+      "name": "UNION works on datasets, part by part",
+      "zh": "(?:UNION|数据集)[^。]{0,20}每段各自读取",
+      "en": "(?:UNION|datasets)[^.]{0,40}each part read on its own"
+    }
+  ]
+}

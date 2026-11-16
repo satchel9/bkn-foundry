@@ -9,20 +9,22 @@ package driveradapters
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/common"
-	"ontology-query/common/visitor"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/visitor"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
 )
 
 func TestOperationSpanAttributesUseRouteTemplate(t *testing.T) {
@@ -31,6 +33,80 @@ func TestOperationSpanAttributesUseRouteTemplate(t *testing.T) {
 		attributes[1].Value.AsString() != "/api/ontology-query/v1/knowledge-networks/:kn_id/subgraph" ||
 		attributes[2].Value.AsInt64() != http.StatusAccepted {
 		t.Fatalf("unexpected span attributes: %#v", attributes)
+	}
+}
+
+func TestBindObjectMetricRequestPreservesHighPrecisionHavingLiteral(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(
+		`{"having":{"operator":"eq","value":0.1234567890123456789012345}}`))
+	var body interfaces.ObjectMetricQueryRequestV1
+	if err := bindObjectMetricRequestV1(ctx, &body); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := body.Having.Value.(json.Number); !ok || got.String() != "0.1234567890123456789012345" {
+		t.Fatalf("having = %#v, want precise json.Number", body.Having.Value)
+	}
+}
+
+func TestBindObjectMetricRequestRejectsRemovedInstanceIdentityFilter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(
+		`{"instance_identities":[{"id":"order-1"}]}`))
+	var body interfaces.ObjectMetricQueryRequestV1
+	err := bindObjectMetricRequestV1(ctx, &body)
+	if err == nil || !strings.Contains(err.Error(), "unknown field") {
+		t.Fatalf("error = %v, want unknown-field rejection", err)
+	}
+}
+
+func TestBindObjectMetricRequestRejectsLifecycleContext(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(
+		`{"bkn_context":{"conversation_id":"conv-1","interaction_id":"int-1"}}`))
+	var body interfaces.ObjectMetricQueryRequestV1
+	err := bindObjectMetricRequestV1(ctx, &body)
+	if err == nil || !strings.Contains(err.Error(), `unknown field "bkn_context"`) {
+		t.Fatalf("error = %v, want lifecycle unknown-field rejection", err)
+	}
+}
+
+func TestBindObjectMetricTrialAcceptsFullDefinition(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{
+		"definition":{
+			"id":"", "version":1, "code":"", "name":"Orders", "description":"Order count",
+			"owner_object_type_id":"order", "metric_type":"atomic",
+			"result_semantics":{}, "specification":{}, "query_capabilities":{},
+			"lifecycle":{
+				"status":"draft", "ontology_version":"current",
+				"expression_language_version":"1.0", "function_registry_version":"1.0",
+				"aggregation_registry_version":"1.0", "unit_registry_version":"1.0"
+			}
+		}, "query":{}
+	}`))
+	var body interfaces.ObjectMetricTrialRequestV1
+	if err := bindObjectMetricRequestV1(ctx, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Definition.Description != "Order count" || body.Definition.Lifecycle.UnitRegistryVersion != "1.0" {
+		t.Fatalf("full definition fields were lost: %#v", body.Definition)
+	}
+}
+
+func TestBindObjectMetricRequestRejectsTrailingJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, body := range []string{`{} {}`, `{} invalid`} {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		var query interfaces.ObjectMetricQueryRequestV1
+		if err := bindObjectMetricRequestV1(ctx, &query); err == nil {
+			t.Fatalf("body %q: expected trailing JSON to be rejected", body)
+		}
 	}
 }
 
@@ -71,11 +147,11 @@ func (allowQueryAuthorizationService) AuthorizeActionTypeQuery(context.Context, 
 	return nil
 }
 
-func (allowQueryAuthorizationService) AuthorizeMetricQuery(context.Context, string, string, string) error {
+func (allowQueryAuthorizationService) AuthorizeObjectMetricQuery(context.Context, string, string, string) error {
 	return nil
 }
 
-func (allowQueryAuthorizationService) AuthorizeMetricDryRun(context.Context, string, string, *interfaces.MetricDefinition) error {
+func (allowQueryAuthorizationService) AuthorizeObjectMetricTrial(context.Context, string, string, *interfaces.ObjectMetricDefinitionV1, *interfaces.ObjectMetricQueryRequestV1) error {
 	return nil
 }
 
@@ -145,6 +221,65 @@ func Test_RestHandler_HealthCheck(t *testing.T) {
 		engine.ServeHTTP(w, req)
 		So(w.Result().StatusCode, ShouldEqual, http.StatusNotFound)
 	})
+}
+
+func TestObjectMetricRoutesRequireExplicitExtensionRegistration(t *testing.T) {
+	restoreGin := setGinMode()
+	defer restoreGin()
+	engine := gin.New()
+	handler := &restHandler{appSetting: &common.AppSetting{}}
+	handler.RegisterPublic(engine)
+
+	objectMetricPath := "/api/ontology-query/v1/knowledge-networks/:kn_id/object-metrics/:metric_id/data"
+	for _, route := range engine.Routes() {
+		if route.Path == objectMetricPath {
+			t.Fatalf("community handler unexpectedly registered %q", objectMetricPath)
+		}
+	}
+
+	RegisterObjectMetricRoutes(engine, &common.AppSetting{}, nil, nil)
+	found := false
+	for _, route := range engine.Routes() {
+		if route.Path == "/api/ontology-query/v2/knowledge-networks/:kn_id/object-metrics/:metric_id/data" {
+			t.Fatalf("obsolete V2 object-metric route remains registered: %q", route.Path)
+		}
+		if route.Method == http.MethodPost && route.Path == objectMetricPath {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("extension registration did not mount POST %q", objectMetricPath)
+	}
+	for _, path := range []string{
+		"/api/ontology-query/v1/knowledge-networks/:kn_id/object-metrics/:metric_id/data/drill-through",
+		"/api/ontology-query/v1/knowledge-networks/:kn_id/object-metrics/trial/drill-through",
+		"/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-metrics/:metric_id/data/drill-through",
+		"/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-metrics/trial/drill-through",
+	} {
+		registered := false
+		for _, route := range engine.Routes() {
+			if route.Method == http.MethodPost && route.Path == path {
+				registered = true
+				break
+			}
+		}
+		if !registered {
+			t.Fatalf("extension registration did not mount POST %q", path)
+		}
+	}
+}
+
+func TestLegacyMetricRoutesAreNotRegistered(t *testing.T) {
+	restoreGin := setGinMode()
+	defer restoreGin()
+	engine := gin.New()
+	(&restHandler{appSetting: &common.AppSetting{}}).RegisterPublic(engine)
+
+	for _, route := range engine.Routes() {
+		if strings.Contains(route.Path, "/knowledge-networks/:kn_id/metrics") {
+			t.Fatalf("legacy metric route remains registered: %s %s", route.Method, route.Path)
+		}
+	}
 }
 
 func Test_RestHandler_verifyJsonContentType(t *testing.T) {
@@ -264,7 +399,7 @@ func Test_RestHandler_verifyOAuth(t *testing.T) {
 		})
 
 		Convey("失败 - Token验证失败", func() {
-			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, rest.NewHTTPError(context.TODO(), http.StatusUnauthorized, rest.PublicError_Unauthorized))
+			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, httperrors.NewHTTPError(context.TODO(), http.StatusUnauthorized, httperrors.PublicError_Unauthorized))
 
 			req := httptest.NewRequest(http.MethodGet, "/test", nil)
 			w := httptest.NewRecorder()

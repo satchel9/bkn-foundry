@@ -14,6 +14,93 @@
 # stay literal.
 
 error_messages = {
+    "BknAgent.Prompt.TranslationStale": {
+        "code": "BknAgent.Prompt.TranslationStale",
+        "description": "提示词或原文语言已变更，请重新加载后再保存译文。",
+        "detail": "提示词或原文语言已变更，请重新加载后再保存译文。",
+        "solution": "重新加载提示词并确认原文语言。",
+    },
+    "BknAgent.Prompt.TranslationIsSource": {
+        "code": "BknAgent.Prompt.TranslationIsSource",
+        "description": "不能将原文语言保存为译文。",
+        "detail": "不能将原文语言保存为译文。",
+        "solution": "重新加载提示词并确认原文语言。",
+    },
+    "BknAgent.Agent.BindingChanged": {
+        "code": "BknAgent.ParamError.Conflict",
+        "description": 'Agent 的提示词绑定已被并发修改。',
+        "detail": 'Agent 的提示词绑定已被并发修改。',
+        "solution": '请重新加载 Agent 配置后重试更新。',
+    },
+    "BknAgent.Execution.ToolScopeMismatch": {
+        "code": "BknAgent.Execution.ToolScopeMismatch",
+        "description": "工具请求了其他知识网络，调用已拒绝。",
+        "detail": "工具请求了其他知识网络，调用已拒绝。",
+        "solution": "请仅查询当前知识网络。",
+    },
+    "BknAgent.Auth.TokenRequired": {
+        "code": "BknAgent.Auth.TokenRequired",
+        "description": "需要有效的 Bearer 凭据。",
+        "detail": "需要有效的 Bearer 凭据。",
+        "solution": "请使用有效的 OAuth token 或用户签发的 AppKey。",
+    },
+    "BknAgent.Execution.Unavailable": {
+        "code": "BknAgent.Execution.Unavailable",
+        "description": "执行依赖不可用或返回无效响应。",
+        "detail": "执行依赖不可用或返回无效响应。",
+        "solution": "请检查身份认证、授权服务和 Context Loader 后重试。",
+    },
+    "BknAgent.Execution.Forbidden": {
+        "code": "BknAgent.Execution.Forbidden",
+        "description": "当前账号没有该知识网络的权限。",
+        "detail": "当前账号没有该知识网络的权限。",
+        "solution": "请申请该知识网络的权限。",
+    },
+    "BknAgent.Execution.Unsupported": {
+        "code": "BknAgent.Execution.Unsupported",
+        "description": "此 Agent 使用了公共执行范围尚不支持的能力。",
+        "detail": "此 Agent 使用了公共执行范围尚不支持的能力。",
+        "solution": "请使用已支持的内置 Agent 配置。",
+    },
+    "BknAgent.Execution.ContextMissing": {
+        "code": "BknAgent.Execution.ContextMissing",
+        "description_template": "此 Agent 需要 context.{field}。",
+        "description": "此 Agent 需要更多请求上下文。",
+        "detail_template": "此 Agent 需要 context.{field}。",
+        "detail": "此 Agent 需要更多请求上下文。",
+        "solution": "请提供该 Agent 内置工具所需的上下文。",
+    },
+    "BknAgent.Execution.ContextInvalid": {
+        "code": "BknAgent.Execution.ContextInvalid",
+        "description": "请求上下文不符合此 Agent 的要求。",
+        "detail_template": "上下文无效或不应提供：{field}",
+        "detail": "请求上下文不符合此 Agent 的要求。",
+        "solution": "只提供该 Agent 使用的上下文，并符合其格式。",
+    },
+    "BknAgent.Execution.ResultInvalid": {
+        "code": "BknAgent.Execution.ResultInvalid",
+        "description": "执行结果未通过校验。",
+        "detail": "执行结果未通过校验。",
+        "solution": "请使用新的请求 ID 重试；持续出现请反馈。",
+    },
+    "BknAgent.Execution.Conflict": {
+        "code": "BknAgent.Execution.Conflict",
+        "description": "请求与已有执行或会话范围冲突。",
+        "detail": "请求与已有执行或会话范围冲突。",
+        "solution": "请查询已有执行；更换输入或网络时创建新请求或会话。",
+    },
+    "BknAgent.Execution.Failed": {
+        "code": "BknAgent.Execution.Failed",
+        "description": "执行失败。",
+        "detail": "执行失败。",
+        "solution": "请检查执行记录，必要时使用新的请求 ID 重试。",
+    },
+    "BknAgent.MetricDesign.ProposalInvalid": {
+        "code": "BknAgent.MetricDesign.ProposalInvalid",
+        "description": "对象指标设计建议未通过校验。",
+        "detail": "对象指标修改建议不符合字段要求，请查看出错字段和原因后重试。",
+        "solution": "可补充指标描述后重试；持续出现时请提供执行 ID。",
+    },
     "BknAgent.Auth.AccountRequired": {
         "code": "BknAgent.Auth.AccountRequired",
         "description": "缺少调用方身份",
@@ -83,6 +170,13 @@ error_messages = {
         "detail_template": "prompt {prompt_id} 无版本 {version}",
         "detail": "目标版本不存在",
         "solution": "",
+    },
+    "BknAgent.Prompt.VersionConflict": {
+        "code": "BknAgent.Prompt.VersionConflict",
+        "description": "请求的提示词版本已存在或版本号不连续。",
+        "detail_template": "请求版本 {version}，下一个可用版本 {next_version}。",
+        "detail": "本次发布与当前版本历史冲突。",
+        "solution": "请刷新版本历史并核对发布结果，再决定是否重新发布。",
     },
     "BknAgent.Prompt.Conflict": {
         "code": "BknAgent.ParamError.Conflict",
@@ -154,6 +248,13 @@ error_messages = {
         "detail": "未知的工具引用类型",
         "solution": "",
     },
+    "BknAgent.ToolRef.BuiltinUnknown": {
+        "code": "BknAgent.ParamError.ToolRef",
+        "description": "内置工具引用的 provider 或工具不存在",
+        "detail_template": "{ref}",
+        "detail": "内置工具引用的 provider 或工具不存在",
+        "solution": "请使用 bkn-agent 已注册的 provider 及其工具名。",
+    },
     "BknAgent.ToolRef.BoxIdMissing": {
         "code": "BknAgent.ParamError.ToolRef",
         "description": "toolbox 工具缺 box_id",
@@ -189,6 +290,41 @@ error_messages = {
         "detail": "该 agent 属于其他账户",
         "solution": "只有创建者可修改或删除该 agent。",
     },
+    "BknAgent.Agent.BuiltinUndeletable": {
+        "code": "BknAgent.Forbidden",
+        "description": "内置 Agent 不能删除",
+        "detail_template": "agent {agent_id} 是平台内置的 Agent",
+        "detail": "内置 Agent 不能删除",
+        "solution": "平台功能依赖内置 Agent；需要还原时，在系统管理恢复它的初始版本。",
+    },
+    "BknAgent.Agent.BuiltinStaysPublished": {
+        "code": "BknAgent.ParamError.Status",
+        "description": "内置 Agent 不能取消发布",
+        "detail_template": "agent {agent_id} 是平台内置的 Agent",
+        "detail": "内置 Agent 必须保持发布",
+        "solution": "平台功能依赖内置 Agent，保持 status=published。",
+    },
+    "BknAgent.Agent.NoInitialVersion": {
+        "code": "BknAgent.NotFound",
+        "description": "这个内置 Agent 没有初始版本",
+        "detail_template": "agent {agent_id} 没有初始版本",
+        "detail": "没有初始版本",
+        "solution": "确认 bkn-agent 的数据库迁移已执行到最新版本。",
+    },
+    "BknAgent.Agent.VersionInUse": {
+        "code": "BknAgent.ParamError.Version",
+        "description": "不能删除正在使用的 Agent 版本",
+        "detail_template": "v{version} 正在使用",
+        "detail": "该版本正在使用",
+        "solution": "先切换到其他版本，再删除这个版本。",
+    },
+    "BknAgent.Agent.InitialVersion": {
+        "code": "BknAgent.ParamError.Version",
+        "description": "不能删除初始版本",
+        "detail_template": "v{version} 是初始版本",
+        "detail": "初始版本用于恢复，不能删除",
+        "solution": "初始版本始终保留，供恢复使用。",
+    },
     "BknAgent.Agent.Conflict": {
         "code": "BknAgent.ParamError.Conflict",
         "description": "agent 名称或 id 已存在",
@@ -209,6 +345,12 @@ error_messages = {
         "detail_template": "agent {agent_id} mode={mode}",
         "detail": "该 agent 不是对话模式",
         "solution": "task agent 走 /run（M3）。",
+    },
+    "BknAgent.Task.IdempotencyConflict": {
+        "code": "BknAgent.Task.IdempotencyConflict",
+        "description": "该任务键已用于不同的输入。",
+        "detail": "该任务键已用于不同的输入。",
+        "solution": "复用原始输入，或使用新的任务键。",
     },
     "BknAgent.Task.ModeMismatch": {
         "code": "BknAgent.ParamError.Mode",
@@ -261,6 +403,24 @@ error_messages = {
         "description": "服务内部错误",
         "detail": "服务内部错误",
         "solution": "查看 bkn-agent 日志与 trace_id 定位；下游不可用时稍后重试。",
+    },
+    "BknAgent.Tool.Unavailable": {
+        "code": "BknAgent.Tool.Unavailable",
+        "description": "工具调用没有成功完成。",
+        "detail": "工具调用没有成功完成。",
+        "solution": "可以换一种方式查询；持续出现时请检查对应的服务。",
+    },
+    "BknAgent.Model.Unavailable": {
+        "code": "BknAgent.Model.Unavailable",
+        "description": "模型服务暂时不可用。",
+        "detail": "模型服务暂时不可用。",
+        "solution": "请稍后重试；持续失败时请检查模型工厂及其上游服务。",
+    },
+    "BknAgent.Model.Rejected": {
+        "code": "BknAgent.Model.Rejected",
+        "description": "模型服务拒绝了这次请求。",
+        "detail": "模型服务拒绝了这次请求。",
+        "solution": "请检查模型配置、上下文长度或调用额度后再试。",
     },
     "BknAgent.Chat.Timeout": {
         "code": "BknAgent.Chat.Timeout",

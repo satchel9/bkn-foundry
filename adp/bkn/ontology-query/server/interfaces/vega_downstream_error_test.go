@@ -32,6 +32,58 @@ func Test_VegaDownstreamError(t *testing.T) {
 		}
 	})
 
+	t.Run("keyword limits retain safe field and limit guidance", func(t *testing.T) {
+		err := NewVegaDownstreamError(http.StatusBadRequest,
+			`{"error_code":"VegaBackend.Resource.QueryValueExceedsKeywordLimit","description":"keyword limit exceeded","error_details":"private diagnostic","metadata":{"field":"status","limit":256,"private":"secret"}}`)
+		if !err.CanExposeQueryClientMessage() {
+			t.Fatal("keyword limit guidance must survive the query proxy")
+		}
+		metadata := err.ClientMetadata()
+		if len(metadata) != 2 || metadata["field"] != "status" || metadata["limit"] != float64(256) {
+			t.Fatalf("expected only safe keyword metadata, got %v", metadata)
+		}
+		message := err.ClientMessage()
+		if !strings.Contains(message, "status") || !strings.Contains(message, "256") || strings.Contains(message, "private") {
+			t.Fatalf("expected safe field and limit guidance, got %q", message)
+		}
+	})
+
+	t.Run("rejects invalid keyword metadata and unexpected status codes", func(t *testing.T) {
+		for _, metadata := range []string{`null`, `{}`, `"malformed"`, `[]`, `{"field":"status","limit":"256"}`, `{"field":"status","limit":-1}`, `{"field":"status","limit":1.5}`, `{"field":" ","limit":256}`, `{"field":"status","limit":9007199254740992}`} {
+			err := NewVegaDownstreamError(http.StatusBadRequest, `{"error_code":"VegaBackend.Resource.QueryValueExceedsKeywordLimit","error_details":"private diagnostic","metadata":`+metadata+`}`)
+			if err.ClientMetadata() != nil || strings.Contains(err.ClientMessage(), "private") || err.ClientMessage() == "" {
+				t.Fatalf("invalid metadata must use safe guidance: %s", metadata)
+			}
+		}
+		for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+			err := NewVegaDownstreamError(status, `{"error_code":"VegaBackend.Resource.QueryValueExceedsKeywordLimit","metadata":{"field":"status","limit":256}}`)
+			if err.CanExposeQueryClientMessage() || err.ClientMetadata() != nil {
+				t.Fatalf("status %d must remain redacted", status)
+			}
+		}
+	})
+
+	t.Run("execution budgets retain only safe guidance", func(t *testing.T) {
+		for _, budget := range []string{"exact_distinct_time", "exact_distinct_group_memory", "exact_distinct_response_memory", "aggregation_time"} {
+			err := NewVegaDownstreamError(http.StatusUnprocessableEntity,
+				`{"error_code":"VegaBackend.Query.ExecutionBudgetExceeded","error_details":"private diagnostic","metadata":{"budget":"`+budget+`","private":"secret"}}`)
+			if !err.CanExposeQueryClientMessage() || err.StatusCode != http.StatusUnprocessableEntity {
+				t.Fatal("execution budget guidance must survive the query proxy")
+			}
+			metadata := err.ClientMetadata()
+			if len(metadata) != 1 || metadata["budget"] != budget || strings.Contains(err.ClientMessage(), "private") || err.ClientMessage() == "" {
+				t.Fatalf("expected only safe budget guidance, got %v, %q", metadata, err.ClientMessage())
+			}
+		}
+		for _, status := range []int{http.StatusUnprocessableEntity, http.StatusForbidden, http.StatusInternalServerError} {
+			err := NewVegaDownstreamError(status,
+				`{"error_code":"VegaBackend.Query.ExecutionBudgetExceeded","metadata":{"budget":"private diagnostic"}}`)
+			if err.ClientMetadata() != nil || (status != http.StatusUnprocessableEntity && err.CanExposeQueryClientMessage()) {
+				t.Fatalf("unexpected budget metadata or status %d must remain redacted", status)
+			}
+		}
+	})
+
 	t.Run("5xx 仍然是依赖故障", func(t *testing.T) {
 		err := NewVegaDownstreamError(http.StatusInternalServerError, body)
 		if err.IsClientError() {

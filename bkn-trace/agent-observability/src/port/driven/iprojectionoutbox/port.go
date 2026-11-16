@@ -41,7 +41,12 @@ func IsPermanent(err error) bool {
 	return errors.As(err, &classified) && classified.Permanent()
 }
 
+const MaxPayloadBytes = (16 << 20) + (64 << 10)
+const MaxLeaseBytes = 32 << 20
+
 type Item struct {
+	PayloadDeferred  bool      `json:"-"`
+	PayloadTooLarge  bool      `json:"-"`
 	ID               uint64    `json:"outbox_id"`
 	AggregateType    string    `json:"aggregate_type"`
 	AggregateID      string    `json:"aggregate_id"`
@@ -65,6 +70,12 @@ type Store interface {
 	MoveToDLQ(ctx context.Context, item Item, errorCode string) error
 }
 
+// PayloadLoader reads a deferred body only while the claimed lease is current.
+// Answer workers call it within the same task budget as artifact delivery.
+type PayloadLoader interface {
+	LoadPayload(ctx context.Context, item Item) ([]byte, error)
+}
+
 type ReplayRequest struct {
 	DLQID         uint64
 	Operator      string
@@ -78,4 +89,30 @@ type DLQAdmin interface {
 
 type Sink interface {
 	Project(ctx context.Context, item Item) error
+}
+
+// DependencyError carries a bounded adapter classification, not a response body.
+// Only explicitly recoverable dependency failures may use the recovery window
+// instead of the ordinary attempt limit. Unwrap retains the internal cause.
+type DependencyError struct {
+	Cause       error
+	Kind        string
+	HTTPStatus  int
+	Recoverable bool
+}
+
+func (e *DependencyError) Error() string { return "projection dependency failed" }
+func (e *DependencyError) Unwrap() error { return e.Cause }
+
+// ReplayTimeReader is queried only after a recoverable failure of an old item.
+// It preserves immutable creation time and the existing bounded claim path.
+type ReplayTimeReader interface {
+	ProjectionReplayTime(context.Context, string) (time.Time, error)
+}
+
+// DiagnosticDLQStore preserves the terminal policy decision separately from a
+// bounded dependency code in existing failure_class/last_error_code columns.
+// Older stores retain their existing MoveToDLQ behavior.
+type DiagnosticDLQStore interface {
+	MoveToDLQWithDiagnostic(context.Context, Item, string, string) error
 }

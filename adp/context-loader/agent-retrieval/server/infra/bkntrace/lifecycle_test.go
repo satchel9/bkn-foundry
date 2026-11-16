@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -18,12 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 func TestGuardBeginUsesCoreCreatedAtForOperationEvidence(t *testing.T) {
@@ -96,8 +97,8 @@ func TestLifecycleClientEnsureOperationUsesTrustedContext(t *testing.T) {
 		if got := r.Header.Get("X-BKN-Trace-Query-Token"); got != "" {
 			t.Errorf("internal lifecycle request must not carry gateway token, got %q", got)
 		}
-		if got := r.Header.Get(sharedrest.AcceptLanguageHeader); got != sharedrest.AmericanEnglish {
-			t.Errorf("Accept-Language = %q, want %q", got, sharedrest.AmericanEnglish)
+		if got := r.Header.Get(i18n.AcceptLanguageHeader); got != string(i18n.AmericanEnglish) {
+			t.Errorf("Accept-Language = %q, want %q", got, i18n.AmericanEnglish)
 		}
 		switch r.URL.Path {
 		case "/api/agent-observability/v1/interactions/int-1":
@@ -173,7 +174,7 @@ func TestLifecycleClientEnsureOperationUsesTrustedContext(t *testing.T) {
 		AccountID: "user-1", AccountType: interfaces.AccessorTypeUser, AuthMethod: "api_key",
 		TokenInfo: &interfaces.TokenInfo{ClientID: "client-1", VisitorName: "供应链管理员"},
 	})
-	ctx = sharedrest.WithLanguage(ctx, sharedrest.AmericanEnglish)
+	ctx = i18n.WithLanguage(ctx, i18n.AmericanEnglish)
 	client := NewLifecycleClient(server.URL, server.Client())
 	result, apiErr, err := client.EnsureOperation(ctx, EnsureOperationInput{
 		ConversationID: "conv-1", InteractionID: "int-1", OperationKey: "logical-1",
@@ -982,3 +983,22 @@ func matchingFinishReceipt(status, _ string) Receipt {
 		TraceID:       "4b3d59daeff5bfbb23d46c47a5051ec9",
 	}
 }
+
+// The successful HTTP headers do not make a partial body a valid ACK. Its
+// underlying transport failure must remain recognizable by business guards.
+func TestLifecycleSuccessBodyReadFailurePreservesInfrastructureCause(t *testing.T) {
+	for _, failure := range []error{context.DeadlineExceeded, &net.DNSError{Err: "body read timed out", IsTimeout: true}} {
+		client := lifecycleClientWithTransport(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(io.MultiReader(strings.NewReader(`{"interaction_id":`), lifecycleBodyReadFailure{err: failure}))}, nil
+		})
+		var target Interaction
+		apiErr, err := client.Call(finishLifecycleContext(false), http.MethodGet, "/interactions/int-1", nil, &target)
+		if apiErr != nil || !errors.Is(err, ErrInvalidLifecycleResponse) || !errors.Is(err, failure) || !IsTraceInfrastructureFailure(nil, err) {
+			t.Fatalf("body read lost infrastructure cause: api=%#v err=%v", apiErr, err)
+		}
+	}
+}
+
+type lifecycleBodyReadFailure struct{ err error }
+
+func (r lifecycleBodyReadFailure) Read([]byte) (int, error) { return 0, r.err }

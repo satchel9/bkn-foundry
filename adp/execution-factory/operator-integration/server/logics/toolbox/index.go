@@ -21,7 +21,6 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/intcomp"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/metadata"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/metric"
-	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/operator"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/proxy"
 	proxyexecution "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/proxy_execution"
 )
@@ -37,30 +36,33 @@ var (
 
 // ToolServiceImpl toolbox.
 type ToolServiceImpl struct {
-	DBTx             model.DBTx
-	ToolBoxDB        model.IToolboxDB
-	ToolDB           model.IToolDB
-	Proxy            interfaces.ProxyHandler
-	ProxyMaxTimeout  time.Duration
-	CategoryManager  interfaces.CategoryManager
-	Logger           interfaces.Logger
-	UserMgnt         interfaces.UserManagement
-	Validator        interfaces.Validator
-	OperatorMgnt     interfaces.OperatorManager
-	IntCompConfigSvc interfaces.IIntCompConfigService
-	AuthService      interfaces.IAuthorizationService
-	AuditLog         interfaces.LogModelOperator[*metric.AuditLogBuilderParams]
-	MetadataService  interfaces.IMetadataService
-	ActionEvidence   bkntrace.Emitter
-	ActionExecutions bkntrace.ExecutionGate
-	ProxyAuthorizer  interfaces.ProxyExecutionAuthorizer
-	ProxyAudit       interfaces.ProxyExecutionAuditRecorder
+	DBTx            model.DBTx
+	ToolBoxDB       model.IToolboxDB
+	ToolDB          model.IToolDB
+	Proxy           interfaces.ProxyHandler
+	ProxyMaxTimeout time.Duration
+	// ProxyFunctionGrace extends the HTTP client timeout of platform Function calls.
+	ProxyFunctionGrace time.Duration
+	CategoryManager    interfaces.CategoryManager
+	Logger             interfaces.Logger
+	UserMgnt           interfaces.UserManagement
+	Validator          interfaces.Validator
+	IntCompConfigSvc   interfaces.IIntCompConfigService
+	AuthService        interfaces.IAuthorizationService
+	AuditLog           interfaces.LogModelOperator[*metric.AuditLogBuilderParams]
+	MetadataService    interfaces.IMetadataService
+	ActionEvidence     bkntrace.Emitter
+	ActionExecutions   bkntrace.ExecutionGate
+	ProxyAuthorizer    interfaces.ProxyExecutionAuthorizer
+	ProxyAudit         interfaces.ProxyExecutionAuditRecorder
 	// CapabilityIndex keeps the unified capability index in step with tool writes (#1370).
 	//
 	// Every write below tells it which tools changed, after the transaction has committed. It
 	// re-reads the rows itself, so telling it about a write that was then rolled back is safe:
 	// what it indexes is whatever the table ended up holding.
 	CapabilityIndex capabilityindex.Reconciler
+	// BknBackend runs Cypher functions (#2670), and checks them with explain before they are saved.
+	BknBackend interfaces.BknBackendClient
 }
 
 // NewToolServiceImpl creates a toolbox service.
@@ -69,23 +71,24 @@ func NewToolServiceImpl() interfaces.IToolService {
 		conf := config.NewConfigLoader()
 		redisClient, _, _ := conf.RedisConfig.GetClient()
 		toolService = &ToolServiceImpl{
-			DBTx:             dbaccess.NewBaseTx(),
-			ToolBoxDB:        dbaccess.NewToolboxDB(),
-			ToolDB:           dbaccess.NewToolDB(),
-			Proxy:            proxy.NewProxyServer(),
-			ProxyMaxTimeout:  time.Duration(conf.ProxyModuleConfig.MaxTimeout) * time.Second,
-			Logger:           conf.GetLogger(),
-			UserMgnt:         drivenadapters.NewUserManagementClient(),
-			Validator:        validator.NewValidator(),
-			CategoryManager:  category.NewCategoryManager(),
-			OperatorMgnt:     operator.NewOperatorManager(),
-			IntCompConfigSvc: intcomp.NewIntCompConfigService(),
-			AuthService:      auth.NewAuthServiceImpl(),
-			AuditLog:         metric.NewAuditLogBuilder(),
-			MetadataService:  metadata.NewMetadataService(),
-			CapabilityIndex:  capabilityindex.NewReconciler(),
-			ActionEvidence:   bkntrace.NewConfiguredKafkaEmitter(conf.GetLogger()),
-			ActionExecutions: bkntrace.NewRedisExecutionGate(redisClient),
+			DBTx:               dbaccess.NewBaseTx(),
+			ToolBoxDB:          dbaccess.NewToolboxDB(),
+			ToolDB:             dbaccess.NewToolDB(),
+			Proxy:              proxy.NewProxyServer(),
+			ProxyMaxTimeout:    time.Duration(conf.ProxyModuleConfig.MaxTimeout) * time.Second,
+			ProxyFunctionGrace: time.Duration(conf.ProxyModuleConfig.PlatformFunctionGrace) * time.Second,
+			Logger:             conf.GetLogger(),
+			UserMgnt:           drivenadapters.NewUserManagementClient(),
+			Validator:          validator.NewValidator(),
+			CategoryManager:    category.NewCategoryManager(),
+			IntCompConfigSvc:   intcomp.NewIntCompConfigService(),
+			AuthService:        auth.NewAuthServiceImpl(),
+			AuditLog:           metric.NewAuditLogBuilder(),
+			MetadataService:    metadata.NewMetadataService(),
+			BknBackend:         drivenadapters.NewBknBackendClient(),
+			CapabilityIndex:    capabilityindex.NewReconciler(),
+			ActionEvidence:     bkntrace.NewConfiguredKafkaEmitter(conf.GetLogger()),
+			ActionExecutions:   bkntrace.NewRedisExecutionGate(redisClient),
 			ProxyAuthorizer: proxyexecution.NewAuthorizer(
 				drivenadapters.NewProxyExecutionAuthorizationAccess(),
 			),

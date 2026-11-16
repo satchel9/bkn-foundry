@@ -104,8 +104,9 @@ func newBoundToolFixture(t *testing.T) *boundToolFixture {
 
 func (f *boundToolFixture) expectAction(source interfaces.ActionSource) {
 	f.query.EXPECT().QueryActions(gomock.Any(), gomock.Any()).Return(&interfaces.QueryActionsResponse{
-		ActionSource: &source,
-		Actions:      []interfaces.ActionParams{{Parameters: map[string]any{"order_id": "o-1"}}},
+		ExecutionSchema: testActionExecutionSchema(),
+		ActionSource:    &source,
+		Actions:         []interfaces.ActionParams{{Parameters: map[string]any{"order_id": "o-1"}}},
 	}, nil)
 }
 
@@ -327,7 +328,7 @@ func TestGetActionInfoProxyReadFailsClosed(t *testing.T) {
 			if resp != nil || statusOf(err) != test.wantStatus {
 				t.Fatalf("GetActionInfo() = %+v, %v; want HTTP %d", resp, err, test.wantStatus)
 			}
-			if !reflect.DeepEqual(f.seq.steps, test.wantSteps) && !(len(f.seq.steps) == 0 && len(test.wantSteps) == 0) {
+			if !reflect.DeepEqual(f.seq.steps, test.wantSteps) && (len(f.seq.steps) != 0 || len(test.wantSteps) != 0) {
 				t.Fatalf("steps = %v, want %v", f.seq.steps, test.wantSteps)
 			}
 		})

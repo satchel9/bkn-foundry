@@ -7,27 +7,30 @@
 package driveradapters
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	attr "go.opentelemetry.io/otel/attribute"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/capability_binding"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/capability_binding"
 )
 
 const (
@@ -59,8 +62,18 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 
 	// Archive uploads predate these query parameters and historically behaved as overwrite +
 	// non-strict. Keep those omission defaults for existing callers while honoring explicit values.
+	// replace is overwrite that also deletes what the package leaves out; only uploads take it.
+	replace := c.Query(interfaces.QueryParam_ImportMode) == interfaces.ImportMode_Replace
+	overwriteChanges, parseErr := strconv.ParseBool(c.DefaultQuery("overwrite_changes", "false"))
+	if parseErr != nil {
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails("overwrite_changes must be true or false")
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
 	mode, strictMode, httpErr := parseKnowledgeNetworkImportOptions(ctx, c,
-		interfaces.ImportMode_Overwrite, false)
+		interfaces.ImportMode_Overwrite, false, true)
 	if httpErr != nil {
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -70,8 +83,12 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	// Read the uploaded file.
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-			WithErrorDetails(commonValidationDetail(ctx, "UploadedFileReadFailed", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.UploadedFileReadFailed", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(localizedText)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
@@ -80,11 +97,15 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 
 	// Validate the file type.
 	if header.Header.Get("Content-Type") != "application/octet-stream" {
-		// Fall back to the filename extension.
-		ext := filepath.Ext(header.Filename)
-		if ext != ".tar" && ext != ".tgz" && ext != ".tar.gz" {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-				WithErrorDetails(commonValidationDetail(ctx, "ArchiveFileTypeInvalid", nil))
+		// Fall back to the filename extension. The suffix is matched on the whole name:
+		// filepath.Ext of "net.tar.gz" is ".gz", which never matched ".tar.gz".
+		if !hasArchiveSuffix(header.Filename) {
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.ArchiveFileTypeInvalid", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+				WithErrorDetails(localizedText)
 			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 			rest.ReplyError(c, httpErr)
 			return
@@ -95,8 +116,12 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	branch := c.DefaultQuery("branch", interfaces.MAIN_BRANCH)
 	bindingPolicy := strings.TrimSpace(c.DefaultQuery("binding_policy", bknBindingPolicyPreserve))
 	if bindingPolicy != bknBindingPolicyPreserve && bindingPolicy != bknBindingPolicyDetach {
-		httpErr = rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-			WithErrorDetails(commonValidationDetail(ctx, "BindingPolicyInvalid", map[string]any{"value": bindingPolicy}))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.BindingPolicyInvalid", map[string]any{"value": bindingPolicy})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr = httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(localizedText)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
@@ -106,19 +131,48 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 		branch, mode, strictMode, bindingPolicy, header.Filename, header.Size)
 
 	// Load the network directly from the tar archive in memory.
-	bknNetwork, err := bknsdk.LoadNetworkFromTar(file)
+	// The archive format is read from its first bytes: plain tar as always, tar.gz, or zip.
+	bknNetwork, err := bknsdk.LoadNetworkFromArchive(file)
 	if err != nil {
 		logger.Errorf("Failed to load network from tar: %s", err.Error())
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-			WithErrorDetails(commonValidationDetail(ctx, "ArchiveLoadFailed", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.ArchiveLoadFailed", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(localizedText)
+		if strings.Contains(err.Error(), "legacy metrics") {
+			httpErr = httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+				WithErrorDetails("legacy metrics/*.bkn is unsupported; migrate metrics to object metrics V1 before import")
+		}
+		// A package refused by its declared bkn_spec says which definition to fix; the generic
+		// load failure would leave the author only the server log to find out.
+		var specErr *bknsdk.SpecError
+		if errors.As(err, &specErr) {
+			httpErr = httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+				WithErrorDetails(err.Error())
+		}
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
+	resolvedBranch, branchOK := r.writeWholeDraftBranch(&ctx, c, bknNetwork.ID)
+	if !branchOK {
+		return
+	}
+	branch = resolvedBranch
 	bknNetwork.Branch = branch
+	if replace && !overwriteChanges {
+		logics.DraftWriteFrom(ctx).RefuseDraftChanges = true
+	} else if replace && overwriteChanges {
+		// The package replaces the unpublished changes, so a direct import publishes only itself.
+		logics.DraftWriteFrom(ctx).RefuseDraftChanges = false
+	}
 
 	// Import the network.
 	kn := logics.ToADPNetWork(bknNetwork)
+	kn.ReplaceContent = replace
+	kn.ObjectMetrics = make([]*interfaces.ObjectMetricRecordV1, 0, len(bknNetwork.ObjectMetrics))
 	otMap := make(map[string]*interfaces.ObjectType)
 	for _, bknObj := range bknNetwork.ObjectTypes {
 		ot := logics.ToADPObjectType(kn.KNID, kn.Branch, bknObj)
@@ -137,6 +191,9 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 		risk := logics.ToADPRiskType(kn.KNID, kn.Branch, bknRisk)
 		kn.RiskTypes = append(kn.RiskTypes, risk)
 	}
+	for _, bknValueType := range bknNetwork.ValueTypes {
+		kn.ValueTypes = append(kn.ValueTypes, logics.ToADPValueType(kn.KNID, kn.Branch, bknValueType))
+	}
 	for _, bknCG := range bknNetwork.ConceptGroups {
 		cg := logics.ToADPConceptGroup(kn.KNID, kn.Branch, bknCG)
 		kn.ConceptGroups = append(kn.ConceptGroups, cg)
@@ -147,20 +204,28 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 			}
 		}
 	}
-	for _, bknM := range bknNetwork.Metrics {
-		if bknM == nil {
-			continue
+	for _, rawMetric := range bknNetwork.ObjectMetrics {
+		var metric interfaces.ObjectMetricRecordV1
+		decoder := json.NewDecoder(bytes.NewReader(rawMetric))
+		decoder.UseNumber()
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&metric); err != nil {
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+				WithErrorDetails(err.Error())
+			rest.ReplyError(c, httpErr)
+			return
 		}
-		kn.Metrics = append(kn.Metrics, logics.ToADPMetricDefinition(kn.KNID, branch, bknM))
+		metric.KNID, metric.Branch = kn.KNID, branch
+		kn.ObjectMetrics = append(kn.ObjectMetrics, &metric)
 	}
 	// Validate required knowledge network creation fields, lengths, and enum values.
 	err = ValidateKN(ctx, kn)
 	if err != nil {
-		httpErr := err.(*rest.HTTPError)
+		httpErr := err.(*httperrors.HTTPError)
 
 		// Record the error log.
 		otellog.LogError(ctx, fmt.Sprintf("Validate knowledge network[%s] failed: %s. %v", kn.KNName,
-			httpErr.BaseError.Description, httpErr.BaseError.ErrorDetails), nil)
+			httpErr.ErrorCode, httpErr.ErrorDetails), nil)
 
 		// Set trace attributes for the error.
 		span.SetAttributes(attr.Key("kn_name").String(kn.KNName))
@@ -173,7 +238,7 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	if len(kn.ObjectTypes) > 0 {
 		err = ValidateObjectTypes(ctx, kn.KNID, kn.ObjectTypes, strictMode)
 		if err != nil {
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 			rest.ReplyError(c, httpErr)
 			return
@@ -182,7 +247,7 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	if len(kn.RelationTypes) > 0 {
 		err = ValidateRelationTypes(ctx, kn.KNID, kn.RelationTypes, strictMode)
 		if err != nil {
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 			rest.ReplyError(c, httpErr)
 			return
@@ -191,7 +256,7 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	if len(kn.ActionTypes) > 0 {
 		err = ValidateActionTypes(ctx, kn.KNID, kn.ActionTypes, strictMode)
 		if err != nil {
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 			rest.ReplyError(c, httpErr)
 			return
@@ -201,7 +266,7 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 		for _, conceptGroup := range kn.ConceptGroups {
 			err = ValidateConceptGroup(ctx, conceptGroup)
 			if err != nil {
-				httpErr := err.(*rest.HTTPError)
+				httpErr := err.(*httperrors.HTTPError)
 				oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 				rest.ReplyError(c, httpErr)
 				return
@@ -211,20 +276,17 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	if len(kn.RiskTypes) > 0 {
 		err = ValidateRiskTypes(ctx, kn.KNID, kn.RiskTypes)
 		if err != nil {
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 			rest.ReplyError(c, httpErr)
 			return
 		}
 	}
-	if len(kn.Metrics) > 0 {
-		err = ValidateMetricRequests(ctx, kn.Metrics, strictMode)
-		if err != nil {
-			httpErr := err.(*rest.HTTPError)
-			oteltrace.AddHttpAttrs4HttpError(span, httpErr)
-			rest.ReplyError(c, httpErr)
-			return
-		}
+	if err = ValidateValueTypes(ctx, kn.ValueTypes); err != nil {
+		httpErr := err.(*httperrors.HTTPError)
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
 	}
 	if bindingPolicy == bknBindingPolicyDetach {
 		detachBKNExternalBindings(kn)
@@ -236,7 +298,7 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 	// Create the knowledge network.
 	knID, err := r.kns.CreateKN(ctx, kn, mode, persistenceStrictMode)
 	if err != nil {
-		httpErr := err.(*rest.HTTPError)
+		httpErr := err.(*httperrors.HTTPError)
 
 		// Set trace attributes for the error.
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
@@ -257,14 +319,26 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 		declaredCapabilities = nil
 	}
 	var capabilityReport *interfaces.CapabilityImportReport
-	_, capErr := r.publishKNCapabilityMutation(ctx, knID, branch, nil,
-		func(mutationCtx context.Context, tx *sql.Tx) (*interfaces.KNCapabilityMutationResult, error) {
-			var bindings []*interfaces.CapabilityBinding
-			var importErr error
-			capabilityReport, bindings, importErr = r.cbs.ImportCapabilitiesTx(
-				mutationCtx, tx, knID, branch, declaredCapabilities)
-			return &interfaces.KNCapabilityMutationResult{Bindings: bindings}, importErr
-		})
+	importCapabilities := r.cbs.ImportCapabilitiesTx
+	// A replace drops every binding the package does not keep: all current ones are named as
+	// removed, and the ones it keeps come back as bound.
+	var removedBindingIDs []string
+	var capErr error
+	if replace && !kn.ImportSkipped {
+		importCapabilities = r.cbs.ReplaceCapabilitiesTx
+		removedBindingIDs, capErr = r.cbs.BindingIDs(ctx, knID, branch)
+	}
+	var capResult *interfaces.KNCapabilityMutationResult
+	if capErr == nil {
+		capResult, capErr = r.publishKNCapabilityMutation(ctx, knID, branch, removedBindingIDs,
+			func(mutationCtx context.Context, tx *sql.Tx) (*interfaces.KNCapabilityMutationResult, error) {
+				var bindings []*interfaces.CapabilityBinding
+				var importErr error
+				capabilityReport, bindings, importErr = importCapabilities(
+					mutationCtx, tx, knID, branch, declaredCapabilities)
+				return &interfaces.KNCapabilityMutationResult{Bindings: bindings}, importErr
+			})
+	}
 	if capErr != nil {
 		logger.Errorf("Upload BKN: capability import failed: kn_id=%s, err=%v", knID, capErr)
 		capabilityReport = &interfaces.CapabilityImportReport{
@@ -272,6 +346,32 @@ func (r *restHandler) UploadBKN(c *gin.Context) {
 				Reason: capability_binding.CapabilitySkipUnreachable,
 				Detail: capErr.Error(),
 			}},
+		}
+	}
+
+	if r.auditRecorder != nil {
+		name := kn.KNName
+		if kn.ImportSkipped {
+			// Ignore may still add capability bindings, but the archive's network name was not persisted.
+			name = ""
+			changed := false
+			if capErr == nil && capResult != nil {
+				for _, binding := range capResult.Bindings {
+					if binding != nil && binding.CreatedByAttach {
+						changed = true
+						break
+					}
+				}
+			}
+			if changed {
+				if storedName, exists, lookupErr := r.kns.CheckKNExistByID(ctx, knID, branch); lookupErr == nil && exists {
+					name = storedName
+				}
+			}
+		}
+		c.Set("operation_audit_skip", name == "")
+		if name != "" {
+			c.Set("operation_audit_target_names", []string{name})
 		}
 	}
 
@@ -364,29 +464,51 @@ func (r *restHandler) DownloadBKN(c *gin.Context) {
 	// Read path parameters.
 	kn_id := c.Param("kn_id")
 	if kn_id == "" {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
-			WithErrorDetails(commonValidationDetail(ctx, "KnowledgeNetworkIDRequired", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.KnowledgeNetworkIDRequired", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(localizedText)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
 
 	// Read query parameters.
-	branch := c.DefaultQuery("branch", interfaces.MAIN_BRANCH)
+	branch, branchOK := r.readBranch(&ctx, c, kn_id)
+	if !branchOK {
+		return
+	}
+	spec := strings.TrimSpace(c.Query("bkn_spec"))
+	switch spec {
+	case interfaces.BKN_EXPORT_SPEC_AUTO, interfaces.BKN_EXPORT_SPEC_2, interfaces.BKN_EXPORT_SPEC_3:
+	default:
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter_BknSpec).
+			WithErrorDetails(fmt.Sprintf("bkn_spec must be %s or %s, or left out, got %q",
+				interfaces.BKN_EXPORT_SPEC_2, interfaces.BKN_EXPORT_SPEC_3, spec))
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
 
-	logger.Debugf("Download BKN: kn_id=%s, branch=%s", kn_id, branch)
+	logger.Debugf("Download BKN: kn_id=%s, branch=%s, bkn_spec=%s", kn_id, branch, spec)
 
 	// Export a tar archive through the service.
-	tarData, err := r.bs.ExportToTar(ctx, kn_id, branch)
+	tarData, err := r.bs.ExportToTar(ctx, kn_id, branch, spec)
 	if err != nil {
 		logger.Errorf("Download BKN failed: %s", err.Error())
 		// An error the service already classified travels as it is. Flattening every failure into
 		// "internal error" hides the one the caller can act on: an export refused because the
 		// execution factory is unreachable is worth retrying, and a generic 500 does not say so.
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		if !errors.As(err, &httpErr) {
-			httpErr = rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KnowledgeNetwork_InternalError).
-				WithErrorDetails(commonValidationDetail(ctx, "InternalRequestFailed", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.InternalRequestFailed", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr = httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KnowledgeNetwork_InternalError).
+				WithErrorDetails(localizedText)
 		}
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -401,4 +523,69 @@ func (r *restHandler) DownloadBKN(c *gin.Context) {
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	c.Data(http.StatusOK, "application/octet-stream", tarData)
+}
+
+// CheckBKN runs the network check on a knowledge network branch (external endpoint). It is read-only
+// and works on any network, 2.x included.
+func (r *restHandler) CheckBKN(c *gin.Context) {
+	ctx, span := oteltrace.StartServerSpan(c)
+	defer span.End()
+
+	visitor, err := r.verifyOAuth(ctx, c)
+	if err != nil {
+		return
+	}
+	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{
+		ID:   visitor.ID,
+		Type: string(visitor.Type),
+	})
+	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
+
+	knID := c.Param("kn_id")
+	if knID == "" {
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.KnowledgeNetworkIDRequired", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_InvalidParameter).
+			WithErrorDetails(localizedText)
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
+	branch, branchOK := r.readBranch(&ctx, c, knID)
+	if !branchOK {
+		return
+	}
+
+	result, err := r.bs.CheckNetwork(ctx, knID, branch)
+	if err != nil {
+		var httpErr *httperrors.HTTPError
+		if !errors.As(err, &httpErr) {
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.InternalRequestFailed", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr = httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_KnowledgeNetwork_InternalError).
+				WithErrorDetails(localizedText)
+		}
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
+	rest.ReplyOK(c, http.StatusOK, result)
+}
+
+// archiveSuffixes are the file names an archive upload may carry when it is not sent as
+// application/octet-stream. The loader reads the format from the content, not from the name.
+var archiveSuffixes = []string{".tar", ".tgz", ".tar.gz", ".zip"}
+
+func hasArchiveSuffix(filename string) bool {
+	name := strings.ToLower(filename)
+	for _, suffix := range archiveSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
 }

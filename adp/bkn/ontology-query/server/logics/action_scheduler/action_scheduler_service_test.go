@@ -8,24 +8,40 @@ package action_scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/common"
-	cond "ontology-query/common/condition"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
-	"ontology-query/logics"
-	"ontology-query/logics/action_logs"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
 )
+
+func TestBuildExecutionParamsNormalizesStoredStringConstants(t *testing.T) {
+	s := &actionSchedulerService{}
+	action := &interfaces.ActionType{Parameters: []interfaces.Parameter{
+		{Name: "code", Type: "string", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST, Value: json.Number("123")},
+		{Name: "flag", Type: "string", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST, Value: true},
+		{Name: "missing", Type: "string", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST, Value: nil},
+	}}
+	params, err := s.buildExecutionParams(action, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"code": "123", "flag": "true", "missing": "null"} {
+		if params[name] != want {
+			t.Errorf("%s = %v, want %q", name, params[name], want)
+		}
+	}
+}
 
 func Test_buildExecutionParams(t *testing.T) {
 	Convey("Test buildExecutionParams", t, func() {
@@ -39,7 +55,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP,
 						Value:     "pod_ip",
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 
 			objData := map[string]any{
@@ -67,7 +83,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST,
 						Value:     60,
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 
 			objData := map[string]any{}
@@ -85,7 +101,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						Name:      "Authorization",
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT,
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{}
 			dynamicParams := map[string]any{
@@ -115,7 +131,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						Name:      "token",
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT,
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{
 				"_instance_id": "test-instance",
@@ -145,7 +161,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP,
 						Value:     "pod_ip",
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{
 				"_instance_id": "test-instance",
@@ -158,7 +174,7 @@ func Test_buildExecutionParams(t *testing.T) {
 
 			params, err := s.buildExecutionParams(actionType, objData, nil)
 
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
 			_, exists := params["target_ip"]
 			So(exists, ShouldBeFalse) // Parameter should not be set if property is missing
 		})
@@ -170,20 +186,20 @@ func Test_buildExecutionParams(t *testing.T) {
 						Name:      "token",
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT,
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{}
 
 			params, err := s.buildExecutionParams(actionType, objData, nil)
 
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
 			_, exists := params["token"]
 			So(exists, ShouldBeFalse)
 		})
 
 		Convey("should handle empty parameters", func() {
 			actionType := &interfaces.ActionType{
-				Parameters: []interfaces.Parameter{},
+				Parameters: []interfaces.Parameter{}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{}
 
@@ -200,7 +216,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						Name:      "props.headers",
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT,
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{}
 			dynamicParams := map[string]any{
@@ -225,7 +241,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP,
 						Value:     "network.ip",
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{
 				"network": map[string]any{
@@ -258,7 +274,7 @@ func Test_buildExecutionParams(t *testing.T) {
 						ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP,
 						Value:     "pod_ip",
 					},
-				},
+				}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 			objData := map[string]any{
 				"pod_ip": "192.168.1.1",
@@ -534,7 +550,7 @@ func Test_executeAsync_ContextAndProgress(t *testing.T) {
 				BoxID:  "box_001",
 				ToolID: "tool_001",
 			},
-			Parameters: []interfaces.Parameter{},
+			Parameters: []interfaces.Parameter{}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 		}
 		attachTestActionProxySnapshot(t, execution, actionType)
 		req := &interfaces.ActionExecutionRequest{
@@ -565,11 +581,19 @@ func Test_executeAsync_ContextAndProgress(t *testing.T) {
 				credential, ok := interfaces.CallerRuntimeCredentialFromContext(ctx)
 				So(ok, ShouldBeTrue)
 				So(credential.Authorization, ShouldEqual, "Bearer caller-token")
+				traceContext, ok := common.GetTraceContextFromCtx(ctx)
+				So(ok, ShouldBeTrue)
+				So(traceContext.ConversationID, ShouldEqual, "conv_001")
+				So(traceContext.InteractionID, ShouldEqual, "int_001")
+				So(traceContext.OperationID, ShouldEqual, "op_registered")
 				return map[string]any{"checked": true}, nil
 			})
 
 		service.executeAsync(execution, actionType, req,
-			interfaces.CallerRuntimeCredential{Authorization: "Bearer caller-token"})
+			interfaces.CallerRuntimeCredential{
+				Authorization: "Bearer caller-token", ConversationID: "conv_001",
+				InteractionID: "int_001", ParentOperationID: "op_registered",
+			})
 
 		So(len(progressUpdates), ShouldBeGreaterThanOrEqualTo, 1)
 		So(progressUpdates[0].SuccessCount, ShouldEqual, 1)
@@ -586,7 +610,8 @@ func Test_resolveExecutionMode(t *testing.T) {
 			at := &interfaces.ActionType{Parameters: []interfaces.Parameter{
 				{Name: "text", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT},
 				{Name: "order_no", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP, Value: "order_no"},
-			}}
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
+			}
 			So(resolveExecutionMode(at), ShouldEqual, interfaces.ExecutionModePerInstance)
 		})
 
@@ -594,12 +619,13 @@ func Test_resolveExecutionMode(t *testing.T) {
 			at := &interfaces.ActionType{Parameters: []interfaces.Parameter{
 				{Name: "source", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST, Value: "bkn"},
 				{Name: "text", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT},
-			}}
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
+			}
 			So(resolveExecutionMode(at), ShouldEqual, interfaces.ExecutionModeOnce)
 		})
 
 		Convey("无参数时只执行一次", func() {
-			at := &interfaces.ActionType{Parameters: []interfaces.Parameter{}}
+			at := &interfaces.ActionType{Parameters: []interfaces.Parameter{}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"}}
 			So(resolveExecutionMode(at), ShouldEqual, interfaces.ExecutionModeOnce)
 		})
 	})
@@ -633,7 +659,7 @@ func Test_executeAsync_AggregatedInvokesToolOnce(t *testing.T) {
 			Parameters: []interfaces.Parameter{
 				{Name: "source", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_CONST, Value: "bkn"},
 				{Name: "text", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT},
-			},
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 		}
 		attachTestActionProxySnapshot(t, execution, actionType)
 
@@ -704,7 +730,7 @@ func aggregatedOnceFixture(t *testing.T, execID string) (*interfaces.ActionExecu
 		},
 		Parameters: []interfaces.Parameter{
 			{Name: "text", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT},
-		},
+		}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 	}
 	attachTestActionProxySnapshot(t, execution, actionType)
 	req := &interfaces.ActionExecutionRequest{
@@ -827,7 +853,7 @@ func Test_executeAsync_PerInstanceStillFansOut(t *testing.T) {
 			},
 			Parameters: []interfaces.Parameter{
 				{Name: "order_no", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP, Value: "order_no"},
-			},
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 		}
 		attachTestActionProxySnapshot(t, execution, actionType)
 		req := &interfaces.ActionExecutionRequest{
@@ -896,7 +922,7 @@ func Test_executeAsync_PerInstanceCancelledMidway(t *testing.T) {
 			},
 			Parameters: []interfaces.Parameter{
 				{Name: "order_no", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP, Value: "order_no"},
-			},
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 		}
 		attachTestActionProxySnapshot(t, execution, actionType)
 		req := &interfaces.ActionExecutionRequest{
@@ -964,7 +990,7 @@ func Test_ExecuteAction_InputDynamicParamsValidation(t *testing.T) {
 			return interfaces.ActionType{
 				ATID:       "at_001",
 				ATName:     "needs_input",
-				Parameters: p,
+				Parameters: p, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 			}
 		}
 
@@ -981,10 +1007,10 @@ func Test_ExecuteAction_InputDynamicParamsValidation(t *testing.T) {
 
 			_, err := service.ExecuteAction(ctx, req)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
+			So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
 		})
 
 		Convey("仅提供部分 input（缺少另一个参数）", func() {
@@ -1005,10 +1031,10 @@ func Test_ExecuteAction_InputDynamicParamsValidation(t *testing.T) {
 
 			_, err := service.ExecuteAction(ctx, req)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
+			So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
 		})
 
 		Convey("dynamic_params 中某 key 为 null，视为未提供", func() {
@@ -1027,542 +1053,10 @@ func Test_ExecuteAction_InputDynamicParamsValidation(t *testing.T) {
 
 			_, err := service.ExecuteAction(ctx, req)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
-		})
-	})
-}
-
-func Test_ExecuteAction_ScanMode(t *testing.T) {
-	Convey("Test ExecuteAction with scan mode (empty _instance_identities)", t, func() {
-		mockCtrl := gomock.NewController(t)
-		defer mockCtrl.Finish()
-
-		appSetting := &common.AppSetting{}
-		omAccess := omock.NewMockOntologyManagerAccess(mockCtrl)
-		aoAccess := omock.NewMockAgentOperatorAccess(mockCtrl)
-		aoAccess.EXPECT().GetBoxMetadataType(gomock.Any(), gomock.Any(), gomock.Any()).Return(interfaces.ProxyTargetTypeToolBox, nil).AnyTimes()
-		ots := omock.NewMockObjectTypeService(mockCtrl)
-		logsService := action_logs.NewActionLogsService(appSetting)
-
-		// Set global variables
-		logics.OMA = omAccess
-		logics.AOA = aoAccess
-
-		service := &actionSchedulerService{
-			appSetting:  appSetting,
-			omAccess:    omAccess,
-			aoAccess:    aoAccess,
-			logsService: logsService,
-			ots:         ots,
-			proxy:       &actionProxyResolverStub{},
-			permissions: &actionPermissionStub{},
-		}
-
-		ctx := context.Background()
-		knID := "kn_001"
-		actionTypeID := "at_001"
-		objectTypeID := "ot_001"
-
-		Convey("成功 - 扫描模式：找到符合条件的实例", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:               knID,
-				Branch:             interfaces.MAIN_BRANCH,
-				ActionTypeID:       actionTypeID,
-				InstanceIdentities: []map[string]any{}, // Empty, triggers scan mode
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "restart_pod",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{
-					Type:   interfaces.ActionSourceTypeTool,
-					BoxID:  "box_001",
-					ToolID: "tool_001",
-				},
-				Parameters: []interfaces.Parameter{},
-			}
-
-			// Variable to capture scan result
-			var scanVerified bool
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(interfaces.ObjectType{KNID: knID}, true, nil)
-
-			// Mock GetObjectsByObjectTypeID to return scanned instances
-			scannedObjects := interfaces.Objects{
-				Datas: []map[string]any{
-					{
-						interfaces.SYSTEM_PROPERTY_INSTANCE_ID:       "1",
-						interfaces.SYSTEM_PROPERTY_INSTANCE_IDENTITY: map[string]any{"pod_ip": "192.168.1.1", "id": "1"},
-						interfaces.SYSTEM_PROPERTY_DISPLAY:           "pod-192.168.1.1",
-						"pod_ip":                                     "192.168.1.1",
-						"id":                                         "1",
-					},
-					{
-						interfaces.SYSTEM_PROPERTY_INSTANCE_ID:       "2",
-						interfaces.SYSTEM_PROPERTY_INSTANCE_IDENTITY: map[string]any{"pod_ip": "192.168.1.2", "id": "2"},
-						interfaces.SYSTEM_PROPERTY_DISPLAY:           "pod-192.168.1.2",
-						"pod_ip":                                     "192.168.1.2",
-						"id":                                         "2",
-					},
-				},
-				TotalCount: 2,
-			}
-
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).DoAndReturn(
-				func(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
-					// Verify query parameters
-					So(query.KNID, ShouldEqual, knID)
-					So(query.ObjectTypeID, ShouldEqual, objectTypeID)
-					scanVerified = true
-					return scannedObjects, nil
-				})
-
-			// Execute - will panic due to unmocked logsService, but scan logic should complete
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Expected panic due to unmocked logsService
-						logger.Infof("Expected panic due to unmocked logsService: %v", r)
-					}
-				}()
-				_, _ = service.ExecuteAction(ctx, req)
-			}()
-
-			// Verify scan mode was triggered and identities were populated
-			So(scanVerified, ShouldBeTrue)
-			So(len(req.Instances), ShouldEqual, 2)
-			So(req.Instances[0].InstanceID, ShouldEqual, "1")
-			So(req.Instances[1].InstanceID, ShouldEqual, "2")
-		})
-
-		Convey("失败 - 扫描模式：扫描后没有找到符合条件的实例", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:               knID,
-				Branch:             interfaces.MAIN_BRANCH,
-				ActionTypeID:       actionTypeID,
-				InstanceIdentities: []map[string]any{}, // Empty, triggers scan mode
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "restart_pod",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{Type: interfaces.ActionSourceTypeTool, BoxID: "box_001", ToolID: "tool_001"},
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(interfaces.ObjectType{KNID: knID}, true, nil)
-
-			// Mock GetObjectsByObjectTypeID to return empty result
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).
-				Return(interfaces.Objects{Datas: []map[string]any{}}, nil)
-
-			_, err := service.ExecuteAction(ctx, req)
-
-			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
-			So(ok, ShouldBeTrue)
-			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
-		})
-
-		Convey("失败 - 扫描模式：扫描过程出错", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:               knID,
-				Branch:             interfaces.MAIN_BRANCH,
-				ActionTypeID:       actionTypeID,
-				InstanceIdentities: []map[string]any{}, // Empty, triggers scan mode
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "restart_pod",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{Type: interfaces.ActionSourceTypeTool, BoxID: "box_001", ToolID: "tool_001"},
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(interfaces.ObjectType{KNID: knID}, true, nil)
-
-			// Mock GetObjectsByObjectTypeID to return error
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).
-				Return(interfaces.Objects{}, rest.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_InternalError).
-					WithErrorDetails("scan failed"))
-
-			_, err := service.ExecuteAction(ctx, req)
-
-			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
-			So(ok, ShouldBeTrue)
-			So(httpErr.HTTPCode, ShouldEqual, http.StatusInternalServerError)
-		})
-
-		Convey("失败 - 扫描模式：超过最大执行数量限制", func() {
-			// Save original limit and restore after test
-			originalLimit := maxExecutionObjects
-			maxExecutionObjects = 5 // Set a low limit for testing
-			defer func() { maxExecutionObjects = originalLimit }()
-
-			req := &interfaces.ActionExecutionRequest{
-				KNID:               knID,
-				Branch:             interfaces.MAIN_BRANCH,
-				ActionTypeID:       actionTypeID,
-				InstanceIdentities: []map[string]any{}, // Empty, triggers scan mode
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "restart_pod",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{Type: interfaces.ActionSourceTypeTool, BoxID: "box_001", ToolID: "tool_001"},
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(interfaces.ObjectType{KNID: knID}, true, nil)
-
-			// Mock GetObjectsByObjectTypeID to return more objects than the limit
-			manyObjects := interfaces.Objects{
-				Datas: []map[string]any{},
-			}
-			for i := 0; i < 10; i++ { // 10 objects, limit is 5
-				manyObjects.Datas = append(manyObjects.Datas, map[string]any{
-					interfaces.SYSTEM_PROPERTY_INSTANCE_IDENTITY: map[string]any{"id": fmt.Sprintf("%d", i)},
-				})
-			}
-			manyObjects.TotalCount = 10
-
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).
-				Return(manyObjects, nil)
-
-			_, err := service.ExecuteAction(ctx, req)
-
-			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
-			So(ok, ShouldBeTrue)
-			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
-		})
-	})
-}
-
-func Test_ExecuteAction_UnboundObjectType(t *testing.T) {
-	Convey("Test ExecuteAction with unbound object type", t, func() {
-		mockCtrl := gomock.NewController(t)
-		defer mockCtrl.Finish()
-
-		appSetting := &common.AppSetting{}
-		omAccess := omock.NewMockOntologyManagerAccess(mockCtrl)
-		aoAccess := omock.NewMockAgentOperatorAccess(mockCtrl)
-		aoAccess.EXPECT().GetBoxMetadataType(gomock.Any(), gomock.Any(), gomock.Any()).Return(interfaces.ProxyTargetTypeToolBox, nil).AnyTimes()
-		ots := omock.NewMockObjectTypeService(mockCtrl)
-		logsService := action_logs.NewActionLogsService(appSetting)
-
-		// Set global variables
-		logics.OMA = omAccess
-		logics.AOA = aoAccess
-
-		service := &actionSchedulerService{
-			appSetting:  appSetting,
-			omAccess:    omAccess,
-			aoAccess:    aoAccess,
-			logsService: logsService,
-			ots:         ots,
-			proxy:       &actionProxyResolverStub{},
-			permissions: &actionPermissionStub{},
-		}
-
-		ctx := context.Background()
-		knID := "kn_001"
-		actionTypeID := "at_001"
-
-		Convey("成功 - 未绑定对象类 + 无 identities → 构造虚拟实例", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:               knID,
-				Branch:             interfaces.MAIN_BRANCH,
-				ActionTypeID:       actionTypeID,
-				InstanceIdentities: []map[string]any{}, // Empty
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "test_action",
-				ObjectTypeID: "", // Unbound object type.
-				ActionSource: interfaces.ActionSource{
-					Type:   interfaces.ActionSourceTypeTool,
-					BoxID:  "box_001",
-					ToolID: "tool_001",
-				},
-				Parameters: []interfaces.Parameter{},
-			}
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-
-			// Execute - will panic due to unmocked logsService, but logic should complete
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Expected panic due to unmocked logsService
-						logger.Infof("Expected panic due to unmocked logsService: %v", r)
-					}
-				}()
-				_, _ = service.ExecuteAction(ctx, req)
-			}()
-
-			// Verify virtual instance was created
-			So(len(req.Instances), ShouldEqual, 1)
-			So(len(req.ObjDatas), ShouldEqual, 1)
-		})
-
-		Convey("成功 - 未绑定对象类 + 有 identities → 按 identities 构造实例", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:         knID,
-				Branch:       interfaces.MAIN_BRANCH,
-				ActionTypeID: actionTypeID,
-				InstanceIdentities: []map[string]any{
-					{"id": "123", "name": "test"},
-					{"id": "456", "name": "test2"},
-				},
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "test_action",
-				ObjectTypeID: "", // Unbound object type.
-				ActionSource: interfaces.ActionSource{
-					Type:   interfaces.ActionSourceTypeTool,
-					BoxID:  "box_001",
-					ToolID: "tool_001",
-				},
-				Parameters: []interfaces.Parameter{},
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-
-			// Execute - will panic due to unmocked logsService, but logic should complete
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Expected panic due to unmocked logsService
-						logger.Infof("Expected panic due to unmocked logsService: %v", r)
-					}
-				}()
-				_, _ = service.ExecuteAction(ctx, req)
-			}()
-
-			// Verify instances were created from identities
-			So(len(req.Instances), ShouldEqual, 2)
-			So(len(req.ObjDatas), ShouldEqual, 2)
-			So(req.Instances[0].InstanceIdentity, ShouldResemble, map[string]any{"id": "123", "name": "test"})
-			So(req.Instances[1].InstanceIdentity, ShouldResemble, map[string]any{"id": "456", "name": "test2"})
-		})
-	})
-}
-
-func Test_ExecuteAction_AddActionType(t *testing.T) {
-	Convey("Test ExecuteAction with add action type", t, func() {
-		mockCtrl := gomock.NewController(t)
-		defer mockCtrl.Finish()
-
-		appSetting := &common.AppSetting{}
-		omAccess := omock.NewMockOntologyManagerAccess(mockCtrl)
-		aoAccess := omock.NewMockAgentOperatorAccess(mockCtrl)
-		aoAccess.EXPECT().GetBoxMetadataType(gomock.Any(), gomock.Any(), gomock.Any()).Return(interfaces.ProxyTargetTypeToolBox, nil).AnyTimes()
-		ots := omock.NewMockObjectTypeService(mockCtrl)
-		logsService := action_logs.NewActionLogsService(appSetting)
-
-		// Set global variables
-		logics.OMA = omAccess
-		logics.AOA = aoAccess
-
-		service := &actionSchedulerService{
-			appSetting:  appSetting,
-			omAccess:    omAccess,
-			aoAccess:    aoAccess,
-			logsService: logsService,
-			ots:         ots,
-			proxy:       &actionProxyResolverStub{},
-			permissions: &actionPermissionStub{},
-		}
-
-		ctx := context.Background()
-		knID := "kn_001"
-		actionTypeID := "at_001"
-		objectTypeID := "ot_001"
-
-		Convey("成功 - add 行动类型 + 有 identities + 查询不到实例 → 构造实例并评估条件", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:         knID,
-				Branch:       interfaces.MAIN_BRANCH,
-				ActionTypeID: actionTypeID,
-				InstanceIdentities: []map[string]any{
-					{"id": "123", "status": "active"},
-				},
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "add_action",
-				ActionType:   "add",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{
-					Type:   interfaces.ActionSourceTypeTool,
-					BoxID:  "box_001",
-					ToolID: "tool_001",
-				},
-				Condition: &cond.CondCfg{
-					Name:      "status",
-					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "active",
-					},
-				},
-				Parameters: []interfaces.Parameter{},
-			}
-
-			objectType := interfaces.ObjectType{
-				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-					OTID: objectTypeID,
-					DataProperties: []cond.DataProperty{
-						{Name: "status", Type: "string"},
-					},
-				},
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-
-			// Mock GetObjectType (needed for condition evaluation)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(objectType, true, nil).Times(2)
-
-			// Mock GetObjectsByObjectTypeID - first query by identities only (returns empty)
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).DoAndReturn(
-				func(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
-					// Verify this is the first query (by identities only)
-					return interfaces.Objects{Datas: []map[string]any{}}, nil
-				})
-
-			// Execute - will panic due to unmocked logsService, but logic should complete
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Expected panic due to unmocked logsService
-						logger.Infof("Expected panic due to unmocked logsService: %v", r)
-					}
-				}()
-				_, _ = service.ExecuteAction(ctx, req)
-			}()
-
-			// Verify instances were created (condition evaluation may filter some)
-			So(len(req.Instances), ShouldBeGreaterThanOrEqualTo, 0)
-		})
-
-		Convey("成功 - add 行动类型 + 有 identities + 查询到实例 → 按 identities 和行动条件过滤", func() {
-			req := &interfaces.ActionExecutionRequest{
-				KNID:         knID,
-				Branch:       interfaces.MAIN_BRANCH,
-				ActionTypeID: actionTypeID,
-				InstanceIdentities: []map[string]any{
-					{"id": "123"},
-				},
-			}
-
-			actionType := interfaces.ActionType{
-				ATID:         actionTypeID,
-				ATName:       "add_action",
-				ActionType:   "add",
-				ObjectTypeID: objectTypeID,
-				ActionSource: interfaces.ActionSource{
-					Type:   interfaces.ActionSourceTypeTool,
-					BoxID:  "box_001",
-					ToolID: "tool_001",
-				},
-				Condition: &cond.CondCfg{
-					Name:      "status",
-					Operation: "==",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "active",
-					},
-				},
-				Parameters: []interfaces.Parameter{},
-			}
-			objectType := interfaces.ObjectType{
-				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-					OTID: objectTypeID,
-					DataProperties: []cond.DataProperty{
-						{Name: "status", Type: "string"},
-					},
-				},
-			}
-
-			filteredObjects := interfaces.Objects{
-				Datas: []map[string]any{
-					{
-						interfaces.SYSTEM_PROPERTY_INSTANCE_ID:       "123",
-						interfaces.SYSTEM_PROPERTY_INSTANCE_IDENTITY: map[string]any{"id": "123"},
-						interfaces.SYSTEM_PROPERTY_DISPLAY:           "test-instance",
-						"status":                                     "active",
-					},
-				},
-				TotalCount: 1,
-			}
-
-			// Mock GetActionType
-			omAccess.EXPECT().GetActionType(gomock.Any(), knID, interfaces.MAIN_BRANCH, actionTypeID).
-				Return(actionType, map[string]any{"id": actionTypeID}, true, nil)
-			omAccess.EXPECT().GetObjectType(gomock.Any(), knID, interfaces.MAIN_BRANCH, objectTypeID).
-				Return(objectType, true, nil)
-
-			// Mock GetObjectsByObjectTypeID - first query by identities only (returns found)
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).DoAndReturn(
-				func(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
-					// First call: query by identities only
-					return interfaces.Objects{Datas: []map[string]any{{"id": "123"}}}, nil
-				})
-			// Mock GetObjectsByObjectTypeID - second query by identities and condition
-			ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).DoAndReturn(
-				func(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
-					// Second call: query by identities and condition
-					So(query.ActualCondition, ShouldNotBeNil)
-					So(query.ActualCondition.Operation, ShouldEqual, "and")
-					return filteredObjects, nil
-				})
-
-			// Execute - will panic due to unmocked logsService, but logic should complete
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						// Expected panic due to unmocked logsService
-						logger.Infof("Expected panic due to unmocked logsService: %v", r)
-					}
-				}()
-				_, _ = service.ExecuteAction(ctx, req)
-			}()
-
-			// Verify instances were filtered correctly
-			So(len(req.Instances), ShouldEqual, 1)
-			So(req.Instances[0].InstanceID, ShouldEqual, "123")
+			So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_InvalidParameter)
 		})
 	})
 }
@@ -1594,7 +1088,7 @@ func Test_executeAsync_AppendsOnlyNewResults(t *testing.T) {
 			},
 			Parameters: []interfaces.Parameter{
 				{Name: "order_no", ValueFrom: interfaces.LOGIC_PARAMS_VALUE_FROM_PROP, Value: "order_no"},
-			},
+			}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 		}
 		attachTestActionProxySnapshot(t, execution, actionType)
 		req := &interfaces.ActionExecutionRequest{}

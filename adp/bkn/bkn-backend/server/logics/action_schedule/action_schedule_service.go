@@ -14,18 +14,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"github.com/robfig/cron/v3"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 var (
@@ -38,13 +39,10 @@ type actionScheduleService struct {
 	asa        interfaces.ActionScheduleAccess
 	ata        interfaces.ActionTypeAccess
 	aea        interfaces.ActionExecutionAccess
+	ps         interfaces.PermissionService
 	//db         interface{ Begin() (interface{}, error) }
 
 	cronParser cron.Parser
-}
-
-func actionScheduleDetail(ctx context.Context, name string, templateData map[string]any) string {
-	return i18n.Translate(rest.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail."+name, templateData)
 }
 
 // NewActionScheduleService creates a singleton instance of ActionScheduleService
@@ -55,11 +53,33 @@ func NewActionScheduleService(appSetting *common.AppSetting) interfaces.ActionSc
 			asa:        logics.ASA,
 			ata:        logics.ATA,
 			aea:        logics.AEA,
+			ps:         permission.NewPermissionService(appSetting),
 			// Standard 5-field cron parser (minute, hour, day of month, month, day of week)
 			cronParser: cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow),
 		}
 	})
 	return assService
+}
+
+func (s *actionScheduleService) validateScheduleTarget(ctx context.Context, schedule *interfaces.ActionSchedule) error {
+	actionTypes, err := s.ata.GetActionTypesByIDs(ctx, schedule.KNID, schedule.Branch, []string{schedule.ActionTypeID})
+	if err != nil {
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetActionTypeFailed).
+			WithErrorDetails(err.Error())
+	}
+	if len(actionTypes) == 0 {
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.ActionTypeNotFound", map[string]any{"actionTypeID": schedule.ActionTypeID})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_ActionTypeNotFound).
+			WithErrorDetails(localizedText)
+	}
+	if err := interfaces.ValidateIdentitySchedule(actionTypes[0], schedule.InstanceIdentities); err != nil {
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidParameter).
+			WithErrorDetails(err.Error())
+	}
+	return nil
 }
 
 // CreateSchedule creates a new action schedule
@@ -69,25 +89,18 @@ func (s *actionScheduleService) CreateSchedule(ctx context.Context, schedule *in
 
 	// Validate cron expression
 	if err := s.ValidateCronExpression(schedule.CronExpression); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
-			WithErrorDetails(actionScheduleDetail(ctx, "CronExpressionInvalid", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.CronExpressionInvalid", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
+			WithErrorDetails(localizedText)
 		otellog.LogError(ctx, "Validate cron expression failed", err)
 		return "", httpErr
 	}
 
-	// Validate action type exists
-	actionTypes, err := s.ata.GetActionTypesByIDs(ctx, schedule.KNID, schedule.Branch, []string{schedule.ActionTypeID})
-	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetActionTypeFailed).
-			WithErrorDetails(err.Error())
-		otellog.LogError(ctx, "Failed to get action type", httpErr)
-		return "", httpErr
-	}
-	if len(actionTypes) == 0 {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_ActionTypeNotFound).
-			WithErrorDetails(actionScheduleDetail(ctx, "ActionTypeNotFound", map[string]any{"actionTypeID": schedule.ActionTypeID}))
-		otellog.LogError(ctx, "Action type not found", httpErr)
-		return "", httpErr
+	if err := s.validateScheduleTarget(ctx, schedule); err != nil {
+		return "", err
 	}
 	if err := s.checkActionExecution(ctx, "schedule_create", schedule.KNID, schedule.ActionTypeID, schedule.DynamicParams); err != nil {
 		return "", err
@@ -113,8 +126,12 @@ func (s *actionScheduleService) CreateSchedule(ctx context.Context, schedule *in
 	if schedule.Status == interfaces.ScheduleStatusActive {
 		nextRunTime, err := s.CalculateNextRunTime(schedule.CronExpression, now)
 		if err != nil {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
-				WithErrorDetails(actionScheduleDetail(ctx, "CronExpressionInvalid", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.CronExpressionInvalid", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
+				WithErrorDetails(localizedText)
 			otellog.LogError(ctx, "Calculate next run time failed", err)
 			return "", httpErr
 		}
@@ -123,7 +140,7 @@ func (s *actionScheduleService) CreateSchedule(ctx context.Context, schedule *in
 
 	// Create in database
 	if err := s.asa.CreateSchedule(ctx, nil, schedule); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_CreateFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_CreateFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to create schedule", httpErr)
 		return "", httpErr
@@ -142,13 +159,13 @@ func (s *actionScheduleService) UpdateSchedule(ctx context.Context, scheduleID s
 	// Check if schedule exists
 	existing, err := s.asa.GetSchedule(ctx, scheduleID)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedule", httpErr)
 		return httpErr
 	}
 	if existing == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
 		otellog.LogError(ctx, "Schedule not found", httpErr)
 		return httpErr
 	}
@@ -157,8 +174,12 @@ func (s *actionScheduleService) UpdateSchedule(ctx context.Context, scheduleID s
 	cronExpr := existing.CronExpression
 	if req.CronExpression != "" {
 		if err := s.ValidateCronExpression(req.CronExpression); err != nil {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
-				WithErrorDetails(actionScheduleDetail(ctx, "CronExpressionInvalid", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.CronExpressionInvalid", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
+				WithErrorDetails(localizedText)
 			otellog.LogError(ctx, "Validate cron expression failed", err)
 			return httpErr
 		}
@@ -189,6 +210,16 @@ func (s *actionScheduleService) UpdateSchedule(ctx context.Context, scheduleID s
 
 	executableConfigChanged := req.CronExpression != "" || req.InstanceIdentities != nil || req.DynamicParams != nil
 	if executableConfigChanged {
+		identities := existing.InstanceIdentities
+		if req.InstanceIdentities != nil {
+			identities = req.InstanceIdentities
+		}
+		if err := s.validateScheduleTarget(ctx, &interfaces.ActionSchedule{
+			KNID: existing.KNID, Branch: existing.Branch, ActionTypeID: existing.ActionTypeID,
+			InstanceIdentities: identities,
+		}); err != nil {
+			return err
+		}
 		dynamicParams := existing.DynamicParams
 		if req.DynamicParams != nil {
 			dynamicParams = req.DynamicParams
@@ -203,8 +234,12 @@ func (s *actionScheduleService) UpdateSchedule(ctx context.Context, scheduleID s
 	if req.CronExpression != "" && existing.Status == interfaces.ScheduleStatusActive {
 		nextRunTime, err := s.CalculateNextRunTime(cronExpr, now)
 		if err != nil {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
-				WithErrorDetails(actionScheduleDetail(ctx, "CronExpressionInvalid", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.CronExpressionInvalid", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
+				WithErrorDetails(localizedText)
 			otellog.LogError(ctx, fmt.Sprintf("Failed to calculate next run time for schedule %s", scheduleID), err)
 			return httpErr
 		}
@@ -212,7 +247,7 @@ func (s *actionScheduleService) UpdateSchedule(ctx context.Context, scheduleID s
 	}
 
 	if err := s.asa.UpdateSchedule(ctx, nil, update); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to update schedule", httpErr)
 		return httpErr
@@ -230,8 +265,12 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 
 	// Validate status
 	if status != interfaces.ScheduleStatusActive && status != interfaces.ScheduleStatusInactive {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidStatus).
-			WithErrorDetails(actionScheduleDetail(ctx, "StatusValueInvalid", map[string]any{"status": status}))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.StatusValueInvalid", map[string]any{"status": status})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidStatus).
+			WithErrorDetails(localizedText)
 		otellog.LogError(ctx, "Invalid schedule status", httpErr)
 		return httpErr
 	}
@@ -239,13 +278,13 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 	// Check if schedule exists
 	existing, err := s.asa.GetSchedule(ctx, scheduleID)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedule", httpErr)
 		return httpErr
 	}
 	if existing == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
 		otellog.LogError(ctx, "Schedule not found", httpErr)
 		return httpErr
 	}
@@ -256,8 +295,12 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 		now := time.Now().UnixMilli()
 		nextRunTime, err = s.CalculateNextRunTime(existing.CronExpression, now)
 		if err != nil {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
-				WithErrorDetails(actionScheduleDetail(ctx, "CronExpressionInvalid", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.CronExpressionInvalid", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidCronExpression).
+				WithErrorDetails(localizedText)
 			otellog.LogError(ctx, "Calculate next run time failed", err)
 			return httpErr
 		}
@@ -265,6 +308,9 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 
 	if status == interfaces.ScheduleStatusActive &&
 		existing.Status != interfaces.ScheduleStatusActive {
+		if err := s.validateScheduleTarget(ctx, existing); err != nil {
+			return err
+		}
 		if err := s.checkActionExecution(ctx, "schedule_activate", existing.KNID, existing.ActionTypeID, existing.DynamicParams); err != nil {
 			return err
 		}
@@ -277,7 +323,7 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 			Updater:          accountInfo,
 			UpdateTime:       time.Now().UnixMilli(),
 		}); err != nil {
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
 				WithErrorDetails(err.Error())
 			otellog.LogError(ctx, "Failed to update schedule status", httpErr)
 			return httpErr
@@ -288,7 +334,7 @@ func (s *actionScheduleService) UpdateScheduleStatus(ctx context.Context, schedu
 	}
 
 	if err := s.asa.UpdateScheduleStatus(ctx, scheduleID, status, nextRunTime); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_UpdateFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to update schedule status", httpErr)
 		return httpErr
@@ -312,7 +358,7 @@ func (s *actionScheduleService) DeleteSchedules(ctx context.Context, knID, branc
 	// Verify all schedules exist and belong to the kn/branch
 	schedules, err := s.asa.GetSchedules(ctx, scheduleIDs)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedules", httpErr)
 		return httpErr
@@ -321,25 +367,42 @@ func (s *actionScheduleService) DeleteSchedules(ctx context.Context, knID, branc
 	for _, id := range scheduleIDs {
 		schedule, exists := schedules[id]
 		if !exists {
-			httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound).
-				WithErrorDetails(actionScheduleDetail(ctx, "ScheduleNotFound", map[string]any{"scheduleID": id}))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.ScheduleNotFound", map[string]any{"scheduleID": id})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound).
+				WithErrorDetails(localizedText)
 			otellog.LogError(ctx, "Schedule not found", httpErr)
 			return httpErr
 		}
 		if schedule.KNID != knID || schedule.Branch != branch {
-			httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidParameter).
-				WithErrorDetails(actionScheduleDetail(ctx, "ScheduleScopeMismatch", map[string]any{
-					"scheduleID": id,
-					"knID":       knID,
-					"branch":     branch,
-				}))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.ActionSchedule.Detail.ScheduleScopeMismatch", map[string]any{
+				"scheduleID": id,
+				"knID":       knID,
+				"branch":     branch,
+			})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_ActionSchedule_InvalidParameter).WithErrorDetails(localizedText)
 			otellog.LogError(ctx, "Schedule does not belong to request scope", httpErr)
 			return httpErr
 		}
 	}
 
+	if s.ps == nil {
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+			berrors.BknBackend_InternalError_CheckPermissionFailed)
+	}
+	if err := s.ps.CheckPermission(ctx, interfaces.PermissionResource{
+		Type: interfaces.RESOURCE_TYPE_KN, ID: knID,
+	}, []string{interfaces.OPERATION_TYPE_MODIFY}); err != nil {
+		return err
+	}
+
 	if err := s.asa.DeleteSchedules(ctx, nil, scheduleIDs); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_DeleteFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_DeleteFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to delete schedules", httpErr)
 		return httpErr
@@ -357,13 +420,13 @@ func (s *actionScheduleService) GetSchedule(ctx context.Context, scheduleID stri
 
 	schedule, err := s.asa.GetSchedule(ctx, scheduleID)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedule", httpErr)
 		return nil, httpErr
 	}
 	if schedule == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_ActionSchedule_NotFound)
 		otellog.LogError(ctx, "Schedule not found", httpErr)
 		return nil, httpErr
 	}
@@ -379,7 +442,7 @@ func (s *actionScheduleService) GetSchedules(ctx context.Context, scheduleIDs []
 
 	schedules, err := s.asa.GetSchedules(ctx, scheduleIDs)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedules", httpErr)
 		return nil, httpErr
@@ -396,7 +459,7 @@ func (s *actionScheduleService) ListSchedules(ctx context.Context, queryParams i
 
 	schedules, err := s.asa.ListSchedules(ctx, queryParams)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to list schedules", httpErr)
 		return nil, 0, httpErr
@@ -404,7 +467,7 @@ func (s *actionScheduleService) ListSchedules(ctx context.Context, queryParams i
 
 	total, err := s.asa.GetSchedulesTotal(ctx, queryParams)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_ActionSchedule_GetFailed).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Failed to get schedules total", httpErr)
 		return nil, 0, httpErr
@@ -438,7 +501,7 @@ func (s *actionScheduleService) CalculateNextRunTime(cronExpr string, from int64
 func (s *actionScheduleService) checkActionExecution(ctx context.Context, phase, knID, actionTypeID string,
 	dynamicParams map[string]any) error {
 	if s == nil || s.aea == nil {
-		return rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			berrors.BknBackend_ActionSchedule_InternalError).WithErrorDetails("action execution authorization is not configured")
 	}
 	logger.Infof("Action execution permission check: phase=%s kn_id=%s action_type_id=%s", phase, knID, actionTypeID)

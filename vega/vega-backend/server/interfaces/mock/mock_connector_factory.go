@@ -14,6 +14,7 @@ import (
 	reflect "reflect"
 
 	interfaces "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sqlbuilder "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	licverify "github.com/openbkn-ai/licverify"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -40,6 +41,21 @@ func NewMockConnectorFactory(ctrl *gomock.Controller) *MockConnectorFactory {
 // EXPECT returns an object that allows the caller to indicate expected use.
 func (m *MockConnectorFactory) EXPECT() *MockConnectorFactoryMockRecorder {
 	return m.recorder
+}
+
+// ConvertSQLFilterCondition mocks base method.
+func (m *MockConnectorFactory) ConvertSQLFilterCondition(tp string, condition interfaces.FilterCondition, resource *interfaces.Resource) (sqlbuilder.SqlNode, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ConvertSQLFilterCondition", tp, condition, resource)
+	ret0, _ := ret[0].(sqlbuilder.SqlNode)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ConvertSQLFilterCondition indicates an expected call of ConvertSQLFilterCondition.
+func (mr *MockConnectorFactoryMockRecorder) ConvertSQLFilterCondition(tp, condition, resource any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ConvertSQLFilterCondition", reflect.TypeOf((*MockConnectorFactory)(nil).ConvertSQLFilterCondition), tp, condition, resource)
 }
 
 // CreateConnectorInstance mocks base method.
@@ -111,17 +127,18 @@ func (mr *MockConnectorFactoryMockRecorder) GetConnectorFieldConfig(ctx, ct any)
 }
 
 // GetSensitiveFields mocks base method.
-func (m *MockConnectorFactory) GetSensitiveFields(tp string) []string {
+func (m *MockConnectorFactory) GetSensitiveFields(tp string, cfg interfaces.ConnectorConfig) ([]string, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetSensitiveFields", tp)
+	ret := m.ctrl.Call(m, "GetSensitiveFields", tp, cfg)
 	ret0, _ := ret[0].([]string)
-	return ret0
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // GetSensitiveFields indicates an expected call of GetSensitiveFields.
-func (mr *MockConnectorFactoryMockRecorder) GetSensitiveFields(tp any) *gomock.Call {
+func (mr *MockConnectorFactoryMockRecorder) GetSensitiveFields(tp, cfg any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSensitiveFields", reflect.TypeOf((*MockConnectorFactory)(nil).GetSensitiveFields), tp)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSensitiveFields", reflect.TypeOf((*MockConnectorFactory)(nil).GetSensitiveFields), tp, cfg)
 }
 
 // RegisterConnector mocks base method.
@@ -174,6 +191,35 @@ func (mr *MockConnectorFactoryMockRecorder) SetConnectorEnabled(tp, enabled any)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetConnectorEnabled", reflect.TypeOf((*MockConnectorFactory)(nil).SetConnectorEnabled), tp, enabled)
 }
 
+// SupportDiscover mocks base method.
+func (m *MockConnectorFactory) SupportDiscover(tp string) (bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SupportDiscover", tp)
+	ret0, _ := ret[0].(bool)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SupportDiscover indicates an expected call of SupportDiscover.
+func (mr *MockConnectorFactoryMockRecorder) SupportDiscover(tp any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SupportDiscover", reflect.TypeOf((*MockConnectorFactory)(nil).SupportDiscover), tp)
+}
+
+// ValidateBuildSchema mocks base method.
+func (m *MockConnectorFactory) ValidateBuildSchema(tp string, resource *interfaces.Resource) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ValidateBuildSchema", tp, resource)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ValidateBuildSchema indicates an expected call of ValidateBuildSchema.
+func (mr *MockConnectorFactoryMockRecorder) ValidateBuildSchema(tp, resource any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateBuildSchema", reflect.TypeOf((*MockConnectorFactory)(nil).ValidateBuildSchema), tp, resource)
+}
+
 // ValidateConnectorTypeRegistration mocks base method.
 func (m *MockConnectorFactory) ValidateConnectorTypeRegistration(ct *interfaces.ConnectorType) error {
 	m.ctrl.T.Helper()
@@ -186,4 +232,32 @@ func (m *MockConnectorFactory) ValidateConnectorTypeRegistration(ct *interfaces.
 func (mr *MockConnectorFactoryMockRecorder) ValidateConnectorTypeRegistration(ct any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateConnectorTypeRegistration", reflect.TypeOf((*MockConnectorFactory)(nil).ValidateConnectorTypeRegistration), ct)
+}
+
+// ValidateFilterCondition mocks base method.
+func (m *MockConnectorFactory) ValidateFilterCondition(tp string, condition interfaces.FilterCondition, resource *interfaces.Resource) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ValidateFilterCondition", tp, condition, resource)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ValidateFilterCondition indicates an expected call of ValidateFilterCondition.
+func (mr *MockConnectorFactoryMockRecorder) ValidateFilterCondition(tp, condition, resource any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateFilterCondition", reflect.TypeOf((*MockConnectorFactory)(nil).ValidateFilterCondition), tp, condition, resource)
+}
+
+// ValidateFilterability mocks base method.
+func (m *MockConnectorFactory) ValidateFilterability(tp string, resource *interfaces.Resource) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ValidateFilterability", tp, resource)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// ValidateFilterability indicates an expected call of ValidateFilterability.
+func (mr *MockConnectorFactoryMockRecorder) ValidateFilterability(tp, resource any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateFilterability", reflect.TypeOf((*MockConnectorFactory)(nil).ValidateFilterability), tp, resource)
 }

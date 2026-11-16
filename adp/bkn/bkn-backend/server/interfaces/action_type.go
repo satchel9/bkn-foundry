@@ -7,7 +7,7 @@
 package interfaces
 
 import (
-	cond "bkn-backend/common/condition"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
 )
 
 const (
@@ -91,14 +91,15 @@ type ImpactContractItem struct {
 }
 
 type ActionTypeWithKeyField struct {
-	ATID         string           `json:"id" mapstructure:"id"`
-	ATName       string           `json:"name" mapstructure:"name"`
-	ActionType   string           `json:"action_type" mapstructure:"action_type"`
-	ActionIntent string           `json:"action_intent,omitempty" mapstructure:"action_intent"`
-	ObjectTypeID string           `json:"object_type_id" mapstructure:"object_type_id"`
-	ObjectType   SimpleObjectType `json:"object_type,omitempty" mapstructure:"object_type"` // Bound object type for display
-	Condition    *ActionCondCfg   `json:"condition,omitempty" mapstructure:"condition"`
-	Affect       *ActionAffect    `json:"affect" mapstructure:"affect"`
+	OperationConfig *ActionOperationConfig `json:"operation_config,omitempty" mapstructure:"operation_config"`
+	ATID            string                 `json:"id" mapstructure:"id"`
+	ATName          string                 `json:"name" mapstructure:"name"`
+	ActionType      string                 `json:"action_type" mapstructure:"action_type"`
+	ActionIntent    string                 `json:"action_intent,omitempty" mapstructure:"action_intent"`
+	ObjectTypeID    string                 `json:"object_type_id" mapstructure:"object_type_id"`
+	ObjectType      SimpleObjectType       `json:"object_type,omitempty" mapstructure:"object_type"` // Bound object type for display
+	Condition       *ActionCondCfg         `json:"condition,omitempty" mapstructure:"condition"`
+	Affect          *ActionAffect          `json:"affect" mapstructure:"affect"`
 	// ImpactContracts and the legacy affect field are mutually exclusive. When only affect is supplied,
 	// validation adds one contract with expected_operation from action_type and retains affect.
 	ImpactContracts []ImpactContractItem `json:"impact_contracts,omitempty" mapstructure:"impact_contracts"`
@@ -111,8 +112,16 @@ type ActionTypeWithKeyField struct {
 type ActionType struct {
 	ActionTypeWithKeyField `mapstructure:",squash"`
 	CommonInfo             `mapstructure:",squash"`
-	KNID                   string `json:"kn_id" mapstructure:"kn_id"`
-	Branch                 string `json:"branch" mapstructure:"branch"`
+	// Aliases are the other names of the action type (BKN spec 3.0). An interactive update that
+	// leaves them out keeps the stored ones.
+	Aliases []string `json:"aliases,omitempty" mapstructure:"aliases"`
+	// Lifecycle says whether the action type is still in use (BKN spec 3.0, §4.3); nil is active.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty" mapstructure:"lifecycle"`
+	// declared names the declaration fields the JSON carried, null included.
+	declared map[string]bool
+	KNID     string `json:"kn_id" mapstructure:"kn_id"`
+	Branch   string `json:"branch" mapstructure:"branch"`
+	Revision string `json:"revision,omitempty" mapstructure:"-"`
 
 	Creator    AccountInfo `json:"creator" mapstructure:"creator"`
 	CreateTime int64       `json:"create_time" mapstructure:"create_time"`
@@ -142,10 +151,11 @@ type ActionSource struct {
 type ActionCondCfg struct {
 	ObjectTypeID string `json:"object_type_id,omitempty" mapstructure:"object_type_id"` // Object type identified by the action condition
 
-	Field            string           `json:"field,omitempty" mapstructure:"field"`
-	Operation        string           `json:"operation,omitempty" mapstructure:"operation"`
-	SubConds         []*ActionCondCfg `json:"sub_conditions,omitempty" mapstructure:"sub_conditions"`
-	cond.ValueOptCfg `mapstructure:",squash"`
+	Field     string           `json:"field,omitempty" mapstructure:"field"`
+	Operation string           `json:"operation,omitempty" mapstructure:"operation"`
+	SubConds  []*ActionCondCfg `json:"sub_conditions,omitempty" mapstructure:"sub_conditions"`
+	ValueFrom string           `json:"value_from,omitempty" mapstructure:"value_from"`
+	Value     any              `json:"value,omitempty" mapstructure:"value"`
 
 	RemainCfg map[string]any `json:",omitempty" mapstructure:",remain,squash"`
 
@@ -169,13 +179,15 @@ type Schedule struct {
 // Object type pagination query.
 type ActionTypesQueryParams struct {
 	PaginationQueryParameters
-	NamePattern   string
-	Tag           string
-	Branch        string
-	KNID          string
-	ObjectTypeIDs []string
-	ATIDs         []string
-	ActionType    string
+	NamePattern       string
+	Tag               string
+	Branch            string
+	KNID              string
+	ObjectTypeIDs     []string
+	ATIDs             []string
+	ActionType        string
+	OperationKind     string
+	RelationOperation string
 	// ValidAuthorizationIDsOnly excludes stored IDs that cannot be represented
 	// as canonical Safe child resources.
 	ValidAuthorizationIDsOnly bool
@@ -202,3 +214,9 @@ func IsValidActionTypeIntentValue(s string) bool {
 func IsValidExpectedOperation(s string) bool {
 	return ExpectedOperationMap[s]
 }
+
+func (d *ActionType) RevisionID() string { return d.ATID }
+
+func (d *ActionType) SetRevision(revision string) { d.Revision = revision }
+
+func (d *ActionType) GetRevision() string { return d.Revision }

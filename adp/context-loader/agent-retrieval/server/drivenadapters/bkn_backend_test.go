@@ -10,12 +10,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"testing"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/mocks"
 )
@@ -389,34 +390,13 @@ func TestSearchMetricTypes_Success(t *testing.T) {
 			KnID: "kn-001",
 		}
 
-		respBody := []byte(`{
-			"entries": [
-				{
-					"id": "m_001",
-					"name": "cpu_usage",
-					"comment": "CPU usage metric",
-					"unit_type": "percent",
-					"unit": "%",
-					"metric_type": "atomic",
-					"scope_type": "object_type",
-					"scope_ref": "pod",
-					"time_dimension": {
-						"name": "timestamp"
-					},
-					"calculation_formula": {
-						"op": "avg"
-					},
-					"analysis_dimensions": [
-						{
-							"name": "cluster"
-						}
-					]
-				}
-			],
-			"total_count": 1
-		}`)
-		mockHTTPClient.EXPECT().PostNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(200, respBody, nil)
+		respBody := []byte(`{"entries":[{"definition":{"id":"m_001","version":2,"name":"cpu_usage","description":"CPU usage metric","metric_type":"atomic","owner_object_type_id":"pod","lifecycle":{"status":"published"}}}],"total_count":1}`)
+		mockHTTPClient.EXPECT().GetNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, src string, values url.Values, _ map[string]string) (int, []byte, error) {
+				convey.So(src, convey.ShouldEndWith, "/kn-001/object-metrics")
+				convey.So(values.Get("status"), convey.ShouldEqual, "published")
+				return 200, respBody, nil
+			})
 
 		resp, err := client.SearchMetricTypes(ctx, req)
 		convey.So(err, convey.ShouldBeNil)
@@ -424,6 +404,7 @@ func TestSearchMetricTypes_Success(t *testing.T) {
 		convey.So(resp.TotalCount, convey.ShouldEqual, 1)
 		convey.So(len(resp.Entries), convey.ShouldEqual, 1)
 		convey.So(resp.Entries[0].ID, convey.ShouldEqual, "m_001")
+		convey.So(resp.Entries[0].Version, convey.ShouldEqual, 2)
 		convey.So(resp.Entries[0].Name, convey.ShouldEqual, "cpu_usage")
 		convey.So(resp.Entries[0].ScopeType, convey.ShouldEqual, "object_type")
 		convey.So(resp.Entries[0].ScopeRef, convey.ShouldEqual, "pod")
@@ -440,6 +421,7 @@ func TestSearchMetricTypes_HTTPError(t *testing.T) {
 		mockHTTPClient := mocks.NewMockHTTPClient(ctrl)
 
 		mockLogger.EXPECT().WithContext(gomock.Any()).Return(mockLogger).AnyTimes()
+		mockLogger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
 		mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any()).AnyTimes()
 
 		client := &bknBackendAccess{
@@ -453,39 +435,8 @@ func TestSearchMetricTypes_HTTPError(t *testing.T) {
 			KnID: "kn-001",
 		}
 
-		mockHTTPClient.EXPECT().PostNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		mockHTTPClient.EXPECT().GetNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(0, nil, errors.New("connection refused"))
-
-		_, err := client.SearchMetricTypes(ctx, req)
-		convey.So(err, convey.ShouldNotBeNil)
-	})
-}
-
-// TestSearchMetricTypes_NotFound test SearchMetricTypes 404 error.
-func TestSearchMetricTypes_NotFound(t *testing.T) {
-	convey.Convey("TestSearchMetricTypes_NotFound", t, func() {
-		ctrl := gomock.NewController(t)
-		defer ctrl.Finish()
-
-		mockLogger := mocks.NewMockLogger(ctrl)
-		mockHTTPClient := mocks.NewMockHTTPClient(ctrl)
-
-		mockLogger.EXPECT().WithContext(gomock.Any()).Return(mockLogger).AnyTimes()
-		mockLogger.EXPECT().Warnf(gomock.Any(), gomock.Any()).AnyTimes()
-
-		client := &bknBackendAccess{
-			logger:     mockLogger,
-			baseURL:    "http://localhost:8080/api/bkn-backend",
-			httpClient: mockHTTPClient,
-		}
-
-		ctx := context.Background()
-		req := &interfaces.QueryConceptsReq{
-			KnID: "kn-001",
-		}
-
-		mockHTTPClient.EXPECT().PostNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(404, nil, nil)
 
 		_, err := client.SearchMetricTypes(ctx, req)
 		convey.So(err, convey.ShouldNotBeNil)
@@ -565,17 +516,6 @@ func TestBknBackendAccess_NotFoundWithBodyUsesBknError(t *testing.T) {
 			},
 		},
 		{
-			name: "SearchMetricTypes",
-			expectHTTP: func(mockHTTPClient *mocks.MockHTTPClient, respBody []byte) {
-				mockHTTPClient.EXPECT().PostNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-					Return(http.StatusNotFound, respBody, nil)
-			},
-			call: func(ctx context.Context, client *bknBackendAccess) error {
-				_, err := client.SearchMetricTypes(ctx, &interfaces.QueryConceptsReq{KnID: "kn-001"})
-				return err
-			},
-		},
-		{
 			name: "GetActionTypeDetail",
 			expectHTTP: func(mockHTTPClient *mocks.MockHTTPClient, respBody []byte) {
 				mockHTTPClient.EXPECT().GetNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
@@ -612,21 +552,42 @@ func TestBknBackendAccess_NotFoundWithBodyUsesBknError(t *testing.T) {
 				"description": "knowledge network not found",
 				"solution": "check kn_id",
 				"error_link": "https://example.com/bkn-error",
-				"error_details": {"kn_id": "kn-001"}
+				"error_details": {"kn_id": "kn-001"},
+				"metadata": {"field": "kn_id"}
 			}`)
 			testCase.expectHTTP(mockHTTPClient, respBody)
 
 			err := testCase.call(context.Background(), client)
 			convey.So(err, convey.ShouldNotBeNil)
 
-			httpErr, ok := err.(*infraErr.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			convey.So(ok, convey.ShouldBeTrue)
 			convey.So(httpErr.HTTPCode, convey.ShouldEqual, http.StatusNotFound)
-			convey.So(httpErr.Code, convey.ShouldEqual, "BknBackend.KnowledgeNetwork.NotFound")
-			convey.So(httpErr.Description, convey.ShouldEqual, "knowledge network not found")
-			convey.So(httpErr.Solution, convey.ShouldEqual, "check kn_id")
-			convey.So(httpErr.ErrorLink, convey.ShouldEqual, "https://example.com/bkn-error")
-			convey.So(httpErr.ErrorDetails, convey.ShouldResemble, map[string]interface{}{"kn_id": "kn-001"})
+			source, ok := httpErr.ErrorDetails.(httperrors.BaseError)
+			convey.So(ok, convey.ShouldBeTrue)
+			convey.So(source.ErrorCode, convey.ShouldEqual, "BknBackend.KnowledgeNetwork.NotFound")
+			convey.So(source.Description, convey.ShouldEqual, "knowledge network not found")
+			convey.So(source.ErrorDetails, convey.ShouldResemble, map[string]interface{}{"kn_id": "kn-001"})
+			convey.So(source.Metadata, convey.ShouldResemble, map[string]any{"field": "kn_id"})
 		})
+	}
+}
+
+func TestGetRelationTypeDetailPreservesCurrentSharedEnvelope(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockLogger := mocks.NewMockLogger(ctrl)
+	mockHTTPClient := mocks.NewMockHTTPClient(ctrl)
+	mockLogger.EXPECT().Errorf(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	client := &bknBackendAccess{logger: mockLogger, baseURL: "http://localhost/api/bkn-backend", httpClient: mockHTTPClient}
+	body := []byte(`{"error_code":"BknBackend.RelationType.NotFound","description":"Relation type not found. Check its ID.","error_details":"{{ literal }}","metadata":{"field":"relation_type_id"}}`)
+	mockHTTPClient.EXPECT().GetNoUnmarshal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(404, body, nil)
+	_, err := client.GetRelationTypeDetail(t.Context(), "kn-001", []string{"rt-001"}, true)
+	var public *httperrors.HTTPError
+	if !errors.As(err, &public) {
+		t.Fatalf("error type = %T", err)
+	}
+	source, ok := public.ErrorDetails.(httperrors.BaseError)
+	if !ok || source.ErrorCode != "BknBackend.RelationType.NotFound" || source.Description != "Relation type not found. Check its ID." || source.Metadata["field"] != "relation_type_id" || source.ErrorDetails != "{{ literal }}" {
+		t.Fatalf("source envelope = %#v", public.ErrorDetails)
 	}
 }

@@ -1,19 +1,22 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
-// Licensed under the Apache License, Version 2.0.
-// See the LICENSE file in the project root for details.
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 
 package capability_binding
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // Reasons a declared capability could not be bound. They are returned to the caller rather than
@@ -24,6 +27,9 @@ const (
 	CapabilitySkipAmbiguous   = "ambiguous_name"
 	CapabilitySkipUnusable    = "not_usable"
 	CapabilitySkipUnreachable = "execution_factory_unreachable"
+	// A knowledge base declared where kb-api is not deployed, or while it is unreachable.
+	CapabilitySkipNotSupported             = "not_supported"
+	CapabilitySkipKnowledgeBaseUnreachable = "knowledge_base_service_unreachable"
 )
 
 // ImportCapabilities resolves a model file's capability declarations against this environment and
@@ -100,6 +106,21 @@ func (cbs *capabilityBindingService) ImportCapabilitiesTx(ctx context.Context, t
 		})
 	}
 
+	for _, knowledgeBase := range declared.KnowledgeBases {
+		if knowledgeBase == nil {
+			continue
+		}
+		kbID, skip := cbs.resolveKnowledgeBase(ctx, knowledgeBase)
+		if skip != nil {
+			report.Skipped = append(report.Skipped, skip)
+			continue
+		}
+		entries = append(entries, &interfaces.AttachCapabilityEntry{
+			CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE,
+			CapabilityID:   kbID,
+		})
+	}
+
 	if len(entries) == 0 {
 		return report, nil, nil
 	}
@@ -160,6 +181,66 @@ func (cbs *capabilityBindingService) resolveSkill(ctx context.Context,
 	default:
 		return "", skip(CapabilitySkipAmbiguous,
 			fmt.Sprintf("%d skills are named %q", len(matches), declared.Name))
+	}
+}
+
+// resolveKnowledgeBase finds a declared knowledge base in this environment's kb-api, by id and
+// then by exact name, the same way a skill is found, except that an id is trusted only together
+// with its declared name. A deployment without kb-api skips it as
+// not_supported rather than failing the import.
+func (cbs *capabilityBindingService) resolveKnowledgeBase(ctx context.Context,
+	declared *bknsdk.BknCapabilityKnowledgeBase) (string, *interfaces.CapabilitySkip) {
+	label := declared.Name
+	if label == "" {
+		label = declared.ID
+	}
+	skip := func(reason, detail string) *interfaces.CapabilitySkip {
+		return &interfaces.CapabilitySkip{
+			CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE,
+			Name:           label,
+			DeclaredID:     declared.ID,
+			Reason:         reason,
+			Detail:         detail,
+		}
+	}
+	unreachable := func(err error) *interfaces.CapabilitySkip {
+		if errors.Is(err, interfaces.ErrKnowledgeBaseUnavailable) {
+			return skip(CapabilitySkipNotSupported, "this deployment has no knowledge base service")
+		}
+		return skip(CapabilitySkipKnowledgeBaseUnreachable, err.Error())
+	}
+	if cbs.kba == nil {
+		return "", unreachable(interfaces.ErrKnowledgeBaseUnavailable)
+	}
+
+	// Knowledge base ids are small integers counted per environment, so a declared id usually
+	// exists elsewhere too, naming a different knowledge base. An id hit counts only when the
+	// declared name agrees; otherwise the name decides, as it would for a missing id.
+	if id := strings.TrimSpace(declared.ID); id != "" {
+		kb, err := cbs.kba.GetKnowledgeBase(ctx, id)
+		if err != nil {
+			return "", unreachable(err)
+		}
+		if kb != nil && (declared.Name == "" || kb.Name == declared.Name) {
+			return id, nil
+		}
+	}
+
+	if declared.Name == "" {
+		return "", skip(CapabilitySkipNotFound, "no knowledge base with the declared id, and no name to fall back to")
+	}
+	matches, err := cbs.kba.FindKnowledgeBasesByName(ctx, declared.Name)
+	if err != nil {
+		return "", unreachable(err)
+	}
+	switch len(matches) {
+	case 0:
+		return "", skip(CapabilitySkipNotFound, fmt.Sprintf("no knowledge base named %q", declared.Name))
+	case 1:
+		return matches[0].ID, nil
+	default:
+		return "", skip(CapabilitySkipAmbiguous,
+			fmt.Sprintf("%d knowledge bases are named %q", len(matches), declared.Name))
 	}
 }
 
@@ -363,4 +444,45 @@ func mcpUnusableReason(tools []*interfaces.MCPToolBrief, toolName string) string
 		return fmt.Sprintf("mcp server %s is %s", tools[0].MCPID, tools[0].MCPStatus)
 	}
 	return ""
+}
+
+func (cbs *capabilityBindingService) ReplaceCapabilitiesTx(ctx context.Context, tx *sql.Tx, knID, branch string,
+	declared *bknsdk.BknCapabilities) (*interfaces.CapabilityImportReport, []*interfaces.CapabilityBinding, error) {
+	report, bound, err := cbs.ImportCapabilitiesTx(ctx, tx, knID, branch, declared)
+	if err != nil {
+		return nil, nil, err
+	}
+	existing, err := cbs.BindingIDs(ctx, knID, branch)
+	if err != nil {
+		return nil, nil, err
+	}
+	keep := make(map[string]struct{}, len(bound))
+	for _, binding := range bound {
+		keep[binding.ID] = struct{}{}
+	}
+	var stale []string
+	for _, id := range existing {
+		if _, ok := keep[id]; !ok {
+			stale = append(stale, id)
+		}
+	}
+	if len(stale) > 0 {
+		if _, err := cbs.DetachCapabilities(ctx, tx, knID, branch, stale); err != nil {
+			return nil, nil, err
+		}
+	}
+	return report, bound, nil
+}
+
+func (cbs *capabilityBindingService) BindingIDs(ctx context.Context, knID, branch string) ([]string, error) {
+	bindings, err := cbs.cba.ListBindings(ctx, interfaces.CapabilityBindingsQueryParams{KNID: knID, Branch: branch})
+	if err != nil {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+			berrors.BknBackend_CapabilityBinding_InternalError).WithErrorDetails(err.Error())
+	}
+	ids := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		ids = append(ids, binding.ID)
+	}
+	return ids, nil
 }

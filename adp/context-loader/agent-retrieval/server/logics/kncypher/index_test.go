@@ -10,8 +10,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/bkntrace"
-	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 )
 
@@ -41,10 +42,12 @@ func TestRunCypherCarriesTheQueryAcrossUntouched(t *testing.T) {
 
 	query := "MATCH (o:order)-[:rel_order_item_order]->(i:order_item) WHERE o.amount > $floor RETURN o.order_no AS no"
 	_, err := service.RunCypher(context.Background(), &RunCypherReq{
-		KnID:       "  kn_retail  ",
-		Branch:     "  main  ",
-		Query:      query,
-		Parameters: map[string]any{"floor": 100},
+		KnID:             "  kn_retail  ",
+		Branch:           "  main  ",
+		Query:            query,
+		Parameters:       map[string]any{"floor": 100},
+		ObjectProperties: map[string][]string{"o": {"order_no"}},
+		TimeoutSec:       10,
 	})
 	if err != nil {
 		t.Fatalf("RunCypher() error = %v", err)
@@ -62,6 +65,12 @@ func TestRunCypherCarriesTheQueryAcrossUntouched(t *testing.T) {
 	}
 	if got, ok := bkn.req.Parameters["floor"]; !ok || got != 100 {
 		t.Fatalf("parameters = %v, want floor carried across", bkn.req.Parameters)
+	}
+	if got := bkn.req.ObjectProperties["o"]; len(got) != 1 || got[0] != "order_no" {
+		t.Fatalf("object_properties = %v, want them carried across", bkn.req.ObjectProperties)
+	}
+	if bkn.req.TimeoutSec != 10 {
+		t.Fatalf("timeout_sec = %d, want it carried across", bkn.req.TimeoutSec)
 	}
 }
 
@@ -180,10 +189,10 @@ func TestRunCypherClassifiesFailureBoundaries(t *testing.T) {
 	}{
 		{name: "cancelled", err: context.Canceled, wantStage: "interrupted", wantCode: "RUN_CYPHER_INTERRUPTED"},
 		{name: "deadline", err: context.DeadlineExceeded, wantStage: "interrupted", wantCode: "RUN_CYPHER_TIMEOUT"},
-		{name: "parse", err: &infraErr.HTTPError{Code: "BknBackend.BadRequest.BknBackend.Cypher.SyntaxError"}, wantStage: "parse", wantCode: "RUN_CYPHER_PARSE_FAILED"},
-		{name: "bind", err: &infraErr.HTTPError{Code: "BknBackend.BadRequest.BknBackend.Cypher.InvalidQuery"}, wantStage: "bind", wantCode: "RUN_CYPHER_BIND_FAILED"},
-		{name: "compile", err: &infraErr.HTTPError{Code: "BknBackend.InternalServerError.BknBackend.Cypher.InternalError"}, wantStage: "compile", wantCode: "RUN_CYPHER_COMPILE_FAILED"},
-		{name: "vega", err: &infraErr.HTTPError{Code: "BknBackend.InternalServerError.BknBackend.Cypher.QueryFailed"}, wantStage: "vega_execution", wantCode: "RUN_CYPHER_VEGA_FAILED"},
+		{name: "parse", err: &httperrors.HTTPError{BaseError: httperrors.BaseError{ErrorCode: "BknBackend.BadRequest.BknBackend.Cypher.SyntaxError"}}, wantStage: "parse", wantCode: "RUN_CYPHER_PARSE_FAILED"},
+		{name: "bind", err: &httperrors.HTTPError{BaseError: httperrors.BaseError{ErrorCode: "BknBackend.BadRequest.BknBackend.Cypher.InvalidQuery"}}, wantStage: "bind", wantCode: "RUN_CYPHER_BIND_FAILED"},
+		{name: "compile", err: &httperrors.HTTPError{BaseError: httperrors.BaseError{ErrorCode: "BknBackend.InternalServerError.BknBackend.Cypher.InternalError"}}, wantStage: "compile", wantCode: "RUN_CYPHER_COMPILE_FAILED"},
+		{name: "vega", err: &httperrors.HTTPError{BaseError: httperrors.BaseError{ErrorCode: "BknBackend.InternalServerError.BknBackend.Cypher.QueryFailed"}}, wantStage: "vega_execution", wantCode: "RUN_CYPHER_VEGA_FAILED"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -192,5 +201,50 @@ func TestRunCypherClassifiesFailureBoundaries(t *testing.T) {
 				t.Fatalf("failure = %+v, want stage=%q code=%q", got, test.wantStage, test.wantCode)
 			}
 		})
+	}
+}
+
+// explain reaches bkn-backend, and an explained query records neither
+// evidence of a read nor a failed one: it reads nothing.
+func TestRunCypherExplainsWithoutEvidence(t *testing.T) {
+	previousEvents, previousFailure := emitRunCypherEvents, emitRunCypherFailure
+	t.Cleanup(func() { emitRunCypherEvents, emitRunCypherFailure = previousEvents, previousFailure })
+	emitted := false
+	emitRunCypherEvents = func(context.Context, interfaces.Logger, string, string, int, json.RawMessage) string {
+		emitted = true
+		return ""
+	}
+	emitRunCypherFailure = func(context.Context, interfaces.Logger, string, string, bkntrace.RunCypherFailure) string {
+		emitted = true
+		return ""
+	}
+	for _, failure := range []error{nil, errors.New("refused")} {
+		bkn := &recordingBkn{err: failure, resp: &interfaces.CypherQueryResp{Plan: json.RawMessage(`{"shape":"match"}`)}}
+		resp, err := NewKnCypherServiceWith(bkn).RunCypher(context.Background(), &RunCypherReq{
+			KnID: "kn_retail", Query: "MATCH (o:order) RETURN o.order_no", Explain: true,
+		})
+		if bkn.req == nil || !bkn.req.Explain {
+			t.Fatalf("explain did not reach bkn-backend: %+v", bkn.req)
+		}
+		if failure == nil && (err != nil || string(resp.Plan) != `{"shape":"match"}`) {
+			t.Fatalf("RunCypher() = %+v, %v", resp, err)
+		}
+		if failure != nil && err == nil {
+			t.Fatalf("RunCypher() dropped the refusal")
+		}
+	}
+	if emitted {
+		t.Fatal("an explained query emitted run evidence")
+	}
+}
+
+func TestClassifyRunCypherFailureReadsNestedSourceCode(t *testing.T) {
+	err := &httperrors.HTTPError{BaseError: httperrors.BaseError{
+		ErrorCode:    "agentRetrieval.BadRequest.CommonExternalServerError",
+		ErrorDetails: httperrors.BaseError{ErrorCode: "BknBackend.Cypher.SyntaxError", Description: "invalid query"},
+	}}
+	failure := classifyRunCypherFailure(err)
+	if failure.Stage != "parse" || failure.Code != "RUN_CYPHER_PARSE_FAILED" {
+		t.Fatalf("failure = %+v", failure)
 	}
 }

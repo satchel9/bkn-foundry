@@ -16,8 +16,8 @@ const (
 )
 
 // VisitorType values for the introspect ext.visitor_type claim. The lib maps
-// "realname" -> user; ISF emits "realname" for human users (verified from live
-// ISF introspect), so bkn-safe does the same.
+// "realname" -> user; the legacy identity service emits "realname" for human
+// users (verified from live introspection), so bkn-safe does the same.
 const (
 	VisitorTypeRealname  = "realname"
 	VisitorTypeAnonymous = "anonymous"
@@ -38,10 +38,53 @@ func ExtClaims(u *model.User, loginIP, clientType string) map[string]any {
 	return map[string]any{
 		"visitor_type": VisitorTypeRealname,
 		"login_ip":     loginIP,
-		"udid":         "", // ISF user tokens carry an empty udid (captured)
+		"udid":         "", // Legacy identity tokens carry an empty udid (captured)
 		"account_type": accountType,
 		"client_type":  clientType,
 	}
+}
+
+// OIDC scopes that release standard profile claims in the ID token and at
+// /userinfo (OpenID Connect Core §5.4).
+const (
+	ScopeProfile = "profile"
+	ScopeEmail   = "email"
+	ScopePhone   = "phone"
+)
+
+// IDTokenClaims builds the claims hydra puts in the ID token and serves at
+// /userinfo for the granted scopes. Claims are released only for the scope
+// that covers them, and empty values are left out. This never touches the
+// access-token ext contract above.
+//
+// No *_verified claim is sent: the local user store verifies neither email
+// nor telephone. phone_number is the stored value as is, not normalized to
+// E.164.
+func IDTokenClaims(u *model.User, grantedScope []string) map[string]any {
+	claims := map[string]any{}
+	for _, s := range grantedScope {
+		switch s {
+		case ScopeProfile:
+			if u.Name != "" {
+				claims["name"] = u.Name
+			}
+			if u.Account != "" {
+				claims["preferred_username"] = u.Account
+			}
+			if !u.UpdatedAt.IsZero() {
+				claims["updated_at"] = u.UpdatedAt.Unix()
+			}
+		case ScopeEmail:
+			if u.Email != "" {
+				claims["email"] = u.Email
+			}
+		case ScopePhone:
+			if u.Telephone != "" {
+				claims["phone_number"] = u.Telephone
+			}
+		}
+	}
+	return claims
 }
 
 // Provider orchestrates the hydra login & consent flow against the local user
@@ -143,8 +186,11 @@ func (p *Provider) Consent(ctx context.Context, challenge, loginIP, clientType s
 	if err != nil {
 		return "", err
 	}
+	if !u.Enabled {
+		return "", ErrUserDisabled
+	}
 	ext := ExtClaims(u, loginIP, clientType)
-	return p.hydra.AcceptConsent(ctx, cr, ext, remember)
+	return p.hydra.AcceptConsent(ctx, cr, ext, IDTokenClaims(u, cr.RequestedScope), remember)
 }
 
 // RejectConsent denies the consent request, returning hydra's redirect target.

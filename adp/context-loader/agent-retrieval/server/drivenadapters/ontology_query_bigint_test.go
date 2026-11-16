@@ -116,12 +116,12 @@ func TestQueryLogicPropertiesPreservesBigIntegers(t *testing.T) {
 }
 
 func TestQueryMetricDataPreservesBigIntegers(t *testing.T) {
-	resp, err := rawBodyClient(t, `{"datas":[{"values":[9223372036854775808]}]}`).QueryMetricData(
-		context.Background(), "kn-1", "m-1", false, &interfaces.MetricQueryDownstreamReq{})
+	resp, err := rawBodyClient(t, `{"entries":[{"status":"ok","value":9223372036854775808}],"status":"ok"}`).QueryMetricData(
+		context.Background(), "kn-1", "main", "m-1", 1, &interfaces.ObjectMetricQuery{})
 	if err != nil {
 		t.Fatalf("QueryMetricData() error = %v", err)
 	}
-	wantNumber(t, resp.Datas[0].Values[0], "9223372036854775808")
+	wantNumber(t, resp.Entries[0].Value, "9223372036854775808")
 }
 
 func TestExploreSubgraphPreservesBigIntegers(t *testing.T) {
@@ -167,7 +167,7 @@ func TestCallMCPToolPreservesBigIntegers(t *testing.T) {
 
 	ctx := common.SetRawTokenToCtx(context.Background(), "caller-token")
 	result, err := client.CallMCPTool(ctx, &interfaces.CallMCPToolRequest{
-		McpID: "mcp-1", ToolName: "run_sql",
+		McpID: "mcp-1", ToolName: "run_cypher",
 	})
 	if err != nil {
 		t.Fatalf("CallMCPTool() error = %v", err)

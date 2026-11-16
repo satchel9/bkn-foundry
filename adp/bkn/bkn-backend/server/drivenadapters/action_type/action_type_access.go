@@ -7,8 +7,10 @@
 package action_type
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,8 +25,8 @@ import (
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -255,6 +257,20 @@ func (ata *actionTypeAccess) CreateActionType(ctx context.Context, tx *sql.Tx, a
 		common.LogSafeError(ctx, "Failed to marshal ImpactContracts, err", err)
 		return err
 	}
+	operationConfigBytes, err := marshalOperationConfig(actionType.OperationConfig)
+	if err != nil {
+		return err
+	}
+	aliases, err := common.EncodeAliases(actionType.Aliases)
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to marshal Aliases, err", err)
+		return err
+	}
+	lifecycleStatus, deprecation, err := common.EncodeLifecycle(actionType.Lifecycle.Columns())
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to marshal Lifecycle, err", err)
+		return err
+	}
 
 	sqlStr, vals, err := sq.Insert(AT_TABLE_NAME).
 		Columns(
@@ -269,7 +285,10 @@ func (ata *actionTypeAccess) CreateActionType(ctx context.Context, tx *sql.Tx, a
 			"f_branch",
 			"f_action_type",
 			"f_action_intent",
-			"f_impact_contracts",
+			"f_impact_contracts", "f_operation_config",
+			"f_aliases",
+			"f_lifecycle_status",
+			"f_deprecation",
 			"f_object_type_id",
 			"f_condition",
 			"f_affect",
@@ -282,6 +301,7 @@ func (ata *actionTypeAccess) CreateActionType(ctx context.Context, tx *sql.Tx, a
 			"f_updater",
 			"f_updater_type",
 			"f_update_time",
+			"f_revision",
 		).
 		Values(
 			actionType.ATID,
@@ -296,6 +316,10 @@ func (ata *actionTypeAccess) CreateActionType(ctx context.Context, tx *sql.Tx, a
 			actionType.ActionType,
 			actionType.ActionIntent,
 			impactContractsBytes,
+			operationConfigBytes,
+			aliases,
+			lifecycleStatus,
+			deprecation,
 			actionType.ObjectTypeID,
 			conditionBytes,
 			affectBytes,
@@ -307,7 +331,8 @@ func (ata *actionTypeAccess) CreateActionType(ctx context.Context, tx *sql.Tx, a
 			actionType.CreateTime,
 			actionType.Updater.ID,
 			actionType.Updater.Type,
-			actionType.UpdateTime).
+			actionType.UpdateTime,
+			interfaces.NewDefinitionRevision()).
 		ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of insert action type, error", err)
@@ -340,10 +365,10 @@ func (ata *actionTypeAccess) CreateActionTypes(ctx context.Context, tx *sql.Tx,
 		end := min(start+actionTypeInsertBatchSize, len(actionTypes))
 		builder := sq.Insert(AT_TABLE_NAME).Columns(
 			"f_id", "f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_bkn_raw_content",
-			"f_kn_id", "f_branch", "f_action_type", "f_action_intent", "f_impact_contracts",
+			"f_kn_id", "f_branch", "f_action_type", "f_action_intent", "f_impact_contracts", "f_operation_config", "f_aliases", "f_lifecycle_status", "f_deprecation",
 			"f_object_type_id", "f_condition", "f_affect", "f_action_source", "f_parameters",
 			"f_schedule", "f_creator", "f_creator_type", "f_create_time", "f_updater",
-			"f_updater_type", "f_update_time",
+			"f_updater_type", "f_update_time", "f_revision",
 		)
 		for _, actionType := range actionTypes[start:end] {
 			values, err := actionTypeInsertValues(actionType)
@@ -377,10 +402,10 @@ func actionTypeInsertValues(actionType *interfaces.ActionType) ([]any, error) {
 		actionType.ATID, actionType.ATName, libCommon.TagSlice2TagString(actionType.Tags),
 		actionType.Comment, actionType.Icon, actionType.Color, actionType.BKNRawContent,
 		actionType.KNID, actionType.Branch, actionType.ActionType, actionType.ActionIntent,
-		serialized.impactContracts, actionType.ObjectTypeID, serialized.condition, serialized.affect,
+		serialized.impactContracts, serialized.operationConfig, serialized.aliases, serialized.lifecycleStatus, serialized.deprecation, actionType.ObjectTypeID, serialized.condition, serialized.affect,
 		serialized.actionSource, serialized.parameters, serialized.schedule, actionType.Creator.ID,
 		actionType.Creator.Type, actionType.CreateTime, actionType.Updater.ID, actionType.Updater.Type,
-		actionType.UpdateTime,
+		actionType.UpdateTime, interfaces.NewDefinitionRevision(),
 	}, nil
 }
 
@@ -390,7 +415,11 @@ type serializedActionTypeFields struct {
 	actionSource    []byte
 	parameters      []byte
 	schedule        []byte
+	operationConfig []byte
 	impactContracts []byte
+	aliases         any
+	lifecycleStatus any
+	deprecation     any
 }
 
 func serializeActionTypeFields(actionType *interfaces.ActionType) (serializedActionTypeFields, error) {
@@ -412,6 +441,15 @@ func serializeActionTypeFields(actionType *interfaces.ActionType) (serializedAct
 		return result, err
 	}
 	if result.impactContracts, err = marshalImpactContractsJSON(actionType); err != nil {
+		return result, err
+	}
+	if result.operationConfig, err = marshalOperationConfig(actionType.OperationConfig); err != nil {
+		return result, err
+	}
+	if result.aliases, err = common.EncodeAliases(actionType.Aliases); err != nil {
+		return result, err
+	}
+	if result.lifecycleStatus, result.deprecation, err = common.EncodeLifecycle(actionType.Lifecycle.Columns()); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -439,7 +477,10 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 		"f_branch",
 		"f_action_type",
 		"f_action_intent",
-		"f_impact_contracts",
+		"f_impact_contracts", "f_operation_config",
+		"f_aliases",
+		"f_lifecycle_status",
+		"f_deprecation",
 		"f_object_type_id",
 		"f_condition",
 		"f_affect",
@@ -494,12 +535,16 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 		}
 		tagsStr := ""
 		var (
-			conditionBytes     []byte
-			affectBytes        []byte
-			actionSourceBytes  []byte
-			parametersBytes    []byte
-			scheduleBytes      []byte
-			impactContractsRaw []byte
+			conditionBytes       []byte
+			affectBytes          []byte
+			actionSourceBytes    []byte
+			parametersBytes      []byte
+			scheduleBytes        []byte
+			operationConfigRaw   []byte
+			impactContractsRaw   []byte
+			aliasesRaw           []byte
+			lifecycleStatusBytes []byte
+			deprecationBytes     []byte
 		)
 		err := rows.Scan(
 			&actionType.ATID,
@@ -514,6 +559,10 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 			&actionType.ActionType,
 			&actionType.ActionIntent,
 			&impactContractsRaw,
+			&operationConfigRaw,
+			&aliasesRaw,
+			&lifecycleStatusBytes,
+			&deprecationBytes,
 			&actionType.ObjectTypeID,
 			&conditionBytes,
 			&affectBytes,
@@ -536,7 +585,7 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 		actionType.Tags = libCommon.TagString2TagSlice(tagsStr)
 
 		// 2.0 Deserialize condition.
-		err = common.UnmarshalStoredJSON(conditionBytes, &actionType.Condition)
+		err = unmarshalStoredActionJSON(conditionBytes, &actionType.Condition)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Condition after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
@@ -554,7 +603,7 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 			return []*interfaces.ActionType{}, err
 		}
 		// 2.3 Deserialize parameters.
-		err = common.UnmarshalStoredJSON(parametersBytes, &actionType.Parameters)
+		err = unmarshalStoredActionJSON(parametersBytes, &actionType.Parameters)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Parameters after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
@@ -564,6 +613,11 @@ func (ata *actionTypeAccess) ListActionTypes(ctx context.Context, query interfac
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Schedule after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
+		}
+		actionType.Aliases = common.DecodeStoredAliases(ctx, aliasesRaw)
+		actionType.Lifecycle = interfaces.LifecycleOf(common.DecodeStoredLifecycle(ctx, lifecycleStatusBytes, deprecationBytes))
+		if err := unmarshalStoredActionJSON(operationConfigRaw, &(&actionType).OperationConfig); err != nil {
+			return nil, err
 		}
 		if err = unmarshalImpactContractsJSON(impactContractsRaw, &actionType); err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal ImpactContracts after getting action type, err", err)
@@ -594,7 +648,10 @@ func (ata *actionTypeAccess) ListActionTypeSummaries(ctx context.Context,
 		"f_branch",
 		"f_action_type",
 		"f_action_intent",
-		"f_impact_contracts",
+		"f_impact_contracts", "f_operation_config",
+		"f_aliases",
+		"f_lifecycle_status",
+		"f_deprecation",
 		"f_object_type_id",
 		"f_condition",
 		"f_affect",
@@ -638,12 +695,16 @@ func (ata *actionTypeAccess) ListActionTypeSummaries(ctx context.Context,
 		item := &interfaces.ActionType{ModuleType: interfaces.MODULE_TYPE_ACTION_TYPE}
 		tags := ""
 		var (
-			conditionBytes     []byte
-			affectBytes        []byte
-			actionSourceBytes  []byte
-			parametersBytes    []byte
-			scheduleBytes      []byte
-			impactContractsRaw []byte
+			conditionBytes       []byte
+			affectBytes          []byte
+			actionSourceBytes    []byte
+			parametersBytes      []byte
+			scheduleBytes        []byte
+			operationConfigRaw   []byte
+			impactContractsRaw   []byte
+			aliasesRaw           []byte
+			lifecycleStatusBytes []byte
+			deprecationBytes     []byte
 		)
 		if err := rows.Scan(
 			&item.ATID,
@@ -657,6 +718,10 @@ func (ata *actionTypeAccess) ListActionTypeSummaries(ctx context.Context,
 			&item.ActionType,
 			&item.ActionIntent,
 			&impactContractsRaw,
+			&operationConfigRaw,
+			&aliasesRaw,
+			&lifecycleStatusBytes,
+			&deprecationBytes,
 			&item.ObjectTypeID,
 			&conditionBytes,
 			&affectBytes,
@@ -673,7 +738,7 @@ func (ata *actionTypeAccess) ListActionTypeSummaries(ctx context.Context,
 			return nil, err
 		}
 		item.Tags = libCommon.TagString2TagSlice(tags)
-		if err := common.UnmarshalStoredJSON(conditionBytes, &item.Condition); err != nil {
+		if err := unmarshalStoredActionJSON(conditionBytes, &item.Condition); err != nil {
 			return nil, err
 		}
 		if err := common.UnmarshalStoredJSON(affectBytes, &item.Affect); err != nil {
@@ -682,10 +747,15 @@ func (ata *actionTypeAccess) ListActionTypeSummaries(ctx context.Context,
 		if err := common.UnmarshalStoredJSON(actionSourceBytes, &item.ActionSource); err != nil {
 			return nil, err
 		}
-		if err := common.UnmarshalStoredJSON(parametersBytes, &item.Parameters); err != nil {
+		if err := unmarshalStoredActionJSON(parametersBytes, &item.Parameters); err != nil {
 			return nil, err
 		}
 		if err := common.UnmarshalStoredJSON(scheduleBytes, &item.Schedule); err != nil {
+			return nil, err
+		}
+		item.Aliases = common.DecodeStoredAliases(ctx, aliasesRaw)
+		item.Lifecycle = interfaces.LifecycleOf(common.DecodeStoredLifecycle(ctx, lifecycleStatusBytes, deprecationBytes))
+		if err := unmarshalStoredActionJSON(operationConfigRaw, &(item).OperationConfig); err != nil {
 			return nil, err
 		}
 		if err := unmarshalImpactContractsJSON(impactContractsRaw, item); err != nil {
@@ -753,7 +823,10 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 		"f_branch",
 		"f_action_type",
 		"f_action_intent",
-		"f_impact_contracts",
+		"f_impact_contracts", "f_operation_config",
+		"f_aliases",
+		"f_lifecycle_status",
+		"f_deprecation",
 		"f_object_type_id",
 		"f_condition",
 		"f_affect",
@@ -793,12 +866,16 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 		}
 		tagsStr := ""
 		var (
-			conditionBytes     []byte
-			affectBytes        []byte
-			actionSourceBytes  []byte
-			parametersBytes    []byte
-			scheduleBytes      []byte
-			impactContractsRaw []byte
+			conditionBytes       []byte
+			affectBytes          []byte
+			actionSourceBytes    []byte
+			parametersBytes      []byte
+			scheduleBytes        []byte
+			operationConfigRaw   []byte
+			impactContractsRaw   []byte
+			aliasesRaw           []byte
+			lifecycleStatusBytes []byte
+			deprecationBytes     []byte
 		)
 
 		err := rows.Scan(
@@ -814,6 +891,10 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 			&actionType.ActionType,
 			&actionType.ActionIntent,
 			&impactContractsRaw,
+			&operationConfigRaw,
+			&aliasesRaw,
+			&lifecycleStatusBytes,
+			&deprecationBytes,
 			&actionType.ObjectTypeID,
 			&conditionBytes,
 			&affectBytes,
@@ -837,7 +918,7 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 		actionType.Tags = libCommon.TagString2TagSlice(tagsStr)
 
 		// 2.0 Deserialize condition.
-		err = common.UnmarshalStoredJSON(conditionBytes, &actionType.Condition)
+		err = unmarshalStoredActionJSON(conditionBytes, &actionType.Condition)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Condition after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
@@ -855,7 +936,7 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 			return []*interfaces.ActionType{}, err
 		}
 		// 2.3 Deserialize parameters.
-		err = common.UnmarshalStoredJSON(parametersBytes, &actionType.Parameters)
+		err = unmarshalStoredActionJSON(parametersBytes, &actionType.Parameters)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Parameters after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
@@ -865,6 +946,11 @@ func (ata *actionTypeAccess) GetActionTypesByIDs(ctx context.Context, knID strin
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Schedule after getting action type, err", err)
 			return []*interfaces.ActionType{}, err
+		}
+		actionType.Aliases = common.DecodeStoredAliases(ctx, aliasesRaw)
+		actionType.Lifecycle = interfaces.LifecycleOf(common.DecodeStoredLifecycle(ctx, lifecycleStatusBytes, deprecationBytes))
+		if err := unmarshalStoredActionJSON(operationConfigRaw, &(&actionType).OperationConfig); err != nil {
+			return nil, err
 		}
 		if err = unmarshalImpactContractsJSON(impactContractsRaw, &actionType); err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal ImpactContracts after getting action type, err", err)
@@ -930,6 +1016,20 @@ func (ata *actionTypeAccess) UpdateActionType(ctx context.Context, tx *sql.Tx, a
 		common.LogSafeError(ctx, "Failed to marshal ImpactContracts, err", err)
 		return err
 	}
+	operationConfigBytes, err := marshalOperationConfig(actionType.OperationConfig)
+	if err != nil {
+		return err
+	}
+	aliases, err := common.EncodeAliases(actionType.Aliases)
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to marshal Aliases, err", err)
+		return err
+	}
+	lifecycleStatus, deprecation, err := common.EncodeLifecycle(actionType.Lifecycle.Columns())
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to marshal Lifecycle, err", err)
+		return err
+	}
 
 	data := map[string]any{
 		"f_name":             actionType.ATName,
@@ -941,6 +1041,10 @@ func (ata *actionTypeAccess) UpdateActionType(ctx context.Context, tx *sql.Tx, a
 		"f_action_type":      actionType.ActionType,
 		"f_action_intent":    actionType.ActionIntent,
 		"f_impact_contracts": impactContractsBytes,
+		"f_operation_config": operationConfigBytes,
+		"f_aliases":          aliases,
+		"f_lifecycle_status": lifecycleStatus,
+		"f_deprecation":      deprecation,
 		"f_object_type_id":   actionType.ObjectTypeID,
 		"f_condition":        conditionBytes,
 		"f_affect":           affectBytes,
@@ -950,11 +1054,13 @@ func (ata *actionTypeAccess) UpdateActionType(ctx context.Context, tx *sql.Tx, a
 		"f_updater":          actionType.Updater.ID,
 		"f_updater_type":     actionType.Updater.Type,
 		"f_update_time":      actionType.UpdateTime,
+		"f_revision":         interfaces.NewDefinitionRevision(),
 	}
 	sqlStr, vals, err := sq.Update(AT_TABLE_NAME).
 		SetMap(data).
 		Where(sq.Eq{"f_id": actionType.ATID}).
 		Where(sq.Eq{"f_kn_id": actionType.KNID}).
+		Where(sq.Eq{"f_branch": actionType.Branch}).
 		ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of update action type by action type id, error", err)
@@ -969,18 +1075,10 @@ func (ata *actionTypeAccess) UpdateActionType(ctx context.Context, tx *sql.Tx, a
 		common.LogSafeError(ctx, "update action type error", err)
 		return err
 	}
-
-	// Number of rows affected by the SQL statement.
-	RowsAffected, err := ret.RowsAffected()
-	if err != nil {
-		common.LogSafeError(ctx, "Get RowsAffected error", err)
+	key := sq.Eq{"f_id": actionType.ATID, "f_kn_id": actionType.KNID, "f_branch": actionType.Branch}
+	if err = common.EnsureRowUpdated(ctx, tx, ret, AT_TABLE_NAME, key); err != nil {
+		common.LogSafeError(ctx, "Update action type found no row", err)
 		return err
-	}
-
-	if RowsAffected != 1 {
-		// Do not return an error when affected rows are not one because the update has occurred.
-		otellog.LogWarn(ctx, fmt.Sprintf("Update action type affected unexpected row count: action_type_id=%s, rows=%d",
-			actionType.ATID, RowsAffected))
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -1007,7 +1105,7 @@ func (ata *actionTypeAccess) UpdateActionTypes(ctx context.Context, tx *sql.Tx,
 	}
 	columns := []string{
 		"f_name", "f_tags", "f_comment", "f_icon", "f_color", "f_bkn_raw_content",
-		"f_action_type", "f_action_intent", "f_impact_contracts", "f_object_type_id",
+		"f_action_type", "f_action_intent", "f_impact_contracts", "f_operation_config", "f_aliases", "f_lifecycle_status", "f_deprecation", "f_object_type_id",
 		"f_condition", "f_affect", "f_action_source", "f_parameters", "f_schedule",
 		"f_updater", "f_updater_type", "f_update_time",
 	}
@@ -1051,6 +1149,7 @@ func (ata *actionTypeAccess) UpdateActionTypes(ctx context.Context, tx *sql.Tx,
 			statement.WriteString(column)
 			statement.WriteString(" END")
 		}
+		statement.WriteString(", f_revision = REPLACE(UUID(), '-', '')")
 		statement.WriteString(" WHERE f_kn_id = ? AND f_branch = ? AND f_id IN (")
 		args = append(args, knID, branch)
 		for index, actionType := range batch {
@@ -1081,7 +1180,7 @@ func actionTypeUpdateValues(actionType *interfaces.ActionType) ([]any, error) {
 	return []any{
 		actionType.ATName, libCommon.TagSlice2TagString(actionType.Tags), actionType.Comment,
 		actionType.Icon, actionType.Color, actionType.BKNRawContent, actionType.ActionType,
-		actionType.ActionIntent, serialized.impactContracts, actionType.ObjectTypeID,
+		actionType.ActionIntent, serialized.impactContracts, serialized.operationConfig, serialized.aliases, serialized.lifecycleStatus, serialized.deprecation, actionType.ObjectTypeID,
 		serialized.condition, serialized.affect, serialized.actionSource, serialized.parameters,
 		serialized.schedule, actionType.Updater.ID, actionType.Updater.Type, actionType.UpdateTime,
 	}, nil
@@ -1243,6 +1342,12 @@ func processQueryCondition(query interfaces.ActionTypesQueryParams, subBuilder s
 		subBuilder = subBuilder.Where(sq.Eq{"f_branch": interfaces.MAIN_BRANCH})
 	}
 
+	if query.OperationKind != "" {
+		subBuilder = subBuilder.Where(sq.Expr("JSON_VALUE(f_operation_config, '$.type') = ?", query.OperationKind))
+	}
+	if query.RelationOperation != "" {
+		subBuilder = subBuilder.Where(sq.Expr("JSON_VALUE(f_operation_config, '$.relation_operation') = ?", query.RelationOperation))
+	}
 	if query.ActionType != "" {
 		subBuilder = subBuilder.Where(sq.Eq{"f_action_type": query.ActionType})
 	}
@@ -1284,7 +1389,10 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 		"f_branch",
 		"f_action_type",
 		"f_action_intent",
-		"f_impact_contracts",
+		"f_impact_contracts", "f_operation_config",
+		"f_aliases",
+		"f_lifecycle_status",
+		"f_deprecation",
 		"f_object_type_id",
 		"f_condition",
 		"f_affect",
@@ -1324,12 +1432,16 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 		}
 		tagsStr := ""
 		var (
-			conditionBytes     []byte
-			affectBytes        []byte
-			actionSourceBytes  []byte
-			parametersBytes    []byte
-			scheduleBytes      []byte
-			impactContractsRaw []byte
+			conditionBytes       []byte
+			affectBytes          []byte
+			actionSourceBytes    []byte
+			parametersBytes      []byte
+			scheduleBytes        []byte
+			operationConfigRaw   []byte
+			impactContractsRaw   []byte
+			aliasesRaw           []byte
+			lifecycleStatusBytes []byte
+			deprecationBytes     []byte
 		)
 		err := rows.Scan(
 			&actionType.ATID,
@@ -1344,6 +1456,10 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 			&actionType.ActionType,
 			&actionType.ActionIntent,
 			&impactContractsRaw,
+			&operationConfigRaw,
+			&aliasesRaw,
+			&lifecycleStatusBytes,
+			&deprecationBytes,
 			&actionType.ObjectTypeID,
 			&conditionBytes,
 			&affectBytes,
@@ -1366,7 +1482,7 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 		actionType.Tags = libCommon.TagString2TagSlice(tagsStr)
 
 		// 2.0 Deserialize condition.
-		err = common.UnmarshalStoredJSON(conditionBytes, &actionType.Condition)
+		err = unmarshalStoredActionJSON(conditionBytes, &actionType.Condition)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Condition after getting action type, err", err)
 			return map[string]*interfaces.ActionType{}, err
@@ -1384,7 +1500,7 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 			return map[string]*interfaces.ActionType{}, err
 		}
 		// 2.3 Deserialize parameters.
-		err = common.UnmarshalStoredJSON(parametersBytes, &actionType.Parameters)
+		err = unmarshalStoredActionJSON(parametersBytes, &actionType.Parameters)
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Parameters after getting action type, err", err)
 			return map[string]*interfaces.ActionType{}, err
@@ -1394,6 +1510,11 @@ func (ata *actionTypeAccess) GetAllActionTypesByKnID(ctx context.Context, knID s
 		if err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal Schedule after getting action type, err", err)
 			return map[string]*interfaces.ActionType{}, err
+		}
+		actionType.Aliases = common.DecodeStoredAliases(ctx, aliasesRaw)
+		actionType.Lifecycle = interfaces.LifecycleOf(common.DecodeStoredLifecycle(ctx, lifecycleStatusBytes, deprecationBytes))
+		if err := unmarshalStoredActionJSON(operationConfigRaw, &(&actionType).OperationConfig); err != nil {
+			return nil, err
 		}
 		if err = unmarshalImpactContractsJSON(impactContractsRaw, &actionType); err != nil {
 			common.LogSafeError(ctx, "Failed to unmarshal ImpactContracts after getting action type, err", err)
@@ -1420,4 +1541,88 @@ func unmarshalImpactContractsJSON(raw []byte, actionType *interfaces.ActionType)
 		return nil
 	}
 	return sonic.Unmarshal(raw, &actionType.ImpactContracts)
+}
+
+// ListAliasedActionTypes lists the ID, name and aliases of every action type of the branch that has
+// aliases. A network without aliases answers no rows.
+func (ata *actionTypeAccess) ListAliasedActionTypes(ctx context.Context, knID string, branch string) ([]*interfaces.ActionType, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListAliasedActionTypes")
+	defer span.End()
+
+	sqlStr, vals, err := sq.Select("f_id", "f_name", "f_aliases").From(AT_TABLE_NAME).
+		Where(sq.Eq{"f_kn_id": knID}).
+		Where(sq.Eq{"f_branch": branch}).
+		Where(sq.NotEq{"f_aliases": nil}).
+		ToSql()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ata.db.Query(sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "Query aliased action types failed", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []*interfaces.ActionType
+	for rows.Next() {
+		actionType := &interfaces.ActionType{ModuleType: interfaces.MODULE_TYPE_ACTION_TYPE}
+		var aliases []byte
+		if err = rows.Scan(&actionType.ATID, &actionType.ATName, &aliases); err != nil {
+			return nil, err
+		}
+		actionType.Aliases = common.DecodeStoredAliases(ctx, aliases)
+		result = append(result, actionType)
+	}
+	span.SetStatus(codes.Ok, "")
+	return result, rows.Err()
+}
+
+func (ata *actionTypeAccess) ListDeprecatedActionTypes(ctx context.Context, knID string, branch string) ([]*interfaces.ActionType, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListDeprecatedActionTypes")
+	defer span.End()
+
+	sqlStr, vals, err := sq.Select("f_id", "f_name", "f_lifecycle_status", "f_deprecation").From(AT_TABLE_NAME).
+		Where(sq.Eq{"f_kn_id": knID}).
+		Where(sq.Eq{"f_branch": branch}).
+		Where(sq.Eq{"f_lifecycle_status": interfaces.LIFECYCLE_DEPRECATED}).
+		ToSql()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := ata.db.Query(sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "Query deprecated action types failed", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []*interfaces.ActionType
+	for rows.Next() {
+		actionType := &interfaces.ActionType{ModuleType: interfaces.MODULE_TYPE_ACTION_TYPE}
+		var status, deprecation []byte
+		if err = rows.Scan(&actionType.ATID, &actionType.ATName, &status, &deprecation); err != nil {
+			return nil, err
+		}
+		actionType.Lifecycle = interfaces.LifecycleOf(common.DecodeStoredLifecycle(ctx, status, deprecation))
+		result = append(result, actionType)
+	}
+	span.SetStatus(codes.Ok, "")
+	return result, rows.Err()
+}
+
+// marshalOperationConfig stores legacy definitions as SQL NULL.
+func marshalOperationConfig(config *interfaces.ActionOperationConfig) ([]byte, error) {
+	if config == nil {
+		return nil, nil
+	}
+	return sonic.Marshal(config)
+}
+
+// Preserve action literals without changing numeric decoding in other model types.
+func unmarshalStoredActionJSON(raw []byte, target any) error {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	return decoder.Decode(target)
 }

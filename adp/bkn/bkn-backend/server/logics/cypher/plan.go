@@ -8,10 +8,11 @@ package cypher
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
-	"bkn-backend/interfaces"
-	dtype "bkn-backend/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 // The planner turns an accepted query plus the model into the shape of one
@@ -35,6 +36,29 @@ type Plan struct {
 	Skip      *int64
 	Limit     *int64
 
+	// Grouped says the query aggregates even when no returned column does,
+	// as when a WITH aggregated and RETURN shows only what it grouped by.
+	// Having is the condition each group must meet, from the WHERE of that
+	// WITH; it reads aggregates over the group.
+	Grouped bool
+	Having  PlanPredicate
+
+	// Totals aggregate the rows the rest of the plan yields, one per group,
+	// and are then what the statement returns; see Query.Totals.
+	Totals []PlanTotal
+
+	// Intersection, when set, is the whole statement; see Query.Intersection.
+	Intersection *PlanIntersection
+	// Union, when set, is the whole statement; see Query.Union.
+	Union *PlanUnion
+
+	// Carried is a carried stage the statement joins; see Query.Carried.
+	Carried *PlanCarried
+
+	// SQLOnly marks a plan only the SQL path answers: totals over groups,
+	// CASE and coalesce. The bind-join executor takes no new capabilities.
+	SQLOnly bool
+
 	// Properties lists, in the model's own terms, every property the query
 	// names: what it returns, filters on, sorts by or aggregates over. Join
 	// keys and the primary keys that keep relationships distinct are not in
@@ -44,6 +68,15 @@ type Plan struct {
 	Properties []PlanProperty
 }
 
+// PlanTotal is one aggregate over the groups. Of is the alias of the column
+// of Select it reads, and is empty for count(*).
+type PlanTotal struct {
+	Function string
+	Distinct bool
+	Of       string
+	Alias    string
+}
+
 // PlanProperty is one property the query names, on one object type.
 type PlanProperty struct {
 	ObjectTypeID string
@@ -51,7 +84,7 @@ type PlanProperty struct {
 }
 
 // PlanTable is one node of the pattern, bound to the resource behind its
-// object type. ResourceID goes into the {{.resource_id}} placeholder that
+// object type. ResourceID goes into the {{resource_id}} placeholder that
 // vega-backend substitutes, so the physical table name never appears here.
 type PlanTable struct {
 	Alias        string
@@ -63,19 +96,29 @@ type PlanTable struct {
 	// an outer join, so its columns are null on a row that found nothing. Every
 	// condition over it belongs to that join rather than to WHERE.
 	Optional bool
+	// Backing marks the resource an indirect relation reads its links from.
+	// It is not a node: it has no object type, no variable and no row policy
+	// of its own, and it is read only through the join it belongs to.
+	Backing bool
 }
 
-// PlanJoin joins two tables on the key pairs of a direct relation type.
+// PlanJoin joins two tables on the key pairs of a relation type.
 //
-// Readings holds one set of key pairs per way the relation can be read. A
-// directed pattern has one; an undirected one between two nodes of the same
+// Readings holds one set of key pairs per way a direct relation can be read.
+// A directed pattern has one; an undirected one between two nodes of the same
 // object type has two, and a row matches if either holds.
+//
+// An indirect relation has no key pairs between its ends: it links them
+// through a row of its backing resource, which Backing describes, and
+// Readings stays empty.
 type PlanJoin struct {
 	Left           int
 	Right          int
 	RelationTypeID string
 	Direction      Direction
-	Readings       [][]PlanJoinKey
+	// Variable is the relationship's name when the query binds it.
+	Variable string
+	Readings [][]PlanJoinKey
 	// Optional makes this an outer join: the row on the anchor side survives
 	// whether or not the other side has a match.
 	Optional bool
@@ -87,6 +130,28 @@ type PlanJoin struct {
 	// the whole semantics: in WHERE they would turn it back into an inner one
 	// and drop the rows it exists to keep.
 	Conditions []PlanPredicate
+	// Backing is set for an indirect relation.
+	Backing *PlanBacking
+	// Filtered marks a filtered_cross_join relation: it has no key pairs, and
+	// Filter -- both ends' conditions together, nil when they always hold --
+	// is what links two rows.
+	Filtered bool
+	Filter   PlanPredicate
+}
+
+// PlanBacking is how an indirect relation links its two ends: a row of the
+// backing table matches the left table on LeftKeys and the right table on
+// RightKeys, in pattern order. Every key pair of both sides has to hold on the
+// same backing row, so a link row that matches one end on part of its keys
+// links nothing.
+type PlanBacking struct {
+	Table int
+	// LeftKeys pair a column of the left table (LeftColumn) with a column of
+	// the backing table (RightColumn).
+	LeftKeys []PlanJoinKey
+	// RightKeys pair a column of the backing table (LeftColumn) with a column
+	// of the right table (RightColumn).
+	RightKeys []PlanJoinKey
 }
 
 // PlanJoinKey is one equality between a column of the left table and a column
@@ -105,12 +170,15 @@ type PlanColumn struct {
 	Alias      string
 	Aggregate  *PlanAggregate
 	Expression PlanExpression
+	// Graph is set for a graph value instead of the fields above.
+	Graph PlanGraph
 }
 
-// aggregates reports whether the column collapses rows: it is an aggregate, or
-// it computes something from one.
+// aggregates reports whether the column collapses rows: it is an aggregate, it
+// computes something from one, or it collects.
 func (c PlanColumn) aggregates() bool {
-	return c.Aggregate != nil || (c.Expression != nil && planContainsAggregate(c.Expression))
+	return c.Aggregate != nil || (c.Expression != nil && planContainsAggregate(c.Expression)) ||
+		(c.Graph != nil && planGraphCollects(c.Graph))
 }
 
 // PlanAggregate is COUNT, SUM, AVG, MIN or MAX. Star is count(*), which counts
@@ -124,6 +192,19 @@ type PlanAggregate struct {
 	Column   string
 	Property string
 	Argument PlanExpression
+	// Keys are the further primary key columns counted with Column: those of
+	// a node whose object type has more than one, or both ends' keys for
+	// count(DISTINCT r). Each combination is counted once.
+	Keys []PlanAggregateKey
+}
+
+// PlanAggregateKey is one further primary key column of what is counted.
+// Table is the aggregate's own table for a node, and either end's table for
+// count(DISTINCT r), which tells relationships apart by both ends' keys.
+type PlanAggregateKey struct {
+	Table    int
+	Column   string
+	Property string
 }
 
 func (PlanAggregate) planExpression() {}
@@ -168,6 +249,14 @@ type PlanNegative struct {
 
 func (PlanNegative) planExpression() {}
 
+// PlanConditionValue is a condition returned as a value: true, false, or null
+// when it cannot be decided.
+type PlanConditionValue struct {
+	Predicate PlanPredicate
+}
+
+func (PlanConditionValue) planExpression() {}
+
 func planContainsAggregate(value PlanExpression) bool {
 	switch node := value.(type) {
 	case PlanAggregate:
@@ -176,6 +265,18 @@ func planContainsAggregate(value PlanExpression) bool {
 		return planContainsAggregate(node.Left) || planContainsAggregate(node.Right)
 	case PlanNegative:
 		return planContainsAggregate(node.Operand)
+	case PlanCase, PlanCoalesce, PlanScalarFunction:
+		for _, part := range caseValues(value) {
+			if planContainsAggregate(part) {
+				return true
+			}
+		}
+		for _, condition := range caseConditions(value) {
+			if planPredicateAggregates(condition) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}
@@ -240,9 +341,12 @@ type PlanMembership struct {
 
 func (PlanMembership) planPredicate() {}
 
-// PlanStringMatch is STARTS WITH, ENDS WITH or CONTAINS against a resolved
-// string. The value is kept as written; turning it into a LIKE pattern is the
-// generator's job, next to the rest of the escaping.
+// LikePattern marks a stored filter condition whose value is already a complete
+// SQL LIKE pattern. It is not a Cypher operator and is never parsed from text.
+const LikePattern StringMatchOperator = "LIKE PATTERN"
+
+// PlanStringMatch is a Cypher string match or a stored complete LIKE pattern.
+// The value is kept as written; generation handles the two meanings separately.
 type PlanStringMatch struct {
 	Table        int
 	Column       string
@@ -264,18 +368,34 @@ type PlanExpressionComparison struct {
 
 func (PlanExpressionComparison) planPredicate() {}
 
-// PlanColumnComparison compares two columns. The analyzer does not produce one
-// -- a query comparing two properties is refused -- but the planner needs it
-// to say that two hops of a pattern did not traverse the same relationship.
+// PlanColumnComparison compares two columns: one property against another as
+// the query wrote it, or two hops the planner requires to differ so that a
+// pattern does not traverse the same relationship twice.
 type PlanColumnComparison struct {
 	LeftTable   int
 	LeftColumn  string
 	Operator    string
 	RightTable  int
 	RightColumn string
+	// LeftProperty and RightProperty are set when the query wrote the
+	// comparison, and empty when the planner added it.
+	LeftProperty  string
+	RightProperty string
 }
 
 func (PlanColumnComparison) planPredicate() {}
+
+// PlanSemiJoin keeps a row when its column's value is among the values Sub
+// returns. Sub is a complete plan of its own with one DISTINCT column; it is
+// authorized and row-filtered like the plan it belongs to.
+type PlanSemiJoin struct {
+	Table    int
+	Column   string
+	Property string
+	Sub      *Plan
+}
+
+func (PlanSemiJoin) planPredicate() {}
 
 // PlanNever is a condition that never holds. It says so explicitly rather than
 // leaving an empty operator list behind, which would generate SQL that does
@@ -306,6 +426,11 @@ type PlanError struct {
 }
 
 func (e *PlanError) Error() string {
+	// Something outside the query text, such as object_properties, has no
+	// position to point at.
+	if e.Pos == (Position{}) {
+		return e.Err.Error()
+	}
 	return fmt.Sprintf("line %d:%d: %v", e.Pos.Line, e.Pos.Column, e.Err)
 }
 
@@ -330,35 +455,107 @@ type planner struct {
 	distinctness []PlanPredicate
 	objectType   []*interfaces.ObjectType // per table, parallel to plan.Tables
 	tableOf      map[string]int           // variable name to table index
+	// groupKeys are what a WITH grouped by, resolved to columns.
+	groupKeys []PlanColumn
+	// groupedNodes are the tables a WITH grouped by as whole nodes. Grouped by
+	// their keys, each group holds one object, so every property of it has one
+	// value per group.
+	groupedNodes map[int]bool
+	// relationshipOf maps a relationship variable to the join it names.
+	relationshipOf map[string]joinVariable
+	// snapshotProperties are the properties object_properties asks of each
+	// node variable, and snapshotUsed which of them the query returns.
+	snapshotProperties map[string][]string
+	snapshotUsed       map[string]bool
+	// carriedKinds are the kinds of the values a carried stage named.
+	carriedKinds map[string]numberKind
 }
 
 // CompileOptions carries what the query itself does not: the values its
 // parameters stand for.
 type CompileOptions struct {
 	Parameters map[string]any
+	// ObjectProperties names, per node variable, the properties a returned
+	// node value carries besides its identity.
+	ObjectProperties map[string][]string
 }
 
 // Compile binds a query to a knowledge network and produces its plan.
 func Compile(query *Query, schema *Schema, options CompileOptions) (*Plan, error) {
+	if err := bindRowCounts(query, options.Parameters); err != nil {
+		return nil, err
+	}
+	if err := bindNullChecks(query, options.Parameters); err != nil {
+		return nil, err
+	}
+	if query.Intersection != nil {
+		return compileIntersection(query.Intersection, schema, options)
+	}
+	if query.Union != nil {
+		return compileUnion(query.Union, schema, options)
+	}
 	p := &planner{
 		schema:     schema,
 		parameters: options.Parameters,
 		plan: &Plan{
 			NetworkID: schema.KNID, Branch: schema.Branch,
 			Distinct: query.Distinct, Skip: query.Skip, Limit: query.Limit,
+			Grouped: query.Grouped,
 		},
-		tableOf: map[string]int{},
+		tableOf:            map[string]int{},
+		relationshipOf:     map[string]joinVariable{},
+		snapshotProperties: options.ObjectProperties,
+		snapshotUsed:       map[string]bool{},
 	}
 	if err := p.planPattern(query.Pattern); err != nil {
 		return nil, err
 	}
+	if query.Carried != nil {
+		if err := p.planCarried(query.Carried); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.planWhere(query.Where); err != nil {
+		return nil, err
+	}
+	if err := p.planGroupKeys(query.GroupKeys); err != nil {
 		return nil, err
 	}
 	if err := p.planReturn(query.Return); err != nil {
 		return nil, err
 	}
+	if query.Having != nil {
+		having, err := p.planPredicate(query.Having)
+		if err != nil {
+			return nil, err
+		}
+		p.plan.Having = having
+		// A property the condition reads outside an aggregate belongs to a
+		// node the WITH grouped by, so grouping by it as well changes no
+		// group; it is what lets the database read it for the group.
+		for _, column := range havingColumns(having) {
+			if !hasColumn(p.plan.GroupBy, column) {
+				p.plan.GroupBy = append(p.plan.GroupBy, column)
+			}
+		}
+	}
 	if err := p.planOrderBy(query.OrderBy); err != nil {
+		return nil, err
+	}
+	totals := make(map[string]bool, len(query.Totals))
+	for _, total := range query.Totals {
+		if totals[total.Alias] {
+			// planReturn's rule, for the columns totals return instead.
+			return nil, planErrorf(total.Pos,
+				"column name %q is returned twice; give one of them a different alias", total.Alias)
+		}
+		totals[total.Alias] = true
+		p.plan.SQLOnly = true
+		p.plan.Totals = append(p.plan.Totals, PlanTotal{
+			Function: total.Function, Distinct: total.Distinct, Of: total.Of, Alias: total.Alias,
+		})
+	}
+	if err := p.checkGraphReturn(query.Return); err != nil {
 		return nil, err
 	}
 	return p.plan, nil
@@ -551,13 +748,14 @@ func (p *planner) addJoin(edge EdgeRef, left, right int) error {
 	if err != nil {
 		return &PlanError{Pos: edge.Pos, Err: err}
 	}
-	if relationType.Type != interfaces.RELATION_TYPE_DIRECT {
-		// A filtered cross join has no key pairs to join on: it pairs every
-		// row that passes one side's filter with every row that passes the
-		// other. That is a different SQL shape, so it is refused rather than
-		// approximated.
-		return planErrorf(edge.Pos,
-			"relation type %q is a %s relation; only direct relations can be used in a pattern yet",
+	switch relationType.Type {
+	case interfaces.RELATION_TYPE_DIRECT:
+	case interfaces.RELATION_TYPE_INDIRECT:
+		return p.addIndirectJoin(edge, relationType, left, right)
+	case interfaces.RELATION_TYPE_FILTERED_CROSS_JOIN:
+		return p.addFilteredCrossJoin(edge, relationType, left, right)
+	default:
+		return planErrorf(edge.Pos, "relation type %q is a %s relation, which a pattern cannot use",
 			relationType.RTName, relationType.Type)
 	}
 
@@ -568,8 +766,9 @@ func (p *planner) addJoin(edge EdgeRef, left, right int) error {
 
 	join := PlanJoin{
 		Left: left, Right: right, RelationTypeID: relationType.RTID, Direction: edge.Direction,
-		Optional: edge.Optional, OptionalTable: edge.OptionalNode,
+		Optional: edge.Optional, OptionalTable: edge.OptionalNode, Variable: edge.Variable,
 	}
+	var readForwards []bool
 	for _, forwards := range p.readings(edge.Direction) {
 		source, target := left, right
 		if !forwards {
@@ -584,6 +783,7 @@ func (p *planner) addJoin(edge EdgeRef, left, right int) error {
 			return err
 		}
 		join.Readings = append(join.Readings, keys)
+		readForwards = append(readForwards, forwards)
 		// One hop is recorded per edge, not per reading. An undirected edge
 		// has two readings and no recorded hop: a lone one has nothing to
 		// coincide with, and one beside another over the same relation type
@@ -606,6 +806,11 @@ func (p *planner) addJoin(edge EdgeRef, left, right int) error {
 			relationType.RTName, relationType.SourceObjectTypeID, relationType.TargetObjectTypeID,
 			p.objectType[left].OTID, p.objectType[right].OTID)
 	}
+	if edge.Variable != "" {
+		if err := p.bindRelationship(edge, relationType, mappings, readForwards, left, right); err != nil {
+			return err
+		}
+	}
 	for _, condition := range edge.Conditions {
 		planned, err := p.planPredicate(condition)
 		if err != nil {
@@ -614,6 +819,34 @@ func (p *planner) addJoin(edge EdgeRef, left, right int) error {
 		join.Conditions = append(join.Conditions, planned)
 	}
 	p.plan.Joins = append(p.plan.Joins, join)
+	return nil
+}
+
+// bindRelationship records a relationship variable. Its value says which end
+// is the source, so a relationship whose direction the model leaves open --
+// an undirected one between two nodes of the same object type -- is refused
+// rather than given a direction it may not have.
+func (p *planner) bindRelationship(edge EdgeRef, relationType *interfaces.RelationType, mappings []interfaces.Mapping,
+	readForwards []bool, left, right int) error {
+	if _, taken := p.tableOf[edge.Variable]; taken {
+		return planErrorf(edge.Pos, "variable %q names a node already; use a different name for the relationship",
+			edge.Variable)
+	}
+	if _, taken := p.relationshipOf[edge.Variable]; taken {
+		return planErrorf(edge.Pos, "relationship variable %q is bound twice; use a different name", edge.Variable)
+	}
+	if len(readForwards) != 1 {
+		return planErrorf(edge.Pos,
+			"relationship %q could run either way between these nodes; write its direction to return it", edge.Variable)
+	}
+	source, target := left, right
+	if !readForwards[0] {
+		source, target = right, left
+	}
+	p.relationshipOf[edge.Variable] = joinVariable{
+		join: len(p.plan.Joins), sourceTable: source, targetTable: target,
+		mappings: mappings, digest: relationDigest(relationType, mappings), pos: edge.Pos,
+	}
 	return nil
 }
 
@@ -675,12 +908,21 @@ func (p *planner) planWhere(predicate Predicate) error {
 func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 	switch node := predicate.(type) {
 	case Comparison:
+		if node.Right.Name != nil {
+			return nil, fmt.Errorf("name %q was not resolved before planning", node.Right.Name.Name)
+		}
 		table, column, err := p.resolveProperty(node.Left)
 		if err != nil {
 			return nil, err
 		}
 		value, err := p.resolveValue(node.Right, node.Pos)
 		if err != nil {
+			return nil, err
+		}
+		if err := p.checkTemporal(table, node.Left.Property, value); err != nil {
+			return nil, err
+		}
+		if err := p.checkDateString(table, node.Left.Property, value, node.Right); err != nil {
 			return nil, err
 		}
 		return PlanCondition{
@@ -706,6 +948,9 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 		}
 		return PlanNegation{Operand: operand}, nil
 
+	case NeverMatches:
+		return PlanNever{}, nil
+
 	case NullCheck:
 		table, column, err := p.resolveProperty(node.Property)
 		if err != nil {
@@ -714,6 +959,9 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 		return PlanNullCheck{Table: table, Column: column, Property: node.Property.Property, Negated: node.Negated}, nil
 
 	case Membership:
+		if node.ListName != nil {
+			return nil, fmt.Errorf("name %q was not resolved before planning", node.ListName.Name)
+		}
 		table, column, err := p.resolveProperty(node.Property)
 		if err != nil {
 			return nil, err
@@ -722,6 +970,12 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 			values, err := p.resolveListParameter(*node.ListParameter)
 			if err != nil {
 				return nil, err
+			}
+			for _, value := range values {
+				if err := p.checkDateString(table, node.Property.Property, value,
+					Operand{Parameter: node.ListParameter}); err != nil {
+					return nil, err
+				}
 			}
 			return PlanMembership{
 				Table: table, Column: column, Property: node.Property.Property,
@@ -736,6 +990,12 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := p.checkTemporal(table, node.Property.Property, resolved); err != nil {
+				return nil, err
+			}
+			if err := p.checkDateString(table, node.Property.Property, resolved, value); err != nil {
+				return nil, err
+			}
 			values = append(values, resolved)
 			inputPointers = append(inputPointers, operandInputPointer(value))
 		}
@@ -746,6 +1006,12 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 
 	case ExpressionComparison:
 		return p.planExpressionComparison(node)
+
+	case PropertyComparison:
+		return p.planPropertyComparison(node)
+
+	case SemiJoin:
+		return p.planSemiJoin(node)
 
 	case StringMatch:
 		table, column, err := p.resolveProperty(node.Property)
@@ -778,24 +1044,70 @@ func (p *planner) planPredicate(predicate Predicate) (PlanPredicate, error) {
 	}
 }
 
-// planExpressionComparison plans a comparison with arithmetic on a side. The
-// arithmetic side is a number, so the other one has to be too: MySQL would
-// compare it against a string by converting the string, which Cypher never
-// does.
+// planExpressionComparison plans a comparison with a computed value on a side.
+// The two sides have to be the same kind of value: MySQL would compare a
+// number against a string by converting the string, which Cypher never does.
+// A CASE or coalesce may give a string, so a string literal or parameter is
+// planned as one and compared with it.
 func (p *planner) planExpressionComparison(node ExpressionComparison) (PlanPredicate, error) {
 	sides := [2]Expression{node.Left, node.Right}
 	planned := [2]PlanExpression{}
+	kinds := [2]numberKind{}
 	for i, side := range sides {
-		if literal, ok := side.(Literal); ok && literalKind(literal) == kindNotNumber {
-			return nil, planErrorf(literal.Pos, "comparing a computed number with %s", literal.describe())
-		}
-		value, _, err := p.planExpression(side)
+		value, kind, err := p.planComparedValue(side)
 		if err != nil {
 			return nil, err
 		}
-		planned[i] = value
+		planned[i], kinds[i] = value, kind
+	}
+	for i, side := range sides {
+		other := kinds[1-i]
+		if kinds[i] != kindNotNumber || (other != kindInteger && other != kindFloat) {
+			continue
+		}
+		if literal, ok := side.(Literal); ok {
+			return nil, planErrorf(literal.Pos, "comparing a computed number with %s", literal.describe())
+		}
+		return nil, planErrorf(side.expressionPosition(), "comparing a number with a value that is not one")
 	}
 	return PlanExpressionComparison{Left: planned[0], Operator: node.Operator, Right: planned[1]}, nil
+}
+
+// planComparedValue plans one side of a computed comparison. Unlike a term of
+// arithmetic it may be a string. A boolean is refused on either side: MySQL
+// stores one as 1 or 0 and would compare that.
+func (p *planner) planComparedValue(side Expression) (PlanExpression, numberKind, error) {
+	switch node := side.(type) {
+	case Literal:
+		if node.Kind == LiteralBoolean {
+			return nil, kindUnknown, planErrorf(node.Pos, "comparing a computed value with %s", node.describe())
+		}
+		return PlanValueLiteral{Value: node, InputPointer: "$.query"}, literalKind(node), nil
+	case ParameterRef:
+		literal, err := p.resolveValue(Operand{Parameter: &node}, node.Pos)
+		if err != nil {
+			return nil, kindUnknown, err
+		}
+		if literal.Kind == LiteralBoolean || literal.Kind == LiteralNull {
+			return nil, kindUnknown, planErrorf(node.Pos,
+				"parameter %q is compared with a computed value, which takes a number or a string; got %s",
+				node.Name, literal.describe())
+		}
+		return PlanValueLiteral{Value: literal, InputPointer: parameterInputPointer(node.Name)}, literalKind(literal), nil
+	case PropertyRef:
+		table, column, err := p.resolveProperty(node)
+		if err != nil {
+			return nil, kindUnknown, err
+		}
+		kind, declared := p.propertyKind(table, node.Property)
+		if strings.ToLower(declared) == dtype.DATATYPE_BOOLEAN {
+			return nil, kindUnknown, planErrorf(node.Pos,
+				"comparing a computed value with %s, which is boolean; compare it on its own", node)
+		}
+		return PlanValueColumn{Table: table, Column: column, Property: node.Property}, kind, nil
+	default:
+		return p.planExpression(side)
+	}
 }
 
 // stringMatchTypes are the property types STARTS WITH, ENDS WITH and CONTAINS
@@ -877,7 +1189,63 @@ func (p *planner) resolveValue(value Operand, pos Position) (Literal, error) {
 		return Literal{}, planErrorf(value.Parameter.Pos, "parameter %q %v", name, err)
 	}
 	literal.Pos = value.Parameter.Pos
+	if temporal := value.Parameter.Temporal; temporal != "" {
+		if literal.Kind != LiteralString || !plainDate(literal.String) {
+			return Literal{}, planErrorf(value.Parameter.Pos,
+				"parameter %q is used as %s(), which takes a date string such as 2026-08-13 without a time zone; got %s",
+				name, temporal, literal.describe())
+		}
+		literal.Temporal = temporal
+	}
 	return literal, nil
+}
+
+// checkTemporal refuses a date constant against a property that does not
+// hold dates: Cypher never finds a date equal to a string or a number.
+func (p *planner) checkTemporal(table int, property string, value Literal) error {
+	if value.Temporal == "" {
+		return nil
+	}
+	declared, known := p.dataPropertyType(table, property)
+	if known && valueFamily(declared) != "" && valueFamily(declared) != "date" {
+		return planErrorf(value.Pos, "%s() is compared with %q, which holds %s rather than dates",
+			value.Temporal, property, declared)
+	}
+	return nil
+}
+
+// calendarTypes are the property types a string compared with them has to be a
+// date for. A time of day is left out: "09:30:00" is what such a property
+// holds, and it is not a date.
+var calendarTypes = map[string]struct{}{
+	dtype.DATATYPE_DATE:      {},
+	dtype.DATATYPE_DATETIME:  {},
+	dtype.DATATYPE_TIMESTAMP: {},
+}
+
+// checkDateString refuses a string compared with a date property when the
+// string is not a date. The SQL path hands the string to the data source, which
+// reads one it cannot parse as some fixed instant -- MySQL as the earliest --
+// so the comparison would match every row or none instead of failing. The
+// forms accepted are those the executor compares by wall-clock time. A value
+// written as date('...') was checked when it was read.
+func (p *planner) checkDateString(table int, property string, value Literal, written Operand) error {
+	if value.Kind != LiteralString || value.Temporal != "" {
+		return nil
+	}
+	declared, known := p.dataPropertyType(table, property)
+	if !known || !isIn(calendarTypes, strings.ToLower(declared)) {
+		return nil
+	}
+	if _, ok := wallClock(value.String); ok {
+		return nil
+	}
+	what := fmt.Sprintf("%q", value.String)
+	if written.Parameter != nil {
+		what = fmt.Sprintf("parameter %q, %q,", written.Parameter.Name, value.String)
+	}
+	return planErrorf(value.Pos, "%s is not a date, and %q holds %s values; write the date as 2026-08-13 "+
+		"or 2026-08-13T09:30:00", what, property, declared)
 }
 
 func (p *planner) planReturn(projections []Projection) error {
@@ -914,10 +1282,18 @@ func (p *planner) refuseUngroupedProperties(projections []Projection) error {
 			continue
 		}
 		for _, bare := range ungroupedColumns(column.Expression) {
-			if !p.isProjected(bare.Table, bare.Column) {
+			if !p.isProjected(bare.Table, bare.Column) && !p.isGroupKey(bare.Table, bare.Column) &&
+				!p.groupedNodes[bare.Table] {
 				return planErrorf(projectionPosition(projections[i]),
 					"%q reads %s outside an aggregate; return %s as a column of its own so the result is grouped by it",
 					projections[i].Alias, bare.Property, bare.Property)
+			}
+		}
+		for _, name := range ungroupedCarried(column.Expression) {
+			if !p.carriedProjected(name) {
+				return planErrorf(projectionPosition(projections[i]),
+					"%q reads %s outside an aggregate; return %s as a column of its own so the result is grouped by it",
+					projections[i].Alias, name, name)
 			}
 		}
 	}
@@ -933,12 +1309,26 @@ func ungroupedColumns(value PlanExpression) []PlanValueColumn {
 		return append(ungroupedColumns(node.Left), ungroupedColumns(node.Right)...)
 	case PlanNegative:
 		return ungroupedColumns(node.Operand)
+	case PlanCase, PlanCoalesce, PlanScalarFunction:
+		var columns []PlanValueColumn
+		for _, condition := range caseConditions(value) {
+			for _, column := range havingColumns(condition) {
+				columns = append(columns, PlanValueColumn{Table: column.Table, Column: column.Column, Property: column.Property})
+			}
+		}
+		for _, part := range caseValues(value) {
+			columns = append(columns, ungroupedColumns(part)...)
+		}
+		return columns
 	default:
 		return nil
 	}
 }
 
 func (p *planner) planProjection(projection Projection) (*PlanColumn, error) {
+	if projection.Value != nil {
+		return p.planGraphColumn(projection)
+	}
 	if projection.Expression != nil {
 		value, _, err := p.planExpression(projection.Expression)
 		if err != nil {
@@ -975,6 +1365,12 @@ func (p *planner) planAggregateOver(aggregate Aggregate) (*PlanAggregate, number
 		if err != nil {
 			return nil, kindUnknown, err
 		}
+		if kind == kindNotNumber && (aggregate.Function == "SUM" || aggregate.Function == "AVG") {
+			// A CASE or coalesce that gives strings; min, max and count take
+			// those, and sum and avg do not.
+			return nil, kindUnknown, planErrorf(aggregate.Pos, "%s takes numbers; %s gives something else",
+				strings.ToLower(aggregate.Function), aggregate.ArgumentText)
+		}
 		return &PlanAggregate{Function: aggregate.Function, Distinct: aggregate.Distinct, Argument: argument}, kind, nil
 	}
 	planned, err := p.planAggregateProperty(aggregate)
@@ -986,6 +1382,9 @@ func (p *planner) planAggregateOver(aggregate Aggregate) (*PlanAggregate, number
 }
 
 func (p *planner) planAggregateProperty(aggregate Aggregate) (*PlanAggregate, error) {
+	if aggregate.Variable != "" {
+		return p.planNodeCount(aggregate)
+	}
 	if aggregate.Property == nil {
 		return &PlanAggregate{Function: aggregate.Function, Star: true}, nil
 	}
@@ -1007,6 +1406,33 @@ func (p *planner) planAggregateProperty(aggregate Aggregate) (*PlanAggregate, er
 // it rather than accepting one is also what stops a statement from grouping by
 // something the caller never sees.
 func (p *planner) planGrouping() {
+	if p.plan.Grouped {
+		// A WITH said what to group by. Returned columns that are not
+		// aggregates are among its keys or properties of a node it grouped
+		// by, so grouping by them as well changes no group.
+		p.plan.GroupBy = append([]PlanColumn(nil), p.groupKeys...)
+		for _, column := range p.plan.Select {
+			if !column.aggregates() && !hasColumn(p.plan.GroupBy, column) {
+				p.plan.GroupBy = append(p.plan.GroupBy, column)
+			}
+		}
+		// A column that computes with an aggregate may read a property of a
+		// node grouped as a whole. The property has one value per group, so
+		// grouping by it changes no group, and it lets a database that wants
+		// every column it reads grouped accept the statement.
+		for _, column := range p.plan.Select {
+			if column.Expression == nil || !planContainsAggregate(column.Expression) {
+				continue
+			}
+			for _, bare := range ungroupedColumns(column.Expression) {
+				read := PlanColumn{Table: bare.Table, Column: bare.Column, Property: bare.Property}
+				if p.groupedNodes[bare.Table] && !hasColumn(p.plan.GroupBy, read) {
+					p.plan.GroupBy = append(p.plan.GroupBy, read)
+				}
+			}
+		}
+		return
+	}
 	aggregates := 0
 	for _, column := range p.plan.Select {
 		if column.aggregates() {
@@ -1027,6 +1453,8 @@ func (p *planner) planGrouping() {
 
 func projectionPosition(projection Projection) Position {
 	switch {
+	case projection.Value != nil:
+		return projection.Pos
 	case projection.Expression != nil:
 		return projection.Pos
 	case projection.Aggregate != nil:
@@ -1046,6 +1474,8 @@ const (
 	kindInteger
 	kindFloat
 	kindNotNumber
+	// kindNull is a null literal, which only CASE and coalesce take as a value.
+	kindNull
 )
 
 var integerTypes = map[string]struct{}{
@@ -1115,10 +1545,36 @@ func (p *planner) planExpression(value Expression) (PlanExpression, numberKind, 
 		if err != nil {
 			return nil, kindUnknown, err
 		}
+		if kind == kindNotNumber {
+			return nil, kindUnknown, planErrorf(node.Pos, "arithmetic takes numbers; this value is not one")
+		}
 		return PlanNegative{Operand: operand}, kind, nil
 
 	case Arithmetic:
 		return p.planArithmetic(node)
+
+	case ConditionValue:
+		predicate, err := p.planPredicate(node.Predicate)
+		if err != nil {
+			return nil, kindUnknown, err
+		}
+		return PlanConditionValue{Predicate: predicate}, kindNotNumber, nil
+
+	case CaseValue:
+		return p.planCase(node)
+
+	case Coalesce:
+		return p.planCoalesce(node)
+
+	case ScalarFunction:
+		return p.planScalarFunction(node)
+
+	case CarriedValue:
+		kind, known := p.carriedKinds[node.Name]
+		if !known {
+			return nil, kindUnknown, planErrorf(node.Pos, "%s is not a value the WITH passed on", node.Name)
+		}
+		return PlanCarriedValue{Alias: node.Name}, kind, nil
 
 	default:
 		return nil, kindUnknown, planErrorf(value.expressionPosition(), "unsupported expression %T", value)
@@ -1179,6 +1635,11 @@ func (p *planner) planArithmetic(node Arithmetic) (PlanExpression, numberKind, e
 	right, rightKind, err := p.planExpression(node.Right)
 	if err != nil {
 		return nil, kindUnknown, err
+	}
+	if leftKind == kindNotNumber || rightKind == kindNotNumber {
+		// Only CASE and coalesce get here with something else: every other
+		// term was refused as it was planned.
+		return nil, kindUnknown, planErrorf(node.Pos, "arithmetic takes numbers; a CASE, coalesce or function call here gives something else")
 	}
 	planned := PlanArithmetic{Operator: node.Operator, Left: left, Right: right}
 	switch node.Operator {
@@ -1248,8 +1709,7 @@ func (p *planner) planSortKey(key SortKey) (*PlanOrder, error) {
 				return &PlanOrder{Alias: key.Alias}, nil
 			}
 		}
-		return nil, planErrorf(key.Pos,
-			"%q is not returned by this query, so there is nothing to sort by", key.Alias)
+		return nil, p.unknownSortName(key)
 
 	case key.Property != nil:
 		table, column, err := p.resolveProperty(*key.Property)
@@ -1262,7 +1722,8 @@ func (p *planner) planSortKey(key SortKey) (*PlanOrder, error) {
 		// test is on aggregating rather than on GROUP BY, because a query
 		// that aggregates every column derives no GROUP BY and collapses just
 		// as hard.
-		if (p.plan.Distinct || p.aggregating()) && !p.isProjected(table, column) {
+		if (p.plan.Distinct || p.aggregating()) && !p.isProjected(table, column) &&
+			(p.plan.Distinct || !p.isGroupKey(table, column)) {
 			collapsed := "DISTINCT"
 			if p.aggregating() {
 				collapsed = "an aggregate"
@@ -1306,10 +1767,17 @@ func (p *planner) planSortExpression(key SortKey) (*PlanOrder, error) {
 	}
 	if p.aggregating() {
 		for _, bare := range ungroupedColumns(value) {
-			if !p.isProjected(bare.Table, bare.Column) {
+			if !p.isProjected(bare.Table, bare.Column) && (p.plan.Distinct || !p.isGroupKey(bare.Table, bare.Column)) {
 				return nil, planErrorf(key.Pos,
 					"this sort key reads %s outside an aggregate, and a query with an aggregate can only be sorted by a returned value; add %s to RETURN",
 					bare.Property, bare.Property)
+			}
+		}
+		for _, name := range ungroupedCarried(value) {
+			if !p.carriedProjected(name) {
+				return nil, planErrorf(key.Pos,
+					"this sort key reads %s outside an aggregate, and a query with an aggregate can only be sorted by a returned value; add %s to RETURN",
+					name, name)
 			}
 		}
 	}
@@ -1320,12 +1788,22 @@ func (p *planner) planSortExpression(key SortKey) (*PlanOrder, error) {
 // the test: aggregating every column derives no GROUP BY and still collapses
 // the result to a single row.
 func (p *planner) aggregating() bool {
+	if p.plan.Grouped {
+		return true
+	}
 	for _, column := range p.plan.Select {
 		if column.aggregates() {
 			return true
 		}
 	}
 	return false
+}
+
+// isGroupKey reports whether a column is one a WITH grouped by, which has one
+// value per group whether or not RETURN shows it. Under DISTINCT that is not
+// enough to sort by: a sort key there has to be returned.
+func (p *planner) isGroupKey(table int, column string) bool {
+	return hasColumn(p.groupKeys, PlanColumn{Table: table, Column: column})
 }
 
 func (p *planner) isProjected(table int, column string) bool {
@@ -1340,16 +1818,357 @@ func (p *planner) isProjected(table int, column string) bool {
 
 func (p *planner) resolveProperty(ref PropertyRef) (int, string, error) {
 	table, bound := p.tableOf[ref.Variable]
+	if _, isRelationship := p.relationshipOf[ref.Variable]; !bound && isRelationship {
+		return 0, "", planErrorf(ref.Pos,
+			"relationship %q has no properties: a relation here is a join between two object types", ref.Variable)
+	}
 	if !bound {
 		return 0, "", planErrorf(ref.Pos, "variable %q is not defined in the MATCH pattern", ref.Variable)
 	}
-	column, err := p.schema.PropertyColumn(p.objectType[table], ref.Property)
+	column, err := p.tableProperty(table, ref.Property, ref.Pos)
+	return table, column, err
+}
+
+// tableProperty resolves a property of one table of the pattern to its column
+// and records it as read, whether or not a variable names the table.
+func (p *planner) tableProperty(table int, property string, pos Position) (string, error) {
+	column, err := p.schema.PropertyColumn(p.objectType[table], property)
 	if err != nil {
-		return 0, "", &PlanError{Pos: ref.Pos, Err: err}
+		return "", &PlanError{Pos: pos, Err: err}
 	}
 	p.plan.Properties = append(p.plan.Properties, PlanProperty{
 		ObjectTypeID: p.objectType[table].OTID,
-		Property:     ref.Property,
+		Property:     property,
 	})
-	return table, column, nil
+	return column, nil
+}
+
+// unknownSortName refuses ORDER BY on a name nothing is returned as, and says
+// what could be sorted by instead. Naming an aggregate function, as in
+// ORDER BY count, is the usual slip: the aggregate needs a name of its own.
+func (p *planner) unknownSortName(key SortKey) error {
+	names := make([]string, 0, len(p.plan.Select))
+	for _, column := range p.plan.Select {
+		names = append(names, strconv.Quote(column.Alias))
+	}
+	if _, aggregate := aggregateFunctions[strings.ToLower(key.Alias)]; aggregate {
+		return planErrorf(key.Pos,
+			"%q is not returned by this query, so there is nothing to sort by; to sort by an aggregate, "+
+				"name it in RETURN, as in %s(*) AS n, and ORDER BY n (returned: %s)",
+			key.Alias, strings.ToLower(key.Alias), strings.Join(names, ", "))
+	}
+	return planErrorf(key.Pos,
+		"%q is not returned by this query, so there is nothing to sort by (returned: %s)",
+		key.Alias, strings.Join(names, ", "))
+}
+
+// planPropertyComparison plans one property against another. Properties the
+// model types differently are refused: Cypher says a string is never a number,
+// while MySQL converts one to compare it, so the two would answer differently.
+func (p *planner) planPropertyComparison(node PropertyComparison) (PlanPredicate, error) {
+	leftTable, leftColumn, err := p.resolveProperty(node.Left)
+	if err != nil {
+		return nil, err
+	}
+	rightTable, rightColumn, err := p.resolveProperty(node.Right)
+	if err != nil {
+		return nil, err
+	}
+	leftType, leftKnown := p.dataPropertyType(leftTable, node.Left.Property)
+	rightType, rightKnown := p.dataPropertyType(rightTable, node.Right.Property)
+	if leftKnown && rightKnown {
+		leftFamily, rightFamily := valueFamily(leftType), valueFamily(rightType)
+		if leftFamily != "" && rightFamily != "" && leftFamily != rightFamily {
+			return nil, planErrorf(node.Pos, "comparing %s (%s) with %s (%s): the two are never equal or ordered",
+				node.Left, leftType, node.Right, rightType)
+		}
+	}
+	return PlanColumnComparison{
+		LeftTable: leftTable, LeftColumn: leftColumn, LeftProperty: node.Left.Property,
+		Operator:   node.Operator,
+		RightTable: rightTable, RightColumn: rightColumn, RightProperty: node.Right.Property,
+	}, nil
+}
+
+// valueFamily groups the declared types whose values compare with each other,
+// or is empty for a type it does not place.
+func valueFamily(declared string) string {
+	lowered := strings.ToLower(declared)
+	switch {
+	case lowered == "":
+		return ""
+	case isIn(integerTypes, lowered), isIn(floatTypes, lowered):
+		return "number"
+	case isIn(stringMatchTypes, lowered):
+		return "string"
+	case lowered == dtype.DATATYPE_BOOLEAN:
+		return "boolean"
+	case lowered == dtype.DATATYPE_DATE, lowered == dtype.DATATYPE_DATETIME,
+		lowered == dtype.DATATYPE_TIMESTAMP, lowered == dtype.DATATYPE_TIME:
+		return "date"
+	default:
+		return ""
+	}
+}
+
+func isIn(set map[string]struct{}, key string) bool {
+	_, ok := set[key]
+	return ok
+}
+
+// planNodeCount plans count(n) and count(DISTINCT n). A node is there when its
+// key is, so counting n counts its key: a row an OPTIONAL MATCH found nothing
+// for has none and is not counted, and DISTINCT counts each object once. A
+// node that must match is on every row, so without a key count(n) is count(*).
+func (p *planner) planNodeCount(aggregate Aggregate) (*PlanAggregate, error) {
+	table, bound := p.tableOf[aggregate.Variable]
+	if relationship, isRelationship := p.relationshipOf[aggregate.Variable]; !bound && isRelationship {
+		return p.planRelationshipCount(aggregate, relationship)
+	}
+	if !bound {
+		return nil, planErrorf(aggregate.Pos, "variable %q is not defined in the MATCH pattern", aggregate.Variable)
+	}
+	keys := p.objectType[table].PrimaryKeys
+	switch {
+	case aggregate.Distinct && len(keys) == 0:
+		return nil, planErrorf(aggregate.Pos,
+			"count(DISTINCT %s) needs the object type to have a primary key to tell its objects apart; "+
+				"count a property that identifies %s instead, as in count(DISTINCT %s.property)",
+			aggregate.Variable, aggregate.Variable, aggregate.Variable)
+	case len(keys) == 0 && p.plan.Tables[table].Optional:
+		return nil, planErrorf(aggregate.Pos,
+			"count(%s) needs a primary key to tell a found %s from a missing one; count one of its properties instead",
+			aggregate.Variable, aggregate.Variable)
+	case len(keys) == 0:
+		return &PlanAggregate{Function: aggregate.Function, Star: true}, nil
+	}
+	key := PropertyRef{Variable: aggregate.Variable, Property: keys[0], Pos: aggregate.Pos}
+	_, column, err := p.resolveProperty(key)
+	if err != nil {
+		return nil, err
+	}
+	planned := &PlanAggregate{
+		Function: aggregate.Function, Distinct: aggregate.Distinct,
+		Table: table, Column: column, Property: keys[0],
+	}
+	// The first key column says whether the node is there; DISTINCT tells
+	// objects apart by all of them.
+	if aggregate.Distinct {
+		for _, property := range keys[1:] {
+			_, column, err := p.resolveProperty(PropertyRef{Variable: aggregate.Variable, Property: property, Pos: aggregate.Pos})
+			if err != nil {
+				return nil, err
+			}
+			planned.Keys = append(planned.Keys, PlanAggregateKey{Table: table, Column: column, Property: property})
+		}
+	}
+	return planned, nil
+}
+
+// planRelationshipCount plans count(r) and count(DISTINCT r). A relationship
+// here is a join between two objects, so it is there when both ends are: on
+// every row of a MATCH, and on a row of an OPTIONAL MATCH when the node that
+// clause attaches is, which its key says. DISTINCT tells relationships apart
+// by both ends' keys, since one pair of objects is one relationship of the
+// type, and a row whose optional end is missing has no key to count.
+func (p *planner) planRelationshipCount(aggregate Aggregate, relationship joinVariable) (*PlanAggregate, error) {
+	join := p.plan.Joins[relationship.join]
+	if !aggregate.Distinct {
+		if !join.Optional {
+			return &PlanAggregate{Function: aggregate.Function, Star: true}, nil
+		}
+		return p.planEndCount(aggregate, join.OptionalTable)
+	}
+	var planned *PlanAggregate
+	for _, table := range []int{relationship.sourceTable, relationship.targetTable} {
+		keys := p.objectType[table].PrimaryKeys
+		if len(keys) == 0 {
+			return nil, planErrorf(aggregate.Pos,
+				"count(DISTINCT %s) needs both ends to have a primary key to tell its relationships apart; "+
+					"the object type %q has none",
+				aggregate.Variable, p.objectType[table].OTName)
+		}
+		for _, property := range keys {
+			column, err := p.tableProperty(table, property, aggregate.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if planned == nil {
+				planned = &PlanAggregate{
+					Function: aggregate.Function, Distinct: true,
+					Table: table, Column: column, Property: property,
+				}
+				continue
+			}
+			planned.Keys = append(planned.Keys, PlanAggregateKey{Table: table, Column: column, Property: property})
+		}
+	}
+	return planned, nil
+}
+
+// planEndCount counts the rows on which the optional end of a relationship
+// was found, by its first key.
+func (p *planner) planEndCount(aggregate Aggregate, table int) (*PlanAggregate, error) {
+	keys := p.objectType[table].PrimaryKeys
+	if len(keys) == 0 {
+		return nil, planErrorf(aggregate.Pos,
+			"count(%s) needs the object type %q to have a primary key to tell a found relationship from a missing one; "+
+				"count one of its properties instead",
+			aggregate.Variable, p.objectType[table].OTName)
+	}
+	column, err := p.tableProperty(table, keys[0], aggregate.Pos)
+	if err != nil {
+		return nil, err
+	}
+	return &PlanAggregate{Function: aggregate.Function, Table: table, Column: column, Property: keys[0]}, nil
+}
+
+// planGroupKeys resolves what a WITH grouped by. A node groups by its primary
+// key, so two objects that share a name stay two groups.
+func (p *planner) planGroupKeys(keys []GroupKey) error {
+	for _, key := range keys {
+		if key.Property != nil {
+			table, column, err := p.resolveProperty(*key.Property)
+			if err != nil {
+				return err
+			}
+			p.groupKeys = append(p.groupKeys, PlanColumn{Table: table, Column: column, Property: key.Property.Property})
+			continue
+		}
+		table, bound := p.tableOf[key.Node]
+		if !bound {
+			return planErrorf(key.Pos, "variable %q is not defined in the MATCH pattern", key.Node)
+		}
+		primaryKeys := p.objectType[table].PrimaryKeys
+		if len(primaryKeys) == 0 {
+			return planErrorf(key.Pos, "grouping by %s needs its object type to have a primary key; "+
+				"WITH one of its properties instead, as in WITH %s.property AS name", key.Node, key.Node)
+		}
+		for _, primaryKey := range primaryKeys {
+			_, column, err := p.resolveProperty(PropertyRef{Variable: key.Node, Property: primaryKey, Pos: key.Pos})
+			if err != nil {
+				return err
+			}
+			p.groupKeys = append(p.groupKeys, PlanColumn{Table: table, Column: column, Property: primaryKey})
+		}
+		if p.groupedNodes == nil {
+			p.groupedNodes = map[int]bool{}
+		}
+		p.groupedNodes[table] = true
+	}
+	return nil
+}
+
+func hasColumn(columns []PlanColumn, column PlanColumn) bool {
+	if column.Expression != nil || column.Aggregate != nil {
+		return false
+	}
+	for _, existing := range columns {
+		if existing.Expression == nil && existing.Aggregate == nil &&
+			existing.Table == column.Table && existing.Column == column.Column {
+			return true
+		}
+	}
+	return false
+}
+
+// havingColumns lists the columns a per-group condition reads outside any
+// aggregate.
+func havingColumns(predicate PlanPredicate) []PlanColumn {
+	var columns []PlanColumn
+	add := func(table int, column, property string) {
+		columns = append(columns, PlanColumn{Table: table, Column: column, Property: property})
+	}
+	var walk func(PlanPredicate)
+	walk = func(predicate PlanPredicate) {
+		switch node := predicate.(type) {
+		case PlanCondition:
+			add(node.Table, node.Column, node.Property)
+		case PlanNullCheck:
+			add(node.Table, node.Column, node.Property)
+		case PlanMembership:
+			add(node.Table, node.Column, node.Property)
+		case PlanStringMatch:
+			add(node.Table, node.Column, node.Property)
+		case PlanColumnComparison:
+			add(node.LeftTable, node.LeftColumn, node.LeftProperty)
+			add(node.RightTable, node.RightColumn, node.RightProperty)
+		case PlanExpressionComparison:
+			for _, bare := range append(ungroupedColumns(node.Left), ungroupedColumns(node.Right)...) {
+				add(bare.Table, bare.Column, bare.Property)
+			}
+		case PlanNegation:
+			walk(node.Operand)
+		case PlanLogical:
+			for _, operand := range node.Operands {
+				walk(operand)
+			}
+		}
+	}
+	walk(predicate)
+	return columns
+}
+
+// planSemiJoin plans the earlier stage as a plan of its own and keeps the rows
+// whose property is among its values. What that stage reads is part of what
+// the query reads, so its properties join this plan's.
+func (p *planner) planSemiJoin(node SemiJoin) (PlanPredicate, error) {
+	table, column, err := p.resolveProperty(node.Outer)
+	if err != nil {
+		return nil, err
+	}
+	sub, err := Compile(node.Sub, p.schema, CompileOptions{Parameters: p.parameters})
+	if err != nil {
+		return nil, err
+	}
+	p.plan.Properties = append(p.plan.Properties, sub.Properties...)
+	// Only SQL answers the earlier stage, then only SQL answers the query.
+	p.plan.SQLOnly = p.plan.SQLOnly || sub.SQLOnly
+	value := sub.Select[0]
+	if outerType, known := p.dataPropertyType(table, node.Outer.Property); known {
+		if objectType := p.schema.objectTypesByID[sub.Tables[value.Table].ObjectTypeID]; objectType != nil {
+			for _, dp := range objectType.DataProperties {
+				if dp == nil || dp.Name != value.Property || dp.Type == "" {
+					continue
+				}
+				outer, inner := valueFamily(outerType), valueFamily(dp.Type)
+				if outer != "" && inner != "" && outer != inner {
+					return nil, planErrorf(node.Pos, "comparing %s (%s) with values of %s (%s): the two are never equal",
+						node.Outer, outerType, value.Property, dp.Type)
+				}
+			}
+		}
+	}
+	return PlanSemiJoin{Table: table, Column: column, Property: node.Outer.Property, Sub: sub}, nil
+}
+
+// subPlans lists the plans a plan reads besides its own tables: those of the
+// semi-joins in its conditions, the two lists of an intersection, and a
+// carried stage.
+func (plan *Plan) subPlans() []*Plan {
+	var subs []*Plan
+	if plan.Intersection != nil {
+		subs = append(subs, plan.Intersection.Lists[:]...)
+	}
+	if plan.Carried != nil {
+		subs = append(subs, plan.Carried.Stage)
+	}
+	if plan.Union != nil {
+		subs = append(subs, plan.Union.Parts...)
+	}
+	var walk func(PlanPredicate)
+	walk = func(predicate PlanPredicate) {
+		switch node := predicate.(type) {
+		case PlanSemiJoin:
+			subs = append(subs, node.Sub)
+		case PlanLogical:
+			for _, operand := range node.Operands {
+				walk(operand)
+			}
+		case PlanNegation:
+			walk(node.Operand)
+		}
+	}
+	walk(plan.Where)
+	return subs
 }

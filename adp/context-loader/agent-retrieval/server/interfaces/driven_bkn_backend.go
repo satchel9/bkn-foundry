@@ -43,20 +43,8 @@ const (
 type LogicPropertyType string
 
 const (
-	LogicPropertyTypeMetric LogicPropertyType = "metric" // Metric type
-	LogicPropertyTypeTool   LogicPropertyType = "tool"   // Tool type
+	LogicPropertyTypeTool LogicPropertyType = "tool" // Tool type
 )
-
-type KnBaseError struct {
-	ErrorCode               string         `json:"error_code"`         // Error code
-	Description             string         `json:"description"`        // Error description
-	Solution                string         `json:"solution"`           // Solution
-	ErrorLink               string         `json:"error_link"`         // Error link
-	ErrorDetails            interface{}    `json:"error_details"`      // Detail content
-	Metadata                map[string]any `json:"metadata,omitempty"` // Machine-readable error metadata
-	DescriptionTemplateData map[string]any `json:"-"`                  // Description parameters
-	SolutionTemplateData    map[string]any `json:"-"`                  // Solution parameters
-}
 
 type ResourceInfo struct {
 	Type string `json:"type"` // Data source type
@@ -81,13 +69,45 @@ type DataProperty struct {
 	Comment             string            `json:"comment,omitempty"`              // Comment
 	MappedField         any               `json:"mapped_field,omitempty"`         // View field info
 	ConditionOperations []KnOperationType `json:"condition_operations,omitempty"` // List of query condition operators supported by this data property
+
+	// BKN spec 3.0 property declarations (SPECIFICATION.md §6.8), stored and returned by
+	// bkn-backend. A property without declarations carries none of them.
+	Aliases     []string             `json:"aliases,omitempty"`
+	Semantic    string               `json:"semantic,omitempty"`
+	Required    bool                 `json:"required,omitempty"` // Absent means false; bkn-backend omits false
+	Constraints *PropertyConstraints `json:"constraints,omitempty"`
+}
+
+// PropertyConstraints is a data property's entry in ### Property Constraints (SPECIFICATION.md
+// §6.8), mirroring bkn-backend. An empty field is not declared.
+type PropertyConstraints struct {
+	ValueType string       `json:"value_type,omitempty"`
+	Range     *ValueRange  `json:"range,omitempty"`
+	Length    *LengthRange `json:"length,omitempty"`
+	Pattern   string       `json:"pattern,omitempty"`
+	Unit      string       `json:"unit,omitempty"`
+	Unique    bool         `json:"unique,omitempty"`
+	CRS       string       `json:"crs,omitempty"`
+	Timezone  string       `json:"timezone,omitempty"`
+}
+
+// ValueRange is a closed interval; either bound may be absent.
+type ValueRange struct {
+	Min any `json:"min,omitempty"`
+	Max any `json:"max,omitempty"`
+}
+
+// LengthRange is a closed interval on the number of characters.
+type LengthRange struct {
+	Min *int `json:"min,omitempty"`
+	Max *int `json:"max,omitempty"`
 }
 
 // LogicPropertyDef Logic property definition (extracted from object type definition)
 type LogicPropertyDef struct {
 	Name        string              `json:"name"`
 	DisplayName string              `json:"display_name,omitempty"`
-	Type        LogicPropertyType   `json:"type"` // Logic property type: metric or tool
+	Type        LogicPropertyType   `json:"type"` // Logic property type: tool
 	Comment     string              `json:"comment,omitempty"`
 	DataSource  map[string]any      `json:"data_source,omitempty"`
 	Parameters  []PropertyParameter `json:"parameters,omitempty"`
@@ -105,52 +125,60 @@ type PropertyParameter struct {
 
 // ObjectType Object type structure definition
 type ObjectType struct {
-	ModuleType           string                         `json:"module_type,omitempty"` // Module type
-	ID                   string                         `json:"id"`                    // Object ID
-	Name                 string                         `json:"name"`                  // Object name
-	Tags                 []string                       `json:"tags,omitempty"`        // Tags
-	Comment              string                         `json:"comment,omitempty"`     // Comment
-	Score                float64                        `json:"_score,omitempty"`      // Score
-	DataSource           *ResourceInfo                  `json:"data_source"`
-	DataProperties       []*DataProperty                `json:"data_properties,omitempty"`  // Data properties
-	LogicProperties      []*LogicPropertyDef            `json:"logic_properties,omitempty"` // Logic properties
-	PrimaryKeys          []string                       `json:"primary_keys"`               // Primary key fields
+	ModuleType      string              `json:"module_type,omitempty"` // Module type
+	ID              string              `json:"id"`                    // Object ID
+	Name            string              `json:"name"`                  // Object name
+	Tags            []string            `json:"tags,omitempty"`        // Tags
+	Comment         string              `json:"comment,omitempty"`     // Comment
+	Score           float64             `json:"_score,omitempty"`      // Score
+	DataSource      *ResourceInfo       `json:"data_source"`
+	DataProperties  []*DataProperty     `json:"data_properties,omitempty"`  // Data properties
+	LogicProperties []*LogicPropertyDef `json:"logic_properties,omitempty"` // Logic properties
+	// PrimaryKeys is omitted when the object type has none: a nil slice would
+	// encode as null, which the get_object_types output schema rejects.
+	PrimaryKeys          []string                       `json:"primary_keys,omitempty"`
 	EffectivePermissions map[string]PropertyAccessLevel `json:"effective_permissions,omitempty"`
 	// DataSourceMetadataUnavailable is bkn-backend reporting that it could not read the bound
 	// resource for this response, so condition_operations are missing rather than empty: what the
 	// object type can be searched by is unknown, not "nothing".
 	DataSourceMetadataUnavailable bool `json:"data_source_metadata_unavailable,omitempty"`
+	// Lifecycle says whether the object type is still in use (BKN spec 3.0 §4.3); nil is active.
+	// It reaches every answer that carries the object type, so one looked up by id says what
+	// replaces it.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
+	// Aliases are other names of the object type (BKN spec 3.0 §6.8). search_schema surfaces them.
+	Aliases []string `json:"aliases,omitempty"`
 
-	// RelatedMetrics are the metrics scoped to this object type (scope_type=object_type,
-	// scope_ref=<this id>). It is filled by get_object_types only: a metric that is not
-	// bound to a logic property is invisible from the object type otherwise, which is
-	// what leaves an agent with no way to reach it except run_sql.
+	// RelatedMetrics are published Object Metrics V1 owned by this object type.
+	// get_object_types fills this list for caller-visible definitions.
 	RelatedMetrics []*RelatedMetric `json:"related_metrics,omitempty"`
 	// RelatedMetricCount is the same information one number wide, for the get_kn_detail
 	// summary: enough to decide whether drilling into this object type is worth it.
 	RelatedMetricCount int `json:"related_metric_count,omitempty"`
+
+	// DataPropertyCount and LogicPropertyCount stand in for the property lists when a
+	// get_kn_detail answer was too large to carry them (see ReduceToOutline).
+	DataPropertyCount  int `json:"data_property_count,omitempty"`
+	LogicPropertyCount int `json:"logic_property_count,omitempty"`
 }
 
-// RelatedMetric is one metric scoped to an object type, as advertised on that object
-// type by get_object_types.
+// RelatedMetric is one published object-metric version advertised by get_object_types.
 //
 // It carries what an agent needs to *choose* a metric — what it measures, in which
 // unit, sliceable by which dimensions — and stops there. The calculation formula is
 // deliberately absent: the whole point of query_metric is that the agent does not
 // reimplement the formula, it names the metric and lets ontology-query apply it.
 type RelatedMetric struct {
-	ID                 string   `json:"id"`
-	Name               string   `json:"name"`
-	Comment            string   `json:"comment,omitempty"`
-	MetricType         string   `json:"metric_type,omitempty"`
-	Unit               string   `json:"unit,omitempty"`
-	UnitType           string   `json:"unit_type,omitempty"`
-	ScopeRef           string   `json:"scope_ref,omitempty"`
-	AnalysisDimensions []string `json:"analysis_dimensions,omitempty"`
-	// TimeDimension is the property the metric is measured over, empty when the
-	// metric has none. An agent reads it to know whether a range query (instant=false
-	// with a step) is meaningful at all.
-	TimeDimension string `json:"time_dimension,omitempty"`
+	ID                 string                    `json:"id"`
+	Version            int                       `json:"version"`
+	Name               string                    `json:"name"`
+	Comment            string                    `json:"comment,omitempty"`
+	MetricType         string                    `json:"metric_type,omitempty"`
+	Unit               string                    `json:"unit,omitempty"`
+	UnitType           string                    `json:"unit_type,omitempty"`
+	OwnerObjectTypeID  string                    `json:"owner_object_type_id"`
+	AnalysisDimensions []ObjectMetricPropertyRef `json:"analysis_dimensions,omitempty"`
+	TimeDimensions     []ObjectMetricPropertyRef `json:"time_dimensions,omitempty"`
 }
 
 // RelationType Relation type structure definition
@@ -168,6 +196,75 @@ type RelationType struct {
 	TargetObjectType   any    `json:"target_object_type,omitempty"` // Provide name when viewing details
 	MappingRules       any    `json:"mapping_rules,omitempty"`      // Mapping rules based on type, direct corresponds to []Mapping structure
 	Type               string `json:"type"`                         // Relation type
+
+	// BKN spec 3.0 relation declarations (SPECIFICATION.md §7.6), as bkn-backend returns them.
+	// Relation properties ride in mapping_rules.properties of an indirect relation.
+	ReverseName  string               `json:"reverse_name,omitempty"`
+	Aliases      []string             `json:"aliases,omitempty"`
+	Cardinality  string               `json:"cardinality,omitempty"`
+	Constraints  *RelationConstraints `json:"constraints,omitempty"`
+	Importance   string               `json:"importance,omitempty"`
+	FallbackFor  string               `json:"fallback_for,omitempty"`
+	Verification string               `json:"verification,omitempty"`
+	Lifecycle    *Lifecycle           `json:"lifecycle,omitempty"`
+}
+
+// RelationConstraints is a relation type's ### Relation Constraints (SPECIFICATION.md §7.6).
+type RelationConstraints struct {
+	Required        []string `json:"required,omitempty"`
+	Characteristics []string `json:"characteristics,omitempty"`
+}
+
+// Lifecycle is the lifecycle of an object, relation or action type (SPECIFICATION.md §4.3). nil,
+// or status active, is a type still in use.
+type Lifecycle struct {
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	ReplacedBy string `json:"replaced_by,omitempty"`
+}
+
+// Lifecycle status values.
+const (
+	LifecycleActive     = "active"
+	LifecycleDeprecated = "deprecated"
+)
+
+// Relation importance values.
+const (
+	RelationImportancePrimary   = "primary"
+	RelationImportanceSecondary = "secondary"
+)
+
+// Inactive returns the lifecycle when it says something, and nil for a type still in use.
+func (l *Lifecycle) Inactive() *Lifecycle {
+	if l == nil || ((l.Status == "" || l.Status == LifecycleActive) && l.Reason == "" && l.ReplacedBy == "") {
+		return nil
+	}
+	return l
+}
+
+// IsFallback reports whether the relation is the fallback path of a primary relation.
+func (r *RelationType) IsFallback() bool {
+	return r != nil && r.FallbackFor != "" && r.Importance == RelationImportanceSecondary
+}
+
+// MayHaveFallback reports whether a fallback path may point at the relation. The spec allows one
+// only on an active primary direct or indirect relation with many_to_one or one_to_one
+// cardinality and no characteristics, so the many relations that do not qualify cost no lookup.
+func (r *RelationType) MayHaveFallback() bool {
+	if r == nil || r.Lifecycle.Inactive() != nil {
+		return false
+	}
+	if r.Importance != "" && r.Importance != RelationImportancePrimary {
+		return false
+	}
+	if r.Cardinality != "many_to_one" && r.Cardinality != "one_to_one" {
+		return false
+	}
+	if r.Type != "direct" && r.Type != "indirect" {
+		return false
+	}
+	return r.Constraints == nil || len(r.Constraints.Characteristics) == 0
 }
 
 // ActionType Action type structure definition
@@ -180,6 +277,10 @@ type ActionType struct {
 	Score      float64  `json:"_score,omitempty"`      // Score
 
 	ObjectTypeID string `json:"object_type_id"` // Object type ID bound to action type
+	// Lifecycle says whether the action type is still in use (BKN spec 3.0 §4.3); nil is active.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
+	// Aliases are other names of the action type (BKN spec 3.0 §8.2). search_schema surfaces them.
+	Aliases []string `json:"aliases,omitempty"`
 }
 
 // ConceptGroup BKN concept group structure used by exported knowledge-network detail.
@@ -240,6 +341,9 @@ type QueryConceptsReq struct {
 	Sort          []*KnSortParams `json:"sort"`
 	Limit         int             `json:"limit"`      // Return count, default 10. Range 1-10000
 	NeedTotal     bool            `json:"need_total"` // Whether total count is needed, default false
+	// ExcludeDeprecated asks bkn-backend to leave deprecated concepts out. A bkn-backend before
+	// the field ignores it and returns them.
+	ExcludeDeprecated bool `json:"exclude_deprecated,omitempty"`
 }
 
 // Concepts Retrieved concepts list
@@ -271,6 +375,7 @@ type ActionTypeConcepts struct {
 // MetricType Metric type structure definition
 type MetricType struct {
 	ID                 string `json:"id"`                            // Metric ID
+	Version            int    `json:"version,omitempty"`             // Published object-metric version
 	Name               string `json:"name"`                          // Metric name
 	Comment            string `json:"comment,omitempty"`             // Metric comment
 	UnitType           string `json:"unit_type,omitempty"`           // Unit type
@@ -279,7 +384,7 @@ type MetricType struct {
 	ScopeType          string `json:"scope_type"`                    // Scope type
 	ScopeRef           string `json:"scope_ref"`                     // Scope ref
 	TimeDimension      any    `json:"time_dimension,omitempty"`      // Time dimension
-	CalculationFormula any    `json:"calculation_formula"`           // Calculation formula
+	CalculationFormula any    `json:"calculation_formula,omitempty"` // Legacy calculation formula, absent on V1 metrics
 	AnalysisDimensions any    `json:"analysis_dimensions,omitempty"` // Analysis dimensions
 }
 
@@ -309,13 +414,16 @@ type KnowledgeNetworkDetail struct {
 	// tool into every "describe this network" answer.
 	MountedCapabilities *MountedCapabilityCounts `json:"mounted_capabilities,omitempty"`
 
-	// The three counts and the notice below appear together, and only when the network
-	// was too large to answer with its concept model -- see ReduceToNavigationShell.
+	// The three counts appear only on the navigation shell -- see ReduceToNavigationShell.
 	// On every other answer the arrays are the count, so repeating it would be noise.
-	ObjectTypeCount   int    `json:"object_type_count,omitempty"`
-	RelationTypeCount int    `json:"relation_type_count,omitempty"`
-	ActionTypeCount   int    `json:"action_type_count,omitempty"`
-	Notice            string `json:"notice,omitempty"`
+	ObjectTypeCount   int `json:"object_type_count,omitempty"`
+	RelationTypeCount int `json:"relation_type_count,omitempty"`
+	ActionTypeCount   int `json:"action_type_count,omitempty"`
+	// Notice appears whenever the answer carries less than the level asked for: on the
+	// navigation shell, and on an outline (see FitWithin).
+	Notice string `json:"notice,omitempty"`
+
+	navigationShell bool
 }
 
 // MountedCapabilityCounts is how many capabilities of each kind a network has mounted.
@@ -419,6 +527,7 @@ func (d *KnowledgeNetworkDetail) ReduceToNavigationShell() {
 	d.ObjectTypes = nil
 	d.RelationTypes = nil
 	d.ActionTypes = nil
+	d.navigationShell = true
 }
 
 // NavigationShellNoticeKey names the localized notice that fits this shell.
@@ -496,8 +605,13 @@ func (d *KnowledgeNetworkDetail) Slim(level string) {
 	for _, a := range d.ActionTypes {
 		if a != nil {
 			a.Score = 0
+			a.Aliases = nil
 		}
 	}
+	// Property and relation declarations are search_schema's to surface; no level of this answer
+	// carries them, except lifecycle and the fallback marking (see OmitRelationDeclarations).
+	OmitPropertyDeclarations(d.ObjectTypes)
+	OmitRelationDeclarations(d.RelationTypes)
 	if level == DetailLevelFull {
 		return
 	}
@@ -637,13 +751,19 @@ type RelationTypesResp struct {
 	KnID          string          `json:"kn_id"`
 	RelationTypes []*RelationType `json:"relation_types"`
 	Missing       []string        `json:"missing,omitempty"`
+
+	// The three below appear only when the caller listed instead of naming ids, and
+	// mean what they mean on ObjectTypesResp.
+	TotalCount int64  `json:"total_count,omitempty"`
+	NextOffset *int   `json:"next_offset,omitempty"`
+	Notice     string `json:"notice,omitempty"`
 }
 
 // FilterObjectTypes returns the object types whose ID (or, as a fallback, Name)
 // appears in ids, in request order and de-duplicated, plus the ids that matched
 // nothing. This is the drill-down that get_kn_detail's summary level omits; it
 // keeps the heavy per-property detail (mapped_field, condition_operations, logic
-// sources) so results stay run_sql-capable, but drops the property display_name
+// sources), but drops the property display_name
 // (a UI label of little value to an agent).
 func (d *KnowledgeNetworkDetail) FilterObjectTypes(ids []string) (matched []*ObjectType, missing []string) {
 	if d == nil {
@@ -756,6 +876,15 @@ type CypherQueryReq struct {
 	// a parameter changes which rows come back, never which resource or
 	// column is read.
 	Parameters map[string]any `json:"parameters,omitempty"`
+	// ObjectProperties names, per returned node variable, the properties its
+	// node value should carry besides its identity.
+	ObjectProperties map[string][]string `json:"object_properties,omitempty"`
+	// Explain asks for the query's plan instead of its rows: the query is
+	// compiled and authorized as it would be to run, and nothing is read.
+	Explain bool `json:"explain,omitempty"`
+	// TimeoutSec asks bkn-backend for a statement timeout shorter than its
+	// configured one, in seconds; zero leaves the configured one.
+	TimeoutSec int `json:"timeout_sec,omitempty"`
 }
 
 // CypherQueryColumn is one output column of a Cypher query.
@@ -768,8 +897,19 @@ type CypherQueryColumn struct {
 // is deliberately absent: it names physical tables and columns, which a caller
 // is not entitled to just because they may read the data.
 type CypherQueryResp struct {
-	Columns            []CypherQueryColumn      `json:"columns"`
-	Entries            []map[string]any         `json:"entries"`
+	Columns []CypherQueryColumn `json:"columns"`
+	Entries []map[string]any    `json:"entries"`
+	// ValueTypes and Execution come with a query that returns nodes,
+	// relationships, maps or collect(...). They are passed through as
+	// bkn-backend wrote them, since bkn-backend owns their shape.
+	ValueTypes json.RawMessage `json:"value_types,omitempty"`
+	Execution  json.RawMessage `json:"execution,omitempty"`
+	// Plan comes back instead of rows when the query asked to be explained,
+	// as bkn-backend wrote it.
+	Plan json.RawMessage `json:"plan,omitempty"`
+	// Limited says the query wrote no LIMIT and stopped at the default
+	// number of rows, so more may match.
+	Limited            bool                     `json:"limited,omitempty"`
 	TraceDescriptor    json.RawMessage          `json:"-"`
 	PermissionImpacts  []ObjectPermissionImpact `json:"-"`
 	PermissionGuidance []*PermissionGuidance    `json:"permission_guidance,omitempty"`
@@ -817,16 +957,14 @@ type BknBackendAccess interface {
 	// GetActionTypeDetail Get action type details
 	GetActionTypeDetail(ctx context.Context, knID string, atIDs []string, includeDetail bool) ([]*ActionType, error)
 
-	// SearchMetricTypes Search metric types
+	// SearchMetricTypes searches published Object Metrics V1 definitions.
 	SearchMetricTypes(ctx context.Context, query *QueryConceptsReq) (metricTypes *MetricTypeConcepts, err error)
 
-	// ListMetricsByObjectTypes enumerates the metrics scoped to the given object types.
+	// ListMetricsByObjectTypes enumerates caller-visible published Object Metrics V1
+	// definitions owned by the given object types.
 	//
-	// It is deliberately not SearchMetricTypes: that one is a semantic recall over the
-	// concept index and answers "which metrics look relevant to this question", which
-	// is both ranked and only as fresh as the index. Advertising the metrics of an
-	// object type has to be exhaustive and authoritative, so this reads the metric
-	// registry itself.
+	// SearchMetricTypes performs text recall over the same registry; this operation
+	// returns all visible metrics owned by the requested object types.
 	ListMetricsByObjectTypes(ctx context.Context, knID string, otIDs []string) ([]*RelatedMetric, error)
 
 	// ListKNCapabilities returns the Skills and Function tools bound to one knowledge network
@@ -839,10 +977,46 @@ type BknBackendAccess interface {
 	ListKNCapabilities(ctx context.Context, knID, branch, capabilityType string) ([]*CapabilityRef, error)
 }
 
+// BranchBknBackendAccess is required when metric discovery names a non-main
+// branch. Legacy readers continue to serve the default main branch only.
+type BranchBknBackendAccess interface {
+	GetKnowledgeNetworkDetailBranch(ctx context.Context, knID, branch string) (*KnowledgeNetworkDetail, error)
+	ListObjectTypesBranch(ctx context.Context, knID, branch string, offset, limit int) (*ObjectTypePage, error)
+	GetObjectTypeDetailBranch(ctx context.Context, knID, branch string, otIDs []string, includeDetail bool) ([]*ObjectType, error)
+	ListMetricsByObjectTypesBranch(ctx context.Context, knID, branch string, otIDs []string) ([]*RelatedMetric, error)
+}
+
 // KNProxyResolver is implemented by BKN clients used on managed execution
 // paths without widening the read-only backend interface.
 type KNProxyResolver interface {
 	ResolveKNProxyBinding(ctx context.Context, binding KNProxyBinding) (*KNProxyAccount, error)
+}
+
+// ValueTypeReader reads a knowledge network's value types. It is implemented by the bkn-backend
+// client next to BknBackendAccess rather than inside it, so that test doubles of that interface
+// need not grow a method only search_schema uses.
+type ValueTypeReader interface {
+	// ListValueTypes returns every value type of the network's main branch.
+	ListValueTypes(ctx context.Context, knID string) ([]*ValueType, error)
+}
+
+// ValueType is a BKN spec 3.0 value type (SPECIFICATION.md §16), as bkn-backend returns it. Only
+// the enum and the unit are read: search_schema expands the enum, and gives the unit, on the
+// properties that name the value type. range, length and pattern are not read, as they are not
+// output for a property that declares them directly.
+type ValueType struct {
+	ID       string           `json:"id"`
+	Name     string           `json:"name"`
+	BaseType string           `json:"base_type"`
+	Unit     string           `json:"unit,omitempty"`
+	Enum     []*ValueTypeEnum `json:"enum,omitempty"`
+}
+
+// ValueTypeEnum is one enum item. The value is text whatever the base type.
+type ValueTypeEnum struct {
+	Value      string `json:"value"`
+	Display    string `json:"display"`
+	Deprecated bool   `json:"deprecated,omitempty"`
 }
 
 // CapabilityRef is one capability a knowledge network branch has bound. Only the reference
@@ -905,3 +1079,73 @@ const (
 	// executed through the MCP proxy rather than the toolbox proxy.
 	CapabilityTypeMCPTool = "mcp_tool"
 )
+
+// OmitPropertyDeclarations clears the BKN spec 3.0 property declarations and the object type and
+// property aliases from the given object types. Only search_schema surfaces them; get_kn_detail
+// and get_object_types answer as they did before declarations existed, which keeps their size
+// where it was.
+func OmitPropertyDeclarations(objectTypes []*ObjectType) {
+	for _, o := range objectTypes {
+		if o == nil {
+			continue
+		}
+		o.Aliases = nil
+		for _, p := range o.DataProperties {
+			if p == nil {
+				continue
+			}
+			p.Aliases = nil
+			p.Semantic = ""
+			p.Required = false
+			p.Constraints = nil
+		}
+	}
+}
+
+// OmitRelationDeclarations clears the BKN spec 3.0 relation declarations, and those of the relation
+// properties, from the given relation types, keeping the ones a caller needs to use a relation
+// listed or looked up by id safely: lifecycle says what replaces a deprecated relation, and
+// importance with fallback_for marks a fallback path, which these answers list beside its primary.
+// Without them a caller could add up the results of both (SPECIFICATION.md §7.6). search_schema
+// surfaces the rest.
+func OmitRelationDeclarations(relationTypes []*RelationType) {
+	for _, r := range relationTypes {
+		if r == nil {
+			continue
+		}
+		r.ReverseName = ""
+		r.Aliases = nil
+		r.Cardinality = ""
+		r.Constraints = nil
+		r.Verification = ""
+		omitRelationPropertyDeclarations(r.MappingRules)
+	}
+}
+
+// relationPropertyDeclarations are the keys OmitPropertyDeclarations clears from an object type
+// property; a relation property carries the same ones.
+var relationPropertyDeclarations = []string{"aliases", "semantic", "required", "constraints"}
+
+// omitRelationPropertyDeclarations clears the declarations of the relation properties an indirect
+// relation carries in mapping_rules.properties, the way OmitPropertyDeclarations does for object
+// type properties: the name, display name, type, comment and mapped field stay. mapping_rules is
+// read from bkn-backend for each answer, so editing it in place touches nothing shared.
+func omitRelationPropertyDeclarations(mappingRules any) {
+	rules, ok := mappingRules.(map[string]any)
+	if !ok {
+		return
+	}
+	properties, ok := rules["properties"].([]any)
+	if !ok {
+		return
+	}
+	for _, p := range properties {
+		property, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, key := range relationPropertyDeclarations {
+			delete(property, key)
+		}
+	}
+}

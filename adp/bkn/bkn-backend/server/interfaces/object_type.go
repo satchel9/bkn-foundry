@@ -8,16 +8,17 @@ package interfaces
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
 
-	"bkn-backend/common/maskrule"
-	"bkn-backend/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/maskrule"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 const (
 	MAX_PROPERTY_NUM = 1000
 	// Logical property types.
-	LOGIC_PROPERTY_TYPE_METRIC = "metric"
-	LOGIC_PROPERTY_TYPE_TOOL   = "tool"
+	LOGIC_PROPERTY_TYPE_TOOL = "tool"
 )
 
 var (
@@ -49,10 +50,9 @@ var (
 		data_type.DATATYPE_BOOLEAN:          true,
 	}
 
-	// Logical resource types must be valid. metric and tool are currently supported.
+	// Logical resource types must be valid. Tool-backed logical properties are supported.
 	ValidLogicSourceTypes = map[string]bool{
-		LOGIC_PROPERTY_TYPE_METRIC: true,
-		LOGIC_PROPERTY_TYPE_TOOL:   true,
+		LOGIC_PROPERTY_TYPE_TOOL: true,
 	}
 
 	// Valid property types are integer, unsigned integer, float, decimal, string, keyword, text, date, timestamp, time, datetime, boolean, binary, json, vector, point, shape, and ip.
@@ -94,9 +94,18 @@ type ObjectTypeWithKeyField struct {
 type ObjectType struct {
 	ObjectTypeWithKeyField `mapstructure:",squash"`
 	CommonInfo             `mapstructure:",squash"`
+	// Aliases are the other names of the object type (BKN spec 3.0, §6.8). An interactive update
+	// that leaves them out keeps the stored ones.
+	Aliases []string `json:"aliases,omitempty" mapstructure:"aliases"`
+	// Lifecycle says whether the object type is still in use (BKN spec 3.0, §4.3); nil is active. It
+	// is not Status, which holds the index information.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty" mapstructure:"lifecycle"`
+	// declared names the declaration fields the JSON carried, null included.
+	declared map[string]bool
 
 	KNID          string          `json:"kn_id" mapstructure:"kn_id"`
 	Branch        string          `json:"branch" mapstructure:"branch"`
+	Revision      string          `json:"revision,omitempty" mapstructure:"-"`
 	ConceptGroups []*ConceptGroup `json:"concept_groups,omitempty" mapstructure:"concept_groups"`
 
 	Status *ObjectTypeStatus `json:"status,omitempty" mapstructure:"status"`
@@ -104,6 +113,10 @@ type ObjectType struct {
 	// deliberately is not persisted: a stored boolean becomes stale as soon as Vega starts or
 	// finishes rebuilding an index.
 	IndexStatus *ObjectTypeIndexStatus `json:"index_status,omitempty" mapstructure:"-"`
+
+	// RowCount is Vega's exact measurement, exposed only with query_data permission and no row filter.
+	RowCount     *int64 `json:"row_count" mapstructure:"-"`
+	RowCountTime *int64 `json:"row_count_time,omitempty" mapstructure:"-"`
 
 	Creator    AccountInfo `json:"creator" mapstructure:"creator"`
 	CreateTime int64       `json:"create_time" mapstructure:"create_time"`
@@ -186,7 +199,136 @@ type DataProperty struct {
 	// accepted from or written to the object type definition.
 	IndexFeatures []ObjectTypeIndexFeature `json:"index_features,omitempty" mapstructure:"-"`
 
+	// The BKN spec 3.0 property declarations (SPECIFICATION.md §6.8). They describe what the data
+	// should be, for understanding and display; nothing checks the source data against them. A
+	// property without them reads and stores exactly as before.
+	Aliases     []string             `json:"aliases,omitempty" mapstructure:"aliases,omitempty"`
+	Semantic    string               `json:"semantic,omitempty" mapstructure:"semantic,omitempty"`
+	Required    bool                 `json:"required,omitempty" mapstructure:"required,omitempty"`
+	Constraints *PropertyConstraints `json:"constraints,omitempty" mapstructure:"constraints,omitempty"`
+
 	retiredIndexConfigProvided bool
+	// declared names the declaration fields the JSON carried, null included. An interactive update
+	// keeps the stored value of a declaration field the request leaves out, so an old client that
+	// edits a display name does not clear declarations it does not know.
+	declared map[string]bool
+}
+
+// Declaration fields of a data property, as they are named in JSON.
+const (
+	DECLARATION_ALIASES     = "aliases"
+	DECLARATION_SEMANTIC    = "semantic"
+	DECLARATION_REQUIRED    = "required"
+	DECLARATION_CONSTRAINTS = "constraints"
+)
+
+// DeclarationFields lists the declaration fields of a data property.
+var DeclarationFields = []string{DECLARATION_ALIASES, DECLARATION_SEMANTIC, DECLARATION_REQUIRED, DECLARATION_CONSTRAINTS}
+
+// PropertyConstraints is a property's entry in ### Property Constraints (SPECIFICATION.md §6.8). An
+// empty field is not declared.
+type PropertyConstraints struct {
+	ValueType string       `json:"value_type,omitempty" mapstructure:"value_type,omitempty"`
+	Range     *ValueRange  `json:"range,omitempty" mapstructure:"range,omitempty"`
+	Length    *LengthRange `json:"length,omitempty" mapstructure:"length,omitempty"`
+	Pattern   string       `json:"pattern,omitempty" mapstructure:"pattern,omitempty"`
+	Unit      string       `json:"unit,omitempty" mapstructure:"unit,omitempty"`
+	Unique    bool         `json:"unique,omitempty" mapstructure:"unique,omitempty"`
+	CRS       string       `json:"crs,omitempty" mapstructure:"crs,omitempty"`
+	Timezone  string       `json:"timezone,omitempty" mapstructure:"timezone,omitempty"`
+}
+
+// ValueRange is a closed interval: numbers for a numeric property, ISO 8601 text for a date or time
+// property. Either bound may be absent.
+type ValueRange struct {
+	Min any `json:"min,omitempty" mapstructure:"min,omitempty"`
+	Max any `json:"max,omitempty" mapstructure:"max,omitempty"`
+}
+
+// LengthRange is a closed interval on the number of characters.
+type LengthRange struct {
+	Min *int `json:"min,omitempty" mapstructure:"min,omitempty"`
+	Max *int `json:"max,omitempty" mapstructure:"max,omitempty"`
+}
+
+// ClearedDeclaration is a stored declaration an overwrite would clear: the file the definition is
+// overwritten with does not carry it.
+type ClearedDeclaration struct {
+	ObjectTypeID   string `json:"object_type_id,omitempty"`
+	RelationTypeID string `json:"relation_type_id,omitempty"`
+	ActionTypeID   string `json:"action_type_id,omitempty"`
+	// Property is empty for a declaration of the definition itself, such as its aliases.
+	Property string   `json:"property,omitempty"`
+	Fields   []string `json:"fields"`
+}
+
+// EncodeIndexedConstraints rewrites the property constraints of a concept document for the concept
+// index as JSON strings: data_properties[].constraints of an object type and
+// mapping_rules.properties[].constraints of a relation type. The index maps unknown paths
+// dynamically, and a range bound is a number on a numeric property but text on a date property:
+// stored as they are, the first document would fix the field's type and every later one with the
+// other kind would be refused. DecodeIndexedConstraints reverses it. A document without constraints
+// is left as it is.
+func EncodeIndexedConstraints(doc map[string]any) error {
+	for _, props := range indexedPropertyLists(doc) {
+		for _, prop := range props {
+			p, ok := prop.(map[string]any)
+			if !ok {
+				continue
+			}
+			if c, exists := p[DECLARATION_CONSTRAINTS]; exists && c != nil {
+				if _, done := c.(string); done {
+					continue
+				}
+				encoded, err := json.Marshal(c)
+				if err != nil {
+					return err
+				}
+				p[DECLARATION_CONSTRAINTS] = string(encoded)
+			}
+		}
+	}
+	return nil
+}
+
+// DecodeIndexedConstraints reads back what EncodeIndexedConstraints wrote.
+func DecodeIndexedConstraints(entry map[string]any) error {
+	for _, props := range indexedPropertyLists(entry) {
+		for _, prop := range props {
+			p, ok := prop.(map[string]any)
+			if !ok {
+				continue
+			}
+			if encoded, isText := p[DECLARATION_CONSTRAINTS].(string); isText {
+				constraints := &PropertyConstraints{}
+				if err := json.Unmarshal([]byte(encoded), constraints); err != nil {
+					return fmt.Errorf("data property %v constraints in the concept index: %w", p["name"], err)
+				}
+				p[DECLARATION_CONSTRAINTS] = constraints
+			}
+		}
+	}
+	return nil
+}
+
+// indexedPropertyLists returns the property lists of a concept document: the data properties of an
+// object type and the relation properties of an indirect relation type.
+func indexedPropertyLists(doc map[string]any) [][]any {
+	var lists [][]any
+	if props, ok := doc["data_properties"].([]any); ok {
+		lists = append(lists, props)
+	}
+	if rules, ok := doc["mapping_rules"].(map[string]any); ok {
+		if props, ok := rules[DECLARATION_PROPERTIES].([]any); ok {
+			lists = append(lists, props)
+		}
+	}
+	return lists
+}
+
+// IsEmpty reports whether the constraints declare nothing; {} in a request clears them.
+func (c *PropertyConstraints) IsEmpty() bool {
+	return c == nil || *c == (PropertyConstraints{})
 }
 
 // UnmarshalJSON records the removed index_config field without reintroducing it to the public model.
@@ -204,7 +346,66 @@ func (p *DataProperty) UnmarshalJSON(data []byte) error {
 	if rawIndexConfig, ok := raw["index_config"]; ok && string(rawIndexConfig) != "null" {
 		p.retiredIndexConfigProvided = true
 	}
+	for _, field := range DeclarationFields {
+		if _, ok := raw[field]; ok {
+			if p.declared == nil {
+				p.declared = map[string]bool{}
+			}
+			p.declared[field] = true
+		}
+	}
 	return nil
+}
+
+// Declares reports whether the JSON this property was read from carried a declaration field, null
+// included.
+func (p *DataProperty) Declares(field string) bool {
+	return p != nil && p.declared[field]
+}
+
+// DropImpliedRequired clears required on a primary key, which is required by definition, and
+// forgets that the JSON carried it: a later check of the same property must not read the cleared
+// value as a written false.
+func (p *DataProperty) DropImpliedRequired() {
+	if p == nil {
+		return
+	}
+	p.Required = false
+	delete(p.declared, DECLARATION_REQUIRED)
+}
+
+// HasDeclarations reports whether the property carries any declaration. Required on a primary key
+// is implied and does not count.
+func (p *DataProperty) HasDeclarations(primaryKeys []string) bool {
+	if p == nil {
+		return false
+	}
+	return len(p.Aliases) > 0 || p.Semantic != "" || !p.Constraints.IsEmpty() || (p.Required && !slices.Contains(primaryKeys, p.Name))
+}
+
+// KeepUndeclared copies from stored the declaration fields this property's JSON left out, the
+// merge an interactive update makes. A field the JSON carried keeps the JSON's value, null and {}
+// included, which clear it.
+func (p *DataProperty) KeepUndeclared(stored *DataProperty) {
+	if p == nil || stored == nil {
+		return
+	}
+	if !p.Declares(DECLARATION_ALIASES) {
+		p.Aliases = stored.Aliases
+	}
+	if !p.Declares(DECLARATION_SEMANTIC) {
+		p.Semantic = stored.Semantic
+	}
+	if !p.Declares(DECLARATION_REQUIRED) {
+		p.Required = stored.Required
+	}
+	if !p.Declares(DECLARATION_CONSTRAINTS) {
+		p.Constraints = stored.Constraints
+	}
+	if p.Constraints.IsEmpty() {
+		p.Constraints = nil
+	}
+	p.Aliases = NormalizeAliases(p.Aliases)
 }
 
 // HasRetiredIndexConfig reports whether the request contained the retired property-level index_config field.
@@ -234,7 +435,7 @@ type Parameter struct {
 	Name        string  `json:"name" mapstructure:"name"`
 	Type        string  `json:"type" mapstructure:"type"`                               // Parameter type
 	Source      string  `json:"source,omitempty" mapstructure:"source,omitempty"`       // Source type
-	Operation   string  `json:"operation,omitempty" mapstructure:"operation,omitempty"` // Operator for a metric property
+	Operation   string  `json:"operation,omitempty" mapstructure:"operation,omitempty"` // Operator for a logical-property parameter
 	ValueFrom   string  `json:"value_from,omitempty" mapstructure:"value_from,omitempty"`
 	Value       any     `json:"value,omitempty" mapstructure:"value,omitempty"`
 	IfSystemGen *bool   `json:"if_system_generate,omitempty" mapstructure:"if_system_generate,omitempty"`
@@ -285,3 +486,9 @@ type ObjectTypeSampleData struct {
 	TotalCount  int64                         `json:"total_count,omitempty"`
 	SearchAfter []any                         `json:"search_after,omitempty"`
 }
+
+func (d *ObjectType) RevisionID() string { return d.OTID }
+
+func (d *ObjectType) SetRevision(revision string) { d.Revision = revision }
+
+func (d *ObjectType) GetRevision() string { return d.Revision }

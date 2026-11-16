@@ -1,13 +1,17 @@
 ---
 openapi: 3.0.2
 info:
-  title: ObjectType
+  title: BKN 知识网络 · 对象类 API
   version: 0.1.0
   description: |
     Object types use `object_type:{kn_id}/{object_type_id}`. Reads and lists
     require `view_detail`; data reads require `query_data`; updates and deletes
     use `modify` and `delete`. Lists and searches are filtered before total and
     pagination. See `../knowledge-network-authorization.md`.
+
+    Resource IDs use lowercase letters, digits, underscores, and hyphens, start
+    with a letter or digit, and contain at most 128 characters. Resource names
+    contain at most 128 Unicode characters.
 
     With `strict_mode=true`, resource-backed object types read only the Vega schema under
     `view_detail`. Main-branch publication reuses the effective delegator selected by Proxy
@@ -16,6 +20,65 @@ info:
     failures return 502, and timeout/unavailable dependencies return 503. Downstream bodies are
     never copied into the public response. Tool-backed logical properties use the same 400/502/503
     dependency classification.
+
+    ### Refused declarations and references
+
+    A save the declaration rules refuse answers 400 `BknBackend.ObjectType.InvalidParameter.Declarations`. As before,
+    `error_details` holds the English text (several issues are joined with `; `). `metadata.issues` holds the same
+    refusal as records, so that a caller words it in its own language and finds the definition and the property:
+
+    ```json
+    {
+      "error_code": "BknBackend.ObjectType.InvalidParameter.Declarations",
+      "error_details": "Semantic end_time needs an event_time property alongside",
+      "metadata": {"issues": [{
+        "rule": "end_time_without_event_time",
+        "object_type_id": "order",
+        "message": "Semantic end_time needs an event_time property alongside"
+      }]}
+    }
+    ```
+
+    Each issue has `rule` (the stable code below), the ID of the definition it concerns (`object_type_id`,
+    `relation_type_id` or `action_type_id`), `property` for a rule of one data property, `params` (the values the
+    message is built from), `involved` (every definition a rule that spans definitions concerns, as `{kind, id}`;
+    the first is the definition that refers first and the one named by the ID field) and `message` (the English
+    text). A rule within one definition lists the first problem it finds. A rule that spans definitions
+    (`replaced_by`, `fallback_for`, deprecated endpoints) lists every problem that involves a definition of the
+    save. An alias that names another definition (`alias_conflict`) reports only the first conflict.
+
+    A delete refused because definitions still refer to it answers 409 `BknBackend.ObjectType.StillReferenced`.
+    `error_details.references` lists the English sentences, as before. `metadata.references` holds one record per
+    reference: `kind` and `id` name what is referred to, `referrer_kind` and `referrer_id` who refers to it, `via`
+    the declaration (`replaced_by` or `fallback_for`), and `message` the English sentence.
+
+    Rules of this definition kind:
+
+    - Property semantics: `semantic_unknown` (`semantic`, `allowed`), `semantic_type_mismatch` (`semantic`, `allowed`,
+      `type`), `semantic_duplicated` (`semantic`, `other_property`), `end_time_without_event_time`,
+      `latitude_longitude_unpaired`, `location_with_latitude_longitude`, `crs_mismatch` (`latitude_crs`,
+      `longitude_crs`).
+    - Property constraints: `value_type_with_value_rules` (`value_type`), `unique_type_unsupported` (`type`),
+      `crs_without_geo_semantic`, `crs_invalid` (`crs`, `allowed`), `timezone_type_mismatch` (`type`),
+      `timezone_invalid` (`timezone`), `range_bounds_missing`, `range_not_numeric`, `range_not_date` (`type`),
+      `range_not_time` (`type`), `range_min_greater_than_max` (`min`, `max`), `range_min_later_than_max` (`min`,
+      `max`), `range_type_unsupported` (`type`), `length_bounds_missing`, `length_bound_negative` (`bound`),
+      `length_type_mismatch` (`type`, `allowed`), `length_min_greater_than_max` (`min`, `max`),
+      `pattern_type_mismatch` (`type`, `allowed`), `pattern_invalid` (`pattern`, `error`; the expression is not RE2),
+      `unit_type_mismatch` (`type`).
+    - Value types: `value_type_undefined` (`value_type`), `value_type_base_mismatch` (`value_type`, `base_type`,
+      `type`); both name the property.
+    - Aliases of the object type or of a property: `aliases_too_many` (`count`, `max`), `alias_empty`,
+      `alias_full_width_comma` (`alias`), `alias_contains_comma` (`alias`), `alias_too_long` (`alias`, `max`),
+      `alias_duplicated` (`alias`), `alias_equals_own_name` (`alias`), `alias_conflict` (`alias`, and
+      `conflicts_with` or, between two properties, `conflicts_with_property`).
+    - Lifecycle: `lifecycle_fields_without_deprecation`, `lifecycle_reason_missing`, `lifecycle_replaced_by_invalid`
+      (`replaced_by`), `lifecycle_replaced_by_self` (`replaced_by`), `lifecycle_status_invalid` (`status`,
+      `allowed`), and across definitions `replaced_by_missing`, `replaced_by_deprecated` (`replaced_by`).
+    - `primary_key_required_false`: a primary key is written as not required; it is required by definition.
+    - Saving a deprecated object type can also refuse on a relation type bound to it: `endpoint_deprecated`
+      (`object_type`), with `relation_type_id`.
+
 security:
   - OAuth2: []
 paths:
@@ -77,24 +140,26 @@ paths:
             type: string
             default: main
           in: query
-        - name: need_total
-          description: Whether to return total_count. Defaults to true.
-          schema:
-            type: boolean
-            default: true
-          in: query
-        - name: search_after
-          description: Deep-pagination cursor, separated by commas. When provided, offset is ignored.
-          schema:
-            type: string
-          in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListObjectTypes"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: List object types
     post:
       requestBody:
@@ -122,12 +187,12 @@ paths:
                           - 10
               create object type:
                 value:
-                  - id: pod_has_metric
-                    name: pod_has_metric
+                  - id: pod_with_logic_property
+                    name: pod_with_logic_property
                     tags:
                       - event network
                       - topology
-                    comment: Pod information bound to a metric model
+                    comment: Pod information with a tool-backed logical property
                     icon: ""
                     color: ""
                     branch: main
@@ -141,156 +206,113 @@ paths:
                         comment: Primary key
                         mapped_field:
                           name: id
-                        index: true
                       - name: node_id
                         display_name: node_id
                         type: VARCHAR
                         comment: Node ID
                         mapped_field:
                           name: node_id
-                        index: true
                       - name: pod_cluster_id
                         display_name: pod_cluster_id
                         type: VARCHAR
                         comment: Pod cluster ID
                         mapped_field:
                           name: pod_cluster_id
-                        index: true
                       - name: pod_ip
                         display_name: pod_ip
                         type: VARCHAR
                         comment: Pod IP
                         mapped_field:
                           name: pod_ip
-                        index: true
                       - name: pod_name
                         display_name: pod_name
                         type: VARCHAR
                         comment: Pod name
                         mapped_field:
                           name: pod_name
-                        index: true
                       - name: pod_namespace
                         display_name: pod_namespace
                         type: VARCHAR
                         comment: Pod namespace
                         mapped_field:
                           name: pod_namespace
-                        index: true
                       - name: pod_node_name
                         display_name: pod_node_name
                         type: int
                         comment: Pod node name
                         mapped_field:
                           name: pod_node_name
-                        index: true
                       - name: pod_port
                         display_name: pod_port
                         type: VARCHAR
                         comment: Pod port
                         mapped_field:
                           name: pod_port
-                        index: true
                       - name: pod_status
                         display_name: pod_status
                         type: VARCHAR
                         comment: Pod status
                         mapped_field:
                           name: pod_status
-                        index: true
                       - name: service_ip
                         display_name: service_ip
                         type: VARCHAR
                         comment: Service IP
                         mapped_field:
                           name: service_ip
-                        index: true
                       - name: service_name
                         display_name: service_name
                         type: VARCHAR
                         comment: Service name
                         mapped_field:
                           name: service_name
-                        index: true
                       - name: component
                         display_name: component
                         type: VARCHAR
                         comment: Component
                         mapped_field:
                           name: component
-                        index: true
                       - name: pod_create_time
                         display_name: pod_create_time
                         type: VARCHAR
                         comment: Pod creation time
                         mapped_field:
                           name: pod_create_time
-                        index: true
                       - name: pod_delete_time
                         display_name: pod_delete_time
                         type: VARCHAR
                         comment: Pod deletion time
                         mapped_field:
                           name: pod_delete_time
-                        index: true
                       - name: s_create_time
                         display_name: s_create_time
                         type: timestamp
                         comment: System creation time
                         mapped_field:
                           name: s_create_time
-                        index: true
                       - name: s_update_time
                         display_name: s_update_time
                         type: timestamp
                         comment: System update time
                         mapped_field:
                           name: s_update_time
-                        index: true
                       - name: _timestamp
                         display_name: _timestamp
                         type: timestamp
                         comment: Time
                         mapped_field:
                           name: _timestamp
-                        index: true
                       - name: _action
                         display_name: _action
                         type: VARCHAR
                         comment: Action
                         mapped_field:
                           name: _action
-                        index: true
                     logic_properties:
-                      - name: metric_test
-                        display_name: metric_test
-                        type: metric
-                        comment: Pod metrics
-                        index: true
-                        data_source:
-                          type: metric-model
-                          id: pod_metric
-                        parameters:
-                          - name: id
-                            value_from: property
-                            value: id
-                          - name: pod_name
-                            value_from: property
-                            value: pod_name
-                          - name: instant
-                            value_from: input
-                            value: ""
-                          - name: start
-                            value_from: input
-                            value: ""
-                          - name: end
-                            value_from: input
-                            value: ""
                       - name: tool_test
                         display_name: tool_test
                         type: tool
                         comment: Pod tools
-                        index: true
                         data_source:
                           type: tool
                           box_id: pod_toolbox
@@ -328,126 +350,108 @@ paths:
                         comment: Primary key
                         mapped_field:
                           name: id
-                        index: true
                       - name: node_id
                         display_name: node_id
                         type: VARCHAR
                         comment: Node ID
                         mapped_field:
                           name: node_id
-                        index: true
                       - name: pod_cluster_id
                         display_name: pod_cluster_id
                         type: VARCHAR
                         comment: Pod cluster ID
                         mapped_field:
                           name: pod_cluster_id
-                        index: true
                       - name: pod_ip
                         display_name: pod_ip
                         type: VARCHAR
                         comment: Pod IP
                         mapped_field:
                           name: pod_ip
-                        index: true
                       - name: pod_name
                         display_name: pod_name
                         type: VARCHAR
                         comment: Pod name
                         mapped_field:
                           name: pod_name
-                        index: true
                       - name: pod_namespace
                         display_name: pod_namespace
                         type: VARCHAR
                         comment: Pod namespace
                         mapped_field:
                           name: pod_namespace
-                        index: true
                       - name: pod_node_name
                         display_name: pod_node_name
                         type: int
                         comment: Pod node name
                         mapped_field:
                           name: pod_node_name
-                        index: true
                       - name: pod_port
                         display_name: pod_port
                         type: VARCHAR
                         comment: Pod port
                         mapped_field:
                           name: pod_port
-                        index: true
                       - name: pod_status
                         display_name: pod_status
                         type: VARCHAR
                         comment: Pod status
                         mapped_field:
                           name: pod_status
-                        index: true
                       - name: service_ip
                         display_name: service_ip
                         type: VARCHAR
                         comment: Service IP
                         mapped_field:
                           name: service_ip
-                        index: true
                       - name: service_name
                         display_name: service_name
                         type: VARCHAR
                         comment: Service name
                         mapped_field:
                           name: service_name
-                        index: true
                       - name: component
                         display_name: component
                         type: VARCHAR
                         comment: Component
                         mapped_field:
                           name: component
-                        index: true
                       - name: pod_create_time
                         display_name: pod_create_time
                         type: VARCHAR
                         comment: Pod creation time
                         mapped_field:
                           name: pod_create_time
-                        index: true
                       - name: pod_delete_time
                         display_name: pod_delete_time
                         type: VARCHAR
                         comment: Pod deletion time
                         mapped_field:
                           name: pod_delete_time
-                        index: true
                       - name: s_create_time
                         display_name: s_create_time
                         type: timestamp
                         comment: System creation time
                         mapped_field:
                           name: s_create_time
-                        index: true
                       - name: s_update_time
                         display_name: s_update_time
                         type: timestamp
                         comment: System update time
                         mapped_field:
                           name: s_update_time
-                        index: true
                       - name: _timestamp
                         display_name: _timestamp
                         type: timestamp
                         comment: Time
                         mapped_field:
                           name: _timestamp
-                        index: true
                       - name: _action
                         display_name: _action
                         type: VARCHAR
                         comment: Action
                         mapped_field:
                           name: _action
-                        index: true
                     primary_keys:
                       - id
                     display_key: pod_name
@@ -471,126 +475,108 @@ paths:
                         comment: Primary key
                         mapped_field:
                           name: id
-                        index: true
                       - name: node_name
                         display_name: node_name
                         type: VARCHAR
                         comment: Node name
                         mapped_field:
                           name: node_name
-                        index: true
                       - name: node_namespace
                         display_name: node_namespace
                         type: VARCHAR
                         comment: Node namespace
                         mapped_field:
                           name: node_namespace
-                        index: true
                       - name: node_ip
                         display_name: node_ip
                         type: VARCHAR
                         comment: Node IP
                         mapped_field:
                           name: node_ip
-                        index: true
                       - name: node_mac
                         display_name: node_mac
                         type: VARCHAR
                         comment: MAC address
                         mapped_field:
                           name: node_mac
-                        index: true
                       - name: node_status
                         display_name: node_status
                         type: VARCHAR
                         comment: Node status
                         mapped_field:
                           name: node_status
-                        index: true
                       - name: node_memory_capacity
                         display_name: node_memory_capacity
                         type: int
                         comment: Node status
                         mapped_field:
                           name: node_memory_capacity
-                        index: true
                       - name: node_monitor
                         display_name: node_monitor
                         type: VARCHAR
                         comment: Node monitor
                         mapped_field:
                           name: node_monitor
-                        index: true
                       - name: node_disk_capacity
                         display_name: node_disk_capacity
                         type: VARCHAR
                         comment: Node disk capacity
                         mapped_field:
                           name: node_disk_capacity
-                        index: true
                       - name: node_cpu_capacity
                         display_name: node_cpu_capacity
                         type: VARCHAR
                         comment: Node CPU capacity
                         mapped_field:
                           name: node_cpu_capacity
-                        index: true
                       - name: node_core_version
                         display_name: node_core_version
                         type: VARCHAR
                         comment: Node kernel version
                         mapped_field:
                           name: node_core_version
-                        index: true
                       - name: node_create_time
                         display_name: node_create_time
                         type: VARCHAR
                         comment: Node creation time
                         mapped_field:
                           name: node_create_time
-                        index: true
                       - name: node_delete_time
                         display_name: node_delete_time
                         type: VARCHAR
                         comment: Node deletion time
                         mapped_field:
                           name: node_delete_time
-                        index: true
                       - name: node_memory_capacity
                         display_name: node_memory_capacity
                         type: VARCHAR
                         comment: Node memory capacity
                         mapped_field:
                           name: node_memory_capacity
-                        index: true
                       - name: s_create_time
                         display_name: s_create_time
                         type: timestamp
                         comment: System creation time
                         mapped_field:
                           name: s_create_time
-                        index: true
                       - name: s_update_time
                         display_name: s_update_time
                         type: timestamp
                         comment: System update time
                         mapped_field:
                           name: s_update_time
-                        index: true
                       - name: timestamp
                         display_name: timestamp
                         type: timestamp
                         comment: Time
                         mapped_field:
                           name: timestamp
-                        index: true
                       - name: _action
                         display_name: _action
                         type: VARCHAR
                         comment: Action
                         mapped_field:
                           name: _action
-                        index: true
                     primary_keys:
                       - id
                     display_key: node_name
@@ -637,6 +623,16 @@ paths:
             type: string
             default: main
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases, lifecycle and property declarations), such as a 2.x package or an old JSON export, would clear them.
+            Without this parameter the request is refused with 409 BknBackend.ObjectType.DeclarationsWouldBeCleared,
+            whose details list the declarations; pass true to clear them.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: |
             Import mode. normal returns an error for a concept with the same name; overwrite replaces it;
@@ -662,6 +658,9 @@ paths:
         "503":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyUnavailable"
         "201":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
@@ -678,12 +677,12 @@ paths:
                 list object types - first request:
                   value:
                     entries:
-                      - id: pod_has_metric_test
-                        name: pod_has_metric_test
+                      - id: pod_with_logic_property_test
+                        name: pod_with_logic_property_test
                         tags:
                           - event network
                           - topology
-                        comment: Pod information bound to a metric model
+                        comment: Pod information with a tool-backed logical property
                         icon: ""
                         color: ""
                         branch: main
@@ -926,45 +925,10 @@ paths:
                               - in
                               - not_in
                         logic_properties:
-                          - name: metric_test
-                            display_name: metric_test
-                            type: metric
-                            comment: Pod metrics
-                            index: true
-                            data_source:
-                              type: metric-model
-                              id: pod_metric
-                              name: ""
-                            parameters:
-                              - name: id
-                                value_from: property
-                                value: id
-                              - name: pod_name
-                                value_from: property
-                                value: pod_name
-                              - name: instant
-                                value_from: input
-                                value: ""
-                              - name: start
-                                value_from: input
-                                value: ""
-                              - name: end
-                                value_from: input
-                                value: ""
-                              - name: instant
-                                value_from: input
-                                value: ""
-                              - name: start
-                                value_from: input
-                                value: ""
-                              - name: end
-                                value_from: input
-                                value: ""
                           - name: tool_test
                             display_name: tool_test
                             type: tool
                             comment: Pod tools
-                            index: true
                             data_source:
                               type: tool
                               box_id: pod_toolbox
@@ -990,12 +954,12 @@ paths:
                 list object types - subsequent request:
                   value:
                     entries:
-                      - id: pod_has_metric_test2
-                        name: pod_has_metric_test2
+                      - id: pod_with_logic_property_test2
+                        name: pod_with_logic_property_test2
                         tags:
                           - event network
                           - topology
-                        comment: Pod information bound to a metric model
+                        comment: Pod information with a tool-backed logical property
                         icon: ""
                         color: ""
                         branch: main
@@ -1016,13 +980,6 @@ paths:
                             comment: Primary key
                             mapped_field:
                               name: id
-                            index: true
-                            fulltext_config:
-                              analyzer: ""
-                              field_keyword: false
-                            vector_config:
-                              analyzer: ""
-                              field_keyword: false
                           - name: node_id
                             display_name: node_id
                             type: VARCHAR
@@ -1245,45 +1202,10 @@ paths:
                               - in
                               - not_in
                         logic_properties:
-                          - name: metric_test
-                            display_name: metric_test
-                            type: metric
-                            comment: Pod metrics
-                            index: true
-                            data_source:
-                              type: metric-model
-                              id: pod_metric
-                              name: ""
-                            parameters:
-                              - name: id
-                                value_from: property
-                                value: id
-                              - name: pod_name
-                                value_from: property
-                                value: pod_name
-                              - name: instant
-                                value_from: input
-                                value: ""
-                              - name: start
-                                value_from: input
-                                value: ""
-                              - name: end
-                                value_from: input
-                                value: ""
-                              - name: instant
-                                value_from: input
-                                value: ""
-                              - name: start
-                                value_from: input
-                                value: ""
-                              - name: end
-                                value_from: input
-                                value: ""
                           - name: tool_test
                             display_name: tool_test
                             type: tool
                             comment: Pod tools
-                            index: true
                             data_source:
                               type: tool
                               box_id: pod_toolbox
@@ -1340,22 +1262,36 @@ paths:
             type: string
           in: query
         - name: strict_mode
-          description: Whether to strictly validate dependencies. When true, validates external dependencies such as data views, embedding models, and metric or operator bindings used by logical properties. When false, skips this validation.
+          description: Whether to strictly validate dependencies. When true, validates external dependencies such as data views, embedding models, and tools used by logical properties. When false, skips this validation.
           schema:
             type: boolean
             default: true
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
         "400":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadRequest"
         "403":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyForbidden"
+        "404":
+          description: Object type not found on the requested branch (BknBackend.ObjectType.ObjectTypeNotFound)
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
         "502":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadGateway"
         "503":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyUnavailable"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Update an object type
     parameters:
       - name: kn_id
@@ -1393,13 +1329,28 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
+            ETag:
+              $ref: "../_shared/kn-version.yaml#/components/headers/ETag"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ObjectTypeDetails"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: Get object type details
     delete:
       parameters:
@@ -1429,9 +1380,29 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
+        "409":
+          description: |
+            BknBackend.ObjectType.StillReferenced: an object type to delete is still the lifecycle replaced_by of a deprecated object type
+            that this request does not delete. `error_details.references` lists each reference; change or remove them
+            first, or delete the referring definitions in the same request.
+
+            On a versioned network the request also answers 409 `BknBackend.KNVersion.DefinitionModified` when `If-Match`
+            is stale, `BknBackend.KNVersion.DraftRevisionMismatch` when `expected_draft_revision` is stale, and
+            `BknBackend.KNVersion.VersioningDisabling` while versioning is being turned off.
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
       summary: Delete object types
     parameters:
       - name: kn_id
@@ -1502,8 +1473,17 @@ paths:
           schema:
             type: string
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         '200':
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
           content:
             application/json:
@@ -1543,6 +1523,10 @@ paths:
                 $ref: "../_shared/errors.yaml#/components/schemas/Error"
         '401':
           description: Unauthorized
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
   /api/bkn-backend/v1/knowledge-networks/{kn_id}/object-types/{ob_id}/data_properties/{property_names}:
     put:
       description: Requires effective `modify` on `object_type:{kn_id}/{ob_id}`. Before the write, `strict_mode` controls request validation for vector-index embedding-model dependencies; it never bypasses authorization.
@@ -1558,6 +1542,7 @@ paths:
             type: boolean
             default: true
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
       requestBody:
         content:
           application/json:
@@ -1566,7 +1551,20 @@ paths:
         required: true
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: Updated successfully
+        "404":
+          description: Object type not found on the requested branch (BknBackend.ObjectType.ObjectTypeNotFound)
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Update data properties
     parameters:
       - name: kn_id
@@ -1592,7 +1590,7 @@ paths:
       summary: Validate object types
       description: |
         Validates concept dependency existence only and does not write data. Use it for pre-import checks or batch self-checks.
-        When strict_mode is true, validates dependencies such as data views, vector-index embedding models, metric models and operators bound to logical properties, and concept groups.
+        When strict_mode is true, validates dependencies such as data views, vector-index embedding models, tools used by logical properties, and concept groups.
 
         For same-batch references, such as a relation type referencing an object type that has not been persisted, single-type validation recognizes only persisted resources in strict mode when the request cannot include the referenced definition.
         In that case, use full knowledge-network validation with the same structure as the create API, or concept-group validation with nested object_types, relation_types, and action_types. The server derives BatchIDIndex from the submitted JSON, making entries visible within the same create transaction.
@@ -1619,6 +1617,16 @@ paths:
             type: boolean
             default: true
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases, lifecycle and property declarations), such as a 2.x package or an old JSON export, would clear them.
+            Without this parameter the request is refused with 409 BknBackend.ObjectType.DeclarationsWouldBeCleared,
+            whose details list the declarations; pass true to clear them.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: "Same as the create object type API. Defines validation semantics for persisted object type ID or name conflicts: normal, ignore, or overwrite."
           schema:
@@ -1732,10 +1740,11 @@ components:
           description: Property name. It may contain only lowercase English letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
         display_name:
-          description: Property display name
+          description: Property display name. Required and limited to 128 Unicode characters.
+          maxLength: 128
           type: string
         type:
-          description: Property data type. In addition to view field types, metric and tool are supported.
+          description: Property data type. Supported values are the documented data field types.
           type: string
         comment:
           description: Property description
@@ -1746,6 +1755,27 @@ components:
         mask_rule:
           $ref: "#/components/schemas/MaskRule"
           description: Optional Column Masking rule used when the effective property access level is `masked`. It applies only to query results and never modifies source data.
+        aliases:
+          description: |
+            BKN spec 3.0 property declaration: other names of the property. An update that leaves the field
+            out keeps the stored aliases; null or [] clears them.
+          type: array
+          items:
+            type: string
+        semantic:
+          description: |
+            BKN spec 3.0 property declaration: what the property means. One of event_time, end_time,
+            valid_from, valid_to, location, latitude, longitude, status, severity; each value at most once
+            per object type. An update that leaves the field out keeps the stored value; null or "" clears it.
+          type: string
+        required:
+          description: |
+            BKN spec 3.0 property declaration: every instance has a value. A primary key is required by
+            definition and refuses false. An update that leaves the field out keeps the stored value;
+            null clears it.
+          type: boolean
+        constraints:
+          $ref: "#/components/schemas/PropertyConstraints"
         condition_operations:
           description: |
             Supported filter operations for this property. They are inferred from the property type, such as
@@ -1756,6 +1786,107 @@ components:
           type: array
           items:
             type: string
+        index_features:
+          description: |
+            Index features configured on the mapped Vega resource field, projected from the resource schema
+            while responding. Read-only: it is not accepted in requests or stored with the definition. Returned
+            by the detail and search endpoints; omitted when the property has no mapped field or no keyword,
+            fulltext or vector feature is configured.
+          type: array
+          readOnly: true
+          items:
+            $ref: "#/components/schemas/ObjectTypeIndexFeature"
+    ObjectTypeIndexStatus:
+      description: |
+        Whether the object type's bound Vega resource index can currently be used. It is projected from the
+        resource's Vega local_status while responding and is never stored. Returned by the list, detail and
+        search endpoints; omitted from other responses.
+      type: object
+      readOnly: true
+      required:
+        - state
+      properties:
+        state:
+          description: |
+            available: the resource's local index is available. unavailable: the local index is unavailable or
+            stale. unknown: the resource could not be read, or reports another local_status. resource_missing:
+            the bound resource no longer exists. not_applicable: the data source is not a Vega resource.
+          type: string
+          enum:
+            - available
+            - unavailable
+            - unknown
+            - resource_missing
+            - not_applicable
+        source_status:
+          description: The Vega resource's raw local_status. Omitted when the resource was not read.
+          type: string
+    ObjectTypeIndexFeature:
+      description: An index feature configured for one object type data property.
+      type: object
+      readOnly: true
+      required:
+        - type
+        - configured
+        - available
+      properties:
+        type:
+          type: string
+          enum:
+            - keyword
+            - fulltext
+            - vector
+        configured:
+          description: Always true; only configured features are listed.
+          type: boolean
+        available:
+          description: |
+            Whether the feature is usable now: true when index_status.state is available, false when it is
+            unavailable. Null for any other state, so an unknown answer is not read as unavailable.
+          type: boolean
+          nullable: true
+    PropertyConstraints:
+      description: |
+        BKN spec 3.0 property constraints (SPECIFICATION.md §6.8). They describe the data for understanding
+        and display; nothing checks the source data against them. An update that leaves the field out keeps
+        the stored value; a value replaces it whole; null or {} clears it.
+      type: object
+      properties:
+        value_type:
+          description: |
+            ID of a value type of the same network (value-types.yaml) whose base_type is the property's Type.
+            A property that names one writes no range, length, pattern or unit of its own.
+          type: string
+        range:
+          description: Closed interval; numbers for a numeric property, ISO 8601 text for date, datetime and timestamp.
+          type: object
+          properties:
+            min: {}
+            max: {}
+        length:
+          description: Closed interval on the number of characters of a string, keyword or text property.
+          type: object
+          properties:
+            min:
+              type: integer
+            max:
+              type: integer
+        pattern:
+          description: RE2 regular expression for a string, keyword or text property.
+          type: string
+        unit:
+          description: Unit of a numeric property.
+          type: string
+        unique:
+          description: The values are unique, apart from the primary key.
+          type: boolean
+        crs:
+          description: Coordinate system of a location, latitude or longitude property.
+          type: string
+          enum: [wgs84, gcj02, bd09]
+        timezone:
+          description: IANA time zone a datetime value without an offset is read in.
+          type: string
     MaskRule:
       description: |
         Strongly typed Column Masking rule for a data property. String rules keep string output, round keeps JSON number
@@ -1850,41 +1981,11 @@ components:
       type: string
       minLength: 1
       maxLength: 8
-    FulltextConfig:
-      description: Full-text index configuration
-      required:
-        - analyzer
-        - enabled
-      type: object
-      properties:
-        analyzer:
-          description: Analyzer ID. Available values come from fulltext_analyzers returned by GET /api/vega-backend/v1/index-capabilities and depend on the cluster capabilities.
-          type: string
-        enabled:
-          description: Whether enabled
-          type: boolean
-      example:
-        analyzer: standard
-        enabled: true
-    VectorConfig:
-      description: Vector index configuration
-      required:
-        - enabled
-      type: object
-      properties:
-        enabled:
-          description: Whether enabled
-          type: boolean
-        model_id:
-          description: Vector model ID
-          type: string
-      example:
-        enabled: true
-        model_id: some text
     LogicProperty:
       description: Logical properties
       required:
         - name
+        - display_name
         - data_source
         - parameters
       type: object
@@ -1893,17 +1994,16 @@ components:
           description: Property name. It may contain only lowercase English letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
         display_name:
-          description: Property display name
+          description: Property display name. Required and limited to 128 Unicode characters.
+          maxLength: 128
           type: string
         type:
-          description: Property data type. In addition to view field types, metric and tool are supported.
+          description: Logical property type. Only tool is supported; object metrics are independent instance-set resources.
           type: string
+          enum: [tool]
         comment:
           description: Property description
           type: string
-        index:
-          description: Whether to enable indexing. Defaults to true.
-          type: boolean
         data_source:
           $ref: "#/components/schemas/LogicSource"
           description: Logical source
@@ -1913,7 +2013,7 @@ components:
           items:
             $ref: "#/components/schemas/Parameter"
         analysis_dimensions:
-          description: Analysis dimensions of the metric model. Returned when the logical property type is metric.
+          description: Optional analysis dimensions exposed by the tool-backed property.
           type: array
           items:
             $ref: "#/components/schemas/AnalysisDim"
@@ -1999,7 +2099,6 @@ components:
       description: Object type creation information
       required:
         - branch
-        - base_version
         - name
         - primary_keys
         - display_key
@@ -2009,9 +2108,33 @@ components:
         id:
           description: ID. It cannot be changed after creation and may contain only lowercase English letters, digits, underscores, and hyphens. It cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
+        aliases:
+          description: |
+            Other names of the object type (BKN spec 3.0), for concept search and understanding; not its own name or another object type's name. An update that leaves the field out keeps the stored aliases; null or [] clears them.
+          type: array
+          items:
+            type: string
+        lifecycle:
+          description: |
+            Whether the object type is still in use (BKN spec 3.0, §4.3); not the index status. Without it the object type
+            is active. status deprecated needs a reason; replaced_by names an active object type. An update that leaves the
+            field out keeps the stored lifecycle; null or {} clears it.
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [active, deprecated]
+            reason:
+              type: string
+            replaced_by:
+              type: string
         tags:
           description: Tags used for business identification
           type: array
@@ -2063,12 +2186,33 @@ components:
         - display_key
         - data_properties
         - branch
-        - base_version
       type: object
       properties:
         name:
           description: Name
           type: string
+          maxLength: 128
+        aliases:
+          description: |
+            Other names of the object type (BKN spec 3.0), for concept search and understanding; not its own name or another object type's name. An update that leaves the field out keeps the stored aliases; null or [] clears them.
+          type: array
+          items:
+            type: string
+        lifecycle:
+          description: |
+            Whether the object type is still in use (BKN spec 3.0, §4.3); not the index status. Without it the object type
+            is active. status deprecated needs a reason; replaced_by names an active object type. An update that leaves the
+            field out keeps the stored lifecycle; null or {} clears it.
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [active, deprecated]
+            reason:
+              type: string
+            replaced_by:
+              type: string
         tags:
           description: Tags used for business identification
           type: array
@@ -2149,17 +2293,16 @@ components:
       description: Data source
       required:
         - type
-        - id
+        - box_id
+        - tool_id
       type: object
       properties:
         type:
           description: Data source type
-          enum:
-            - metric
-            - tool
+          enum: [tool]
           type: string
         id:
-          description: Data source ID. Required when type is metric.
+          description: Optional external source ID.
           type: string
         box_id:
           description: Toolbox ID. Required when type is tool.
@@ -2195,9 +2338,31 @@ components:
         id:
           description: Object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Object type name
           type: string
+          maxLength: 128
+        aliases:
+          description: Other names of the object type (BKN spec 3.0). Left out when it has none.
+          type: array
+          items:
+            type: string
+        lifecycle:
+          description: |
+            Whether the object type is still in use (BKN spec 3.0, §4.3); not the index status. Left out when the object
+            type is active.
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [deprecated]
+            reason:
+              type: string
+            replaced_by:
+              type: string
         tags:
           description: Tags. May be empty.
           type: array
@@ -2218,8 +2383,27 @@ components:
         kn_id:
           description: Business knowledge network ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         data_source:
           $ref: "#/components/schemas/DataSource"
+        row_count:
+          description: >-
+            Exact count from the bound Vega resource, reused in object type list, detail and search
+            responses. Dataset counts are live; other counts reflect the collection time below.
+            Null when the measurement is missing, query_data is denied, or a row filter applies.
+            Filtered counts use the existing Cypher endpoint; model reads never issue COUNT queries.
+          type: integer
+          format: int64
+          nullable: true
+          readOnly: true
+        row_count_time:
+          description: Vega collection time in Unix milliseconds. Omitted when row_count is null.
+          type: integer
+          format: int64
+          readOnly: true
+        index_status:
+          $ref: "#/components/schemas/ObjectTypeIndexStatus"
         creator:
           $ref: '../_shared/common.yaml#/components/schemas/AccountInfo'
         create_time:
@@ -2266,9 +2450,33 @@ components:
         id:
           description: Object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Object type name
           type: string
+          maxLength: 128
+        aliases:
+          description: |
+            Other names of the object type (BKN spec 3.0), for concept search and understanding; not its own name or another object type's name. An update that leaves the field out keeps the stored aliases; null or [] clears them.
+          type: array
+          items:
+            type: string
+        lifecycle:
+          description: |
+            Whether the object type is still in use (BKN spec 3.0, §4.3); not the index status. Without it the object type
+            is active. status deprecated needs a reason; replaced_by names an active object type. An update that leaves the
+            field out keeps the stored lifecycle; null or {} clears it.
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [active, deprecated]
+            reason:
+              type: string
+            replaced_by:
+              type: string
         tags:
           description: Tags. May be empty.
           type: array
@@ -2337,6 +2545,23 @@ components:
           type: array
           items:
             type: string
+        row_count:
+          description: >-
+            Exact count from the bound Vega resource, reused in object type list, detail and search
+            responses. Dataset counts are live; other counts reflect the collection time below.
+            Null when the measurement is missing, query_data is denied, or a row filter applies.
+            Filtered counts use the existing Cypher endpoint; model reads never issue COUNT queries.
+          type: integer
+          format: int64
+          nullable: true
+          readOnly: true
+        row_count_time:
+          description: Vega collection time in Unix milliseconds. Omitted when row_count is null.
+          type: integer
+          format: int64
+          readOnly: true
+        index_status:
+          $ref: "#/components/schemas/ObjectTypeIndexStatus"
         data_source_metadata_unavailable:
           description: |
             Present and true only when the bound resource could not be read while this response
@@ -2365,9 +2590,6 @@ components:
             index:
               description: Associated index name
               type: string
-            index_available:
-              description: Whether the index is available
-              type: boolean
             doc_count:
               description: Number of documents in the index
               type: integer
@@ -2498,42 +2720,10 @@ components:
           description: Parameter value. When value_from is property, provide the object type data property name; when it is input, omit this field.
           type: string
     Parameter:
-      oneOf:
+      allOf:
         - $ref: "#/components/schemas/Parameter4Operator"
-        - $ref: "#/components/schemas/Parameter4Metric"
-      description: Logical or metric parameters
+      description: Tool-backed logical-property parameter.
       type: object
-    Parameter4Metric:
-      description: Logical parameters
-      required:
-        - name
-        - value_from
-        - operation
-      type: object
-      properties:
-        name:
-          description: Parameter name
-          type: string
-        value_from:
-          description: Value source
-          enum:
-            - property
-            - input
-          type: string
-        value:
-          description: Parameter value. When value_from is property, provide the object type data property name; when it is input, omit this field.
-          type: string
-        operation:
-          description: Operator. Required when mapping a metric model property.
-          enum:
-            - in
-            - "="
-            - "!="
-            - ">"
-            - ">="
-            - <
-            - <=
-          type: string
     KeywordConfig:
       title: Root Type for KeywordConfig
       description: Keyword search configuration
@@ -2712,7 +2902,7 @@ components:
             - like
           type: string
         value:
-          description: Filter value
+          description: Complete SQL LIKE pattern; % matches zero or more characters, _ matches one, backslash escapes the next character, and a trailing escape is invalid. No wildcards are added automatically.
           type: string
     condition_not_like:
       description: Not-like filter
@@ -2741,7 +2931,7 @@ components:
             - not_like
           type: string
         value:
-          description: Filter value
+          description: Complete SQL LIKE pattern; % matches zero or more characters, _ matches one, backslash escapes the next character, and a trailing escape is invalid. No wildcards are added automatically.
           type: string
     condition_regex:
       description: Regular-expression filter
@@ -2957,6 +3147,11 @@ components:
         need_total:
           description: Whether a total count is needed. Defaults to false.
           type: boolean
+        exclude_deprecated:
+          description: |-
+            Whether to leave out definitions whose lifecycle status is deprecated, as concept
+            recall does. Defaults to false. Querying by ID still returns them.
+          type: boolean
     PageTurnQueryWithCursor:
       description: Subsequent request for a paginated query
       required:
@@ -2983,6 +3178,11 @@ components:
           type: integer
         need_total:
           description: Whether a total count is needed. Defaults to false.
+          type: boolean
+        exclude_deprecated:
+          description: |-
+            Whether to leave out definitions whose lifecycle status is deprecated, as concept
+            recall does. Defaults to false. Querying by ID still returns them.
           type: boolean
         cursor:
           description: next_cursor returned by the previous response.

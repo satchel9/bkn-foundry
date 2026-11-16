@@ -70,6 +70,19 @@ func newFixture(t *testing.T) fixture {
 	}
 }
 
+// restartRegistry models applying static definitions at the next process start.
+func (f *fixture) restartRegistry(t *testing.T) {
+	t.Helper()
+	enforcer, err := authz.New(f.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enforcer.InitializeRegistry(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	f.enforcer, f.service = enforcer, proxygrant.New(f.db, enforcer)
+}
+
 func (f fixture) authorize(t *testing.T, resourceID string, operations ...string) {
 	t.Helper()
 	if err := f.enforcer.GrantObjectPermission(f.grantor, "resource", resourceID, "authorize"); err != nil {
@@ -144,6 +157,66 @@ func TestGrantIsIdempotentAndLastSourceRevokesOwnedPolicy(t *testing.T) {
 	}
 }
 
+// A knowledge base bound to a network is read through kb-api as the network's
+// proxy (#2576): query_data is grantable, with its view_detail requirement
+// derived; no other knowledge_base operation is.
+func TestGrantAcceptsKnowledgeBaseQueryDataOnly(t *testing.T) {
+	f := newFixture(t)
+	if err := f.db.Create(&model.ResourceType{ID: "knowledge_base", Name: "Knowledge base"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []model.Operation{
+		{ResourceTypeID: "knowledge_base", ID: "authorize", Name: "authorize"},
+		{ResourceTypeID: "knowledge_base", ID: "view_detail", Name: "view_detail"},
+		{ResourceTypeID: "knowledge_base", ID: "modify", Name: "modify", RequiredOperationIDs: "view_detail"},
+		{ResourceTypeID: "knowledge_base", ID: "query_data", Name: "query_data", RequiredOperationIDs: "view_detail"},
+	} {
+		if err := f.db.Create(&operation).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.restartRegistry(t)
+	request := func(operation string) proxygrant.GrantRequest {
+		return proxygrant.GrantRequest{
+			ProxyAccountID: f.proxyID,
+			GrantorID:      f.grantor,
+			Source: proxygrant.SourceSpec{
+				ResourceType: "knowledge_base", ResourceID: "7", Operation: operation,
+				SourceType: proxygrant.SourceTypeKNProxyBinding, SourceID: "source-kb",
+				KNID: "kn-1", BindingType: "capability", BindingID: "cap-kb",
+			},
+		}
+	}
+
+	// A network binding delegates the binder's own access: without query_data
+	// on the knowledge base there is nothing to hand the proxy.
+	f.grantTypedOperations(t, f.grantor, "knowledge_base", "7", "view_detail")
+	if _, _, err := f.service.Grant(t.Context(), request("query_data")); !errors.Is(err, proxygrant.ErrForbidden) {
+		t.Fatalf("Grant() without the binder's query_data = %v; want forbidden", err)
+	}
+	f.grantTypedOperations(t, f.grantor, "knowledge_base", "7", "query_data")
+
+	source, changed, err := f.service.Grant(t.Context(), request("query_data"))
+	if err != nil || !changed || source.ResourceType != "knowledge_base" || source.Operation != "query_data" {
+		t.Fatalf("Grant() = (%+v, %v, %v)", source, changed, err)
+	}
+	for _, operation := range []string{"query_data", "view_detail"} {
+		if allowed, err := f.enforcer.Check(f.proxyID, "knowledge_base", "7", operation); err != nil || !allowed {
+			t.Fatalf("proxy %s = %v, %v; want allowed", operation, allowed, err)
+		}
+	}
+	if allowed, err := f.enforcer.Check(f.proxyID, "knowledge_base", "8", "query_data"); err != nil || allowed {
+		t.Fatalf("proxy query_data on another knowledge base = %v, %v; want denied", allowed, err)
+	}
+
+	f.grantTypedOperations(t, f.grantor, "knowledge_base", "7", "modify", "authorize")
+	for _, operation := range []string{"view_detail", "modify", "authorize"} {
+		if _, _, err := f.service.Grant(t.Context(), request(operation)); !errors.Is(err, proxygrant.ErrInvalidRequest) {
+			t.Fatalf("Grant(%s) = %v; want invalid request", operation, err)
+		}
+	}
+}
+
 func TestGrantRejectsNonGrantableOperation(t *testing.T) {
 	f := newFixture(t)
 	f.authorize(t, "r-1", "query_data")
@@ -152,6 +225,7 @@ func TestGrantRejectsNonGrantableOperation(t *testing.T) {
 		Update("grantable", false).Error; err != nil {
 		t.Fatal(err)
 	}
+	f.restartRegistry(t)
 
 	if _, changed, err := f.service.Grant(t.Context(), f.request("source-1", "ot-1", "r-1")); !errors.Is(err, proxygrant.ErrInvalidRequest) || changed {
 		t.Fatalf("Grant() = changed %v, err %v; want non-grantable invalid request", changed, err)
@@ -165,6 +239,16 @@ func TestGrantAndSyncNormalizeDirectOperationRequirements(t *testing.T) {
 		Update("implied_operation_ids", "view_detail").Error; err != nil {
 		t.Fatal(err)
 	}
+	f.restartRegistry(t)
+	const callback = "test:proxy-grant-static-metadata"
+	if err := f.db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "operations" || tx.Statement.Table == "resource_types" {
+			t.Errorf("proxy grant queried static metadata: %s", tx.Statement.Table)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.db.Callback().Query().Remove(callback) })
 	f.grantOperations(t, f.grantor, "r-1", "query_data", "view_detail")
 	request := f.request("source-required", "ot-required", "r-1")
 
@@ -254,6 +338,63 @@ func TestGrantAndSyncNormalizeDirectOperationRequirements(t *testing.T) {
 	}
 }
 
+func TestGrantAndRevokeTransitiveOperationRequirements(t *testing.T) {
+	for _, retainIntermediate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retain explicit intermediate=%v", retainIntermediate), func(t *testing.T) {
+			f := newFixture(t)
+			for operation, requirement := range map[string]string{"query_data": "view_detail", "view_detail": "authorize"} {
+				if err := f.db.Model(&model.Operation{}).Where("resource_type_id = ? AND id = ?", "resource", operation).
+					Update("implied_operation_ids", requirement).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.restartRegistry(t)
+			f.grantOperations(t, f.grantor, "r-1", "query_data", "authorize", "view_detail")
+			request := f.request("source-chain", "ot-chain", "r-1")
+			source, changed, err := f.service.Grant(t.Context(), request)
+			if err != nil || !changed {
+				t.Fatalf("Grant()=%+v, %v, %v", source, changed, err)
+			}
+			var active []model.ProxyGrantSource
+			if err := f.db.Where("proxy_account_id = ? AND source_id = ? AND lifecycle_status = ?", f.proxyID, request.Source.SourceID, proxygrant.StatusActive).Find(&active).Error; err != nil {
+				t.Fatal(err)
+			}
+			if len(active) != 3 {
+				t.Fatalf("normalized sources=%+v, want three operations", active)
+			}
+			for _, required := range active {
+				if required.Operation == "query_data" {
+					continue
+				}
+				if _, changed, err := f.service.Revoke(t.Context(), required.ID, proxygrant.RevokeRequest{GrantorID: f.grantor}); !errors.Is(err, proxygrant.ErrSourceRequired) || changed {
+					t.Fatalf("revoke required %s=%v, %v", required.Operation, changed, err)
+				}
+			}
+			if retainIntermediate {
+				explicit := request
+				explicit.Source.Operation = "view_detail"
+				if _, _, err := f.service.Grant(t.Context(), explicit); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, changed, err := f.service.Revoke(t.Context(), source.ID, proxygrant.RevokeRequest{GrantorID: f.grantor}); err != nil || !changed {
+				t.Fatalf("revoke target=%v, %v", changed, err)
+			}
+			var remaining int64
+			if err := f.db.Model(&model.ProxyGrantSource{}).Where("proxy_account_id = ? AND source_id = ? AND lifecycle_status = ?", f.proxyID, request.Source.SourceID, proxygrant.StatusActive).Count(&remaining).Error; err != nil {
+				t.Fatal(err)
+			}
+			wantRemaining := int64(0)
+			if retainIntermediate {
+				wantRemaining = 2
+			}
+			if remaining != wantRemaining {
+				t.Fatalf("remaining sources=%d, want %d", remaining, wantRemaining)
+			}
+		})
+	}
+}
+
 func TestRevokePreservesExplicitRequirementAndReplayIsStrictNoOp(t *testing.T) {
 	f := newFixture(t)
 	if err := f.db.Model(&model.Operation{}).
@@ -261,6 +402,7 @@ func TestRevokePreservesExplicitRequirementAndReplayIsStrictNoOp(t *testing.T) {
 		Update("implied_operation_ids", "view_detail").Error; err != nil {
 		t.Fatal(err)
 	}
+	f.restartRegistry(t)
 	f.grantOperations(t, f.grantor, "r-1", "query_data", "view_detail")
 
 	queryRequest := f.request("source-explicit-required", "ot-explicit-required", "r-1")
@@ -314,6 +456,7 @@ func TestRevokingNormalizedSourcePreservesIndependentRequiredPermissionSource(t 
 		Update("implied_operation_ids", "view_detail").Error; err != nil {
 		t.Fatal(err)
 	}
+	f.restartRegistry(t)
 	f.grantOperations(t, f.grantor, "r-1", "query_data", "view_detail")
 	first, _, err := f.service.Grant(t.Context(), f.request("source-required-1", "ot-required-1", "r-1"))
 	if err != nil {
@@ -423,6 +566,8 @@ func TestKNBindingDerivesExecuteOperationsWithoutAuthorize(t *testing.T) {
 		}
 	}
 
+	f.restartRegistry(t)
+
 	for _, test := range []struct {
 		resourceType string
 		resourceID   string
@@ -461,6 +606,7 @@ func TestSkillCapabilityBindingAcceptsOnlyExecute(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	f.restartRegistry(t)
 	f.grantTypedOperations(t, f.grantor, "skill", "skill-1", "view", "execute")
 	source := func(operation string) proxygrant.SourceSpec {
 		return proxygrant.SourceSpec{
@@ -613,6 +759,7 @@ func TestKNBindingTracksInheritedOperation(t *testing.T) {
 		Update("parent_operation_id", "query_data").Error; err != nil {
 		t.Fatal(err)
 	}
+	f.restartRegistry(t)
 	if err := f.db.Create(&model.ResourceParent{
 		ResourceTypeID: "resource", ResourceID: "r-1", ParentTypeID: "catalog", ParentID: "catalog-1",
 	}).Error; err != nil {
@@ -645,6 +792,8 @@ func TestKNBindingTracksOperationRegistration(t *testing.T) {
 		Delete(&model.Operation{}).Error; err != nil {
 		t.Fatal(err)
 	}
+	assertAllowed(t, f, true) // persisted edits do not alter the running snapshot
+	f.restartRegistry(t)
 	assertAllowed(t, f, false)
 }
 

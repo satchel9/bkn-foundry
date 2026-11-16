@@ -21,7 +21,7 @@ import (
 
 const (
 	capabilityManifestID      = "openbkn.context-loader.mcp"
-	capabilityManifestVersion = "0.1.6"
+	capabilityManifestVersion = "0.1.7"
 
 	capabilityResolutionMatched       = "matched"
 	capabilityResolutionExecutionOnly = "execution_only"
@@ -59,7 +59,7 @@ func capabilityToolSchemas(locale *mcpLocaleBundle, toolName string) (json.RawMe
 	if len(input) == 0 {
 		for _, extra := range mcptool.Extras() {
 			if extra.Name == toolName {
-				return offerBKNContext(extra.Input), extra.Output
+				return extraInputSchema(extra), extra.Output
 			}
 		}
 	}
@@ -133,7 +133,7 @@ func mustLoadCapabilityManifest() CapabilityManifest {
 		tools = append(tools, CapabilityContract{
 			CanonicalToolName:   extra.Name,
 			ToolVersion:         serverVersion,
-			InputSchemaDigest:   schemaDigest(offerBKNContext(extra.Input)),
+			InputSchemaDigest:   schemaDigest(extraInputSchema(extra)),
 			OutputSchemaDigest:  schemaDigest(extra.Output),
 			ExecutionRole:       "extension",
 			EvidenceContract:    "execution_only",
@@ -237,6 +237,7 @@ func capabilitySpecs() []capabilitySpec {
 		{toolKeyExploreSubgraph, "semantic_query", "ontology_subgraph/v1", "cover_physical_descendants", "ontology_subgraph/v1"},
 		{toolKeyGetLogicPropertiesValues, "semantic_query", "execution_only", "none", "none"},
 		{toolKeyQueryMetric, "semantic_query", "ontology_metric_result/v1", "cover_physical_descendants", "ontology_metric_result/v1"},
+		{toolKeyDrillThroughMetric, "semantic_query", "execution_only", "none", "none"},
 		{toolKeyGetActionInfo, "discovery", "execution_only", "none", "none"},
 		{toolKeyExecuteAction, "business_function", "execution_only", "managed_children_only", "none"},
 		{toolKeyGetActionExecution, "business_function", "execution_only", "none", "none"},
@@ -245,10 +246,7 @@ func capabilitySpecs() []capabilitySpec {
 		{toolKeyGetKnDetail, "discovery", "ontology_schema_snapshot/v1", "none", "ontology_schema_snapshot/v1"},
 		{toolKeyGetObjectTypes, "discovery", "ontology_schema_snapshot/v1", "none", "ontology_schema_snapshot/v1"},
 		{toolKeyGetRelationTypes, "discovery", "ontology_schema_snapshot/v1", "none", "ontology_schema_snapshot/v1"},
-		{toolKeyRunSQL, "semantic_query", "mapped_sql_result/v1", "cover_physical_descendants", "mapped_sql_result/v1"},
 		{toolKeyRunCypher, "semantic_query", "semantic_query_descriptor/v1", "cover_physical_descendants", "semantic_query_descriptor/v1"},
-		{toolKeyListResources, "discovery", "execution_only", "none", "none"},
-		{toolKeyDescribeResource, "discovery", "execution_only", "none", "none"},
 		{toolKeyListSkills, "discovery", "execution_only", "none", "none"},
 		{toolKeyGetSkillContent, "discovery", "execution_only", "none", "none"},
 		{toolKeyReadSkillFile, "discovery", "execution_only", "none", "none"},

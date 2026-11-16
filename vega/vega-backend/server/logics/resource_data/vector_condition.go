@@ -42,23 +42,38 @@ func (rds *resourceDataService) resolveVectorConditions(ctx context.Context,
 	if cfg.Operation != filter_condition.OperationKnnVector {
 		return nil
 	}
-	if resource != nil && resource.Category == interfaces.ResourceCategoryTable &&
-		(ignoreLocalIndex || !resourcelogic.HasAvailableLocalIndex(resource)) {
-		if ignoreLocalIndex {
-			return fmt.Errorf("condition [knn_vector] cannot use the local index while ignore_local_index is true")
-		}
-		return fmt.Errorf("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
+	if err := validateVectorIndexConditions(resource, cfg, ignoreLocalIndex); err != nil {
+		return err
 	}
 	text, ok := cfg.Value.(string)
 	if !ok {
 		return nil
 	}
 
-	field, err := vectorFieldFor(resource, cfg.Name)
+	field, err := vectorFieldFor(resource, cfg.Field)
 	if err != nil {
 		return err
 	}
-	modelID, err := rds.embeddingModelForIndex(ctx, resource, cfg.Name)
+	var vectorProperty *interfaces.Property
+	usesLocalIndex := resourcelogic.HasAvailableLocalIndex(resource) &&
+		(resource.Category == interfaces.ResourceCategoryDataset ||
+			resource.Category == interfaces.ResourceCategoryTable && !ignoreLocalIndex)
+	if usesLocalIndex {
+		generatedFields, err := rds.lim.GeneratedFields(resource.SchemaDefinition)
+		if err != nil {
+			return fmt.Errorf("prepare local index generated fields: %w", err)
+		}
+		vectorProperty = generatedFields[field]
+	}
+	if vectorProperty == nil {
+		for _, property := range resource.SchemaDefinition {
+			if property != nil && property.Name == field {
+				vectorProperty = property
+				break
+			}
+		}
+	}
+	modelID, err := rds.embeddingModelForIndex(ctx, resource, cfg.Field)
 	if err != nil {
 		return err
 	}
@@ -78,9 +93,33 @@ func (rds *resourceDataService) resolveVectorConditions(ctx context.Context,
 		return fmt.Errorf("condition [knn_vector] model %q returned no vector for %q", modelID, text)
 	}
 
-	cfg.Name = field
+	if err := filter_condition.ValidateKnnValue(vectorProperty, vectors[0].Vector); err != nil {
+		// 错误向量来自模型输出，不能作为调用方输入错误继续传播。
+		return fmt.Errorf("condition [knn_vector] embedding model returned an invalid vector: %s", err.Error())
+	}
+	cfg.Field = field
 	cfg.Value = vectors[0].Vector
 	return nil
+}
+
+// validateVectorIndexConditions 只检查索引前置条件，不解析字段或调用向量模型。
+func validateVectorIndexConditions(resource *interfaces.Resource, cfg *interfaces.FilterCondCfg, ignoreLocalIndex bool) error {
+	if cfg == nil || resource == nil || resource.Category != interfaces.ResourceCategoryTable ||
+		(!ignoreLocalIndex && resourcelogic.HasAvailableLocalIndex(resource)) {
+		return nil
+	}
+	for _, sub := range cfg.SubConds {
+		if err := validateVectorIndexConditions(resource, sub, ignoreLocalIndex); err != nil {
+			return err
+		}
+	}
+	if cfg.Operation != filter_condition.OperationKnnVector {
+		return nil
+	}
+	if ignoreLocalIndex {
+		return interfaces.NewConditionBuildError("condition [knn_vector] cannot use the local index while ignore_local_index is true")
+	}
+	return interfaces.NewConditionBuildError("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
 }
 
 // vectorFieldFor finds the physical vector field for a source field.
@@ -90,10 +129,10 @@ func (rds *resourceDataService) resolveVectorConditions(ctx context.Context,
 // If any other operator is used, the caller will get a result that is completely different in semantics but seems successful.
 func vectorFieldFor(resource *interfaces.Resource, name string) (string, error) {
 	if resource == nil {
-		return "", fmt.Errorf("condition [knn_vector] left field '%s' has no resource context", name)
+		return "", interfaces.NewConditionBuildError("condition [knn_vector] left field '%s' has no resource context", name)
 	}
 	if !resourcelogic.HasAvailableLocalIndex(resource) {
-		return "", fmt.Errorf("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
+		return "", interfaces.NewConditionBuildError("condition [knn_vector] resource '%s' has no local index; build one before vector search", resource.Name)
 	}
 
 	for _, prop := range resource.SchemaDefinition {
@@ -119,16 +158,16 @@ func vectorFieldFor(resource *interfaces.Resource, name string) (string, error) 
 		}
 	}
 
-	return "", fmt.Errorf("condition [knn_vector] field '%s' has no vector index on resource '%s'", name, resource.Name)
+	return "", interfaces.NewConditionBuildError("condition [knn_vector] field '%s' has no vector index on resource '%s'", name, resource.Name)
 }
 
 // embeddingModelForIndex resolves the model from the current Resource index
 // configuration. An available Resource guarantees this configuration matches
 // its managed index, so queries never depend on a historical BuildTask.
-func (rds *resourceDataService) embeddingModelForIndex(ctx context.Context,
+func (rds *resourceDataService) embeddingModelForIndex(_ context.Context,
 	resource *interfaces.Resource, field string) (string, error) {
 	if resource == nil || resource.IndexConfig == nil {
-		return "", fmt.Errorf("condition [knn_vector] resource has no index configuration")
+		return "", interfaces.NewConditionBuildError("condition [knn_vector] resource has no index configuration")
 	}
 	for _, prop := range resource.SchemaDefinition {
 		if prop == nil || prop.Name != field {
@@ -145,8 +184,8 @@ func (rds *resourceDataService) embeddingModelForIndex(ctx context.Context,
 			if modelID := strings.TrimSpace(resource.IndexConfig.DefaultEmbeddingModel); modelID != "" {
 				return modelID, nil
 			}
-			return "", fmt.Errorf("condition [knn_vector] field '%s' has no embedding model", field)
+			return "", interfaces.NewConditionBuildError("condition [knn_vector] field '%s' has no embedding model", field)
 		}
 	}
-	return "", fmt.Errorf("condition [knn_vector] field '%s' has no vector index on resource '%s'", field, resource.Name)
+	return "", interfaces.NewConditionBuildError("condition [knn_vector] field '%s' has no vector index on resource '%s'", field, resource.Name)
 }

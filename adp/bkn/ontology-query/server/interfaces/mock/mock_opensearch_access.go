@@ -11,7 +11,7 @@ package mock_interfaces
 
 import (
 	context "context"
-	interfaces "ontology-query/interfaces"
+	interfaces "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 	reflect "reflect"
 
 	gomock "go.uber.org/mock/gomock"
@@ -182,6 +182,20 @@ func (m *MockOpenSearchAccess) InsertData(ctx context.Context, indexName, docID 
 func (mr *MockOpenSearchAccessMockRecorder) InsertData(ctx, indexName, docID, data any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "InsertData", reflect.TypeOf((*MockOpenSearchAccess)(nil).InsertData), ctx, indexName, docID, data)
+}
+
+// PutMapping mocks base method.
+func (m *MockOpenSearchAccess) PutMapping(ctx context.Context, indexName string, body any) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PutMapping", ctx, indexName, body)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// PutMapping indicates an expected call of PutMapping.
+func (mr *MockOpenSearchAccessMockRecorder) PutMapping(ctx, indexName, body any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PutMapping", reflect.TypeOf((*MockOpenSearchAccess)(nil).PutMapping), ctx, indexName, body)
 }
 
 // SearchData mocks base method.

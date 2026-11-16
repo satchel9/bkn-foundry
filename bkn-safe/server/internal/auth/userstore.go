@@ -6,7 +6,7 @@
 // (password verified with bcrypt) plus the hydra login/consent/device provider
 // that drives the OAuth2 flow and injects the introspect ext claims.
 //
-// Passwords are validated against bkn-safe's OWN store — NOT eacp/anyshare.
+// Passwords are validated against bkn-safe's OWN store, not an external user service.
 package auth
 
 import (
@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/identity"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/managedproxy"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
@@ -54,6 +55,10 @@ var ErrManagedLoginDisabled = fmt.Errorf("%w: managed account login disabled", E
 
 // ErrUserDisabled is returned when the account exists but is disabled.
 var ErrUserDisabled = errors.New("user disabled")
+
+// ErrAccountAlreadyExists indicates a user creation rejected by the unique
+// account constraint, including a concurrent creation of the same account.
+var ErrAccountAlreadyExists = errors.New("account already exists")
 
 // ErrMustChangePassword is returned when credentials are valid but the user must
 // change their password before the login can be accepted (e.g. the seeded admin
@@ -117,7 +122,25 @@ func (s *UserStore) CreateLocalUser(ctx context.Context, u *model.User, password
 	u.PasswordHash = string(hash)
 	u.Source = model.SourceLocal
 	u.MustChangePassword = true
-	return s.db.WithContext(ctx).Create(u).Error
+	err = s.db.WithContext(ctx).Create(u).Error
+	if err == nil {
+		return nil
+	}
+	// Translate only this operation's error; changing the shared GORM config
+	// would also change the errors returned by unrelated stores.
+	translated := err
+	if translator, ok := s.db.Dialector.(gorm.ErrorTranslator); ok {
+		translated = translator.Translate(err)
+	}
+	if errors.Is(translated, gorm.ErrDuplicatedKey) {
+		// A duplicate primary key must not be described as an account conflict.
+		// Query after the failed insert so concurrent creates are also covered.
+		var existing model.User
+		if lookupErr := s.db.WithContext(ctx).Select("id").Where("account = ?", u.Account).First(&existing).Error; lookupErr == nil {
+			return ErrAccountAlreadyExists
+		}
+	}
+	return err
 }
 
 // UpdateUser patches mutable profile fields of a user (name/email/telephone/
@@ -137,10 +160,10 @@ func (s *UserStore) UpdateUser(ctx context.Context, id string, fields map[string
 	return nil
 }
 
-// DeleteUser removes a user and its directory memberships (department links and
-// group memberships) in one transaction. Casbin role/permission cleanup is the
-// caller's job (it holds the enforcer). Returns gorm.ErrRecordNotFound when the
-// user doesn't exist.
+// DeleteUser removes a user and memberships, invoking companion cleanup in the
+// same transaction. Extensions can return an error to roll back the whole delete.
+// Casbin role/permission cleanup is the caller's job (it holds the enforcer).
+// Returns gorm.ErrRecordNotFound when the user doesn't exist.
 func (s *UserStore) DeleteUser(ctx context.Context, id string) error {
 	if err := rejectManagedMutation(ctx, s.db, id); err != nil {
 		return err
@@ -154,6 +177,9 @@ func (s *UserStore) DeleteUser(ctx context.Context, id string) error {
 			return gorm.ErrRecordNotFound
 		}
 		if err := tx.Where("user_id = ?", id).Delete(&model.UserDepartment{}).Error; err != nil {
+			return err
+		}
+		if err := identity.CleanupUser(tx, id); err != nil {
 			return err
 		}
 		return tx.Where("member_id = ?", id).Delete(&model.GroupMember{}).Error

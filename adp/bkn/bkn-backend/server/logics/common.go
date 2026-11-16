@@ -12,17 +12,17 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func BuildDslQuery(ctx context.Context, queryStr string, query *interfaces.ConceptsQuery) (map[string]any, error) {
 	var dslMap map[string]any
 	err := json.Unmarshal([]byte(queryStr), &dslMap)
 	if err != nil {
-		return map[string]any{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return map[string]any{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_InternalError_UnMarshalDataFailed).
 			WithErrorDetails(fmt.Sprintf("failed to unMarshal dslStr to map, %s", err.Error()))
 	}

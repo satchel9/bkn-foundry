@@ -275,6 +275,10 @@ openbkn bkn object-type query <kn_id> <ot_id> '{
 }'
 ```
 
+`like` and `not_like` take a complete SQL LIKE pattern: `widget` matches the complete value, `%widget%` contains it, `widget%` is a prefix, and `_` matches one character. Use `\%`, `\_`, or `\\` for a literal wildcard or backslash; a trailing escape is invalid. Previously saved patterns without wildcards may have meant containment under the old BKN behavior. Review and update them explicitly; the service does not rewrite saved conditions.
+
+Roll out BKN together with a Vega version that uses complete LIKE patterns and a Studio version that supports them. An older Studio filter editor rejects unescaped `%` and previews LIKE as literal containment. New Vega with old BKN can turn a former containment condition into a full-value match; new BKN with old Vega may reject a new pattern containing `%`. Audit saved conditions and caller-supplied values before the switch. For each entry, record its location, original value, intended match semantics, and adjusted value; add wildcards explicitly to bare values that must keep containment semantics, then verify representative results after the switch. Record the coordinated BKN, Vega, and Studio versions and cutover time in the release plan.
+
 ### Relation Types
 
 ```bash
@@ -301,14 +305,17 @@ openbkn bkn search <kn_id> "high-value customers" --limit 20
 
 ```bash
 openbkn bkn action-type list <kn_id>
-openbkn bkn action-type query <kn_id> '{"name":"calculate_risk"}'
-openbkn bkn action-type execute <kn_id> <action_id> '{"input":{"customer_id":"C-1001"}}'
+openbkn bkn action-type query <kn_id> <action_id>
+openbkn bkn action-type execute <kn_id> <action_id> \
+  --body '{"_instance_identities":[{"customer_id":"C-1001"}],"dynamic_params":{}}'
 
 openbkn bkn action-log list <kn_id> --limit 20
 openbkn bkn action-log get <kn_id> <log_id>
 openbkn bkn action-log cancel <kn_id> <log_id>
-openbkn bkn action-execution get <kn_id> <execution_id>
+openbkn bkn action-execution <kn_id> <execution_id>
 ```
+
+`--body` is the execution request. Name the target the way the action type's operation needs it; an action never scans its condition for targets. A modify or delete passes `_instance_identities` (as above); a create passes `object_input` with the new instance's referenced property values; a relation create or delete passes one `relation_target` (`source_identity` and `target_identity`); a standalone tool call passes only `dynamic_params`.
 
 ### End-to-End Example
 
@@ -410,15 +417,15 @@ console.log('build:', buildTask);
 
 ```bash
 # List knowledge networks
-curl -sk "https://<access-address>/api/ontology-manager/v1/knowledge-networks?name=order&sort=update_time&direction=desc&limit=50" \
+curl -sk "https://<access-address>/api/bkn-backend/v1/knowledge-networks?name=order&sort=update_time&direction=desc&limit=50" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # Get a single knowledge network
-curl -sk "https://<access-address>/api/ontology-manager/v1/knowledge-networks/kn-001" \
+curl -sk "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # Create a knowledge network
-curl -sk -X POST "https://<access-address>/api/ontology-manager/v1/knowledge-networks" \
+curl -sk -X POST "https://<access-address>/api/bkn-backend/v1/knowledge-networks" \
   -H "Authorization: Bearer $(openbkn token)" \
   -H "Content-Type: application/json" \
   -d '{
@@ -429,11 +436,11 @@ curl -sk -X POST "https://<access-address>/api/ontology-manager/v1/knowledge-net
   }'
 
 # List object types
-curl -sk "https://<access-address>/api/ontology-manager/v1/knowledge-networks/kn-001/object-types" \
+curl -sk "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001/object-types" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # Create an object type
-curl -sk -X POST "https://<access-address>/api/ontology-manager/v1/knowledge-networks/kn-001/object-types" \
+curl -sk -X POST "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001/object-types" \
   -H "Authorization: Bearer $(openbkn token)" \
   -H "Content-Type: application/json" \
   -d '{
@@ -469,17 +476,17 @@ curl -sk -X POST "https://<access-address>/api/ontology-query/v1/knowledge-netwo
   -d '{"query": "overdue invoices in Q1", "limit": 10}'
 
 # List relation types
-curl -sk "https://<access-address>/api/ontology-manager/v1/knowledge-networks/kn-001/relation-types" \
+curl -sk "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001/relation-types" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # Execute an action type
-curl -sk -X POST "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001/actions/act-risk/execute" \
+curl -sk -X POST "https://<access-address>/api/ontology-query/v1/knowledge-networks/kn-001/action-types/act-risk/execute" \
   -H "Authorization: Bearer $(openbkn token)" \
   -H "Content-Type: application/json" \
-  -d '{"input": {"customer_id": "C-1001"}}'
+  -d '{"_instance_identities": [{"customer_id": "C-1001"}], "dynamic_params": {}}'
 
 # Get action execution result
-curl -sk "https://<access-address>/api/bkn-backend/v1/knowledge-networks/kn-001/action-executions/exec-001" \
+curl -sk "https://<access-address>/api/ontology-query/v1/knowledge-networks/kn-001/action-executions/exec-001" \
   -H "Authorization: Bearer $(openbkn token)"
 
 # Build / rebuild network indexes

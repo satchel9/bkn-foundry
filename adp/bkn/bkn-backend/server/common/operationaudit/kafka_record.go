@@ -13,9 +13,12 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/auditpublisher"
+
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/locale"
 )
 
 const kafkaAuditSourceID = "bkn-backend"
@@ -70,25 +73,31 @@ func BuildKafkaAuditRecord(entry Entry, environment string) ([]byte, error) {
 		return nil, fmt.Errorf("invalid Audit outcome %q", entry.Outcome)
 	}
 	if entry.HTTPStatus < 100 || entry.HTTPStatus > 599 {
-		return nil, errors.New("Audit HTTP status is missing or invalid")
+		return nil, errors.New("audit HTTP status is missing or invalid")
 	}
 	changedFields, ok := entry.ChangeSummary["changed_fields"].([]string)
 	if !ok {
-		return nil, errors.New("Audit fact has no bounded changed_fields")
+		return nil, errors.New("audit fact has no bounded changed_fields")
 	}
 	if len(changedFields) > 100 {
-		return nil, errors.New("Audit changed_fields exceeds schema limit")
+		return nil, errors.New("audit changed_fields exceeds schema limit")
 	}
 	seen := make(map[string]struct{}, len(changedFields))
 	for _, field := range changedFields {
 		if field == "" || len(field) > 128 {
-			return nil, errors.New("Audit changed_fields contains an invalid field")
+			return nil, errors.New("audit changed_fields contains an invalid field")
 		}
 		if _, duplicate := seen[field]; duplicate {
-			return nil, errors.New("Audit changed_fields contains a duplicate")
+			return nil, errors.New("audit changed_fields contains a duplicate")
 		}
 		seen[field] = struct{}{}
 	}
+	actorName := safeAuditDisplayName(entry.ActorName, 256)
+	targetName := safeAuditDisplayName(entry.TargetName, 512)
+	if actorName == "" || actorName == entry.ActorID || entry.ActorID == "unauthenticated" || targetName == "" || targetName == entry.TargetID {
+		return nil, &InvalidAuditFieldError{Field: "display_snapshot", Reason: "missing readable business snapshot"}
+	}
+
 	actorType := "service_account"
 	if entry.ActorType == "user" {
 		actorType = "user"
@@ -133,7 +142,7 @@ func BuildKafkaAuditRecord(entry Entry, environment string) ([]byte, error) {
 			"source_channel": "api", "transport": "http", "method": method,
 		},
 		"correlation": map[string]any{"request_id": requestID},
-		"summary":     entry.Action + " " + entry.TargetType,
+		"summary":     auditSummary(entry.Action, entry.TargetType, targetName),
 		"facts": map[string]any{
 			"action": entry.Action, "decision": decision, "changed_fields": changedFields,
 		},
@@ -167,7 +176,7 @@ func boundedAuditReference(value string, limit int) string {
 
 func safeAuditDisplayName(value string, limit int) string {
 	name := strings.TrimSpace(value)
-	if len(name) > limit {
+	if utf8.RuneCountInString(name) > limit {
 		return ""
 	}
 	return name
@@ -181,3 +190,10 @@ func validAuditEnvironment(value string) bool {
 		return false
 	}
 }
+
+func auditSummary(action, target, name string) string {
+	return locale.AuditSummary(action, target, name)
+}
+
+// init loads immutable audit copy before this package builds ledger snapshots.
+func init() { locale.Register() }

@@ -134,9 +134,9 @@
         {
           "id": "task_manage",
           "name": "任务管理",
-          "description": "查看、创建、取消和管理数据目录下的构建任务、资源发现任务、语义理解任务及资源发现调度；需要同时具有查看数据目录权限。",
+          "description": "查看、创建、取消和管理数据目录下的构建任务、资源发现任务、语义理解任务及资源发现调度；新授权需要同时具有资源管理权限及查看数据目录权限。",
           "requires": [
-            "view_detail"
+            "resource_manage"
           ]
         },
         {
@@ -246,6 +246,49 @@
           ],
           "description": "配置连接器类型的访问权限。需要同时具有连接器类型的查看权限。"
         }
+      ]
+    },
+    {
+      "id": "knowledge_base",
+      "name": "知识库",
+      "_source": "kb-api (openbkn-ee)",
+      "_note": "专业版知识库的授权根，只做到知识库级，不做文档级。除 create 外的所有操作都要求本知识库 view_detail。连接归创建者使用，不单独授权。",
+      "operations": [
+        {"id": "view_detail", "name": "查看", "description": "查看知识库的配置、来源、文档、分片与解析结果。"},
+        {"id": "create", "name": "新建", "description": "新建知识库，并管理知识库分组。"},
+        {"id": "modify", "name": "修改", "description": "修改知识库配置，添加、修改和移除来源；需要同时具有查看知识库权限。", "requires": ["view_detail"]},
+        {"id": "delete", "name": "删除", "description": "删除知识库及其文档；需要同时具有查看知识库权限。", "requires": ["view_detail"]},
+        {"id": "authorize", "name": "授权", "description": "配置知识库的访问权限；需要同时具有查看知识库权限。", "requires": ["view_detail"]},
+        {"id": "document_manage", "name": "文档管理", "description": "上传、删除、启用或停用知识库中的文档，修改文档的解析设置；需要同时具有查看知识库权限。", "requires": ["view_detail"]},
+        {"id": "task_manage", "name": "任务管理", "description": "触发解析、立即同步来源、重新清洗分片；需要同时具有查看知识库权限。", "requires": ["view_detail"]},
+        {"id": "query_data", "name": "查询", "description": "读取知识库的原始文件，以及经只读接口读取分片与原文；需要同时具有查看知识库权限。", "requires": ["view_detail"]}
+      ]
+    },
+    {
+      "id": "workshop_app",
+      "name": "Workshop 应用",
+      "_source": "workshop (openbkn-ee)",
+      "_note": "专业版 Workshop 应用的授权根，只做到应用级。create 是整类的新建资格，不要求 view。应用内的事件、任务与 AI 对话跟随所属应用授权。读写应用数据仍以用户身份经平台校验知识网络权限。",
+      "operations": [
+        {"id": "view", "name": "查看", "description": "查看应用及其已发布版本。"},
+        {"id": "create", "name": "新建", "description": "新建应用；同时需要对应用所用知识网络具有查看权限。"},
+        {"id": "use", "name": "使用", "description": "在运行页使用应用：登记与核实事件、处理任务；需要同时具有查看应用权限。", "requires": ["view"]},
+        {"id": "modify", "name": "修改", "description": "修改应用信息与草稿，使用构建器 AI 对话；需要同时具有查看应用权限。", "requires": ["view"]},
+        {"id": "publish", "name": "发布", "description": "发布应用的新版本；需要同时具有修改应用权限。", "requires": ["modify"]},
+        {"id": "delete", "name": "删除", "description": "删除应用及其版本与任务（事件属于知识网络，不随应用删除）；需要同时具有修改应用权限。", "requires": ["modify"]},
+        {"id": "authorize", "name": "授权", "description": "配置应用的访问权限；需要同时具有查看应用权限。", "requires": ["view"]}
+      ]
+    },
+    {
+      "id": "graph_analysis",
+      "name": "图分析",
+      "_source": "workshop (openbkn-ee)",
+      "_note": "图探索分析画布的授权根，只做到分析级。分析的卡片查询仍以用户身份经平台校验知识网络权限。",
+      "operations": [
+        {"id": "view", "name": "查看", "description": "查看分析的卡片、连线、页面与 AI 对话。"},
+        {"id": "modify", "name": "修改", "description": "修改分析的卡片、连线、页面，并向 AI 提问；需要同时具有查看分析权限。", "requires": ["view"]},
+        {"id": "delete", "name": "删除", "description": "删除分析；需要同时具有修改分析权限。", "requires": ["modify"]},
+        {"id": "authorize", "name": "授权", "description": "配置分析的访问权限；需要同时具有查看分析权限。", "requires": ["view"]}
       ]
     },
     {
@@ -726,74 +769,6 @@
       ]
     },
     {
-      "id": "operator",
-      "name": "算子",
-      "_source": "execution-factory + flow-automation (ops 取并集; flow-automation 仅用 execute)",
-      "_authorization_note": "独立根资源，不做父级回退。modify/delete/publish/unpublish/authorize requires 同资源的 view；create/view/public_access/execute 独立。",
-      "operations": [
-        {
-          "id": "create",
-          "name": "新建",
-          "description": "新建算子。"
-        },
-        {
-          "id": "modify",
-          "name": "修改",
-          "requires": [
-            "view"
-          ],
-          "description": "修改算子配置。需要同时具有算子的查看权限。"
-        },
-        {
-          "id": "delete",
-          "name": "删除",
-          "requires": [
-            "view"
-          ],
-          "description": "删除算子。需要同时具有算子的查看权限。"
-        },
-        {
-          "id": "view",
-          "name": "查看",
-          "description": "查看算子。"
-        },
-        {
-          "id": "publish",
-          "name": "发布",
-          "requires": [
-            "view"
-          ],
-          "description": "发布算子，使其可被其他用户使用。需要同时具有算子的查看权限。"
-        },
-        {
-          "id": "unpublish",
-          "name": "取消发布",
-          "requires": [
-            "view"
-          ],
-          "description": "取消发布算子。需要同时具有算子的查看权限。"
-        },
-        {
-          "id": "authorize",
-          "name": "授权",
-          "requires": [
-            "view"
-          ],
-          "description": "配置算子的访问权限。需要同时具有算子的查看权限。"
-        },
-        {
-          "id": "public_access",
-          "name": "公开访问",
-          "description": "配置算子的公开访问。"
-        },
-        {
-          "id": "execute",
-          "name": "执行",
-          "description": "执行或调用算子。"
-        }
-      ]
-    },
-    {
       "id": "skill",
       "name": "Skill",
       "_source": "execution-factory",
@@ -1153,6 +1128,19 @@
           "id": "manage",
           "name": "管理",
           "description": "管理登录客户端配置。"
+        }
+      ]
+    },
+    {
+      "id": "admin-agent",
+      "name": "内置 Agent 管理",
+      "_source": "bkn-agent",
+      "_note": "Type level, like admin-client: changing any built-in Agent (model, MCP surface, limits, shared Prompt, restore). Reading stays open to verified accounts.",
+      "operations": [
+        {
+          "id": "manage",
+          "name": "管理",
+          "description": "修改平台内置 Agent 的配置、共享提示词，或恢复它的初始版本。"
         }
       ]
     },

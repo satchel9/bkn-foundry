@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: 工具箱
+  title: 执行工厂 · 工具箱 API
   description: |
     工具箱（tool box）是**一组工具的容器**，也是权限与发布的单位。Agent 挂载的是
     工具箱，不是单个工具。
@@ -10,13 +10,14 @@ info:
     与分类；箱内每个工具有独立的启停开关（`enabled` / `disabled`）。两者是两套状态，
     别混——工具箱已发布不代表箱内工具都启用。
 
-    **工具从哪来**，三条路：
+    **工具从哪来**，两条路：
 
     | 方式 | 接口 |
     |---|---|
     | 直接建（写 OpenAPI 或函数代码） | `POST /tool-box/{box_id}/tool` |
-    | 由已有算子转换 | `POST /operator/convert/tool` |
-    | 一份 OpenAPI 文档批量建算子 + 工具 | `POST /capabilities/openapi-bundle` |
+    | 一份 OpenAPI 文档批量建工具（可顺带新建工具箱） | `POST /capabilities/openapi-bundle` |
+
+    工具箱、MCP Server 与 Skill 共用的分类列表见 [category.yaml](category.yaml)。
 
     **时间戳一律是纳秒**：所有 `*_time` 字段由 `time.Now().UnixNano()` 生成，
     按毫秒解析会得到 1970 年附近的日期。
@@ -210,7 +211,7 @@ paths:
       summary: 按 ID 批量取工具箱名
       operationId: getToolBoxNames
       description: |
-        与 `/operator/names`、`/skills/names` 同契约：不存在的 ID 静默略过、不占位，
+        与 `/skills/names` 同契约：不存在的 ID 静默略过、不占位，
         调用方自己比对哪些没回来。
       requestBody:
         required: true
@@ -315,7 +316,7 @@ paths:
       operationId: updateToolBoxStatus
       description: |
         发布 / 下架工具箱。**工具箱只有三个状态**（`unpublish` / `published` /
-        `offline`），没有算子那边的 `editing`。
+        `offline`），没有 `editing`。
       parameters:
         - $ref: '#/components/parameters/BoxID'
       requestBody:
@@ -360,6 +361,13 @@ paths:
         往箱子里加工具。`metadata_type` 决定必填字段：`function` 走
         `function_input`（代码约定见 [function.yaml](function.yaml)，入口函数必须叫
         `handler`），`openapi` 走 `data`（OpenAPI 原文）。
+
+        **Cypher 函数**：函数工具箱里的函数有两种脚本类型，`python` 与 `cypher`。
+        `script_type=cypher` 时，`code` 是一条只读 Cypher 语句，语句里的 `$name`
+        就是入参，另需 `kn_id`（查哪个知识网络）与 `result_shape`（`value` / `table`）。
+        保存前平台以**调用人身份**向 bkn-backend 发一次 `explain`（只编译、不读数据）：
+        语法错误、写操作、对象类或属性不存在、调用人无权读取时拒绝保存，并带回
+        bkn-backend 的原因；`value` 形状返回多列或节点、关系、map、列表时也拒绝。
 
         **一次可以建出多个工具**：一份 OpenAPI 文档里有几个操作就建几个工具，
         所以响应是 `success_count` / `failure_count` 的批量结果，**部分成功是常态**
@@ -635,6 +643,10 @@ paths:
         调用主体来自 OAuth/AppKey 或受信任内部身份上下文，并且必须对具体
         `tool_box:{box_id}` 持有 `execute`。拒绝或 bkn-safe 判定失败时不会调用工具。
 
+        For platform Function tools, the authenticated request credential reaches
+        the sandbox without requiring conversation/interaction IDs or enabling
+        Trace. The proxy endpoint below uses the same credential forwarding rules.
+
         参数按 HTTP 的四个位置分开传：`header` / `query` / `path` / `body`。
         函数工具的顶层 `timeout` 以秒为单位控制沙箱执行；超时时响应体的
         `status_code` 为 504，接口本身仍返回 200。
@@ -663,7 +675,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -694,18 +706,31 @@ paths:
         这与调试接口不同——调试允许作者跑未发布的东西；生产调用不允许。下架一个
         工具箱即刻让其全部工具停止响应本接口，不等下一次索引对账。
 
-        **函数工具（`metadata_type=function`）的受管上下文**：请求同时带
-        `Authorization`、`bkn-conversation-id`、`bkn-interaction-id` 三者时，平台把
-        已认证的调用者与其托管 Interaction 透传进本次沙箱执行，函数可用
-        `sandbox_sdk.bkn` 以调用者权限读取知识网络，读到的内容归因到同一个
-        Interaction。三者缺一即视为非受管调用，函数拿不到凭据与会话上下文。
+        **Function caller credentials and optional lifecycle context**: both REST debug
+        and proxy execution forward the authenticated request credential to this
+        deployment's own Function runtime, regardless of Trace/evidence capture or
+        whether conversation/interaction IDs are present. The Function can use
+        `bkn_osdk` as the invoking caller without repeating a token in its inputs.
+        Only a complete `bkn-conversation-id` / `bkn-interaction-id` pair is forwarded;
+        partial lifecycle context is omitted. No MCP start/finish is required for
+        these REST calls. Credential forwarding does not grant extra permissions.
 
         这些值由服务端从请求本身捕获，**不是工具的业务参数**，不写进工具 Schema，
-        请求体里同名字段会被服务端捕获值覆盖。非函数工具不透传：OpenAPI 与算子类工具
+        请求体里同名字段会被服务端捕获值覆盖。非函数工具不透传：OpenAPI 类工具
         指向第三方地址，平台身份不出网。
 
         注意随之而来的信任边界：函数代码由注册者提供，沙箱可出网，因此被调函数
         能在自身环境变量里读到调用者的活令牌。只把函数工具发布给可信的注册者。
+
+        **Cypher 函数**不进沙箱：平台以调用人身份在 bkn-backend 中执行语句，行列权限
+        与属性权限按调用人生效，与 Python 函数用调用人令牌读 BKN 得到的结果一致。
+        经知识网络代理调用（逻辑属性取值、Context Loader `execute_tool`）时，代理账号
+        只用来校验这个绑定能否调用该工具，语句仍以代理所代表的调用人身份执行。入参取自
+        `body`，按 `inputs` 的类型转换（如 `"5"` 转为数字），缺少入参或类型不符时
+        不执行查询，信封 `status_code` 为 400。bkn-backend 的拒绝（语法、权限、超时
+        等）原样放进信封的 `status_code` 与 `body`。顶层 `timeout` 是调用方最多等待的
+        秒数，超过时信封 `status_code` 为 504；语句本身的运行时长由 bkn-backend 的配置
+        限定（默认 55 秒）。
       parameters:
         - $ref: '#/components/parameters/BoxID'
         - $ref: '#/components/parameters/ToolID'
@@ -731,65 +756,30 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
-  /operator/convert/tool:
-    post:
-      tags:
-        - ToolBox
-      summary: 把算子转换成工具
-      operationId: convertOperatorToTool
-      description: |
-        拿一个已注册的算子，在指定工具箱里生成对应的工具。算子与工具之间保留血缘，
-        算子更新后工具可随之更新。
-
-        路径挂在 `/operator/` 下但归工具箱模块管——它产出的是工具。
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/ConvertOperatorRequest'
-      responses:
-        '200':
-          description: 转换结果
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  box_id:
-                    type: string
-                  tool_id:
-                    type: string
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/InternalError'
 
   /capabilities/openapi-bundle:
     post:
       tags:
         - ToolBox
-      summary: 一份 OpenAPI 文档批量建算子与工具
+      summary: 一份 OpenAPI 文档批量建工具
       operationId: registerOpenApiBundle
       description: |
-        「能力包」注册：给一份 OpenAPI 3.0 文档，一次性把里面每个操作注册成算子，
-        再转换成工具放进工具箱，两者血缘打通。省掉逐个注册再逐个转换。
+        「能力包」注册：给一份 OpenAPI 3.0 文档，把里面每个操作直接建成一个工具放进
+        工具箱，与 `POST /tool-box/{box_id}/tool` 走同一条建工具路径。新建的工具
+        **初始为 `disabled`**，需要再启用。
 
-        `box_id` 与 `box_name` **二选一**：给 `box_id` 就往已有箱子里加，
-        给 `box_name` 就新建一个箱子。
+        `box_id` 与 `box_name` **二选一**：给 `box_id` 就往已有的 `openapi` 类工具箱
+        里加，`box_id` 为空时按 `box_name` 新建一个 `openapi` 类工具箱。两者都不给
+        返回 400。
 
-        **部分失败是常态**：接口返回 200，`failure_count` 与 `failures` 说明哪些
-        操作没建成。`links` 给出算子与工具的对应关系。
+        **部分失败是常态**：只要建成至少一个工具就返回 200，`failure_count` 与
+        `failures` 说明哪些操作没建成；一个都没建成返回 400。
       requestBody:
         required: true
         content:
@@ -805,7 +795,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/OpenApiBundleResponse'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: 缺少 `box_id` 与 `box_name`、参数不合法，或文档里没有一个操作建成工具
+          content:
+            application/json:
+              schema:
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -932,7 +926,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
               examples:
                 缺 tool_name:
                   value:
@@ -1083,31 +1077,31 @@ components:
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Unauthorized:
       description: 凭据缺失或无效
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Forbidden:
       description: 当前主体缺少所需资源权限
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     NotFound:
       description: 工具箱或工具不存在
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     InternalError:
       description: 服务内部错误
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   schemas:
     BizStatus:
@@ -1117,7 +1111,7 @@ components:
         - published
         - offline
       description: |
-        工具箱的生命周期状态。**只有三个值**，没有算子那边的 `editing`。
+        工具箱的生命周期状态。**只有三个值**，没有 `editing`。
 
     ToolStatus:
       type: string
@@ -1216,8 +1210,15 @@ components:
           default: custom
           description: 来源。
         data:
-          type: string
-          description: OpenAPI 原文，建箱同时导入工具时用。
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: string
+          description: |
+            OpenAPI 文档，建箱同时导入工具时用。
+            JSON 请求体里传 OpenAPI 文档**对象**（不是转义后的字符串，传字符串会解析失败）；
+            `application/x-www-form-urlencoded` 与 `multipart/form-data` 里是 OpenAPI
+            JSON/YAML 原文文本，multipart 时也可作为名为 `data` 的文件上传。
 
     UpdateToolBoxRequest:
       type: object
@@ -1239,8 +1240,15 @@ components:
         metadata_type:
           $ref: '#/components/schemas/MetadataType'
         data:
-          type: string
-          description: OpenAPI 原文。
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: string
+          description: |
+            OpenAPI 文档。
+            JSON 请求体里传 OpenAPI 文档**对象**（不是转义后的字符串，传字符串会解析失败）；
+            `application/x-www-form-urlencoded` 与 `multipart/form-data` 里是 OpenAPI
+            JSON/YAML 原文文本，multipart 时也可作为名为 `data` 的文件上传。
 
     UpdateToolBoxResponse:
       type: object
@@ -1396,7 +1404,8 @@ components:
           additionalProperties: true
           description: |
             工具元数据。`openapi` 类的接口定义在 `api_spec`，`function` 类的代码在
-            `function_content`。
+            `function_content`；Cypher 函数的 `function_content` 另带 `kn_id` 与
+            `result_shape`，`code` 为语句。
         use_rule:
           type: string
           description: 使用规则，告诉大模型什么时候该调这个工具。
@@ -1406,8 +1415,7 @@ components:
           type: string
           enum:
             - tool
-            - operator
-          description: 资源类型。由算子转换而来的工具会标 `operator`。
+          description: 资源类型，恒为 `tool`。
         extend_info:
           type: object
           additionalProperties: true
@@ -1481,13 +1489,34 @@ components:
           type: object
           additionalProperties: true
           description: |
-            函数定义。**`metadata_type=function` 时必填**，结构见
-            [operator.yaml](operator.yaml) 的 `FunctionInput`：入口函数必须叫 `handler`。
+            函数定义。**`metadata_type=function` 时必填**，字段为 `name`、
+            `description`、`script_type`（`python` 或 `cypher`，默认 `python`）、`code`、
+            `inputs`、`outputs`、`dependencies`、`dependencies_url`，以及仅 Cypher 函数
+            使用的 `kn_id`、`result_shape`。
+
+            - `python`：代码约定与 [function.yaml](function.yaml) 一致，入口函数必须叫
+              `handler`。
+            - `cypher`：`code` 为只读 Cypher 语句；`kn_id` 必填；`result_shape` 必填，
+              `value` 返回 `{"value": x}`（只能一列标量，0 行为 null，多于 1 行报错），
+              `table` 返回 `{columns, entries, limited}`。decimal 属性的值和对它的
+              `sum()` 以字符串返回（如 `"13833141.000000"`），计算出的比值等以数字返回。
+              语句在数据源上最多执行 55 秒（bkn-backend `cypherQueryTimeoutSec`），调用时的
+              `timeout` 不能延长它。`inputs` 必须与语句中的 `$name`
+              一一对应（多出或缺少都拒绝），类型只能是 `string`、`number`、`boolean`，
+              或这三者之一的 `array`（用于 `IN $name`）；每个入参都要写
+              `description`。`required: false` 的入参调用时可以不传（或传 null），语句用
+              `($name IS NULL OR …)` 让对应条件在不传时不生效。`outputs` 由平台按 `result_shape` 生成，请求中的值忽略；
+              `dependencies`、`dependencies_url` 必须为空。入参的 `example` 会作为保存
+              校验时的试算值。
         data:
-          type: string
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: string
           description: |
-            OpenAPI 原文。**`metadata_type=openapi` 时必填**。文档里有几个操作就建
-            几个工具。
+            OpenAPI 文档。**`metadata_type=openapi` 时必填**。文档里有几个操作就建
+            几个工具。JSON 请求体里传文档**对象**（传字符串会解析失败）；表单与
+            multipart 里是 JSON/YAML 原文文本，multipart 也可作为名为 `data` 的文件上传。
         extend_info:
           type: object
           additionalProperties: true
@@ -1544,10 +1573,20 @@ components:
         function_input:
           type: object
           additionalProperties: true
-          description: 函数定义（编辑形态，无 name / description）。
+          description: |
+            函数定义（编辑形态，无 name / description）。未传的字段沿用已保存的值。
+            `script_type` 不传时沿用函数已保存的类型；脚本类型不能在 `python` 与 `cypher`
+            之间修改，传了另一种类型会被拒绝，需要换类型时新建函数。
+            Cypher 函数可改 `code`、`inputs`、`kn_id`、`result_shape`，保存前同样经过
+            `explain` 校验。
         data:
-          type: string
-          description: OpenAPI 原文。
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: string
+          description: |
+            OpenAPI 文档。JSON 请求体里传文档**对象**（传字符串会解析失败）；表单与
+            multipart 里是 JSON/YAML 原文文本，multipart 也可作为名为 `data` 的文件上传。
         extend_info:
           type: object
           additionalProperties: true
@@ -1605,27 +1644,6 @@ components:
           type: string
           description: 调用过程中的错误信息。
 
-    ConvertOperatorRequest:
-      type: object
-      required:
-        - operator_id
-        - box_id
-      properties:
-        operator_id:
-          type: string
-          description: 要转换的算子 ID。
-        box_id:
-          type: string
-          description: 目标工具箱 ID。
-        use_rule:
-          type: string
-          description: 使用规则。
-        global_parameters:
-          $ref: '#/components/schemas/GlobalParameter'
-        extend_info:
-          type: object
-          additionalProperties:
-            type: string
 
     OpenApiBundleRequest:
       type: object
@@ -1635,10 +1653,10 @@ components:
       properties:
         box_id:
           type: string
-          description: 已有工具箱 ID。**与 `box_name` 二选一。**
+          description: 已有 `openapi` 类工具箱 ID。**与 `box_name` 二选一，同时给时以它为准。**
         box_name:
           type: string
-          description: 新建工具箱的名称。**与 `box_id` 二选一。**
+          description: 新建 `openapi` 类工具箱的名称，仅在 `box_id` 为空时生效。**与 `box_id` 二选一。**
         box_desc:
           type: string
           description: 工具箱描述。
@@ -1648,29 +1666,17 @@ components:
         box_category:
           type: string
           default: other_category
+          description: 新建工具箱的分类，取值见 [category.yaml](category.yaml)。
         use_rule:
           type: string
           description: 生成的工具的使用规则。
         data:
           type: string
           description: OpenAPI 3.0 文档原文。**必填。**
-        description:
-          type: string
-          description: 生成的算子的描述。
-        direct_publish:
-          type: boolean
-          description: 注册后直接发布算子。
-        operator_info:
-          type: object
-          additionalProperties: true
-          description: 算子信息，结构见 [operator.yaml](operator.yaml) 的 `OperatorInfo`。
-        operator_execute_control:
-          type: object
-          additionalProperties: true
-          description: 算子执行控制，结构见 [operator.yaml](operator.yaml)。
         extend_info:
           type: object
           additionalProperties: true
+          description: 写入每个生成工具的扩展信息。
 
     OpenApiBundleResponse:
       type: object
@@ -1684,17 +1690,14 @@ components:
           items:
             type: string
           description: 生成的工具 ID。
-        operator_ids:
-          type: array
-          items:
-            type: string
-          description: 注册的算子 ID。
         links:
           type: array
           items:
             type: object
-            additionalProperties: true
-          description: 算子与工具的对应关系（血缘）。
+            properties:
+              tool_id:
+                type: string
+          description: 每个生成的工具一项，与 `tool_ids` 一一对应。
         failure_count:
           type: integer
           description: 失败数量。无失败时不返回。
@@ -1702,7 +1705,7 @@ components:
           type: array
           items:
             type: string
-          description: 失败明细。无失败时不返回。
+          description: '失败明细，每项形如 `<工具名>: <错误>`。无失败时不返回。'
 
     ReleaseToolBoxInfo:
       type: object

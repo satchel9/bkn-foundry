@@ -3,6 +3,7 @@ package drivenadapters
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/config"
@@ -26,7 +28,12 @@ type sandBoxControlPlaneClient struct {
 	httpClient        interfaces.HTTPClient
 	executeHTTPClient interfaces.HTTPClient
 	templateID        string // Template ID.
+	// syncPollDeadline is how many seconds the control plane polls a synchronous execution.
+	syncPollDeadline int
 }
+
+// defaultSyncPollDeadline is the control plane's default polling deadline in seconds.
+const defaultSyncPollDeadline = 300
 
 var (
 	sbcpInstance *sandBoxControlPlaneClient // Sandbox control service Client instance.
@@ -44,6 +51,7 @@ func NewSandBoxControlPlaneClient() interfaces.SandBoxControlPlane {
 			httpClient:        rest.NewHTTPClient(),
 			executeHTTPClient: rest.NewHTTPClientWithOptions(rest.HTTPClientOptions{TimeOut: 3605}),
 			templateID:        conf.SandboxControlPlane.PrivateHost,
+			syncPollDeadline:  conf.SandboxControlPlane.SyncPollDeadline,
 		}
 	})
 	return sbcpInstance
@@ -195,7 +203,11 @@ func (c *sandBoxControlPlaneClient) ExecuteCodeSync(ctx context.Context, session
 	src := fmt.Sprintf("%s/executions/sessions/%s/execute-sync", c.baseURL, sessionID)
 	// The control plane defaults to a 300-second polling deadline. Leave time for
 	// it to return the terminal execution status when the requested limit is near it.
-	if req.Timeout > 295 {
+	deadline := c.syncPollDeadline
+	if deadline <= 0 {
+		deadline = defaultSyncPollDeadline
+	}
+	if req.Timeout > deadline-5 {
 		syncTimeout := 3600 // Control plane's maximum sync_timeout.
 		if req.Timeout <= 3595 {
 			syncTimeout = req.Timeout + 5
@@ -210,17 +222,20 @@ func (c *sandBoxControlPlaneClient) ExecuteCodeSync(ctx context.Context, session
 	}
 	if (respCode < http.StatusOK) || (respCode >= http.StatusMultipleChoices) {
 		c.logger.WithContext(ctx).Errorf("ExecuteCodeSync failed, unexpected status code: %d, session_id: %s", respCode, sessionID)
+		if respCode == http.StatusUnprocessableEntity {
+			return nil, sandboxValidationError(ctx, sessionID, req.Code, respData)
+		}
+		// Validation responses can contain the entire source and environment.
+		// Never return a dependency body (including its Base64 representation).
 		err = errors.NewHTTPError(ctx, http.StatusInternalServerError, errors.ErrExtSandboxControlPlaneFailed, map[string]any{
-			"error":     fmt.Sprintf("unexpected status code: %d", respCode),
 			"http_code": respCode,
-			"response":  respData,
 		})
 		return nil, err
 	}
 	resp := &interfaces.ExecuteCodeResp{}
-	err = utils.StringToObject(string(respData), resp)
+	err = utils.UnmarshalPreciseJSON(respData, resp)
 	if err != nil {
-		c.logger.WithContext(ctx).Errorf("ExecuteCodeSync failed, StringToObject failed, err: %v", err)
+		c.logger.WithContext(ctx).Errorf("ExecuteCodeSync failed, response decode failed, err: %v", err)
 		err = errors.NewHTTPError(ctx, http.StatusInternalServerError, errors.ErrExtSandboxControlPlaneFailed, err.Error())
 		return nil, err
 	}
@@ -384,4 +399,38 @@ func normalizeWorkspacePath(raw string) string {
 		return ""
 	}
 	return raw
+}
+
+// sandboxValidationError exposes only an allowlisted validation diagnosis. FastAPI's
+// input and message fields can include source code, credentials, or internal URLs.
+func sandboxValidationError(ctx context.Context, sessionID, code string, body []byte) error {
+	details := map[string]any{"reason": "invalid_execution_input", "stage": "validation"}
+	if common.IsValidExecutionCorrelationID(sessionID) {
+		details["session_id"] = sessionID
+	}
+	var envelope struct {
+		Detail []struct {
+			Type    string   `json:"type"`
+			Loc     []string `json:"loc"`
+			Context struct {
+				MaxLength int `json:"max_length"`
+			} `json:"ctx"`
+		} `json:"detail"`
+	}
+	if json.Unmarshal(body, &envelope) == nil {
+		for _, item := range envelope.Detail {
+			if item.Type == "string_too_long" && len(item.Loc) == 2 &&
+				item.Loc[0] == "body" && item.Loc[1] == "code" && item.Context.MaxLength > 0 {
+				actual := utf8.RuneCountInString(code)
+				if actual > item.Context.MaxLength {
+					details["reason"] = "code_too_long"
+					details["actual"] = actual
+					details["max"] = item.Context.MaxLength
+					details["unit"] = "unicode_characters"
+					break
+				}
+			}
+		}
+	}
+	return errors.DefaultHTTPError(ctx, http.StatusUnprocessableEntity, details)
 }

@@ -18,6 +18,10 @@ import (
 	"sync"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/config"
 	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
@@ -59,14 +63,22 @@ const (
 	listActionExecutionsURI = "/in/v1/knowledge-networks/%s/action-logs"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/subgraph
 	queryInstanceSubgraphURI = "/in/v1/knowledge-networks/%s/subgraph"
-	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/metrics/:metric_id/data
+	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-metrics/:metric_id/data
 	//
 	// Both ids are escaped at call time: metric_id arrives straight from an agent
 	// (the tool schema constrains it to a string and nothing more), and an
 	// unescaped one carrying "?" or "&" would smuggle query parameters — branch
 	// and fill_null among them — into the downstream request.
-	queryMetricDataURI = "/in/v1/knowledge-networks/%s/metrics/%s/data"
+	queryMetricDataURI        = "/in/v1/knowledge-networks/%s/object-metrics/%s/data"
+	drillThroughMetricDataURI = "/in/v1/knowledge-networks/%s/object-metrics/%s/data/drill-through"
 )
+
+func metricBranch(branch string) string {
+	if branch = strings.TrimSpace(branch); branch != "" {
+		return branch
+	}
+	return "main"
+}
 
 // NewOntologyQueryAccess creates an OntologyQueryAccess.
 func NewOntologyQueryAccess() interfaces.DrivenOntologyQuery {
@@ -75,7 +87,7 @@ func NewOntologyQueryAccess() interfaces.DrivenOntologyQuery {
 		ontologyQuery = &ontologyQueryClient{
 			logger:     configLoader.GetLogger(),
 			baseURL:    configLoader.OntologyQuery.BuildURL("/api/ontology-query"),
-			httpClient: rest.NewHTTPClient(),
+			httpClient: newKnVersionClient(rest.NewHTTPClient()),
 		}
 	})
 	return ontologyQuery
@@ -105,9 +117,16 @@ func withVerifiedApplicationPrincipal(ctx context.Context, headers map[string]st
 // property permissions. Response bodies are never logged because even a
 // malformed downstream response may contain protected values.
 func (o *ontologyQueryClient) GetObjectTypeSchema(ctx context.Context, knID, otID string) (*interfaces.ObjectTypeSchemaResp, error) {
+	return o.GetObjectTypeSchemaBranch(ctx, knID, "main", otID)
+}
+
+func (o *ontologyQueryClient) GetObjectTypeSchemaBranch(ctx context.Context, knID, branch, otID string) (*interfaces.ObjectTypeSchemaResp, error) {
 	uri := fmt.Sprintf(queryObjectTypeSchemaURI, url.PathEscape(knID), url.PathEscape(otID))
 	target := o.baseURL + uri
-	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.object.schema", ontologyQueryIdentity(uri, nil))
+	if branch = metricBranch(branch); branch != "main" {
+		target += "?branch=" + url.QueryEscape(branch)
+	}
+	header := common.GetHeaderForChildOperationIdentity(ctx, "ontology.object.schema", ontologyQueryIdentity(strings.TrimPrefix(target, o.baseURL), nil))
 
 	_, respBody, err := o.httpClient.GetBytes(ctx, target, nil, header)
 	if err != nil {
@@ -280,9 +299,9 @@ func resolveAbsentTotal(hasCursor bool, total *int64) *int64 {
 // downstream ontology-query verdict is the only authoritative signal, so the
 // fix is to surface it clearly rather than guess here.
 func classifyQueryError(ctx context.Context, err error) error {
-	var he *infraErr.HTTPError
+	var he *httperrors.HTTPError
 	if errors.As(err, &he) && he.HTTPCode >= http.StatusBadRequest && he.HTTPCode < http.StatusInternalServerError {
-		return infraErr.DefaultHTTPError(ctx, he.HTTPCode, downstreamErrorDetails(he))
+		return infraErr.DefaultHTTPError(ctx, he.HTTPCode, downstreamErrorDetails(err))
 	}
 	return err
 }
@@ -293,13 +312,17 @@ func classifyQueryError(ctx context.Context, err error) error {
 // endpoints were expected). The shared HTTP client's own detail wraps both in a
 // transport string that also carries the internal service URL; it is kept only
 // when the body is not an ontology-query error envelope.
-func downstreamErrorDetails(he *infraErr.HTTPError) any {
+func downstreamErrorDetails(err error) any {
+	var he *httperrors.HTTPError
+	errors.As(err, &he)
+	var dependency *infraErr.DependencyError
+	errors.As(err, &dependency)
 	var envelope struct {
 		ErrorCode    string `json:"error_code"`
 		Description  string `json:"description"`
 		ErrorDetails any    `json:"error_details"`
 	}
-	if len(he.DownstreamBody) > 0 && sonic.Unmarshal(he.DownstreamBody, &envelope) == nil && envelope.ErrorCode != "" {
+	if dependency != nil && len(dependency.Body) > 0 && sonic.Unmarshal(dependency.Body, &envelope) == nil && envelope.ErrorCode != "" {
 		details := envelope.Description
 		switch d := envelope.ErrorDetails.(type) {
 		case nil:
@@ -335,12 +358,15 @@ func downstreamErrorDetails(he *infraErr.HTTPError) any {
 // "对象类 X 未绑定数据源", and get_action_info reported that as 502 "依赖服务不可用",
 // pointing triage at pod health instead of at the knowledge network. See #1225.
 func classifyActionError(ctx context.Context, err error, fallbackDetailKey string) error {
-	var he *infraErr.HTTPError
+	var he *httperrors.HTTPError
 	if errors.As(err, &he) && he.HTTPCode >= http.StatusBadRequest && he.HTTPCode < http.StatusInternalServerError {
 		return classifyQueryError(ctx, err)
 	}
-	return infraErr.DefaultHTTPError(ctx, http.StatusBadGateway,
-		infraErr.LocalizedDetail(ctx, fallbackDetailKey))
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail."+fallbackDetailKey, map[string]any{})
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return infraErr.DefaultHTTPError(ctx, http.StatusBadGateway, localizedText)
 }
 
 // withFunctionRuntimeCredential forwards the caller's own credential, so a
@@ -393,18 +419,25 @@ func (o *ontologyQueryClient) QueryLogicProperties(ctx context.Context, req *int
 
 // QueryActions queries actions.
 func (o *ontologyQueryClient) QueryActions(ctx context.Context, req *interfaces.QueryActionsRequest) (resp *interfaces.QueryActionsResponse, err error) {
-	uri := fmt.Sprintf(queryActionsURI, req.KnID, req.AtID)
+	uri := fmt.Sprintf(queryActionsURI, url.PathEscape(req.KnID), url.PathEscape(req.AtID))
 	url := fmt.Sprintf("%s%s", o.baseURL, uri)
+	if req.IncludeTypeInfo {
+		url += "?include_type_info=true"
+	}
 
 	// Build the request body.
 	body := map[string]any{
 		"_instance_identities": req.InstanceIdentities,
 	}
+	if req.RelationTarget != nil {
+		body["relation_target"] = req.RelationTarget
+	}
+	if len(req.ObjectInput) > 0 {
+		body["object_input"] = req.ObjectInput
+	}
 
 	// Log the request.
-	bodyJSON, _ := sonic.Marshal(body)
-	o.logger.WithContext(ctx).Debugf("[OntologyQuery#QueryActions] URL: %s", url)
-	o.logger.WithContext(ctx).Debugf("[OntologyQuery#QueryActions] Request Body: %s", string(bodyJSON))
+	o.logger.WithContext(ctx).Debugf("[OntologyQuery#QueryActions] URL: %s, explicit_target_count: %d", url, len(req.InstanceIdentities))
 
 	header := common.GetHeaderForChildOperation(ctx, "ontology.action.query", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
@@ -420,8 +453,11 @@ func (o *ontologyQueryClient) QueryActions(ctx context.Context, req *interfaces.
 	err = unmarshalPrecise(respBody, resp)
 	if err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#QueryActions] Unmarshal failed, body: %s, err: %v", string(respBody), err)
-		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "ActionQueryResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ActionQueryResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 		return nil, err
 	}
 
@@ -434,12 +470,18 @@ func (o *ontologyQueryClient) QueryActions(ctx context.Context, req *interfaces.
 
 // ExecuteActions executes actions asynchronously and returns execution_id.
 func (o *ontologyQueryClient) ExecuteActions(ctx context.Context, req *interfaces.ExecuteActionsRequest) (resp *interfaces.ExecuteActionsResponse, err error) {
-	uri := fmt.Sprintf(executeActionsURI, req.KnID, req.AtID)
+	uri := fmt.Sprintf(executeActionsURI, url.PathEscape(req.KnID), url.PathEscape(req.AtID))
 	url := fmt.Sprintf("%s%s", o.baseURL, uri)
 
 	// Buildrequest body (real execution, carries dynamic parameters; does not set method-override, so it is a real POST)
 	body := map[string]any{
 		"_instance_identities": req.InstanceIdentities,
+	}
+	if req.RelationTarget != nil {
+		body["relation_target"] = req.RelationTarget
+	}
+	if len(req.ObjectInput) > 0 {
+		body["object_input"] = req.ObjectInput
 	}
 	if len(req.DynamicParams) > 0 {
 		body["dynamic_params"] = req.DynamicParams
@@ -455,6 +497,7 @@ func (o *ontologyQueryClient) ExecuteActions(ctx context.Context, req *interface
 		url, len(req.InstanceIdentities), dynamicParamKeys)
 
 	header := common.GetHeaderForChildOperation(ctx, "ontology.action.execute", 1)
+	header = withVerifiedApplicationPrincipal(ctx, header)
 	withFunctionRuntimeCredential(ctx, header)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 
@@ -470,8 +513,11 @@ func (o *ontologyQueryClient) ExecuteActions(ctx context.Context, req *interface
 	err = unmarshalPrecise(respBody, resp)
 	if err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#ExecuteActions] Unmarshal failed, body: %s, err: %v", string(respBody), err)
-		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "ActionExecutionResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ActionExecutionResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 		return nil, err
 	}
 
@@ -484,7 +530,7 @@ func (o *ontologyQueryClient) ExecuteActions(ctx context.Context, req *interface
 
 // GetActionExecution queries the status and result of a single action execution.
 func (o *ontologyQueryClient) GetActionExecution(ctx context.Context, req *interfaces.GetActionExecutionRequest) (map[string]any, error) {
-	uri := fmt.Sprintf(getActionExecutionURI, req.KnID, req.ExecutionID)
+	uri := fmt.Sprintf(getActionExecutionURI, url.PathEscape(req.KnID), url.PathEscape(req.ExecutionID))
 	if req.ResultsLimit != nil || req.ResultsOffset != nil {
 		uri = fmt.Sprintf(getActionLogURI, url.PathEscape(req.KnID), url.PathEscape(req.ExecutionID))
 		query := url.Values{}
@@ -512,8 +558,11 @@ func (o *ontologyQueryClient) GetActionExecution(ctx context.Context, req *inter
 	result := map[string]any{}
 	if err = unmarshalPrecise(respBody, &result); err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#GetActionExecution] Unmarshal failed, body: %s, err: %v", string(respBody), err)
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "ActionExecutionLookupResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ActionExecutionLookupResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 	}
 
 	return result, nil
@@ -521,7 +570,7 @@ func (o *ontologyQueryClient) GetActionExecution(ctx context.Context, req *inter
 
 // ListActionExecutions lists action execution history with filters and pagination.
 func (o *ontologyQueryClient) ListActionExecutions(ctx context.Context, req *interfaces.ListActionExecutionsRequest) (map[string]any, error) {
-	uri := fmt.Sprintf(listActionExecutionsURI, req.KnID)
+	uri := fmt.Sprintf(listActionExecutionsURI, url.PathEscape(req.KnID))
 	reqURL := fmt.Sprintf("%s%s", o.baseURL, uri)
 
 	query := url.Values{}
@@ -572,8 +621,11 @@ func (o *ontologyQueryClient) ListActionExecutions(ctx context.Context, req *int
 	result := map[string]any{}
 	if err = unmarshalPrecise(respBody, &result); err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#ListActionExecutions] Unmarshal failed, body: %s, err: %v", string(respBody), err)
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "ActionExecutionHistoryResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ActionExecutionHistoryResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 	}
 
 	return result, nil
@@ -624,8 +676,11 @@ func (o *ontologyQueryClient) ExploreSubgraph(ctx context.Context, req *interfac
 	resp = &interfaces.ExploreSubgraphResp{}
 	if err = unmarshalPrecise(respBody, resp); err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#ExploreSubgraph] invalid response: %v", err)
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "SubgraphQueryResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.SubgraphQueryResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 	}
 	resp.TotalCount = resolveAbsentTotal(len(req.SearchAfter) > 0, resp.TotalCount)
 
@@ -677,8 +732,11 @@ func (o *ontologyQueryClient) QueryInstanceSubgraph(ctx context.Context, req *in
 	err = unmarshalPrecise(respBody, resp)
 	if err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#QueryInstanceSubgraph] invalid response: %v", err)
-		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "SubgraphQueryResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.SubgraphQueryResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 		return nil, err
 	}
 
@@ -689,15 +747,19 @@ func (o *ontologyQueryClient) QueryInstanceSubgraph(ctx context.Context, req *in
 //
 // Take the ontology-query internal route, the same posture as QueryLogicProperties: account information comes with the header.
 // Pass through, authorization is determined downstream.
-func (o *ontologyQueryClient) QueryMetricData(ctx context.Context, knID, metricID string, fillNull bool,
-	req *interfaces.MetricQueryDownstreamReq) (resp *interfaces.MetricQueryDownstreamResp, err error) {
+func (o *ontologyQueryClient) QueryMetricData(ctx context.Context, knID, branch, metricID string, version int,
+	req *interfaces.ObjectMetricQuery) (resp *interfaces.MetricQueryDownstreamResp, err error) {
+	if version < 1 {
+		return nil, fmt.Errorf("object metric version must be positive")
+	}
 	uri := fmt.Sprintf(queryMetricDataURI, url.PathEscape(knID), url.PathEscape(metricID))
 	query := url.Values{}
-	query.Set("fill_null", strconv.FormatBool(fillNull))
+	query.Set("branch", metricBranch(branch))
+	query.Set("version", strconv.Itoa(version))
 	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
 
 	if req == nil {
-		req = &interfaces.MetricQueryDownstreamReq{}
+		req = &interfaces.ObjectMetricQuery{}
 	}
 	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx, "ontology.metric.query", ontologyQueryIdentity(uri+"?"+query.Encode(), req)))
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
@@ -711,6 +773,39 @@ func (o *ontologyQueryClient) QueryMetricData(ctx context.Context, knID, metricI
 	resp = &interfaces.MetricQueryDownstreamResp{}
 	if err = unmarshalPrecise(respBody, resp); err != nil {
 		o.logger.WithContext(ctx).Errorf("[OntologyQuery#QueryMetricData] invalid response: %v", err)
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, err.Error())
+	}
+	return resp, nil
+}
+
+// DrillThroughMetricData resolves a server-issued bucket to authorized source objects.
+func (o *ontologyQueryClient) DrillThroughMetricData(ctx context.Context, knID, branch, metricID string, version int,
+	req *interfaces.MetricDrillThroughReq) (resp *interfaces.MetricDrillThroughResp, err error) {
+	if version < 1 || req == nil {
+		return nil, fmt.Errorf("a published metric version and drill-through request are required")
+	}
+	uri := fmt.Sprintf(drillThroughMetricDataURI, url.PathEscape(knID), url.PathEscape(metricID))
+	query := url.Values{}
+	query.Set("branch", metricBranch(branch))
+	query.Set("version", strconv.Itoa(version))
+	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
+	body := struct {
+		Query     interfaces.ObjectMetricQuery `json:"query"`
+		BucketKey string                       `json:"bucket_key"`
+		PageSize  int                          `json:"page_size,omitempty"`
+		Cursor    string                       `json:"cursor,omitempty"`
+	}{Query: req.Query, BucketKey: req.BucketKey, PageSize: req.PageSize, Cursor: req.Cursor}
+	header := withVerifiedApplicationPrincipal(ctx, common.GetHeaderForChildOperationIdentity(ctx,
+		"ontology.metric.drill-through", ontologyQueryIdentity(uri+"?"+query.Encode(), body)))
+	header[rest.ContentTypeKey] = rest.ContentTypeJSON
+	_, respBody, err := o.httpClient.PostBytes(ctx, target, header, body)
+	if err != nil {
+		o.logger.WithContext(ctx).Warnf("[OntologyQuery#DrillThroughMetricData] kn=%s metric=%s failed: %v", knID, metricID, err)
+		return nil, classifyQueryError(ctx, err)
+	}
+	resp = &interfaces.MetricDrillThroughResp{}
+	if err = unmarshalPrecise(respBody, resp); err != nil {
+		o.logger.WithContext(ctx).Errorf("[OntologyQuery#DrillThroughMetricData] invalid response: %v", err)
 		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, err.Error())
 	}
 	return resp, nil

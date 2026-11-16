@@ -4,7 +4,6 @@ on:
   pull_request:
     paths:
       - 'bkn-trace/**'
-      - 'comm-go/**'
       - 'infra/bkn-agent/charts/**'
       - 'infra/bkn-agent/scripts/test_evidence_kafka_chart.sh'
       - 'docs/api/agent-observability/**'
@@ -19,7 +18,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       mariadb:
         image: mariadb:11.4
@@ -68,19 +67,70 @@ jobs:
         run: make check-swag
       - name: Race tests
         run: make test-race
+      - name: Ordinary Trace missing-projection SQL fallback acceptance
+        env:
+          BKN_TRACE_FALLBACK_TEST_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_2779_test?parseTime=true&multiStatements=true
+        run: |
+          docker exec -e MYSQL_PWD=trace-ci-password "${{ job.services.mariadb.id }}" mariadb -uroot -e 'CREATE DATABASE bkn_trace_2779_test'
+          go test -race -tags=integration ./src/drivenadapter/dbaccess/mariadb/sessionstore -run '^TestTraceSummaryFallbackMariaDB$' -count=1 -v
+      - name: Search projection transient failure and audited replay acceptance
+        env:
+          BKN_TRACE_RECOVERY_TEST_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_2779_recovery?parseTime=true&multiStatements=true
+          BKN_TRACE_RECOVERY_OPENSEARCH_URL: http://127.0.0.1:9200
+        run: go test -race -tags=integration . -run '^TestProjectionRecoveryAcceptance$' -count=1 -v
       - name: MariaDB lifecycle, fault and rebuild integration tests
         env:
           BKN_TRACE_TEST_MARIADB_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_ci?parseTime=true&multiStatements=true
           BKN_TRACE_TEST_OPENSEARCH_ENDPOINT: http://127.0.0.1:9200
         run: make test-integration
+      - name: Bounded Trace archive integration test
+        env:
+          BKN_TRACE_ARCHIVE_BATCH_TEST_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true
+        run: go test -tags=integration ./src/drivenadapter/dbaccess/mariadb/sessionstore -run '^TestTraceArchive(BoundedMariaDB|CheckpointFitsMariaDBPacket|ConcurrentSQLWritesMariaDB|PreservesExtendedIntegrityMariaDB)$' -count=1 -v
+      - name: Log archive packet capacity integration test
+        env:
+          BKN_LOG_ARCHIVE_TEST_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/?parseTime=true
+        run: go test -tags=integration ./src/drivenadapter/dbaccess/mariadb/archivestore -run '^TestLogArchiveCapacityMariaDB$' -count=1 -v
+      - name: Durable answer transaction and recovery integration test
+        env:
+          BKN_TRACE_DURABLE_ANSWER_ADMIN_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true
+        run: go test -tags=integration ./src/drivenadapter/dbaccess/mariadb/sessionstore -run '^(TestDurableAnswer(TransactionRecovery|PacketBoundary)MariaDB|TestLifecycleReadsDoNotWaitForConversationWriter|TestSlowTraceReadDoesNotBlockOperationRegistration|TestFunctionResultClaimLifecycleMariaDB|TestFunctionResultExamplesMariaDB|TestFunctionResultRecordIntegrityMaterializationMariaDB|TestDerivedEvidenceAtomicWithRevisionMariaDB)$' -count=1 -v
+      - name: Authorized root-service discovery integration test
+        env:
+          BKN_ROOT_SERVICES_TEST_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_ci?parseTime=true&multiStatements=true
+          BKN_ROOT_SERVICES_TEST_OS: http://127.0.0.1:9200
+          BKN_ROOT_SERVICE_TIMEOUT_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_ci?parseTime=true&multiStatements=true
+        run: go test -tags=integration ./src/drivenadapter/dbaccess/mariadb/sessionstore -run '^TestRootServiceOptions(Integration|RealServerTimeout)$' -count=1 -v
       - name: MariaDB capacity smoke
         env:
           BKN_TRACE_TEST_MARIADB_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/bkn_trace_ci?parseTime=true&multiStatements=true
         run: make test-performance
+      - name: Projection outbox historical-volume and lease concurrency regression
+        env:
+          BKN_TRACE_OUTBOX_PERF_ADMIN_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true
+        run: make test-outbox-performance
+      - name: Projection outbox 100k and 500k pending capacity regression
+        env:
+          BKN_TRACE_OUTBOX_PERF_ADMIN_DSN: root:trace-ci-password@tcp(127.0.0.1:3306)/?parseTime=true&multiStatements=true
+          BKN_TRACE_OUTBOX_SCALE_OPENSEARCH_URL: http://127.0.0.1:9200
+          BKN_TRACE_OUTBOX_SCALE_WORKER_DURATION: 10s
+        run: make test-outbox-scale
       - name: OpenSearch projection and alias integration test
         env:
           BKN_TRACE_TEST_OPENSEARCH_ENDPOINT: http://127.0.0.1:9200
         run: make test-opensearch-integration
+      - name: Bounded Span browsing integration test
+        env:
+          BKN_SPAN_PAGE_TEST_URL: http://127.0.0.1:9200
+        run: go test -tags=integration ./src/domain/service/tracesvc -run '^TestSpanPageRealOpenSearch$' -count=1 -v
+      - name: Frozen technical Trace archive safety integration test
+        env:
+          BKN_FROZEN_ARCHIVE_TEST_URL: http://127.0.0.1:9200
+        run: go test -tags=integration ./src/drivenadapter/httpaccess/opensearchtraceaccess -run '^TestArchiveFrozenSafetyRealOpenSearch$' -count=1 -v
+      - name: Log archive frozen version and legacy recovery integration test
+        env:
+          BKN_LOG_ARCHIVE_TEST_OS: http://127.0.0.1:9200
+        run: go test -tags=integration ./src/drivenadapter/httpaccess/opensearchconversationaudit -run '^TestLogArchiveFrozenVersionsRealOpenSearch$' -count=1 -v
       - name: Build
         run: make build
       - uses: azure/setup-helm@v4

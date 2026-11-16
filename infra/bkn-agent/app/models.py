@@ -3,7 +3,7 @@ from typing import Annotated, Any, Literal, Optional
 from jsonschema.exceptions import SchemaError
 from jsonschema.validators import validator_for
 from pydantic import AfterValidator, BaseModel, Field, field_serializer, model_validator
-from sqlalchemy import BigInteger, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Index, Integer, String, Text
 from sqlalchemy.dialects.mysql import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -14,6 +14,7 @@ class Base(DeclarativeBase):
 
 class AgentRow(Base):
     __tablename__ = "t_agent"
+    __table_args__ = (Index("ix_agent_prompt_id_agent_id", "f_prompt_id", "f_agent_id"),)
 
     f_agent_id: Mapped[str] = mapped_column(String(50), primary_key=True)
     f_name: Mapped[str] = mapped_column(String(100), unique=True)
@@ -47,9 +48,55 @@ class PromptVersionRow(Base):
     f_prompt_id: Mapped[str] = mapped_column(String(50), primary_key=True)
     f_version: Mapped[int] = mapped_column(Integer, primary_key=True)
     f_content: Mapped[str] = mapped_column(Text)
+    f_localized_content: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    f_source_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
     f_vars_schema: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     f_create_user: Mapped[str] = mapped_column(String(50))
     f_create_time: Mapped[int] = mapped_column(BigInteger)
+
+
+class NetworkSettingRow(Base):
+    """Per-network additions on top of a shared Agent (public executions only)."""
+
+    __tablename__ = "t_agent_network_setting"
+
+    f_agent_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    f_kn_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    f_content: Mapped[dict] = mapped_column(JSON)
+    f_version: Mapped[int] = mapped_column(Integer, default=1)
+    f_update_user: Mapped[str] = mapped_column(String(50))
+    f_update_time: Mapped[int] = mapped_column(BigInteger)
+
+
+class AgentVersionRow(Base):
+    """A snapshot of an Agent's configuration; exactly one per Agent is current."""
+
+    __tablename__ = "t_agent_version"
+
+    f_agent_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    f_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    f_model: Mapped[str] = mapped_column(String(100), default="")
+    f_tools: Mapped[list] = mapped_column(JSON, default=list)
+    f_limits: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    f_prompt_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    f_changes: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    f_initial: Mapped[bool] = mapped_column(Boolean, default=False)
+    f_current: Mapped[bool] = mapped_column(Boolean, default=False)
+    f_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    f_create_user: Mapped[str] = mapped_column(String(50))
+    f_create_time: Mapped[int] = mapped_column(BigInteger)
+
+
+class UserSettingRow(Base):
+    """Per-user additions on top of the shared and network settings."""
+
+    __tablename__ = "t_agent_user_setting"
+
+    f_agent_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    f_account_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    f_content: Mapped[dict] = mapped_column(JSON)
+    f_version: Mapped[int] = mapped_column(Integer, default=1)
+    f_update_time: Mapped[int] = mapped_column(BigInteger)
 
 
 class PromptOverrideRow(Base):
@@ -135,16 +182,41 @@ class ContextLoaderToolRef(_ToolRefBase):
     # When undeclared, the existing behaviour of loading every Context Loader
     # business tool is preserved. An agent meant for read-only diagnosis must
     # list the permitted MCP tool names explicitly, so it cannot still receive
-    # run_sql or execution-class tools beyond what the prompt constrains.
+    # query or execution-class tools beyond what the prompt constrains.
     allowed_tools: Optional[list[str]] = Field(
         default=None,
         max_length=100,
         description="Allowlist of Context Loader MCP tool names this agent may load; omit it to allow all.",
     )
+    # Which Context Loader MCP surface to use: the full tool set or the compact
+    # one. Unset keeps the service-wide CONTEXT_LOADER_MCP_URL.
+    profile: Optional[Literal["full", "compact"]] = None
+
+
+class BuiltinToolRef(_ToolRefBase):
+    """Tools implemented inside bkn-agent (app/core/builtin_tools.py), built per
+    execution from its request context. Independent of MCP and the execution
+    factory; the provider is registered in code, not addressed by url."""
+
+    type: Literal["builtin"]
+    provider: str = Field(min_length=1, max_length=100)
+    # The provider's tools this Agent mounts; omit it to mount all of them.
+    tools: Optional[list[Annotated[str, Field(min_length=1, max_length=128)]]] = Field(
+        default=None, max_length=100
+    )
+
+    @model_validator(mode="after")
+    def _known(self):
+        from app.core import builtin_tools
+
+        reason = builtin_tools.unknown_reason(self.model_dump())
+        if reason:
+            raise ValueError(reason)
+        return self
 
 
 ToolRef = Annotated[
-    McpToolRef | ToolboxToolRef | AgentToolRef | ContextLoaderToolRef,
+    McpToolRef | ToolboxToolRef | AgentToolRef | ContextLoaderToolRef | BuiltinToolRef,
     Field(discriminator="type"),
 ]
 
@@ -160,6 +232,55 @@ class AgentLimits(BaseModel):
     # mf-model-api (logics.py max_tokens: conint(ge=10)): accepting 1..9 would
     # let the agent be created while every execution failed downstream with 400.
     max_output_tokens: Optional[int] = Field(default=None, ge=10, le=65536)
+    # A task with response_format and no tools normally makes a free-form model
+    # call first and then a structured call over that turn. True skips the
+    # free-form call: the structured call (native, then prompt fallback) reads
+    # the message directly. Ignored when the Agent has tools or the task has no
+    # response_format. Unset keeps the two calls.
+    single_structured_call: Optional[bool] = Field(
+        default=None,
+        description=(
+            "For a task with response_format and no tools: skip the free-form "
+            "model call and answer with the structured call alone. Default false."
+        ),
+    )
+    # Context budget, applied on the public execution surface only. Each tool
+    # result sent to the model is capped (schema/discovery tools get their own,
+    # wider cap), the most recent results that fit the question's budget are
+    # kept, and earlier questions are summarized once the context passes the
+    # token threshold. Defaults live in app/core/agent_settings.py.
+    keep_tool_results: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=50,
+        description=(
+            "Tool results of the current question kept for the model: at least "
+            "this many, and more while their capped size fits in "
+            "keep_tool_results x data_result_chars, as long as their total stays "
+            "under 120000 characters; the latest result is always kept. Default 3."
+        ),
+    )
+    data_result_chars: Optional[int] = Field(
+        default=None,
+        ge=500,
+        le=200000,
+        description="Character cap for one data tool result. Default 60000.",
+    )
+    schema_result_chars: Optional[int] = Field(
+        default=None,
+        ge=500,
+        le=500000,
+        description="Character cap for one schema or discovery tool result. Default 120000.",
+    )
+    summarize_after_tokens: Optional[int] = Field(
+        default=None,
+        ge=4000,
+        le=1000000,
+        description=(
+            "Earlier questions are summarized once the saved thread passes this "
+            "many tokens; the current question is never summarized. Default 60000."
+        ),
+    )
 
 
 _ID_PATTERN = r"^[0-9A-Za-z_.-]+$"  # A preset id allows letters, digits, underscore, dot, and hyphen, for stable cross-environment references
@@ -272,6 +393,106 @@ def _check_json_schema(v: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 ResponseFormat = Annotated[Optional[dict[str, Any]], AfterValidator(_check_json_schema)]
 
 
+class ExecutionScope(BaseModel):
+    model_config = {"extra": "forbid"}
+    kn_id: str = Field(min_length=1, max_length=128, pattern=_ID_PATTERN)
+    # Analysis is inference over backend-collected evidence, never a tool runner.
+    purpose: Optional[Literal["eval_root_cause"]] = Field(
+        default=None,
+        description="Root cause analysis for eval_assistant only. Disables all tools and skills; evidence is collected by Eval before execution.",
+    )
+    # The graph explorer's canvas: snapshot, selection, canvas_id and revision.
+    # Required by an Agent that mounts the graph_explorer builtin provider, which
+    # validates it; other Agents must not receive it.
+    canvas: Optional[dict[str, Any]] = None
+    # Which definitions of the network the run reads. Both are sent to Context
+    # Loader as headers and pinned into every scoped tool call like kn_id.
+    kn_version: Optional[str] = Field(
+        default=None,
+        pattern=r"^(running|draft|[1-9][0-9]{0,9})$",
+        description=(
+            "Version of the knowledge network the run reads: running, draft, or a"
+            " version number. Without it the network's default read applies."
+        ),
+    )
+    draft_revision: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Draft revision the run must read; only with kn_version=draft (422"
+            " otherwise). A read after the draft moved on fails instead of mixing"
+            " revisions."
+        ),
+    )
+
+
+class ExecutionRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    agent_id: str = Field(min_length=1, max_length=50, pattern=_ID_PATTERN)
+    message: str = Field(min_length=1, max_length=100000)
+    client_request_id: str = Field(min_length=1, max_length=100, pattern=_ID_PATTERN)
+    thread_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=50, pattern=_ID_PATTERN
+    )
+    model_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=_ID_PATTERN,
+        description=(
+            "Optional chat (llm) model the caller can use; without it the Agent's"
+            " own model answers. A model the caller cannot use, or that is not a"
+            " chat model, is rejected before the run starts. Fixed for the thread:"
+            " a later turn with a different or missing model_id returns 409."
+        ),
+    )
+    context: ExecutionScope
+
+
+class AgentSetting(BaseModel):
+    """A network or user layer: appends instructions and narrows tools and limits.
+
+    It can never widen what the layer above allows; values beyond it are clamped
+    when the layers are merged.
+    """
+
+    model_config = {"extra": "forbid"}
+    instruction: Optional[str] = Field(default=None, max_length=2000)
+    allowed_tools: Optional[
+        list[Annotated[str, Field(min_length=1, max_length=128)]]
+    ] = Field(default=None, max_length=100)
+    limits: Optional[AgentLimits] = None
+
+
+class AgentSettingOut(BaseModel):
+    agent_id: str
+    setting: AgentSetting
+    # 0 means no setting has been saved for this layer.
+    version: int
+    update_time: Optional[int] = None
+
+
+class SharedAgentUpdate(BaseModel):
+    """Shared runtime fields an administrator may change from Studio."""
+
+    model_config = {"extra": "forbid"}
+    # Empty string means the platform default model.
+    model: Optional[str] = Field(default=None, max_length=200)
+    limits: Optional[AgentLimits] = None
+    status: Optional[Literal["draft", "published"]] = None
+    # Context Loader MCP surface for this Agent; null restores the service default.
+    mcp_profile: Optional[Literal["full", "compact"]] = None
+
+
+class ExecutionOut(BaseModel):
+    run_id: str
+    agent_id: str
+    thread_id: str
+    status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
+    result: Optional[dict[str, Any]] = None
+    error: Optional[dict[str, str]] = None
+
+
 class ChatRequest(BaseModel):
     agent_id: str
     thread_id: Optional[str] = None
@@ -291,6 +512,10 @@ class InvokeRequest(BaseModel):
     """Synchronous one-shot execution; agent_id is taken from the path."""
 
     message: str = Field(min_length=1)
+    agent_version: Optional[int] = Field(
+        default=None, ge=1, le=2147483647, strict=True,
+        description="Run this existing agent version; omitted uses the current configuration.",
+    )
     skills: list[str] = Field(default_factory=list)
     prompt_override: Optional[str] = None
     prompt_vars: dict[str, Any] = Field(default_factory=dict)
@@ -299,8 +524,19 @@ class InvokeRequest(BaseModel):
     response_format: ResponseFormat = None
 
 
+class TaskVersionOut(BaseModel):
+    agent_id: str
+    agent_version: int = Field(ge=1)
+    prompt_version: Optional[int] = Field(default=None, ge=1)
+    tool_free: bool
+
+
 class RunRequest(BaseModel):
     agent_id: str
+    agent_version: Optional[int] = Field(
+        default=None, ge=1, le=2147483647, strict=True,
+        description="Run this existing agent version; omitted uses the current configuration.",
+    )
     message: str = Field(min_length=1)
     skills: list[str] = Field(default_factory=list)
     prompt_override: Optional[str] = None
@@ -322,6 +558,33 @@ class PromptSpec(BaseModel):
 class PromptPublish(BaseModel):
     content: str = Field(min_length=1)
     vars_schema: Optional[dict[str, Any]] = None
+
+
+# Match Studio trim whitespace; consume the whole value for generated clients.
+_SHARED_PROMPT_CONTENT_PATTERN = (
+    r"^[\s\S]*[^\u0009-\u000d\u0020\u00a0\u1680\u2000-\u200a"
+    r"\u2028\u2029\u202f\u205f\u3000\ufeff][\s\S]*$"
+)
+
+
+class SharedPromptPublish(PromptPublish):
+    # Older callers may omit this; unknown is explicit, never language detection.
+    source_language: Literal["zh-CN", "en-US"] | None = None
+    content: str = Field(
+        min_length=1,
+        pattern=_SHARED_PROMPT_CONTENT_PATTERN,
+        description="Must contain a character outside ECMAScript trim whitespace; original formatting is preserved.",
+    )
+
+
+class PromptVersionPublish(SharedPromptPublish):
+    version: int = Field(ge=1, le=2147483647, strict=True)
+
+
+class PromptTranslationPut(BaseModel):
+    content: str = Field(min_length=1, pattern=_SHARED_PROMPT_CONTENT_PATTERN)
+    source_language: Literal["zh-CN", "en-US"]
+    source_content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class PromptRollback(BaseModel):
@@ -407,6 +670,17 @@ class ThreadOut(BaseModel):
 class TaskOut(BaseModel):
     task_id: str
     agent_id: str
+    agent_version: Optional[int] = None
+    prompt_version: Optional[int] = None
+    model: Optional[str] = None
+    model_id: Optional[str] = None
+    # Tokens of the model calls that reported usage, agent-as-tool calls
+    # included; unmetered_calls counts those that did not. All None on tasks
+    # from before usage was recorded.
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    model_calls: Optional[int] = None
+    unmetered_calls: Optional[int] = None
     status: Literal["pending", "running", "succeeded", "failed"]
     input: Optional[dict] = None
     output: Optional[str] = None

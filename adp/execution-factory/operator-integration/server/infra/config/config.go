@@ -25,17 +25,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const (
-	DefaultOperatorNameMaxLength  = 50 // Maximum length of operator name.
-	DefaultOperatorHistoryRecords = 10 // Maximum number of operator history records retained.
-)
+const ()
 
 // Config configuration.
 type Config struct {
 	Project                 Project                   `yaml:"project"`
 	OAuth                   OAuthConfig               `yaml:"oauth"`
 	DB                      DBConfig                  `yaml:"db"`
-	OperatorConfig          OperatorConfig            `yaml:"operator"`
 	Logger                  interfaces.Logger         `yaml:"-"`
 	RedisConfig             RedisConfig               `yaml:"redis"`
 	ProxyModuleConfig       ProxyModuleConfig         `yaml:"proxy_module"`
@@ -48,6 +44,7 @@ type Config struct {
 	MFModelAPI              PrivateBaseConfig         `yaml:"mf-model-api"`
 	MFModelManager          PrivateBaseConfig         `yaml:"mf-model-manager"`
 	VegaBackend             PrivateBaseConfig         `yaml:"vega-backend"`
+	BknBackend              PrivateBaseConfig         `yaml:"bkn-backend"` // Runs Cypher functions.
 	AIGenerationConfig      AIGenerationConfig        `yaml:"ai_generation_config"`
 	OSSGatewayBackendConfig OSSGatewayBackendConfig   `yaml:"oss-gateway-backend"`
 	SkillIndexBuildConfig   SkillIndexBuildConfig     `yaml:"skill_index_build"`
@@ -105,6 +102,12 @@ type SandboxControlPlaneConfig struct {
 	MaxSessions int `yaml:"max_sessions" default:"3"`
 	// Number of active sessions, default 1.
 	ActiveSessions int `yaml:"active_sessions" default:"1"`
+	// Tasks a session takes before the next call goes to another session (a new one is
+	// created while the pool has free slots), default 2. Lower it to spread harder.
+	SpreadThreshold int `yaml:"spread_threshold" default:"2"`
+	// Seconds the control plane polls a synchronous execution before giving up, default 300.
+	// Requests whose timeout approaches it ask for a longer sync_timeout.
+	SyncPollDeadline int `yaml:"sync_poll_deadline" default:"300"`
 	// The maximum number of tasks to be executed concurrently in a single session, default 1.
 	MaxConcurrentTasks int `yaml:"max_concurrent_tasks" default:"100"`
 }
@@ -184,18 +187,16 @@ func (conf *Project) GetMachineID() string {
 // ProxyModuleConfig proxy module configuration information.
 type ProxyModuleConfig struct {
 	// Agent configuration.
-	DefaultTimeout int64 `yaml:"default_timeout" default:"30"` // Unit: seconds.
-	MaxTimeout     int64 `yaml:"max_timeout" default:"300"`    // Unit: seconds.
+	// DefaultTimeout applies when the caller sends no timeout. Keep it, MaxTimeout and the
+	// Helm values (service.proxyModule) aligned.
+	DefaultTimeout int64 `yaml:"default_timeout" default:"300"` // Unit: seconds.
+	MaxTimeout     int64 `yaml:"max_timeout" default:"300"`     // Unit: seconds.
+	// PlatformFunctionGrace is added to the HTTP client timeout of a platform Function call, so
+	// the sandbox reports its own timeout (with a reason) before the proxy gives up.
+	PlatformFunctionGrace int64 `yaml:"platform_function_grace" default:"5"` // Unit: seconds.
 	// Agent pool configuration.
 	MaxClients     int   `yaml:"max_clients" default:"50"`      // Maximum number of client connections.
 	ClientLifetime int64 `yaml:"client_lifetime" default:"300"` // Unit: seconds.
-}
-
-// OperatorConfig operator configuration.
-type OperatorConfig struct {
-	ImportFileSizeLimit    int64 `yaml:"import_file_size_limit" default:"2097152"  validate:"min=0,max=104857600"` // Default 2MB.
-	ImportOperatorMaxCount int64 `yaml:"import_operator_max_count" default:"10" validate:"min=1"`                  // Default 10.
-	DescLengthLimit        int64 `yaml:"operator_description_length_limit" default:"255" validate:"min=1"`         // Maximum length of operator description, unit: bytes.
 }
 
 // MCPConfig MCP configuration.
@@ -218,9 +219,9 @@ type MCPConfig struct {
 	CleanupInterval int64 `yaml:"cleanup_interval" default:"60"` // Unit: seconds.
 }
 
-// CategoryConfig operator classification configuration.
+// CategoryConfig category configuration.
 type CategoryConfig struct {
-	InitSwitch bool `yaml:"init_switch"` // Whether to initialize operator classification.
+	InitSwitch bool `yaml:"init_switch"` // Whether to initialize built-in categories.
 }
 
 // DBConfig database configuration.

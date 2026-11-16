@@ -18,10 +18,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
@@ -29,6 +29,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/factory"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/local_index"
 	model_factory "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/model_factory"
 	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
@@ -46,6 +47,7 @@ const buildTaskDispatchBuffer = 1
 type buildTaskService struct {
 	appSetting *common.AppSetting
 	bta        interfaces.BuildTaskAccess
+	cf         interfaces.ConnectorFactory
 	cs         interfaces.CatalogService
 	lim        interfaces.LocalIndexManager // When deleting a task, drop its local index. Test Injection mock
 	mfs        interfaces.ModelFactoryService
@@ -67,6 +69,7 @@ func NewBuildTaskService(appSetting *common.AppSetting, rs interfaces.ResourceSe
 		btService = &buildTaskService{
 			appSetting: appSetting,
 			bta:        logics.BTA,
+			cf:         factory.NewConnectorFactory(appSetting),
 			cs:         catalog.NewCatalogService(appSetting),
 			lim:        local_index.NewLocalIndexManager(appSetting),
 			mfs:        model_factory.NewModelFactoryService(appSetting),
@@ -99,12 +102,16 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 	resource, err := bts.rs.GetByID(ctx, resourceID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get resource failed")
-		return "", rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
+		var httpErr *httperrors.HTTPError
+		if errors.As(err, &httpErr) {
+			return "", httpErr
+		}
+		return "", httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if resource == nil {
 		span.SetStatus(codes.Error, "Resource not found")
-		return "", rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+		return "", httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
 
 	// Creating a task is a write on the table it builds, so it needs task_manage —
@@ -120,16 +127,16 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return "", rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return "", httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
 	if resource.Category != interfaces.ResourceCategoryTable {
 		span.SetStatus(codes.Error, "Resource category is not table")
-		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).
+		return "", httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).
 			WithErrorDetails("Resource category must be table")
 	}
 	if req.Mode == interfaces.BuildTaskModeStreaming {
-		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_StreamingUnsupported).
+		return "", httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_StreamingUnsupported).
 			WithErrorDetails("streaming build tasks are temporarily unsupported")
 	}
 	executeType, err := normalizeCreateBuildTaskExecuteType(ctx, req)
@@ -156,17 +163,26 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 	cat, err := bts.cs.GetByID(ctx, resource.CatalogID, false)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get catalog failed")
-		return "", rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Catalog_InternalError_GetFailed).
+		var httpErr *httperrors.HTTPError
+		if errors.As(err, &httpErr) {
+			return "", httpErr
+		}
+		return "", httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Catalog_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if cat == nil {
 		span.SetStatus(codes.Error, "Catalog not found")
-		return "", rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Catalog_NotFound)
+		return "", httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Catalog_NotFound)
 	}
 	if !cat.Enabled {
 		span.SetStatus(codes.Error, "Catalog is disabled")
-		return "", rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Catalog_IsDisabled).
+		return "", httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Catalog_IsDisabled).
 			WithErrorDetails("catalog is disabled")
+	}
+
+	if err := bts.validateConnectorBuildSchema(ctx, resource, cat.ConnectorType); err != nil {
+		span.SetStatus(codes.Error, "Source build schema rejected")
+		return "", err
 	}
 
 	if err := bts.rejectIfResourceHasActiveTask(ctx, resourceID, ""); err != nil {
@@ -185,7 +201,7 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 
 	if err := bts.bta.Create(ctx, buildTask); err != nil {
 		otellog.LogError(ctx, "Create build task failed", err)
-		return "", rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
+		return "", httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -210,14 +226,14 @@ func validateBuildTaskAnalyzers(ctx context.Context, indexManager interfaces.Loc
 		if err != nil {
 			var unavailableErr *interfaces.IndexCapabilitiesUnavailableError
 			if errors.As(err, &unavailableErr) {
-				return rest.NewHTTPError(ctx, http.StatusServiceUnavailable, verrors.VegaBackend_IndexCapability_InternalError_Unavailable).
+				return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable, verrors.VegaBackend_IndexCapability_InternalError_Unavailable).
 					WithErrorDetails(err.Error())
 			}
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_ValidateAnalyzerFailed).
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_ValidateAnalyzerFailed).
 				WithErrorDetails(err.Error())
 		}
 		if !available {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_Analyzer).
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_Analyzer).
 				WithErrorDetails(fmt.Sprintf("analyzer %q for field %q is unavailable", feature.Fulltext.Analyzer, field))
 		}
 	}
@@ -226,10 +242,10 @@ func validateBuildTaskAnalyzers(ctx context.Context, indexManager interfaces.Loc
 
 func validateBuildTaskKeyFields(ctx context.Context, resource *interfaces.Resource) error {
 	if resource.IndexConfig == nil || len(resource.IndexConfig.PrimaryKeyFields) == 0 {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails("build task requires at least one primary_key_fields entry")
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails("build task requires at least one primary_key_fields entry")
 	}
 	if len(resource.IndexConfig.IncrementalFields) == 0 {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails("build task requires at least one incremental_fields entry")
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails("build task requires at least one incremental_fields entry")
 	}
 
 	schemaFields := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
@@ -244,13 +260,13 @@ func validateBuildTaskKeyFields(ctx context.Context, resource *interfaces.Resour
 	for _, fieldName := range resource.IndexConfig.PrimaryKeyFields {
 		prop, exists := schemaFields[fieldName]
 		if !exists {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields field %q is not in the resource schema", fieldName))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields field %q is not in the resource schema", fieldName))
 		}
 		if _, duplicate := primaryKeys[fieldName]; duplicate {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields contains duplicate field %q", fieldName))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields contains duplicate field %q", fieldName))
 		}
 		if !interfaces.IndexConfig_IsPrimaryKeyType(prop.Type) {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields field %q has unsupported type %q", fieldName, prop.Type))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_PrimaryKeyFields).WithErrorDetails(fmt.Sprintf("primary_key_fields field %q has unsupported type %q", fieldName, prop.Type))
 		}
 		primaryKeys[fieldName] = struct{}{}
 	}
@@ -259,17 +275,37 @@ func validateBuildTaskKeyFields(ctx context.Context, resource *interfaces.Resour
 	for _, fieldName := range resource.IndexConfig.IncrementalFields {
 		prop, exists := schemaFields[fieldName]
 		if !exists {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields field %q is not in the resource schema", fieldName))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields field %q is not in the resource schema", fieldName))
 		}
 		if _, duplicate := incrementalKeys[fieldName]; duplicate {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields contains duplicate field %q", fieldName))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields contains duplicate field %q", fieldName))
 		}
 		if !interfaces.IndexConfig_IsIncrementalFieldType(prop.Type) {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields field %q has unsupported type %q", fieldName, prop.Type))
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_IncrementalFields).WithErrorDetails(fmt.Sprintf("incremental_fields field %q has unsupported type %q", fieldName, prop.Type))
 		}
 		incrementalKeys[fieldName] = struct{}{}
 	}
 	return nil
+}
+
+// validateConnectorBuildSchema 仅委托源端构建限制，service 不解释数据库原始类型。
+func (bts *buildTaskService) validateConnectorBuildSchema(ctx context.Context, resource *interfaces.Resource, connectorType string) error {
+	err := bts.cf.ValidateBuildSchema(connectorType, resource)
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, factory.ErrConnectorEntitlementDenied):
+		return httperrors.NewHTTPError(ctx, http.StatusForbidden, verrors.VegaBackend_Connector_EntitlementDenied)
+	case errors.Is(err, factory.ErrConnectorDisabled):
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Connector_Disabled)
+	case errors.Is(err, factory.ErrConnectorUnavailable):
+		return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable, verrors.VegaBackend_Resource_InternalError).
+			WithErrorDetails("source connector is unavailable")
+	default:
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_UnsupportedSchemaFields).
+			WithErrorDetails(err.Error())
+	}
 }
 
 func validateBuildTaskDefaultFeatures(ctx context.Context, resource *interfaces.Resource) error {
@@ -277,7 +313,7 @@ func validateBuildTaskDefaultFeatures(ctx context.Context, resource *interfaces.
 	if len(fields) == 0 {
 		return nil
 	}
-	return rest.NewHTTPError(ctx, http.StatusBadRequest,
+	return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 		verrors.VegaBackend_BuildTask_InvalidParameter_UnsupportedSchemaFields).
 		WithErrorDetails(fmt.Sprintf(
 			"fields %q use a legacy configuration without required default features; re-save the resource configuration, then create a new build task",
@@ -288,7 +324,7 @@ func validateBuildTaskDefaultFeatures(ctx context.Context, resource *interfaces.
 func normalizeCreateBuildTaskExecuteType(ctx context.Context, req *interfaces.CreateBuildTaskRequest) (string, error) {
 	if req.Mode == interfaces.BuildTaskModeStreaming {
 		if req.ExecuteType != "" {
-			return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidExecuteType).
+			return "", httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidExecuteType).
 				WithErrorDetails("execute_type is only supported for batch build tasks")
 		}
 		return "", nil
@@ -297,7 +333,7 @@ func normalizeCreateBuildTaskExecuteType(ctx context.Context, req *interfaces.Cr
 		return interfaces.BuildTaskExecuteTypeFull, nil
 	}
 	if req.ExecuteType != interfaces.BuildTaskExecuteTypeIncremental && req.ExecuteType != interfaces.BuildTaskExecuteTypeFull {
-		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidExecuteType).
+		return "", httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidExecuteType).
 			WithErrorDetails("Invalid execute type")
 	}
 	return req.ExecuteType, nil
@@ -311,14 +347,14 @@ func (bts *buildTaskService) rejectIfResourceHasActiveTask(ctx context.Context, 
 	})
 	if err != nil {
 		otellog.LogError(ctx, "Check active build task failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	for _, task := range tasks {
 		if excludeTaskID != "" && task.ID == excludeTaskID {
 			continue
 		}
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_Exist).
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_Exist).
 			WithErrorDetails("Resource already has an active build task")
 	}
 	return nil
@@ -337,6 +373,8 @@ func (bts *buildTaskService) newBuildTaskFromCreateRequest(ctx context.Context, 
 	}
 	buildTask := &interfaces.BuildTask{
 		ID:          generatedID.String(),
+		ScheduleID:  req.ScheduleID,
+		TriggerType: interfaces.BuildTaskTriggerManual,
 		ResourceID:  resource.ID,
 		CatalogID:   resource.CatalogID,
 		Status:      interfaces.BuildTaskStatusPending,
@@ -344,6 +382,11 @@ func (bts *buildTaskService) newBuildTaskFromCreateRequest(ctx context.Context, 
 		ExecuteType: req.ExecuteType,
 		Creator:     accountInfo,
 		CreateTime:  now,
+	}
+	if req.ScheduleID != "" && req.TriggerType == interfaces.BuildTaskTriggerScheduled {
+		buildTask.TriggerType = interfaces.BuildTaskTriggerScheduled
+	} else {
+		buildTask.ScheduleID = ""
 	}
 	if req.ExecuteType == interfaces.BuildTaskExecuteTypeIncremental {
 		buildTask.IndexName = resource.LocalIndexName
@@ -355,7 +398,7 @@ func (bts *buildTaskService) newBuildTaskFromCreateRequest(ctx context.Context, 
 		buildTask.IndexName = fmt.Sprintf("%s-%s", interfaces.BuildIndexPrefix, indexID)
 	}
 	if buildTask.IndexName == "" {
-		return nil, rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
 			WithErrorDetails("build task target index is unavailable")
 	}
 
@@ -367,21 +410,10 @@ func (bts *buildTaskService) newBuildTaskFromCreateRequest(ctx context.Context, 
 }
 
 func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, resource *interfaces.Resource, buildTask *interfaces.BuildTask) error {
-	for _, property := range resource.SchemaDefinition {
-		if property == nil {
-			continue
-		}
-		seenFeatureTypes := make(map[string]struct{}, len(property.Features))
-		for _, feature := range property.Features {
-			if feature.FeatureType == "" {
-				continue
-			}
-			if _, exists := seenFeatureTypes[feature.FeatureType]; exists {
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
-					WithErrorDetails(fmt.Sprintf("property %q has more than one %q feature", property.Name, feature.FeatureType))
-			}
-			seenFeatureTypes[feature.FeatureType] = struct{}{}
-		}
+	fields, err := resourcelogic.SnapshotBuildTaskIndexConfigFields(resource)
+	if err != nil {
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(fmt.Sprintf("invalid resource index configuration: %v", err))
 	}
 	defaultEmbeddingModel := ""
 	defaultFulltextAnalyzer := ""
@@ -416,7 +448,7 @@ func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, res
 					modelID = defaultEmbeddingModel
 				}
 				if modelID == "" {
-					return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_EmbeddingModel).
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_EmbeddingModel).
 						WithErrorDetails(fmt.Sprintf("embedding model is required for vector field %q; set config.embedding_model or index_config.default_embedding_model", fieldName))
 				}
 				model, ok := embeddingModelCache[modelID]
@@ -425,14 +457,14 @@ func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, res
 					model, err = bts.mfs.GetModelByID(ctx, modelID)
 					if err != nil {
 						if errors.Is(err, interfaces.ErrModelNotFound) {
-							return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_EmbeddingModel).
+							return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_EmbeddingModel).
 								WithErrorDetails(fmt.Sprintf("embedding model ID %q for vector field %q not found", modelID, fieldName))
 						}
-						return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
+						return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
 							WithErrorDetails(err.Error())
 					}
 					if model == nil || model.ModelID == "" {
-						return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
+						return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_CreateFailed).
 							WithErrorDetails(fmt.Sprintf("model %q is unavailable", modelID))
 					}
 					embeddingModelCache[modelID] = model
@@ -456,28 +488,23 @@ func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, res
 		}
 	}
 
-	fields, err := resourcelogic.SnapshotBuildTaskIndexConfigFields(resource)
-	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
-			WithErrorDetails(fmt.Sprintf("invalid resource index configuration: %v", err))
-	}
 	buildTask.IndexConfig.Fields = fields
 	return nil
 }
 
 func validateIncrementalBaseline(ctx context.Context, resource *interfaces.Resource) error {
 	if !resourcelogic.HasAvailableLocalIndex(resource) || resource.SyncMark == "" {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
 			WithErrorDetails("incremental build requires an available local index and committed checkpoint")
 	}
 	checkpoint, err := sync_checkpoint.DecodeBatch(resource.SyncMark)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
 			WithErrorDetails(fmt.Sprintf("invalid incremental checkpoint: %v", err))
 	}
 	effectiveCursorFields := sync_checkpoint.EffectiveCursorFields(resource.IndexConfig.IncrementalFields, resource.IndexConfig.PrimaryKeyFields)
 	if err := sync_checkpoint.ValidateCursor(checkpoint, effectiveCursorFields, resource.SchemaDefinition); err != nil {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
 			WithErrorDetails(fmt.Sprintf("invalid incremental checkpoint: %v", err))
 	}
 	return nil
@@ -502,12 +529,12 @@ func (bts *buildTaskService) GetByID(ctx context.Context, id string) (*interface
 	buildTask, err := bts.bta.GetByID(ctx, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get build task failed")
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if buildTask == nil {
 		span.SetStatus(codes.Error, "Build task not found")
-		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
 	}
 
 	// A task is read through the table it builds (#472).
@@ -519,7 +546,7 @@ func (bts *buildTaskService) GetByID(ctx context.Context, id string) (*interface
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
 	if err := bts.populateBuildTaskReferences(ctx, []*interfaces.BuildTask{buildTask}); err != nil {
@@ -739,7 +766,7 @@ func (bts *buildTaskService) List(ctx context.Context,
 	buildTasks, total, err := bts.bta.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List build tasks failed")
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -770,12 +797,12 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 	buildTask, err := bts.bta.GetByID(ctx, taskID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get build task failed")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if buildTask == nil {
 		span.SetStatus(codes.Error, "Build task not found")
-		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
 	}
 
 	allowed, cat, err := bts.cs.CheckCatalogPermission(ctx, buildTask.CatalogID,
@@ -786,28 +813,28 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
 	// Failed tasks may also be restarted; otherwise they become dead ends that must be deleted and rebuilt.
 	if buildTask.Status != interfaces.BuildTaskStatusStopped &&
 		buildTask.Status != interfaces.BuildTaskStatusFailed {
 		span.SetStatus(codes.Error, "Invalid state transition for start")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
 			WithErrorDetails(fmt.Sprintf("cannot start task in status: %s", buildTask.Status))
 	}
 	if strings.TrimSpace(buildTask.IndexName) == "" {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
 			WithErrorDetails("build task has no target index after upgrade; create a new build task instead")
 	}
 	if reset && buildTask.ExecuteType == interfaces.BuildTaskExecuteTypeIncremental {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalResetUnsupported).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalResetUnsupported).
 			WithErrorDetails("incremental build tasks cannot be reset")
 	}
 
 	if !cat.Enabled {
 		span.SetStatus(codes.Error, "Catalog is disabled")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Catalog_IsDisabled).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Catalog_IsDisabled).
 			WithErrorDetails("catalog is disabled")
 	}
 
@@ -830,12 +857,12 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 	updated, err := bts.bta.MarkPending(ctx, nil, taskID, resetProgress)
 	if err != nil {
 		otellog.LogError(ctx, "Update build task status failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_UpdateFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_UpdateFailed).
 			WithErrorDetails(err.Error())
 	}
 	if !updated {
 		span.SetStatus(codes.Error, "Build task status changed while starting")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
 			WithErrorDetails("build task status changed while starting; retry with the latest task state")
 	}
 
@@ -847,17 +874,21 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 
 func (bts *buildTaskService) validateStartBuildTaskStillCurrent(ctx context.Context, buildTask *interfaces.BuildTask) error {
 	if buildTask.Mode == interfaces.BuildTaskModeStreaming {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_StreamingUnsupported).
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_StreamingUnsupported).
 			WithErrorDetails("streaming build tasks are temporarily unsupported")
 	}
 	resource, err := bts.rs.GetByID(ctx, buildTask.ResourceID)
 	if err != nil {
 		otellog.LogError(ctx, "Get resource failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
+		var httpErr *httperrors.HTTPError
+		if errors.As(err, &httpErr) {
+			return httpErr
+		}
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if resource == nil {
-		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
 	if err := validateBuildTaskKeyFields(ctx, resource); err != nil {
 		return err
@@ -867,21 +898,23 @@ func (bts *buildTaskService) validateStartBuildTaskStillCurrent(ctx context.Cont
 	}
 
 	if buildTask.IndexConfig == nil {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
 			WithErrorDetails("build task has no index config snapshot; create a new build task instead")
 	}
+	// 创建时已通过 connector 校验；指纹覆盖字段原始类型、统一类型和构建配置，
+	// 启动时确认快照一致即可，无需重复调用 connector。
 	taskFingerprint, err := resourcelogic.BuildTaskIndexConfigFingerprint(buildTask.IndexConfig)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
 			WithErrorDetails(fmt.Sprintf("invalid build task index config snapshot: %v", err))
 	}
 	currentFingerprint, err := resourcelogic.ResourceIndexConfigFingerprint(resource)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
 			WithErrorDetails(fmt.Sprintf("invalid current resource index configuration: %v", err))
 	}
 	if taskFingerprint != currentFingerprint {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
 			WithErrorDetails("resource index config has changed; create a new build task instead")
 	}
 	if buildTask.ExecuteType == interfaces.BuildTaskExecuteTypeIncremental {
@@ -898,12 +931,12 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 	buildTask, err := bts.bta.GetByID(ctx, taskID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get build task failed")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 	if buildTask == nil {
 		span.SetStatus(codes.Error, "Build task not found")
-		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
 	}
 	allowed, _, err := bts.cs.CheckCatalogPermission(ctx, buildTask.CatalogID,
 		[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true)
@@ -913,12 +946,12 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 	}
 	if !allowed {
 		span.SetStatus(codes.Error, "Permission denied")
-		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 	if buildTask.Status != interfaces.BuildTaskStatusRunning &&
 		buildTask.Status != interfaces.BuildTaskStatusPending {
 		span.SetStatus(codes.Error, "Invalid state transition for stop")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
 			WithErrorDetails(fmt.Sprintf("cannot stop task in status: %s", buildTask.Status))
 	}
 
@@ -933,12 +966,12 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 	}
 	if err != nil {
 		otellog.LogError(ctx, "Update build task status failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_UpdateFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_UpdateFailed).
 			WithErrorDetails(err.Error())
 	}
 	if !updated {
 		span.SetStatus(codes.Error, "Build task status changed while stopping")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
 			WithErrorDetails("build task status changed while stopping; retry with the latest task state")
 	}
 
@@ -962,7 +995,7 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 	buildTasks, err := bts.bta.GetByIDs(ctx, ids)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get build tasks failed")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
 
@@ -991,7 +1024,7 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 			}
 			if !allowed {
 				span.SetStatus(codes.Error, "Permission denied")
-				return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+				return httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 			}
 			checkedCatalogIDs[buildTask.CatalogID] = struct{}{}
 		}
@@ -1010,12 +1043,12 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 
 	if len(activeIDs) > 0 {
 		span.SetStatus(codes.Error, "Some tasks are active")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_HasRunningExecution).
+		return httperrors.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_HasRunningExecution).
 			WithErrorDetails(map[string]any{"active_ids": activeIDs})
 	}
 	if len(missingIDs) > 0 && !ignoreMissing {
 		span.SetStatus(codes.Error, "Some build tasks not found")
-		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound).
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound).
 			WithErrorDetails(map[string]any{"missing_ids": missingIDs})
 	}
 	if len(deleteIDs) == 0 {
@@ -1025,13 +1058,13 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 	deleted, err := bts.bta.DeleteByIDs(ctx, deleteIDs)
 	if err != nil {
 		otellog.LogError(ctx, "Delete build tasks failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_DeleteFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_DeleteFailed).
 			WithErrorDetails(err.Error())
 	}
 	if deleted != int64(len(deleteIDs)) {
 		err = fmt.Errorf("expected to delete %d build tasks, deleted %d", len(deleteIDs), deleted)
 		otellog.LogError(ctx, "Delete build tasks affected unexpected rows", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_DeleteFailed).
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_DeleteFailed).
 			WithErrorDetails(err.Error())
 	}
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/semantic_understanding_task"
 )
 
 // indexDiscoverItem represents an index discover item.
@@ -183,7 +184,7 @@ func (dtw *DiscoverTaskWorker) createIndexResource(ctx context.Context,
 		Status:           interfaces.ResourceStatusActive,
 		SourceIdentifier: index.Name,
 	}
-	resource, err := dtw.rs.Create(ctx, req)
+	resource, err := dtw.rs.InternalCreate(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -288,6 +289,8 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 				OriginalDescription: field.Description,
 				Attributes:          field.Attributes,
 				Features:            buildSubFieldFeatures(field.Name, field.SubFields),
+
+				Filterable: field.Filterable,
 			}
 			if existing, ok := existingProperties[field.Name]; ok {
 				property.DisplayName = existing.DisplayName
@@ -298,7 +301,7 @@ func (dtw *DiscoverTaskWorker) enrichIndexMetadata(ctx context.Context, task *in
 		}
 		resource.SchemaDefinition = props
 
-		resource.Description = resolveSourceDescription(resource.Description, sourceOriginalDescription(resource.SourceMetadata), idx.Description)
+		resource.Description = resolveSourceDescription(resource.Description, semantic_understanding_task.SourceOriginalDescription(resource.SourceMetadata), idx.Description)
 
 		// SourceMetadata stores the complete source IndexMeta without additional fields.
 		data, err := sonic.Marshal(idx)
@@ -409,21 +412,26 @@ func (dtw *DiscoverTaskWorker) enrichResourceIndexRowCount(ctx context.Context,
 	count, err := connector.CountRows(queryCtx, meta)
 	cancel()
 
-	if err == nil && count < 0 {
-		err = fmt.Errorf("invalid negative row count")
-	}
-	if err == nil {
-		err = dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli())
-	}
 	if err != nil {
 		if errors.Is(err, interfaces.ErrRowCountUnavailable) && task.ResourceID == "" {
 			result.SkippedCount++
 		} else {
-			result.FailedCount++
+			recordCountQueryFailure(result, resource, err)
 		}
-		logger.Warnf("Resource exact count failed: resource_id=%s error=%v", resource.ID, err)
-	} else {
-		result.UpdatedCount++
+		logCountFailure(resource.ID, err)
+		return nil
 	}
+	if count < 0 {
+		recordCountQueryFailure(result, resource, errInvalidExactCount)
+		logCountFailure(resource.ID, errInvalidExactCount)
+		return nil
+	}
+
+	if err := dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli()); err != nil {
+		recordCountSaveFailure(result, resource)
+		logCountFailure(resource.ID, err)
+		return nil
+	}
+	result.UpdatedCount++
 	return nil
 }

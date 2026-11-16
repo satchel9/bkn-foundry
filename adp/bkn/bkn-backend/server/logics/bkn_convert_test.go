@@ -11,10 +11,9 @@ import (
 
 	. "github.com/smartystreets/goconvey/convey"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	cond "bkn-backend/common/condition"
-	"bkn-backend/common/maskrule"
-	"bkn-backend/interfaces"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/maskrule"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // ── Network ──────────────────────────────────────────────────────────────────
@@ -69,151 +68,6 @@ func Test_ToBKNNetWork(t *testing.T) {
 }
 
 // ── Metric ───────────────────────────────────────────────────────────────────
-
-func Test_ToADPMetricDefinition_MinimalAtomic(t *testing.T) {
-	Convey("ToADPMetricDefinition maps BknMetric fields for atomic formula\n", t, func() {
-		bknM := &bknsdk.BknMetric{
-			BknMetricFrontmatter: bknsdk.BknMetricFrontmatter{
-				ID:   "metric-a",
-				Name: "Metric A",
-				Tags: []string{"t1"},
-			},
-			MetricAttributes: bknsdk.MetricAttributes{
-				MetricType: interfaces.MetricTypeAtomic,
-				UnitType:   "numUnit",
-				Unit:       "none",
-			},
-			Summary:     "sum",
-			Description: "full comment",
-			ScopeType:   interfaces.ScopeTypeObjectType,
-			ScopeRef:    "ot-pod",
-			Formula: &bknsdk.MetricFormula{
-				Kind: interfaces.MetricTypeAtomic,
-				Atomic: &bknsdk.MetricAtomic{
-					Condition: &bknsdk.MetricCondition{
-						Field: "status", Operation: "eq", Value: "running",
-					},
-					Aggregation: &bknsdk.MetricAggregation{
-						Property: "cpu", Aggr: interfaces.MetricAggrSum,
-					},
-				},
-			},
-			TimeDimensions: []bknsdk.MetricTimeDimRow{
-				{Property: "ts", Policy: interfaces.MetricTimeDefaultRangePolicyLast24h},
-			},
-			AnalysisDimensions: []bknsdk.MetricAnalysisDimRow{
-				{Name: "region", DisplayName: "Region"},
-			},
-		}
-
-		adp := ToADPMetricDefinition("kn1", interfaces.MAIN_BRANCH, bknM)
-		So(adp, ShouldNotBeNil)
-		So(adp.ID, ShouldEqual, "metric-a")
-		So(adp.KnID, ShouldEqual, "kn1")
-		So(adp.Branch, ShouldEqual, interfaces.MAIN_BRANCH)
-		So(adp.Name, ShouldEqual, "Metric A")
-		So(adp.Tags, ShouldResemble, []string{"t1"})
-		So(adp.Comment, ShouldEqual, "full comment")
-		So(adp.MetricType, ShouldEqual, interfaces.MetricTypeAtomic)
-		So(adp.UnitType, ShouldEqual, "numUnit")
-		So(adp.Unit, ShouldEqual, "none")
-		So(adp.ScopeType, ShouldEqual, interfaces.ScopeTypeObjectType)
-		So(adp.ScopeRef, ShouldEqual, "ot-pod")
-		So(adp.TimeDimension, ShouldNotBeNil)
-		So(adp.TimeDimension.Property, ShouldEqual, "ts")
-		So(adp.TimeDimension.DefaultRangePolicy, ShouldEqual, interfaces.MetricTimeDefaultRangePolicyLast24h)
-		So(adp.CalculationFormula, ShouldNotBeNil)
-		So(adp.CalculationFormula.Aggregation.Property, ShouldEqual, "cpu")
-		So(adp.CalculationFormula.Aggregation.Aggr, ShouldEqual, interfaces.MetricAggrSum)
-		So(adp.CalculationFormula.Condition, ShouldNotBeNil)
-		So(adp.CalculationFormula.Condition.Field, ShouldEqual, "status")
-		So(adp.AnalysisDimensions, ShouldHaveLength, 1)
-		So(adp.AnalysisDimensions[0].Name, ShouldEqual, "region")
-	})
-}
-
-func Test_ToBKNMetricDefinition_RoundTrip_KeyFields(t *testing.T) {
-	Convey("ToBKNMetricDefinition round-trip preserves key fields\n", t, func() {
-		orig := &interfaces.MetricDefinition{
-			ID:     "m1",
-			KnID:   "kn-x",
-			Branch: interfaces.MAIN_BRANCH,
-			Name:   "N",
-			CommonInfo: interfaces.CommonInfo{
-				Comment:       "c",
-				Tags:          []string{"x"},
-				BKNRawContent: "raw",
-			},
-			UnitType:   "numUnit",
-			Unit:       "none",
-			MetricType: interfaces.MetricTypeAtomic,
-			ScopeType:  interfaces.ScopeTypeObjectType,
-			ScopeRef:   "ot1",
-			TimeDimension: &interfaces.MetricTimeDimension{
-				Property:           "ts",
-				DefaultRangePolicy: interfaces.MetricTimeDefaultRangePolicyLast1h,
-			},
-			CalculationFormula: &interfaces.MetricCalculationFormula{
-				Condition: &cond.CondCfg{
-					Field:       "f",
-					Operation:   "eq",
-					ValueOptCfg: cond.ValueOptCfg{Value: 1},
-				},
-				Aggregation: interfaces.MetricAggregation{Property: "p", Aggr: interfaces.MetricAggrCount},
-			},
-			AnalysisDimensions: []interfaces.MetricAnalysisDimension{
-				{Name: "a1", DisplayName: "A1"},
-			},
-		}
-
-		bkn := ToBKNMetricDefinition(orig)
-		So(bkn, ShouldNotBeNil)
-		So(bkn.ID, ShouldEqual, "m1")
-		So(bkn.Name, ShouldEqual, "N")
-		So(bkn.Tags, ShouldResemble, []string{"x"})
-		So(bkn.ScopeType, ShouldEqual, interfaces.ScopeTypeObjectType)
-		So(bkn.ScopeRef, ShouldEqual, "ot1")
-		So(bkn.MetricAttributes.MetricType, ShouldEqual, interfaces.MetricTypeAtomic)
-
-		back := ToADPMetricDefinition("kn-x", interfaces.MAIN_BRANCH, bkn)
-		So(back.ID, ShouldEqual, orig.ID)
-		So(back.Name, ShouldEqual, orig.Name)
-		So(back.ScopeRef, ShouldEqual, orig.ScopeRef)
-		So(back.CalculationFormula.Aggregation, ShouldResemble, orig.CalculationFormula.Aggregation)
-		So(back.CalculationFormula.Condition.Field, ShouldEqual, orig.CalculationFormula.Condition.Field)
-		So(back.TimeDimension.Property, ShouldEqual, orig.TimeDimension.Property)
-		So(back.AnalysisDimensions[0].Name, ShouldEqual, "a1")
-	})
-}
-
-func Test_MetricCondition_CompositeRoundTrip(t *testing.T) {
-	Convey("metric composite condition round-trips through BKN conversion\n", t, func() {
-		orig := &cond.CondCfg{
-			Operation: cond.OperationAnd,
-			SubConds: []*cond.CondCfg{
-				{Field: "warehouse", Operation: cond.OperationIn, ValueOptCfg: cond.ValueOptCfg{Value: []any{"昆山成品仓"}}},
-				{Field: "stock_status", Operation: cond.OperationEq, ValueOptCfg: cond.ValueOptCfg{Value: "可用"}},
-			},
-		}
-
-		bknCond := condCfgToMetricCondition(orig)
-		So(bknCond, ShouldNotBeNil)
-		So(bknCond.Operation, ShouldEqual, cond.OperationAnd)
-		So(bknCond.SubConds, ShouldHaveLength, 2)
-		So(bknCond.SubConds[0].Field, ShouldEqual, "warehouse")
-		So(bknCond.SubConds[1].Field, ShouldEqual, "stock_status")
-
-		back := metricConditionToCondCfg(bknCond)
-		So(back.Operation, ShouldEqual, orig.Operation)
-		So(back.SubConds, ShouldHaveLength, 2)
-		So(back.SubConds[0].Field, ShouldEqual, "warehouse")
-		So(back.SubConds[0].Operation, ShouldEqual, cond.OperationIn)
-		So(back.SubConds[1].Field, ShouldEqual, "stock_status")
-		So(back.SubConds[1].Operation, ShouldEqual, cond.OperationEq)
-	})
-}
-
-// ── ObjectType ───────────────────────────────────────────────────────────────
 
 func Test_ToADPObjectType(t *testing.T) {
 	Convey("Test ToADPObjectType\n", t, func() {
@@ -749,5 +603,53 @@ func Test_ObjectTypeLogicPropertyToolSource_RoundTrip(t *testing.T) {
 			So(back.LogicProperties[0].DataSource.ToolID, ShouldEqual, "tool-1")
 			So(back.LogicProperties[0].DataSource.ResultPath, ShouldEqual, "$.result.rate_pct")
 		})
+	})
+}
+
+// The 3.0 relation declarations, relation properties and lifecycles convert both ways without loss;
+// a definition without them converts as before.
+func Test_ConvertDeclarationsRoundTrip(t *testing.T) {
+	Convey("relation declarations and lifecycles round trip", t, func() {
+		deprecated := &interfaces.Lifecycle{Status: interfaces.LIFECYCLE_DEPRECATED, Reason: "改用任职记录", ReplacedBy: "employment"}
+		rt := &interfaces.RelationType{
+			RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{
+				RTID: "works_in", RTName: "任职于", SourceObjectTypeID: "employee", TargetObjectTypeID: "dept",
+				Type: interfaces.RELATION_TYPE_INDIRECT,
+				MappingRules: &interfaces.InDirectMapping{
+					BackingDataSource: &interfaces.ResourceInfo{Type: "resource", ID: "res_employment"},
+					SourceMappingRules: []interfaces.Mapping{{
+						SourceProp: interfaces.SimpleProperty{Name: "id"}, TargetProp: interfaces.SimpleProperty{Name: "emp_id"},
+					}},
+					Properties: []*interfaces.DataProperty{{
+						Name: "since", DisplayName: "起始", Type: "date", Semantic: "valid_from",
+						MappedField: &interfaces.Field{Name: "start_date"},
+					}},
+				},
+			},
+			KNID: "kn1", Branch: "main",
+			RelationDeclarations: interfaces.RelationDeclarations{
+				ReverseName: "雇员", Aliases: []string{"在职"}, Cardinality: "many_to_one",
+				Constraints: &interfaces.RelationConstraints{Required: []string{"source"}},
+				Lifecycle:   deprecated, Importance: "secondary", FallbackFor: "works_in_direct", Verification: "unconfirmed",
+			},
+		}
+		bknRel := ToBKNRelationType(rt)
+		So(bknRel.Endpoint.Cardinality, ShouldEqual, "many_to_one")
+		So(bknRel.RequiredEnds, ShouldResemble, []string{"source"})
+		So(len(bknRel.DataProperties), ShouldEqual, 1)
+		back := ToADPRelationType("kn1", "main", bknRel)
+		So(back.RelationDeclarations, ShouldResemble, rt.RelationDeclarations)
+		So(back.RelationProperties(), ShouldResemble, rt.RelationProperties())
+
+		plain := ToADPRelationType("kn1", "main", ToBKNRelationType(&interfaces.RelationType{
+			RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "r", Type: interfaces.RELATION_TYPE_DIRECT},
+		}))
+		So(plain.RelationDeclarations, ShouldResemble, interfaces.RelationDeclarations{})
+
+		ot := &interfaces.ObjectType{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot"}, Lifecycle: deprecated}
+		So(ToADPObjectType("kn1", "main", ToBKNObjectType(ot)).Lifecycle, ShouldResemble, deprecated)
+		at := &interfaces.ActionType{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at"}, Lifecycle: deprecated}
+		So(ToADPActionType("kn1", "main", ToBKNActionType(at)).Lifecycle, ShouldResemble, deprecated)
+		So(ToBKNObjectType(&interfaces.ObjectType{}).Lifecycle, ShouldBeNil)
 	})
 }

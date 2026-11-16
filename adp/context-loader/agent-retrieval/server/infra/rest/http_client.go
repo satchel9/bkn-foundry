@@ -18,13 +18,13 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 
 	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/logger"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/telemetry"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/utils"
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 // httpClient HTTP client structure.
@@ -185,18 +185,16 @@ func (c *httpClient) httpDo(ctx context.Context, mtehod, url string, headers map
 	}
 	err = sonic.Unmarshal(respBody, &respData)
 	if err != nil {
-		c.logger.Error(err.Error())
+		c.logger.Error("Dependency response is not valid JSON")
 		respData = string(respBody)
 	}
 	if (respCode < http.StatusOK) || (respCode >= http.StatusMultipleChoices) {
 		respStr := utils.ObjectToJSON(respData)
-		c.logger.Errorf("Exception(http do error, method: %s, url: %s, headers: %v, reqParam: %v, respCode: %d, error: %s)",
-			mtehod, url, utils.ObjectToJSON(headers), utils.ObjectToJSON(reqParam), respCode, respStr)
+		c.logger.Errorf("Dependency request failed, method: %s, status: %d", mtehod, respCode)
 		// Exception when calling external service.
 		httpErr := infraErr.NewHTTPError(ctx, respCode, infraErr.ErrExtCommonExternalServerError,
 			fmt.Sprintf("Exception(http do error, method: %s, url: %s,  http status: %d, error: %s)", mtehod, url, respCode, respStr))
-		httpErr.DownstreamBody = respBody
-		err = httpErr
+		err = &infraErr.DependencyError{Err: httpErr, Body: respBody}
 		return
 	}
 	return
@@ -228,13 +226,11 @@ func (c *httpClient) httpDoBytes(ctx context.Context, method, url string, header
 	}
 	if (respCode < http.StatusOK) || (respCode >= http.StatusMultipleChoices) {
 		respStr := string(respBody)
-		c.logger.Errorf("Exception(http do error, method: %s, url: %s, headers: %v, reqParam: %v, respCode: %d, error: %s)",
-			method, url, utils.ObjectToJSON(headers), utils.ObjectToJSON(reqParam), respCode, respStr)
+		c.logger.Errorf("Dependency request failed, method: %s, status: %d", method, respCode)
 		// Exception when calling external service.
 		httpErr := infraErr.NewHTTPError(ctx, respCode, infraErr.ErrExtCommonExternalServerError,
 			fmt.Sprintf("Exception(http do error, method: %s, url: %s,  http status: %d, error: %s)", method, url, respCode, respStr))
-		httpErr.DownstreamBody = respBody
-		err = httpErr
+		err = &infraErr.DependencyError{Err: httpErr, Body: respBody}
 		return
 	}
 	return
@@ -267,7 +263,21 @@ func (c *httpClient) httpDoNoUnmarshal(ctx context.Context, mtehod, url string, 
 	}()
 	respBody, err = io.ReadAll(resp.Body)
 	respCode = resp.StatusCode
+	if observe, ok := ctx.Value(responseObserverKey{}).(ResponseObserver); ok && err == nil {
+		observe(respCode, resp.Header, respBody)
+	}
 	return
+}
+
+// ResponseObserver sees every response of the calls made with a context that
+// carries it (see WithResponseObserver).
+type ResponseObserver func(status int, header http.Header, body []byte)
+
+type responseObserverKey struct{}
+
+// WithResponseObserver makes the HTTP client report each response to observe.
+func WithResponseObserver(ctx context.Context, observe ResponseObserver) context.Context {
+	return context.WithValue(ctx, responseObserverKey{}, observe)
 }
 
 func (c *httpClient) generateURL(rawURL string, queryValues url.Values) (*url.URL, error) {
@@ -318,6 +328,6 @@ func (c *httpClient) generateReq(ctx context.Context, httpMethod, url string,
 			req.Header.Add(k, v)
 		}
 	}
-	req.Header.Set(sharedrest.AcceptLanguageHeader, sharedrest.GetLanguageByCtx(ctx))
+	req.Header.Set(i18n.AcceptLanguageHeader, string(i18n.GetLanguageByCtx(ctx)))
 	return
 }

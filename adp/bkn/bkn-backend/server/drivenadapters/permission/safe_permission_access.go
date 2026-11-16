@@ -8,27 +8,75 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // safeClient talks to bkn-safe's clean authz API (/api/safe/v1/authz/*).
 type safeClient struct {
-	baseURL string
-	http    *http.Client
+	baseURL     string
+	http        *http.Client
+	cleanupHTTP *http.Client
+}
+
+const (
+	defaultSafeTimeout            = 5 * time.Second
+	defaultResourceCleanupTimeout = 30 * time.Second
+	resourceCleanupTimeoutEnv     = "BKN_SAFE_RESOURCE_CLEANUP_TIMEOUT"
+)
+
+// safeHTTPStatusError preserves the response status as structured data so
+// callers never need to inspect a potentially sensitive dependency error
+// string to decide whether a compatibility fallback is available.
+type safeHTTPStatusError struct {
+	method     string
+	path       string
+	statusCode int
+}
+
+func (e *safeHTTPStatusError) Error() string {
+	return fmt.Sprintf("bkn-safe %s %s returned status %d", e.method, e.path, e.statusCode)
+}
+
+// concreteResourceOperations is used only when talking to an older bkn-safe
+// that predates the any_operation query flag. Create is deliberately absent:
+// it is a type-level capability and never identifies an existing resource.
+var concreteResourceOperations = []string{
+	interfaces.OPERATION_TYPE_VIEW_DETAIL,
+	interfaces.OPERATION_TYPE_MODIFY,
+	interfaces.OPERATION_TYPE_DELETE,
+	interfaces.OPERATION_TYPE_QUERY_DATA,
+	interfaces.OPERATION_TYPE_AUTHORIZE,
+	interfaces.OPERATION_TYPE_EXECUTE,
+	interfaces.OPERATION_TYPE_FULL_BUSINESS_ACCESS,
 }
 
 func newSafeClient(baseURL string) *safeClient {
 	return &safeClient{
-		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		http:    &http.Client{Timeout: 5 * time.Second},
+		baseURL:     strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+		http:        &http.Client{Timeout: defaultSafeTimeout},
+		cleanupHTTP: &http.Client{Timeout: configuredResourceCleanupTimeout()},
 	}
+}
+
+func configuredResourceCleanupTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(resourceCleanupTimeoutEnv))
+	if raw == "" {
+		return defaultResourceCleanupTimeout
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		return defaultResourceCleanupTimeout
+	}
+	return timeout
 }
 
 func (c *safeClient) allowedAll(ctx context.Context, accessorID, rtype, rid string, ops []string) (bool, error) {
@@ -127,7 +175,44 @@ func (c *safeClient) listAccessibleResources(ctx context.Context, accessorID, re
 
 func (c *safeClient) listAccessibleResourcesWithAnyOperation(ctx context.Context, accessorID,
 	resourceType string) (interfaces.PermissionResourceScope, error) {
-	return c.listAccessibleResourceScope(ctx, accessorID, resourceType, "", true)
+	scope, err := c.listAccessibleResourceScope(ctx, accessorID, resourceType, "", true)
+	if err == nil || !isUnsupportedAnyOperation(err) {
+		return scope, err
+	}
+
+	// bkn-safe 0.2.0 accepts the same resource listing endpoint but not its
+	// any_operation flag. Preserve the OR semantics by joining the concrete
+	// scopes instead of silently reducing visibility to view_detail.
+	return c.listAccessibleResourcesByConcreteOperations(ctx, accessorID, resourceType)
+}
+
+func isUnsupportedAnyOperation(err error) bool {
+	var statusErr *safeHTTPStatusError
+	return errors.As(err, &statusErr) && statusErr.statusCode == http.StatusBadRequest
+}
+
+func (c *safeClient) listAccessibleResourcesByConcreteOperations(ctx context.Context, accessorID,
+	resourceType string) (interfaces.PermissionResourceScope, error) {
+	seen := make(map[string]struct{})
+	result := interfaces.PermissionResourceScope{ResourceIDs: []string{}}
+	for _, operation := range concreteResourceOperations {
+		scope, err := c.listAccessibleResourceScope(ctx, accessorID, resourceType, operation, false)
+		if err != nil {
+			return interfaces.PermissionResourceScope{}, err
+		}
+		if scope.Unrestricted {
+			return scope, nil
+		}
+		result.RequiresCandidateFilter = result.RequiresCandidateFilter || scope.RequiresCandidateFilter
+		for _, resourceID := range scope.ResourceIDs {
+			if _, exists := seen[resourceID]; exists {
+				continue
+			}
+			seen[resourceID] = struct{}{}
+			result.ResourceIDs = append(result.ResourceIDs, resourceID)
+		}
+	}
+	return result, nil
 }
 
 func (c *safeClient) listAccessibleResourceScope(ctx context.Context, accessorID, resourceType,
@@ -173,6 +258,14 @@ func (c *safeClient) deleteResourceParents(ctx context.Context, resourceType str
 }
 
 func (c *safeClient) do(ctx context.Context, method, path string, body, out any) error {
+	return c.doWithClient(ctx, c.http, method, path, body, out)
+}
+
+func (c *safeClient) doCleanup(ctx context.Context, method, path string, body, out any) error {
+	return c.doWithClient(ctx, c.cleanupHTTP, method, path, body, out)
+}
+
+func (c *safeClient) doWithClient(ctx context.Context, client *http.Client, method, path string, body, out any) error {
 	var requestBody io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -188,7 +281,7 @@ func (c *safeClient) do(ctx context.Context, method, path string, body, out any)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.http.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -198,7 +291,7 @@ func (c *safeClient) do(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("read bkn-safe response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("bkn-safe %s %s returned status %d", method, path, resp.StatusCode)
+		return &safeHTTPStatusError{method: method, path: path, statusCode: resp.StatusCode}
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
@@ -301,7 +394,7 @@ func (s *safePermissionAccess) CreateResources(ctx context.Context, policies []i
 
 func (s *safePermissionAccess) DeleteResources(ctx context.Context, resources []interfaces.PermissionResource) error {
 	for _, r := range resources {
-		if err := s.safe.do(ctx, http.MethodDelete, "/api/safe/v1/authz/policies", map[string]any{
+		if err := s.safe.doCleanup(ctx, http.MethodDelete, "/api/safe/v1/authz/policies", map[string]any{
 			"resource": map[string]string{"type": r.Type, "id": r.ID},
 		}, nil); err != nil {
 			return err

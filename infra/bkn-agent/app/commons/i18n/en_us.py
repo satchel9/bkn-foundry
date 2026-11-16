@@ -6,6 +6,93 @@
 # match zh_cn.py exactly; tools/check_i18n_catalogs.py enforces that in CI.
 
 error_messages = {
+    "BknAgent.Prompt.TranslationStale": {
+        "code": "BknAgent.Prompt.TranslationStale",
+        "description": "The prompt or its source language changed. Reload before saving a translation.",
+        "detail": "The prompt or its source language changed. Reload before saving a translation.",
+        "solution": "Reload the prompt and check its source language.",
+    },
+    "BknAgent.Prompt.TranslationIsSource": {
+        "code": "BknAgent.Prompt.TranslationIsSource",
+        "description": "The original language cannot be saved as a translation.",
+        "detail": "The original language cannot be saved as a translation.",
+        "solution": "Reload the prompt and check its source language.",
+    },
+    "BknAgent.Agent.BindingChanged": {
+        "code": "BknAgent.ParamError.Conflict",
+        "description": 'The Agent prompt binding changed concurrently.',
+        "detail": 'The Agent prompt binding changed concurrently.',
+        "solution": 'Reload the Agent configuration and retry the update.',
+    },
+    "BknAgent.Execution.ToolScopeMismatch": {
+        "code": "BknAgent.Execution.ToolScopeMismatch",
+        "description": "The tool requested a different knowledge network; the call was rejected.",
+        "detail": "The tool requested a different knowledge network; the call was rejected.",
+        "solution": "Query only the selected knowledge network.",
+    },
+    "BknAgent.Auth.TokenRequired": {
+        "code": "BknAgent.Auth.TokenRequired",
+        "description": "A valid bearer token is required.",
+        "detail": "A valid bearer token is required.",
+        "solution": "Supply an active OAuth token or user-issued AppKey.",
+    },
+    "BknAgent.Execution.Unavailable": {
+        "code": "BknAgent.Execution.Unavailable",
+        "description": "Execution dependencies are unavailable or returned an invalid response.",
+        "detail": "Execution dependencies are unavailable or returned an invalid response.",
+        "solution": "Check identity, authorization and Context Loader availability before retrying.",
+    },
+    "BknAgent.Execution.Forbidden": {
+        "code": "BknAgent.Execution.Forbidden",
+        "description": "The caller has no access to this knowledge network.",
+        "detail": "The caller has no access to this knowledge network.",
+        "solution": "Request access to the knowledge network.",
+    },
+    "BknAgent.Execution.Unsupported": {
+        "code": "BknAgent.Execution.Unsupported",
+        "description": "This agent requires capabilities not supported by the public execution scope.",
+        "detail": "This agent requires capabilities not supported by the public execution scope.",
+        "solution": "Use the supported built-in Agent configuration.",
+    },
+    "BknAgent.Execution.ContextMissing": {
+        "code": "BknAgent.Execution.ContextMissing",
+        "description_template": "This agent needs context.{field}.",
+        "description": "This agent needs more request context.",
+        "detail_template": "This agent needs context.{field}.",
+        "detail": "This agent needs more request context.",
+        "solution": "Send the context the agent's built-in tools require.",
+    },
+    "BknAgent.Execution.ContextInvalid": {
+        "code": "BknAgent.Execution.ContextInvalid",
+        "description": "The request context is invalid for this agent.",
+        "detail_template": "Invalid or unexpected context: {field}",
+        "detail": "The request context is invalid for this agent.",
+        "solution": "Send only the context this agent uses, in its documented shape.",
+    },
+    "BknAgent.Execution.ResultInvalid": {
+        "code": "BknAgent.Execution.ResultInvalid",
+        "description": "The execution produced a result that failed validation.",
+        "detail": "The execution produced a result that failed validation.",
+        "solution": "Retry with a new request ID; report it if it persists.",
+    },
+    "BknAgent.Execution.Conflict": {
+        "code": "BknAgent.Execution.Conflict",
+        "description": "The request conflicts with an existing execution or thread scope.",
+        "detail": "The request conflicts with an existing execution or thread scope.",
+        "solution": "Read the existing execution or start a new request/thread for different input.",
+    },
+    "BknAgent.Execution.Failed": {
+        "code": "BknAgent.Execution.Failed",
+        "description": "The execution failed.",
+        "detail": "The execution failed.",
+        "solution": "Check the trace and retry with a new request ID if appropriate.",
+    },
+    "BknAgent.MetricDesign.ProposalInvalid": {
+        "code": "BknAgent.MetricDesign.ProposalInvalid",
+        "description": "The metric design proposal failed validation.",
+        "detail": "The suggested metric changes are invalid. Review the field and reason, then retry.",
+        "solution": "Retry the request or adjust the metric description; report the run ID if it persists.",
+    },
     "BknAgent.Auth.AccountRequired": {
         "code": "BknAgent.Auth.AccountRequired",
         "description": "Caller identity is missing.",
@@ -75,6 +162,13 @@ error_messages = {
         "detail_template": "Prompt {prompt_id} has no version {version}.",
         "detail": "The target version does not exist.",
         "solution": "",
+    },
+    "BknAgent.Prompt.VersionConflict": {
+        "code": "BknAgent.Prompt.VersionConflict",
+        "description": "The requested Prompt version already exists or is out of sequence.",
+        "detail_template": "Requested version {version}; next available version {next_version}.",
+        "detail": "The publication conflicts with the current version history.",
+        "solution": "Refresh the version history and check the publication result before publishing again.",
     },
     "BknAgent.Prompt.Conflict": {
         "code": "BknAgent.ParamError.Conflict",
@@ -146,6 +240,13 @@ error_messages = {
         "detail": "Unknown tool reference type.",
         "solution": "",
     },
+    "BknAgent.ToolRef.BuiltinUnknown": {
+        "code": "BknAgent.ParamError.ToolRef",
+        "description": "The builtin tool reference names an unknown provider or tool.",
+        "detail_template": "{ref}",
+        "detail": "The builtin tool reference names an unknown provider or tool.",
+        "solution": "Use a provider registered in bkn-agent and only its tool names.",
+    },
     "BknAgent.ToolRef.BoxIdMissing": {
         "code": "BknAgent.ParamError.ToolRef",
         "description": "The toolbox tool reference has no box_id.",
@@ -174,6 +275,41 @@ error_messages = {
         "detail": "The referenced agent is not a one-shot agent.",
         "solution": "agent-as-tool uses the same one-shot execution path as /run, so the referenced agent must have mode=task.",
     },
+    "BknAgent.Agent.BuiltinUndeletable": {
+        "code": "BknAgent.Forbidden",
+        "description": "Built-in Agents cannot be deleted.",
+        "detail_template": "Agent {agent_id} is a built-in Agent.",
+        "detail": "Built-in Agents cannot be deleted.",
+        "solution": "Platform features depend on built-in Agents; restore the initial version from System Admin instead.",
+    },
+    "BknAgent.Agent.BuiltinStaysPublished": {
+        "code": "BknAgent.ParamError.Status",
+        "description": "Built-in Agents cannot be unpublished.",
+        "detail_template": "Agent {agent_id} is a built-in Agent.",
+        "detail": "Built-in Agents must stay published.",
+        "solution": "Platform features depend on built-in Agents; keep status=published.",
+    },
+    "BknAgent.Agent.NoInitialVersion": {
+        "code": "BknAgent.NotFound",
+        "description": "This built-in Agent has no initial version.",
+        "detail_template": "Agent {agent_id} has no initial version.",
+        "detail": "No initial version.",
+        "solution": "Make sure the bkn-agent database migrations have run to the latest version.",
+    },
+    "BknAgent.Agent.VersionInUse": {
+        "code": "BknAgent.ParamError.Version",
+        "description": "The Agent version in use cannot be deleted.",
+        "detail_template": "v{version} is in use.",
+        "detail": "This version is in use.",
+        "solution": "Switch to another version first, then delete this one.",
+    },
+    "BknAgent.Agent.InitialVersion": {
+        "code": "BknAgent.ParamError.Version",
+        "description": "The initial version cannot be deleted.",
+        "detail_template": "v{version} is the initial version.",
+        "detail": "The initial version is kept for restoring.",
+        "solution": "The initial version is always kept so the Agent can be restored.",
+    },
     "BknAgent.Agent.Forbidden": {
         "code": "BknAgent.Forbidden",
         "description": "You may not modify another account's agent.",
@@ -201,6 +337,12 @@ error_messages = {
         "detail_template": "agent {agent_id} mode={mode}",
         "detail": "This agent is not in chat mode.",
         "solution": "Call a task agent through /run (M3).",
+    },
+    "BknAgent.Task.IdempotencyConflict": {
+        "code": "BknAgent.Task.IdempotencyConflict",
+        "description": "This task key was already used with different input.",
+        "detail": "This task key was already used with different input.",
+        "solution": "Reuse the original input or use a new task key.",
     },
     "BknAgent.Task.ModeMismatch": {
         "code": "BknAgent.ParamError.Mode",
@@ -253,6 +395,24 @@ error_messages = {
         "description": "Internal service error.",
         "detail": "Internal service error.",
         "solution": "Check the bkn-agent logs and the trace_id; retry later if a downstream service is unavailable.",
+    },
+    "BknAgent.Tool.Unavailable": {
+        "code": "BknAgent.Tool.Unavailable",
+        "description": "The tool call did not complete.",
+        "detail": "The tool call did not complete.",
+        "solution": "Try another way to query; if it keeps happening, check the service behind the tool.",
+    },
+    "BknAgent.Model.Unavailable": {
+        "code": "BknAgent.Model.Unavailable",
+        "description": "The model service is temporarily unavailable.",
+        "detail": "The model service is temporarily unavailable.",
+        "solution": "Try again later; if it keeps failing, check the Model Factory and its upstream service.",
+    },
+    "BknAgent.Model.Rejected": {
+        "code": "BknAgent.Model.Rejected",
+        "description": "The model service rejected this request.",
+        "detail": "The model service rejected this request.",
+        "solution": "Check the model configuration, context length, or quota and try again.",
     },
     "BknAgent.Chat.Timeout": {
         "code": "BknAgent.Chat.Timeout",

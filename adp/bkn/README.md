@@ -5,12 +5,13 @@
 `adp/bkn` contains the BKN Engine backend services for Business Knowledge Network
 modeling and query. It is part of BKN Foundry and is not a standalone product UI.
 
-The subsystem currently consists of two Go services:
+The subsystem currently consists of three Go services:
 
 | Service | Path | Default port | Responsibility |
 | --- | --- | --- | --- |
 | BKN Backend | `bkn-backend/` | `13014` | Knowledge network modeling, validation, import/export, concept indexing, metrics, risk types, and action schedules |
 | Ontology Query | `ontology-query/` | `13018` | Object data query, property query, subgraph query, action execution, action logs, and metric data query |
+| BKN Project | `bkn-project/` | `13016` | Projects that build and publish knowledge networks from requirements and data; release lineage |
 
 ## Capability Scope
 
@@ -44,7 +45,7 @@ adp/bkn/
   README.zh.md       # Chinese overview
 ```
 
-Both services follow the same broad layout:
+The services follow the same broad layout:
 
 ```text
 server/
@@ -97,7 +98,7 @@ Internal API prefixes:
 
 Prerequisites:
 
-- Go 1.25+
+- Go 1.26.0+
 - MariaDB 11.4+ or DM8
 - OpenSearch 2.x
 - Running dependencies configured in each service's `server/config/*.yaml`

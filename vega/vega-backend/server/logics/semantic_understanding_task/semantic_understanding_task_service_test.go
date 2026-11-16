@@ -7,7 +7,7 @@ package semantic_understanding_task
 
 import (
 	"context"
-	// "encoding/json" // Catalog 输入组装测试恢复时启用。
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,21 +15,23 @@ import (
 	"testing"
 
 	"github.com/bytedance/sonic"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
-	mock_interfaces "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
+	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
 )
 
 func TestSemanticUnderstandingTaskServiceList(t *testing.T) {
 	t.Run("reports task query failure instead of permission filter failure", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		service := &semanticUnderstandingTaskService{suta: taskAccess, cs: catalogService}
 		catalogService.EXPECT().ListPermittedCatalogIDs(gomock.Any(),
 			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, interfaces.VISIBILITY_MATCH_ALL,
@@ -39,20 +41,20 @@ func TestSemanticUnderstandingTaskServiceList(t *testing.T) {
 
 		tasks, total, err := service.List(context.Background(), interfaces.SemanticUnderstandingTaskQueryParams{})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, "VegaBackend.SemanticUnderstandingTask.InternalError.GetFailed", httpErr.BaseError.ErrorCode)
+		assert.Equal(t, "VegaBackend.SemanticUnderstandingTask.InternalError.GetFailed", httpErr.ErrorCode)
 		assert.Nil(t, tasks)
 		assert.Zero(t, total)
 	})
 
 	t.Run("preserves permission filter failure", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		service := &semanticUnderstandingTaskService{suta: taskAccess, cs: catalogService}
-		permissionErr := rest.NewHTTPError(context.Background(), http.StatusInternalServerError,
+		permissionErr := httperrors.NewHTTPError(context.Background(), http.StatusInternalServerError,
 			verrors.VegaBackend_InternalError_FilterResourcesFailed)
 		catalogService.EXPECT().ListPermittedCatalogIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil, permissionErr)
@@ -78,7 +80,7 @@ func TestBuildCatalogSemanticUnderstandingInput(t *testing.T) {
 				Description:      "订单统计逻辑视图",
 				Status:           interfaces.ResourceStatusActive,
 				Category:         interfaces.ResourceCategoryLogicalView,
-				LogicDefinition:  []*interfaces.LogicDefinitionNode{{ID: "hidden"}},
+				LogicalViewDefinition:  []*interfaces.LogicalViewDefinitionNode{{ID: "hidden"}},
 			},
 			{
 				ID:               "resource-1",
@@ -138,7 +140,7 @@ func TestBuildCatalogSemanticUnderstandingInput(t *testing.T) {
 	require.Len(t, logicalViews, 1)
 	logicalView := logicalViews[0].(map[string]any)
 	assert.Equal(t, "order_summary", logicalView["source_identifier"])
-	assert.NotContains(t, logicalView, "logic_definition")
+	assert.NotContains(t, logicalView, "logical_view_definition")
 }
 */
 
@@ -162,15 +164,62 @@ func TestMarshalSemanticUnderstandingInput(t *testing.T) {
 }
 
 func TestSemanticUnderstandingTaskServiceCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name, language  string
+		contextLanguage i18n.Language
+		expected        string
+	}{
+		{"English request", "en-US", "zh-CN", "en-US"},
+		{"Chinese request", "zh-CN", "en-US", "zh-CN"},
+		{"request language fallback", "", "en-US", "en-US"},
+		{"Chinese context fallback", "", "zh-CN", "zh-CN"},
+		{"invalid explicit language", "fr-FR", "en-US", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+			resourceService := vmock.NewMockResourceService(ctrl)
+			catalogService := vmock.NewMockCatalogService(ctrl)
+			service := &semanticUnderstandingTaskService{suta: taskAccess, rs: resourceService, cs: catalogService}
+			ctx := i18n.WithLanguage(context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
+				interfaces.AccountInfo{ID: "u1", Type: interfaces.ACCESSOR_TYPE_USER}), tc.contextLanguage)
+			resourceService.EXPECT().InternalGetByID(gomock.Any(), nil, "resource-1").Return(sampleSemanticResource(), nil)
+			catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), "catalog-1", gomock.Any(), true).Return(true, nil, nil)
+			if tc.expected != "" {
+				taskAccess.EXPECT().FindActiveByInputHash(gomock.Any(), interfaces.SemanticUnderstandingTaskScopeResource, gomock.Any()).Return(nil, nil)
+				taskAccess.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, task *interfaces.SemanticUnderstandingTask) error {
+					var input interfaces.SemanticUnderstandingResourceAgentInput
+					require.NoError(t, sonic.Unmarshal([]byte(task.Input), &input))
+					assert.Equal(t, tc.expected, input.Options.Language)
+					assert.Equal(t, "order_id", input.Resource.SchemaDefinition[0].Name)
+					return nil
+				})
+			}
+			var req interfaces.CreateSemanticUnderstandingTaskRequest
+			require.NoError(t, sonic.Unmarshal(fmt.Appendf(nil, `{"language":%q,"apply_mode":"dry_run"}`, tc.language), &req))
+			got, err := service.CreateResourceTask(ctx, "resource-1", &req)
+			if tc.expected == "" {
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.False(t, got.Applied)
+			assert.Equal(t, "dry_run", got.ApplyMode)
+		})
+	}
+
 	t.Run("creates pending resource task", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
@@ -218,11 +267,11 @@ func TestSemanticUnderstandingTaskServiceCreate(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
 		active := &interfaces.SemanticUnderstandingTask{ID: "semantic-task-1"}
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, &interfaces.Catalog{ID: "catalog-1", Name: "sales"}, nil)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
@@ -256,12 +305,49 @@ func TestSemanticUnderstandingTaskServiceCreate(t *testing.T) {
 }
 
 func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
+	t.Run("preserves schema fingerprints and numeric attributes when adding sample rows", func(t *testing.T) {
+		for _, literal := range []string{"9007199254740993", "0.1234567890123456789", "1e3"} {
+			t.Run(literal, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				resourceDataService := vmock.NewMockResourceDataService(ctrl)
+				resource := sampleSemanticResource()
+				resource.SchemaDefinition[0].Attributes = map[string]any{
+					"limit": json.Number(literal),
+					"nested": map[string]any{
+						"bounds": []any{json.Number(literal)},
+					},
+				}
+				task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+					ApplyMode:         interfaces.SemanticUnderstandingApplyModeDryRun,
+					IncludeSampleRows: true,
+					SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
+				})
+				require.NoError(t, err)
+				require.NoError(t, validateSemanticTaskSchema(task, resource))
+				resourceDataService.EXPECT().QueryWithPaging(gomock.Any(), resource, gomock.Any()).Return(
+					&interfaces.ResourceDataQueryResult{Entries: []map[string]any{{"order_id": "o-1"}}}, nil)
+				service := &semanticUnderstandingTaskService{rds: resourceDataService}
+
+				require.NoError(t, service.attachUnmaskedSampleRows(context.Background(), resource, task))
+
+				var input interfaces.SemanticUnderstandingResourceAgentInput
+				require.NoError(t, common.UnmarshalPreciseJSON([]byte(task.Input), &input))
+				require.Len(t, input.Resource.SchemaDefinition, 1)
+				assert.Equal(t, resource.SchemaDefinition[0].Attributes, input.Resource.SchemaDefinition[0].Attributes)
+				assert.Equal(t, []map[string]any{{"order_id": "o-1"}}, input.SampleRows)
+				assert.NoError(t, validateSemanticTaskSchema(task, resource))
+				resource.SchemaDefinition[0].Attributes["limit"] = json.Number("0")
+				assert.Error(t, validateSemanticTaskSchema(task, resource))
+			})
+		}
+	})
+
 	t.Run("writes queried rows to the task input and honors max rows", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -286,7 +372,7 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("omits binary other and vector columns from the task input", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
 		resource.SchemaDefinition = append(resource.SchemaDefinition, &interfaces.Property{
 			Name:         "attachmentBlob",
@@ -304,7 +390,7 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 			OriginalType: "knn_vector",
 			Type:         interfaces.DataType_Vector,
 		})
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -356,7 +442,7 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("includes enum columns mapped to string in the task input", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
 		resource.SchemaDefinition = append(resource.SchemaDefinition, &interfaces.Property{
 			Name:         "status",
@@ -364,7 +450,7 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 			OriginalType: "enum",
 			Type:         interfaces.DataType_String,
 		})
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -386,14 +472,14 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("marks samples as policy omitted when every schema field is excluded", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
 		resource.SchemaDefinition = []*interfaces.Property{
 			{Name: "attachmentBlob", OriginalName: "attachment_blob", Type: interfaces.DataType_Binary},
 			{Name: "shape", OriginalName: "shape", Type: interfaces.DataType_Other},
 			{Name: "embedding", OriginalName: "embedding", Type: interfaces.DataType_Vector},
 		}
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -411,9 +497,9 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("writes an empty sample_rows array when the query has no rows", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -440,9 +526,9 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("treats nil entries from a successful query as no rows", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -463,14 +549,14 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("marks samples as payload limited when no queried row fits the payload cap", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
 		resource := sampleSemanticResource()
 		resource.SchemaDefinition = append(resource.SchemaDefinition, &interfaces.Property{
 			Name:         "payload",
 			OriginalName: "payload",
 			Type:         interfaces.DataType_Json,
 		})
-		task, err := normalizeResourceSemanticUnderstandingRequest(resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 2},
 		})
@@ -510,17 +596,17 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("creates a task when sample query fails", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
 		resource := sampleSemanticResource()
 		resourceService.EXPECT().InternalGetByID(gomock.Any(), nil, resource.ID).Return(resource, nil)
 		resourceDataService.EXPECT().QueryWithPaging(gomock.Any(), resource, gomock.Any()).
@@ -535,21 +621,21 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("creates a task when sample query returns an HTTP error", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
 		resource := sampleSemanticResource()
 		resourceService.EXPECT().InternalGetByID(gomock.Any(), nil, resource.ID).Return(resource, nil)
 		resourceDataService.EXPECT().QueryWithPaging(gomock.Any(), resource, gomock.Any()).
-			Return(nil, rest.NewHTTPError(context.Background(), http.StatusTooManyRequests, verrors.VegaBackend_Query_ConcurrencyLimitExceeded))
+			Return(nil, httperrors.NewHTTPError(context.Background(), http.StatusTooManyRequests, verrors.VegaBackend_Query_ConcurrencyLimitExceeded))
 		taskAccess.EXPECT().FindActiveByInputHash(gomock.Any(), interfaces.SemanticUnderstandingTaskScopeResource, gomock.Any()).Return(nil, nil)
 		taskAccess.EXPECT().Create(gomock.Any(), gomock.Any()).Return(nil)
 
@@ -560,17 +646,17 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("creates a task when the resource is not queryable", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
 		resource := sampleSemanticResource()
 		resource.Enabled = false
 		resource.SchemaDefinition = []*interfaces.Property{
@@ -588,17 +674,17 @@ func TestSemanticUnderstandingTaskSampleRows(t *testing.T) {
 	t.Run("reuses a degraded task for a later identical request", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		// 任务的授权判在它所属的目录上（bkn-studio#342）；这些用例验的是别的东西。
 		resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil).AnyTimes()
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 			Return(true, nil, nil).AnyTimes()
-		resourceDataService := mock_interfaces.NewMockResourceDataService(ctrl)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		resourceDataService := vmock.NewMockResourceDataService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
 		resource := sampleSemanticResource()
 		resourceService.EXPECT().InternalGetByID(gomock.Any(), nil, resource.ID).Return(resource, nil).Times(2)
 
@@ -769,11 +855,11 @@ func TestLimitSemanticUnderstandingSampleRows(t *testing.T) {
 func TestSemanticUnderstandingTaskServiceStatusUpdates(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
-	taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-	permRS := mock_interfaces.NewMockResourceService(ctrl)
+	taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+	permRS := vmock.NewMockResourceService(ctrl)
 	permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-	permCS := mock_interfaces.NewMockCatalogService(ctrl)
+	permCS := vmock.NewMockCatalogService(ctrl)
 	permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 	permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 	permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
@@ -799,12 +885,12 @@ func TestSemanticUnderstandingTaskServiceStatusUpdates(t *testing.T) {
 func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 	t.Run("rejects detail without task_manage before checking query_data", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
-		resourceService := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
+		resourceService := vmock.NewMockResourceService(ctrl)
 		service := &semanticUnderstandingTaskService{suta: taskAccess, cs: catalogService, rs: resourceService}
 		task := &interfaces.SemanticUnderstandingTask{ID: "task-1", CatalogID: "c-1", ResourceID: "r-1", Input: "stored input"}
-		taskAccess.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
+		taskAccess.EXPECT().GetByID(gomock.Any(), nil, task.ID).Return(task, nil)
 		catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), task.CatalogID,
 			[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true).Return(false, nil, nil)
 
@@ -824,17 +910,17 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 		wantInput     bool
 	}{
 		{name: "retains input with query_data", resourceID: "r-1", wantInput: true},
-		{name: "clears input without query_data", resourceID: "r-1", permissionErr: rest.NewHTTPError(context.Background(), http.StatusForbidden, rest.PublicError_Forbidden)},
+		{name: "clears input without query_data", resourceID: "r-1", permissionErr: httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden)},
 		{name: "propagates authorization failure", resourceID: "r-1", permissionErr: errors.New("authorization unavailable")},
 		{name: "clears input without a resource"},
 		{name: "skips query_data check for empty input", resourceID: "r-1", emptyInput: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
-			taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-			resourceService := mock_interfaces.NewMockResourceService(ctrl)
-			catalogService := mock_interfaces.NewMockCatalogService(ctrl)
-			userService := mock_interfaces.NewMockUserMgmtService(ctrl)
+			taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+			resourceService := vmock.NewMockResourceService(ctrl)
+			catalogService := vmock.NewMockCatalogService(ctrl)
+			userService := vmock.NewMockUserMgmtService(ctrl)
 			service := &semanticUnderstandingTaskService{suta: taskAccess, rs: resourceService, cs: catalogService, ums: userService}
 			task := &interfaces.SemanticUnderstandingTask{
 				ID: "task-1", CatalogID: "c-1", ResourceID: tc.resourceID,
@@ -845,7 +931,7 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 				task.Input = ""
 			}
 			originalInput := task.Input
-			taskAccess.EXPECT().GetByID(gomock.Any(), task.ID).Return(task, nil)
+			taskAccess.EXPECT().GetByID(gomock.Any(), nil, task.ID).Return(task, nil)
 			catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), task.CatalogID,
 				[]string{interfaces.OPERATION_TYPE_TASK_MANAGE}, true).Return(true, nil, nil)
 			if tc.resourceID != "" && !tc.emptyInput {
@@ -884,12 +970,12 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 	t.Run("enriches creator name", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		userMgmtService := mock_interfaces.NewMockUserMgmtService(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		userMgmtService := vmock.NewMockUserMgmtService(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
@@ -899,7 +985,7 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 			Creator: interfaces.AccountInfo{ID: "u1", Type: interfaces.ACCESSOR_TYPE_USER},
 		}
 
-		taskAccess.EXPECT().GetByID(gomock.Any(), "semantic-task-1").Return(task, nil)
+		taskAccess.EXPECT().GetByID(gomock.Any(), nil, "semantic-task-1").Return(task, nil)
 		userMgmtService.EXPECT().
 			GetAccountNames(gomock.Any(), []*interfaces.AccountInfo{&task.Creator}).
 			DoAndReturn(func(_ context.Context, accountInfos []*interfaces.AccountInfo) error {
@@ -917,17 +1003,17 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 	t.Run("returns not found when task is missing", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
 		service := &semanticUnderstandingTaskService{suta: taskAccess, rs: permRS, cs: permCS}
 
-		taskAccess.EXPECT().GetByID(gomock.Any(), "missing").Return(nil, nil)
+		taskAccess.EXPECT().GetByID(gomock.Any(), nil, "missing").Return(nil, nil)
 
 		got, err := service.GetByID(context.Background(), "missing")
 
@@ -939,19 +1025,19 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 	t.Run("keeps task when account lookup fails", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		userMgmtService := mock_interfaces.NewMockUserMgmtService(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		userMgmtService := vmock.NewMockUserMgmtService(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
 		service := &semanticUnderstandingTaskService{suta: taskAccess, ums: userMgmtService, rs: permRS, cs: permCS}
 		task := &interfaces.SemanticUnderstandingTask{ID: "semantic-task-2"}
 
-		taskAccess.EXPECT().GetByID(gomock.Any(), "semantic-task-2").Return(task, nil)
+		taskAccess.EXPECT().GetByID(gomock.Any(), nil, "semantic-task-2").Return(task, nil)
 		userMgmtService.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(errors.New("user service down"))
 
 		got, err := service.GetByID(context.Background(), "semantic-task-2")
@@ -964,22 +1050,22 @@ func TestSemanticUnderstandingTaskServiceGetByID(t *testing.T) {
 func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	t.Cleanup(ctrl.Finish)
-	taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-	catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+	taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+	catalogService := vmock.NewMockCatalogService(ctrl)
 	catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 		Return(true, nil, nil).AnyTimes()
 	catalogService.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).
 		Return(true, nil, nil).AnyTimes()
 	catalogService.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(&interfaces.Catalog{ID: "catalog-2"}, nil).AnyTimes()
-	resourceService := mock_interfaces.NewMockResourceService(ctrl)
+	resourceService := vmock.NewMockResourceService(ctrl)
 	resourceService.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil).AnyTimes()
 	resourceService.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).
 		Return(&interfaces.Resource{ID: "resource-2"}, nil).AnyTimes()
 	// This case verifies name enrichment; list authorization returns its catalog.
 	catalogService.EXPECT().ListPermittedCatalogIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return([]string{"catalog-1"}, nil).AnyTimes()
-	userMgmtService := mock_interfaces.NewMockUserMgmtService(ctrl)
+	userMgmtService := vmock.NewMockUserMgmtService(ctrl)
 	service := &semanticUnderstandingTaskService{
 		suta: taskAccess,
 		cs:   catalogService,
@@ -1007,7 +1093,7 @@ func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 
 	t.Run("get populates reference names", func(t *testing.T) {
 		task := &interfaces.SemanticUnderstandingTask{ID: "task-3", CatalogID: "catalog-2", ResourceID: "resource-2"}
-		taskAccess.EXPECT().GetByID(gomock.Any(), "task-3").Return(task, nil)
+		taskAccess.EXPECT().GetByID(gomock.Any(), nil, "task-3").Return(task, nil)
 		resourceService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"resource-2"}).Return(map[string]*interfaces.Resource{"resource-2": {ID: "resource-2", Name: "资源二"}}, nil)
 		catalogService.EXPECT().InternalGetByIDs(gomock.Any(), []string{"catalog-2"}).Return(map[string]*interfaces.Catalog{"catalog-2": {ID: "catalog-2", Name: "目录二"}}, nil)
 		userMgmtService.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
@@ -1038,8 +1124,8 @@ func TestSemanticUnderstandingTaskServicePopulatesReferenceNames(t *testing.T) {
 func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 	t.Run("checks a shared catalog only once", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		catalogService := vmock.NewMockCatalogService(ctrl)
 		service := &semanticUnderstandingTaskService{suta: taskAccess, cs: catalogService}
 
 		ids := []string{"task-1", "task-2"}
@@ -1061,11 +1147,11 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 	t.Run("deletes completed tasks and ignores missing ids", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
@@ -1089,11 +1175,11 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 	t.Run("rejects pending or running tasks", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
@@ -1115,11 +1201,11 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 	t.Run("rejects missing tasks when ignore missing is false", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
-		taskAccess := mock_interfaces.NewMockSemanticUnderstandingTaskAccess(ctrl)
-		permRS := mock_interfaces.NewMockResourceService(ctrl)
+		taskAccess := vmock.NewMockSemanticUnderstandingTaskAccess(ctrl)
+		permRS := vmock.NewMockResourceService(ctrl)
 		permRS.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 		permRS.EXPECT().InternalGetByID(gomock.Any(), nil, gomock.Any()).Return(&interfaces.Resource{ID: "r-1"}, nil).AnyTimes()
-		permCS := mock_interfaces.NewMockCatalogService(ctrl)
+		permCS := vmock.NewMockCatalogService(ctrl)
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().CheckCatalogPermission(gomock.Any(), gomock.Any(), gomock.Any(), true).Return(true, nil, nil).AnyTimes()
 		permCS.EXPECT().InternalGetByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.Catalog{ID: "c-1"}, nil).AnyTimes()
@@ -1140,8 +1226,52 @@ func TestSemanticUnderstandingTaskServiceDeleteByIDs(t *testing.T) {
 }
 
 func TestNormalizeResourceSemanticUnderstandingRequest(t *testing.T) {
+	t.Run("new task stores complete attribute snapshot with numeric precision", func(t *testing.T) {
+		resource := &interfaces.Resource{ID: "resource-1", CatalogID: "catalog-1", Category: "table", SourceIdentifier: "orders", SchemaDefinition: []*interfaces.Property{{Name: "id", Type: "integer", Attributes: map[string]any{"limit": json.Number("9007199254740993"), "nested": map[string]any{"nullable": true}}}}}
+		task, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, &interfaces.CreateSemanticUnderstandingTaskRequest{ApplyMode: "dry_run"})
+		require.NoError(t, err)
+		var snapshot interfaces.SemanticUnderstandingResourceAgentInput
+		require.NoError(t, common.UnmarshalPreciseJSON([]byte(task.Input), &snapshot))
+		require.Len(t, snapshot.Resource.SchemaDefinition, 1)
+		assert.Equal(t, json.Number("9007199254740993"), snapshot.Resource.SchemaDefinition[0].Attributes["limit"])
+		assert.Equal(t, map[string]any{"nullable": true}, snapshot.Resource.SchemaDefinition[0].Attributes["nested"])
+	})
+
+	t.Run("language is captured and included in the input hash for all apply modes", func(t *testing.T) {
+		for _, mode := range []string{"dry_run", "fill_empty", "force"} {
+			resource := sampleSemanticResource()
+			var previousHash string
+			for _, language := range []string{"en-US", "zh-CN"} {
+				req := &interfaces.CreateSemanticUnderstandingTaskRequest{Language: language, ApplyMode: mode}
+				got, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), resource, req)
+				require.NoError(t, err)
+				var input interfaces.SemanticUnderstandingResourceAgentInput
+				require.NoError(t, sonic.Unmarshal([]byte(got.Input), &input))
+				assert.Equal(t, language, input.Options.Language)
+				assert.Equal(t, mode, input.Options.ApplyMode)
+				assert.Equal(t, resource.ID, input.Resource.ID)
+				assert.Equal(t, resource.SchemaDefinition[0].Name, input.Resource.SchemaDefinition[0].Name)
+				assert.Equal(t, "order table", input.Resource.Description)
+				assert.Nil(t, req.ConfidenceThreshold)
+				assert.NotEqual(t, previousHash, got.InputHash)
+				previousHash = got.InputHash
+			}
+		}
+	})
+
+	t.Run("falls back to configured service language without a request context language", func(t *testing.T) {
+		previous := i18n.DefaultLanguage
+		t.Cleanup(func() { i18n.DefaultLanguage = previous })
+		i18n.DefaultLanguage = i18n.AmericanEnglish
+		got, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), sampleSemanticResource(), nil)
+		require.NoError(t, err)
+		var input interfaces.SemanticUnderstandingResourceAgentInput
+		require.NoError(t, sonic.Unmarshal([]byte(got.Input), &input))
+		assert.Equal(t, "en-US", input.Options.Language)
+	})
+
 	t.Run("defaults optional values", func(t *testing.T) {
-		got, err := normalizeResourceSemanticUnderstandingRequest(sampleSemanticResource(), nil)
+		got, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), sampleSemanticResource(), nil)
 
 		require.NoError(t, err)
 		assert.Equal(t, interfaces.SemanticUnderstandingTaskScopeResource, got.Scope)
@@ -1158,7 +1288,7 @@ func TestNormalizeResourceSemanticUnderstandingRequest(t *testing.T) {
 	})
 
 	t.Run("accepts unmasked sample policy when including samples", func(t *testing.T) {
-		got, err := normalizeResourceSemanticUnderstandingRequest(sampleSemanticResource(), &interfaces.CreateSemanticUnderstandingTaskRequest{
+		got, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), sampleSemanticResource(), &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy:      &interfaces.SemanticUnderstandingSamplePolicy{Masked: false, MaxRows: 20},
 		})
@@ -1171,7 +1301,7 @@ func TestNormalizeResourceSemanticUnderstandingRequest(t *testing.T) {
 	})
 
 	t.Run("rejects sample rows beyond the semantic understanding limit", func(t *testing.T) {
-		got, err := normalizeResourceSemanticUnderstandingRequest(sampleSemanticResource(), &interfaces.CreateSemanticUnderstandingTaskRequest{
+		got, err := normalizeResourceSemanticUnderstandingRequest(context.Background(), sampleSemanticResource(), &interfaces.CreateSemanticUnderstandingTaskRequest{
 			IncludeSampleRows: true,
 			SamplePolicy: &interfaces.SemanticUnderstandingSamplePolicy{
 				Masked:  false,

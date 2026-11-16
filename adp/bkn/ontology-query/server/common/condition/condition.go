@@ -11,16 +11,36 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	dtype "ontology-query/interfaces/data_type"
-	"ontology-query/locale"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/data_type"
 )
 
 const MaxSubCondition = 100
 
+// ContainsLikeCondition reports whether a condition needs the source's LIKE collation.
+func ContainsLikeCondition(cfg *CondCfg) bool {
+	if cfg == nil {
+		return false
+	}
+	if cfg.Operation == OperationLike || cfg.Operation == OperationNotLike {
+		return true
+	}
+	for _, child := range cfg.SubConds {
+		if ContainsLikeCondition(child) {
+			return true
+		}
+	}
+	return false
+}
+
 func validationError(ctx context.Context, name string, templateData map[string]any) error {
-	return errors.New(locale.ValidationDetail(ctx, name, templateData))
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail."+name, templateData)
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return errors.New(localizedText)
 }
 
 // SQL string escaping.
@@ -232,7 +252,8 @@ func PromoteLegacyLeafWithSubConds(cfg *CondCfg) *CondCfg {
 		ObjectTypeID: cfg.ObjectTypeID,
 		Name:         cfg.Name,
 		Operation:    cfg.Operation,
-		ValueOptCfg:  cfg.ValueOptCfg,
+		ValueFrom:    cfg.ValueFrom,
+		Value:        cfg.Value,
 		RemainCfg:    cfg.RemainCfg,
 		NameField:    cfg.NameField,
 	}

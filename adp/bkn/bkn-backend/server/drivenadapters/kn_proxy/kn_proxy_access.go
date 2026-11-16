@@ -13,7 +13,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -141,13 +141,18 @@ func (a *access) SetPending(ctx context.Context, tx *sql.Tx, knID, modelVersion,
 // operation that also replaces the full bkn-safe grant set but does not enter
 // the normal pending/ready publication state machine (for example deletion).
 func (a *access) ReserveSyncGeneration(ctx context.Context, knID, lockOwner string, updatedAt int64) (int64, error) {
+	return a.ReserveSyncGenerationAbove(ctx, knID, lockOwner, 0, updatedAt)
+}
+
+// ReserveSyncGenerationAbove advances the generation to max(current, floor)+1.
+func (a *access) ReserveSyncGenerationAbove(ctx context.Context, knID, lockOwner string, floor, updatedAt int64) (int64, error) {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	query, args, err := sq.Update(tableName).SetMap(map[string]any{
-		"f_sync_generation": sq.Expr("f_sync_generation + 1"),
+		"f_sync_generation": sq.Expr("(CASE WHEN f_sync_generation < ? THEN ? ELSE f_sync_generation END) + 1", floor, floor),
 		"f_version":         sq.Expr("f_version + 1"),
 		"f_updated_at":      updatedAt,
 	}).Where(sq.Eq{"f_kn_id": knID, "f_lock_owner": lockOwner}).ToSql()
@@ -451,7 +456,7 @@ func (a *access) DeletePublishedSnapshot(ctx context.Context, knID string) error
 }
 
 func (a *access) ResolvePublishedBinding(ctx context.Context, knID string,
-	binding interfaces.KNProxyBinding) (*interfaces.KNProxyBinding, error) {
+	binding interfaces.KNProxyBinding) (resolved *interfaces.KNProxyBinding, err error) {
 	where := sq.Eq{
 		"f_kn_id": knID, "f_binding_type": binding.ChildType, "f_binding_id": binding.ChildID,
 		"f_resource_id": binding.TargetID, "f_operation": binding.Operation,
@@ -469,11 +474,15 @@ func (a *access) ResolvePublishedBinding(ctx context.Context, knID string,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	if !rows.Next() {
-		return nil, nil
+		return nil, rows.Err()
 	}
-	resolved := &interfaces.KNProxyBinding{}
+	resolved = &interfaces.KNProxyBinding{}
 	if err := rows.Scan(&resolved.ChildType, &resolved.ChildID, &resolved.TargetType,
 		&resolved.TargetID, &resolved.Operation); err != nil {
 		return nil, err
@@ -485,7 +494,7 @@ func (a *access) ResolvePublishedBinding(ctx context.Context, knID string,
 }
 
 func (a *access) ResolvePublishedBindings(ctx context.Context, knID string,
-	bindings []interfaces.KNProxyBinding) ([]interfaces.KNProxyBinding, error) {
+	bindings []interfaces.KNProxyBinding) (resolved []interfaces.KNProxyBinding, err error) {
 	if len(bindings) == 0 {
 		return []interfaces.KNProxyBinding{}, nil
 	}
@@ -499,7 +508,11 @@ func (a *access) ResolvePublishedBindings(ctx context.Context, knID string,
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			err = errors.Join(err, closeErr)
+		}
+	}()
 	published := make(map[string]struct{})
 	for rows.Next() {
 		var source interfaces.KNProxyBinding
@@ -511,7 +524,7 @@ func (a *access) ResolvePublishedBindings(ctx context.Context, knID string,
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	resolved := make([]interfaces.KNProxyBinding, 0, len(bindings))
+	resolved = make([]interfaces.KNProxyBinding, 0, len(bindings))
 	for _, binding := range bindings {
 		if _, ok := published[proxyBindingKey(binding)]; ok {
 			resolved = append(resolved, binding)

@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/common"
 	oerrors "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/telemetry"
@@ -14,7 +17,6 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/metric"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/logics/parsers"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/utils"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 )
 
 // UpdateTool update tool.
@@ -72,10 +74,10 @@ func (s *ToolServiceImpl) UpdateTool(ctx context.Context, req *interfaces.Update
 	if tool.Name != req.ToolName {
 		err = s.checkToolNameExist(ctx, req.BoxID, req.ToolName)
 		if err != nil {
-			// Interaction design requires returning specified error information: https://confluence.aishu.cn/pages/viewpage.action?pageId=280780968.
-			httErr := &oerrors.HTTPError{}
+			// Interaction design requires returning specified error information.
+			httErr := &httperrors.HTTPError{}
 			if errors.As(err, &httErr) && httErr.HTTPCode == http.StatusConflict {
-				err = httErr.WithDescription(oerrors.ErrExtCommonNameExists)
+				err = oerrors.NewHTTPError(ctx, httErr.HTTPCode, oerrors.ErrExtCommonNameExists, httErr.ErrorDetails)
 			}
 			return
 		}
@@ -150,13 +152,12 @@ func (s *ToolServiceImpl) buildFunctionInput(ctx context.Context, req *interface
 		Code:            edit.Code,
 		Dependencies:    edit.Dependencies,
 		DependenciesURL: edit.DependenciesURL,
+		KnID:            edit.KnID,
+		ResultShape:     edit.ResultShape,
 	}
 	// The metadata is reconstructed as a whole, and fields not included in the request will be written as null values. When the editor only wants to change one of the items.
 	// (For example, only changing dependencies), the remaining fields must use the existing values, otherwise the parameter definitions and dependencies will be silently cleared.
-	if input.Code != "" && input.Inputs != nil && input.Outputs != nil &&
-		input.Dependencies != nil && input.ScriptType != "" && input.DependenciesURL != "" {
-		return input, nil
-	}
+	// The stored function is always read: whether the edit changes its script type can only be told against it.
 	has, current, err := s.MetadataService.GetMetadataBySource(ctx, toolDB.SourceID, toolDB.SourceType)
 	if err != nil {
 		s.Logger.WithContext(ctx).Errorf("select metadata failed, err: %v", err)
@@ -166,11 +167,34 @@ func (s *ToolServiceImpl) buildFunctionInput(ctx context.Context, req *interface
 		return nil, oerrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.ErrExtMetadataNotFound,
 			fmt.Sprintf("metadata %s not found", toolDB.SourceID))
 	}
+	if input.ScriptType == "" {
+		input.ScriptType = interfaces.ScriptType(current.GetScriptType())
+	}
+	// A Python function and a Cypher function share nothing but their contract:
+	// one has code and dependencies, the other a statement and a network. Changing
+	// one into the other in place would leave the old kind's fields behind.
+	if storedType := current.GetScriptType(); storedType != "" && string(input.ScriptType) != storedType {
+		return nil, oerrors.DefaultHTTPError(ctx, http.StatusBadRequest,
+			fmt.Sprintf("a %s function cannot become a %s function; create a new function instead", storedType, input.ScriptType))
+	}
 	if input.Code == "" {
 		input.Code = current.GetCode()
 	}
-	if input.ScriptType == "" {
-		input.ScriptType = interfaces.ScriptType(current.GetScriptType())
+	if stored, ok := current.(*model.FunctionMetadataDB); ok && stored.IsCypher() {
+		if input.KnID == "" {
+			input.KnID = stored.KnID
+		}
+		if input.ResultShape == "" {
+			input.ResultShape = interfaces.CypherResultShape(stored.ResultShape)
+		}
+		// Dependencies are not a Cypher function's to keep; the stored empty value must
+		// not turn into a "null" the parser reads as a dependency list.
+		input.Dependencies = nil
+		input.DependenciesURL = ""
+		if input.Inputs == nil {
+			input.Inputs, _ = parsers.FunctionParamsFromAPISpec(current.GetAPISpec())
+		}
+		return input, nil
 	}
 	if input.Dependencies == nil && current.GetDependencies() != "" {
 		input.Dependencies = utils.JSONToObject[[]*interfaces.DependencyInfo](current.GetDependencies())
@@ -214,10 +238,10 @@ func (s *ToolServiceImpl) updateToolMetadata(ctx context.Context, req *interface
 				return
 			}
 			metadatas, err = s.MetadataService.ParseMetadata(ctx, req.MetadataType, functionInput)
-		case model.SourceTypeOperator:
-			// The tool converted by the operator does not allow direct editing of metadata.
-			err = oerrors.NewHTTPError(ctx, http.StatusMethodNotAllowed, oerrors.ErrExtToolOperatorNotAllowEdit,
-				"operator tool not allow edit metadata")
+			if err == nil && len(metadatas) > 0 {
+				// Checked by bkn-backend, as the editor, before anything is written.
+				err = s.validateCypherFunctionMetadata(ctx, metadatas[0])
+			}
 		}
 		if err != nil {
 			return
@@ -301,11 +325,12 @@ func (s *ToolServiceImpl) updateToolMetadata(ctx context.Context, req *interface
 		currentMetadataDB.SetScriptType(metadata.GetScriptType())
 		currentMetadataDB.SetDependencies(metadata.GetDependencies())
 		currentMetadataDB.SetDependenciesURL(metadata.GetDependenciesURL())
-	case model.SourceTypeOperator:
-		// The tool converted by the operator does not allow direct editing of metadata.
-		err = oerrors.NewHTTPError(ctx, http.StatusMethodNotAllowed, oerrors.ErrExtToolOperatorNotAllowEdit,
-			"operator tool not allow edit metadata")
-		return
+		if parsed, ok := metadata.(*model.FunctionMetadataDB); ok && parsed.IsCypher() {
+			if stored, ok := currentMetadataDB.(*model.FunctionMetadataDB); ok {
+				stored.KnID = parsed.KnID
+				stored.ResultShape = parsed.ResultShape
+			}
+		}
 	}
 	// Update metadata.
 	currentMetadataDB.SetUpdateInfo(toolDB.UpdateUser)

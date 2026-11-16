@@ -4,7 +4,7 @@
 
 openapi: 3.0.3
 info:
-  title: BKN Safe Enterprise Row-filter Policy Management API
+  title: BKN Safe 管理 · 行过滤策略 API
   version: 1.0.0
   description: |
     Manages one fixed-condition object-instance row-filter policy for a user or
@@ -193,8 +193,8 @@ components:
     ObjectTypeRef:
       type: string
       minLength: 3
-      maxLength: 81
-      pattern: '^[a-z0-9][a-z0-9_-]{0,39}/[a-z0-9][a-z0-9_-]{0,39}$'
+      maxLength: 257
+      pattern: '^[a-z0-9][a-z0-9_-]{0,127}/[a-z0-9][a-z0-9_-]{0,127}$'
     SubjectType:
       type: string
       enum: [user, role]

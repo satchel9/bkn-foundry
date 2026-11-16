@@ -16,6 +16,8 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/semantic_understanding_task"
 )
 
 // tableDiscoverItem represents a table discover item.
@@ -195,7 +197,7 @@ func (dtw *DiscoverTaskWorker) createTableResource(ctx context.Context, catalog 
 		Schema:           table.Schema,
 		SourceIdentifier: sourceIdentifier,
 	}
-	resource, err := dtw.rs.Create(ctx, req)
+	resource, err := dtw.rs.InternalCreate(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +241,7 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 		beforeHash := sourceSnapshotHash(resource)
 
 		// Obtain detailed metadata
-		if err := tableConnector.GetTableMeta(ctx, table); err != nil {
+		if err := tableConnector.GetTableMeta(ctx, table, task.ResourceID != ""); err != nil {
 			// 首次探查失败也保留已知源身份，使单资源刷新能够重试。
 			if len(resource.SourceMetadata) == 0 {
 				data, marshalErr := sonic.Marshal(table)
@@ -313,6 +315,8 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 				OriginalName:        column.Name,
 				OriginalType:        column.Type,
 				OriginalDescription: column.Description,
+
+				Filterable: column.Filterable,
 			}
 			if existing, ok := existingProperties[column.Name]; ok {
 				property.DisplayName = existing.DisplayName
@@ -321,9 +325,10 @@ func (dtw *DiscoverTaskWorker) enrichTableMetadata(ctx context.Context, task *in
 			}
 			props = append(props, property)
 		}
+		resourcelogic.InitializeJSONIndexAttributes(props)
 		resource.SchemaDefinition = props
 
-		resource.Description = resolveSourceDescription(resource.Description, sourceOriginalDescription(resource.SourceMetadata), table.Description)
+		resource.Description = resolveSourceDescription(resource.Description, semantic_understanding_task.SourceOriginalDescription(resource.SourceMetadata), table.Description)
 
 		// 源元数据完整保存 TableMeta，不保留旧的额外字段。
 		data, err := sonic.Marshal(table)
@@ -394,21 +399,26 @@ func (dtw *DiscoverTaskWorker) enrichResourceTableRowCount(ctx context.Context, 
 	if parentErr := ctx.Err(); parentErr != nil {
 		return parentErr
 	}
-	if err == nil && count < 0 {
-		err = fmt.Errorf("invalid negative row count")
-	}
-	if err == nil {
-		err = dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli())
-	}
 	if err != nil {
 		if errors.Is(err, interfaces.ErrRowCountUnavailable) && task.ResourceID == "" {
 			result.SkippedCount++
 		} else {
-			result.FailedCount++
+			recordCountQueryFailure(result, resource, err)
 		}
-		logger.Warnf("Resource exact count failed: resource_id=%s error=%v", resource.ID, err)
-	} else {
-		result.UpdatedCount++
+		logCountFailure(resource.ID, err)
+		return nil
 	}
+	if count < 0 {
+		recordCountQueryFailure(result, resource, errInvalidExactCount)
+		logCountFailure(resource.ID, errInvalidExactCount)
+		return nil
+	}
+
+	if err := dtw.rs.InternalUpdateRowCount(ctx, nil, resource, count, time.Now().UnixMilli()); err != nil {
+		recordCountSaveFailure(result, resource)
+		logCountFailure(resource.ID, err)
+		return nil
+	}
+	result.UpdatedCount++
 	return nil
 }

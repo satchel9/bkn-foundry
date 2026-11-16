@@ -10,11 +10,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func Test_BuildDslQuery(t *testing.T) {
@@ -90,8 +90,8 @@ func Test_BuildDslQuery(t *testing.T) {
 			dsl, err := BuildDslQuery(ctx, queryStr, query)
 			So(err, ShouldNotBeNil)
 			So(dsl, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_InternalError_UnMarshalDataFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_InternalError_UnMarshalDataFailed)
 		})
 
 		Convey("Success with complex query string\n", func() {

@@ -10,13 +10,13 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"ontology-query/common"
-	permissionaccess "ontology-query/drivenadapters/permission"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	permissionaccess "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/drivenadapters/permission"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 type permissionService struct {
@@ -501,13 +501,13 @@ func resourceKey(resourceType, resourceID string) string {
 }
 
 func permissionDenied(ctx context.Context, detail string) error {
-	httpErr := rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).WithErrorDetails(detail)
+	httpErr := httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden).WithErrorDetails(detail)
 	otellog.LogError(ctx, "Query permission denied", httpErr)
 	return httpErr
 }
 
 func permissionUnavailable(ctx context.Context, err error) error {
-	httpErr := rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+	httpErr := httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 		oerrors.OntologyQuery_InternalError_CheckPermissionFailed).WithErrorDetails(err.Error())
 	otellog.LogError(ctx, "Query permission check failed", httpErr)
 	return httpErr

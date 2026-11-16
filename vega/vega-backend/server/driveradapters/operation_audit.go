@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/locale"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common/operationaudit"
@@ -51,7 +52,9 @@ func (r *restHandler) OperationAudit() gin.HandlerFunc {
 		}
 		request := captureOperationAuditRequest(c.Request)
 		c.Next()
-		if r == nil || r.auditRecorder == nil {
+		if r == nil || r.auditRecorder == nil || c.Writer.Status() < 200 || c.Writer.Status() >= 300 ||
+			(c.Writer.Status() == http.StatusAccepted && !c.GetBool("operation_audit_committed")) ||
+			c.GetBool("operation_audit_preview") || c.GetBool("operation_audit_no_changes") {
 			return
 		}
 
@@ -84,6 +87,10 @@ func (r *restHandler) OperationAudit() gin.HandlerFunc {
 		}
 		now := time.Now().UTC()
 		targetID, targetName := operationAuditTarget(c, rule.TargetType, request, requestID)
+		if targetID == "" || targetName == "" || targetName == targetID {
+			logger.Errorf("operation audit fact rejected: missing business target snapshot")
+			return
+		}
 		outcome, failureCode, failureMessage := operationAuditOutcome(c)
 		entry := operationaudit.Entry{
 			EventID:        attemptID.String(),
@@ -179,19 +186,17 @@ func captureOperationAuditRequest(request *http.Request) map[string]any {
 	return value
 }
 
-func operationAuditTarget(c *gin.Context, targetType string, request map[string]any, requestID string) (string, string) {
+func operationAuditTarget(c *gin.Context, _ string, request map[string]any, _ string) (string, string) {
 	targetID := strings.TrimSpace(firstNonEmpty(c.Param("id"), c.Param("ids"), c.Param("type")))
 	if createdID, exists := c.Get(operationAuditTargetIDKey); exists {
 		if id, ok := createdID.(string); ok && strings.TrimSpace(id) != "" {
 			targetID = strings.TrimSpace(id)
 		}
 	}
-	if targetID == "" {
-		targetID = targetType + ":" + requestID
-	}
+
 	if strings.Contains(targetID, ",") {
 		digest := sha256.Sum256([]byte(targetID))
-		return "batch:" + hex.EncodeToString(digest[:]), fmt.Sprintf("%d targets", strings.Count(targetID, ",")+1)
+		targetID = "batch:" + hex.EncodeToString(digest[:])
 	}
 	if len(targetID) > 256 {
 		digest := sha256.Sum256([]byte(targetID))
@@ -206,8 +211,11 @@ func operationAuditTarget(c *gin.Context, targetType string, request map[string]
 			}
 		}
 	}
-	if name == "" {
-		name = targetID
+	if snapshot, exists := c.Get("operation_audit_target_names"); exists {
+		name = ""
+		if names, ok := snapshot.([]string); ok && len(names) > 0 {
+			name = operationAuditNames(names)
+		}
 	}
 	return targetID, name
 }
@@ -276,4 +284,18 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// operationAuditNames keeps a readable bounded batch snapshot, never an ID.
+func operationAuditNames(names []string) string { return locale.AuditNames(names) }
+
+// A catalog and resource identify one task scope, not two batch items.
+func operationAuditTaskName(catalog, resource string) string {
+	if catalog == "" {
+		return resource
+	}
+	if resource == "" {
+		return catalog
+	}
+	return catalog + " / " + resource
 }

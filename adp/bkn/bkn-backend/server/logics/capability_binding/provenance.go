@@ -1,8 +1,6 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
-// Licensed under the Apache License, Version 2.0.
-// See the LICENSE file in the project root for details.
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 
 package capability_binding
 
@@ -13,7 +11,7 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // capabilityKey identifies a capability across both the bindings and the model that uses it.

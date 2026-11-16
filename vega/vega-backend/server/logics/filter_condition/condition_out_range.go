@@ -33,20 +33,15 @@ func (c *OutRangeCond) RequiredValueLen() int      { return 2 }
 func (c *OutRangeCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	fieldsMap map[string]*interfaces.Property) (interfaces.FilterCondition, error) {
 
-	if cfg.Name == "" {
+	if cfg.Field == "" {
 		return nil, fmt.Errorf("condition [out_range] left field is empty")
 	}
-	field, ok := fieldsMap[cfg.Name]
+	field, ok := fieldsMap[cfg.Field]
 	if !ok {
-		// If the field is not defined in the Schema, create a temporary Property object
-		field = &interfaces.Property{
-			Name:         cfg.Name,
-			OriginalName: cfg.Name,
-		}
+		return nil, fmt.Errorf("condition [out_range] left field '%s' not found in schema", cfg.Field)
 	}
-	// For fields not defined in the Schema, skip type checking
-	if ok && !interfaces.DataType_IsDate(field.Type) && !interfaces.DataType_IsNumber(field.Type) {
-		return nil, fmt.Errorf("condition [out_range] left field is not a date/number field: %s:%s", cfg.Name, field.Type)
+	if !interfaces.DataType_IsDate(field.Type) && !interfaces.DataType_IsNumber(field.Type) {
+		return nil, fmt.Errorf("condition [out_range] left field is not a date/number field: %s:%s", cfg.Field, field.Type)
 	}
 
 	if cfg.ValueFrom != interfaces.ValueFrom_Const {
@@ -58,6 +53,10 @@ func (c *OutRangeCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	}
 	if len(val) != 2 {
 		return nil, fmt.Errorf("condition [out_range] right value should be an array of length 2")
+	}
+
+	if val[0] == nil || val[1] == nil {
+		return nil, fmt.Errorf("condition [out_range] bounds must not be nil")
 	}
 
 	return &OutRangeCond{

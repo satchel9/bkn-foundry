@@ -19,6 +19,8 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/local_index"
 	resourcelogic "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/resource"
 )
 
@@ -80,10 +82,11 @@ func extractKeyValues(fields []string, document map[string]any) ([]interfaces.Ke
 	return values, nil
 }
 
-// normalizeJSONDocumentFields 将数据库 JSON 值解析为仅保存在 _source 中的 JSON 值，保留结构和数值精度。
-func normalizeJSONDocumentFields(document map[string]any, properties []*interfaces.Property) error {
+// normalizeBuildDocumentFields 规范源端 JSON、日历日期与日内时间，不套用 HTTP 过滤输入的接受集。
+// sourceTypes 来自 CDC 消息 schema；缺失逻辑类型时不猜测数字的时间单位。
+func normalizeBuildDocumentFields(document map[string]any, properties []*interfaces.Property, sourceTypes map[string]string) error {
 	for _, property := range properties {
-		if property == nil || property.Type != interfaces.DataType_Json {
+		if property == nil || (property.Type != interfaces.DataType_Json && property.Type != interfaces.DataType_Time && property.Type != interfaces.DataType_Date) {
 			continue
 		}
 		value, exists := document[property.Name]
@@ -91,11 +94,19 @@ func normalizeJSONDocumentFields(document map[string]any, properties []*interfac
 			continue
 		}
 
-		normalized, err := normalizeJSONValue(value)
-		if err != nil {
-			return fmt.Errorf("JSON field %q: %w", property.Name, err)
+		if property.Type == interfaces.DataType_Time || property.Type == interfaces.DataType_Date {
+			logicalType := sourceTypes[property.Name]
+			if logicalType == "" {
+				logicalType = sourceTypes[property.OriginalName]
+			}
+			document[property.Name] = normalizeBuildTemporalValue(property.Type, value, logicalType)
+		} else {
+			normalized, err := normalizeJSONValue(value)
+			if err != nil {
+				return fmt.Errorf("JSON field %q: %w", property.Name, err)
+			}
+			document[property.Name] = normalized
 		}
-		document[property.Name] = normalized
 	}
 	return nil
 }
@@ -116,7 +127,7 @@ func normalizeJSONValue(value any) (any, error) {
 		return value, nil
 	}
 	if strings.TrimSpace(text) == "" {
-		return nil, nil //nolint:nilnil // Nil represents an absent database JSON value.
+		return text, nil // 空字符串是内容，不用空值替代。
 	}
 	var parsed any
 	if err := common.UnmarshalPreciseJSON([]byte(text), &parsed); err != nil {
@@ -243,7 +254,11 @@ func buildLocalIndexSchema(buildTask *interfaces.BuildTask, resource *interfaces
 	if err := validateTaskEmbeddingFeatures(schema, buildTask); err != nil {
 		return nil, err
 	}
-	return buildIndexableSchema(schema), nil
+	columns, err := table.ColumnMetadata(resource)
+	if err != nil {
+		return nil, err
+	}
+	return local_index.DecimalIndexSchema(buildIndexableSchema(schema), columns)
 }
 
 func buildIndexableSchema(schema []*interfaces.Property) []*interfaces.Property {
@@ -420,4 +435,25 @@ func indexFeatureFieldName(prop *interfaces.Property, feature *interfaces.Proper
 		return feature.RefProperty
 	}
 	return prop.Name
+}
+
+// indexBuildDocuments 适配构建流水线的 ID 映射；全部写入成功后调用方才可推进 checkpoint。
+func indexBuildDocuments(ctx context.Context, lim interfaces.LocalIndexManager, indexName string, documents map[string]map[string]any) error {
+	writes := make([]interfaces.DocumentWrite, 0, len(documents))
+	for id, document := range documents {
+		writes = append(writes, interfaces.DocumentWrite{ID: id, Document: document})
+	}
+	results, err := lim.IndexDocuments(ctx, indexName, writes)
+	if err != nil {
+		return err
+	}
+	if len(results) != len(writes) {
+		return fmt.Errorf("index response document count does not match request")
+	}
+	for i, result := range results {
+		if result.ID != writes[i].ID || result.Status < 200 || result.Status >= 300 {
+			return fmt.Errorf("index document %q failed with status %d", writes[i].ID, result.Status)
+		}
+	}
+	return nil
 }

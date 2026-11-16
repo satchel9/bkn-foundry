@@ -10,7 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
 	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
@@ -23,7 +29,7 @@ import (
 // The internal endpoint /internal-v1/function/exec/:version runs only a
 // registered function version and cannot execute arbitrary code.
 //
-// The public API enforces the caller's execute permission on the operator type.
+// The public API enforces the caller's execute permission on function:adhoc.
 // Calling the internal endpoint with a service identity would bypass that check,
 // so this request carries the original caller bearer token.
 const executeFunctionURI = "/v1/function/execute"
@@ -82,8 +88,11 @@ func (o *operatorIntegrationClient) ExecuteFunction(
 	ctx context.Context, req *interfaces.ExecuteFunctionRequest,
 ) (*interfaces.ExecuteFunctionResponse, error) {
 	if req == nil || req.Code == "" {
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusBadRequest,
-			infraErr.LocalizedDetail(ctx, "FunctionCodeRequired"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.FunctionCodeRequired", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusBadRequest, localizedText)
 	}
 	if _, hasCallerToken := common.GetRawTokenFromCtx(ctx); !common.IsPublicAPIFromCtx(ctx) && !hasCallerToken {
 		return nil, infraErr.DefaultHTTPError(ctx, http.StatusForbidden,
@@ -113,15 +122,18 @@ func (o *operatorIntegrationClient) ExecuteFunction(
 
 	code, respBody, err := o.httpClient.Post(ctx, fullURL, header, body)
 	if err != nil {
-		o.logger.WithContext(ctx).Errorf("[OperatorIntegration#ExecuteFunction] Request failed, err: %v", err)
+		o.logger.WithContext(ctx).Errorf("[OperatorIntegration#ExecuteFunction] Request failed, status: %d", code)
 		return nil, classifyFunctionExecuteError(ctx, code, err)
 	}
 
 	resp := &interfaces.ExecuteFunctionResponse{}
 	if err = common.UnmarshalPreciseJSON(utils.ObjectToByte(respBody), resp); err != nil {
 		o.logger.WithContext(ctx).Errorf("[OperatorIntegration#ExecuteFunction] Unmarshal failed, err: %v", err)
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-			infraErr.LocalizedDetail(ctx, "FunctionExecutionResponseInvalid"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.FunctionExecutionResponseInvalid", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 	}
 	return resp, nil
 }
@@ -136,7 +148,7 @@ const (
 // /v1/function/execute.
 //
 // The endpoint's gate separates a denial (403 CommonUseForbidden: the caller lacks
-// execute on the operator type) from an authorization outage (503
+// execute on function:adhoc) from an authorization outage (503
 // CommonAuthorizationUnavailable: bkn-safe gave no decision). The code runs in
 // neither case, but only a denial is fixed by requesting a grant, so each gets its
 // own reason. Both used to reach the caller as the same generic sandbox failure.
@@ -147,14 +159,30 @@ const (
 // addresses, so they stay in the server log.
 func classifyFunctionExecuteError(ctx context.Context, code int, err error) error {
 	downstreamCode, description := executionFactoryError(err)
+	if code == http.StatusUnprocessableEntity {
+		return classifyFunctionValidationError(ctx, err)
+	}
+	if code == http.StatusGatewayTimeout && downstreamCode == "Public.GatewayTimeout" {
+		if timeoutErr := classifyFunctionTimeoutError(ctx, err); timeoutErr != nil {
+			return timeoutErr
+		}
+	}
 	switch {
 	case code == http.StatusForbidden && isExecutionFactoryCode(downstreamCode, executionFactoryUseForbidden):
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.FunctionExecuteForbidden", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
 		return infraErr.DefaultHTTPError(ctx, http.StatusForbidden,
-			downstreamCode+": "+infraErr.LocalizedDetail(ctx, "FunctionExecuteForbidden"))
+			downstreamCode+": "+localizedText)
 	case code == http.StatusServiceUnavailable &&
 		isExecutionFactoryCode(downstreamCode, executionFactoryAuthorizationUnavailable):
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.FunctionAuthorizationUnavailable", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
 		return infraErr.DefaultHTTPError(ctx, http.StatusServiceUnavailable,
-			downstreamCode+": "+infraErr.LocalizedDetail(ctx, "FunctionAuthorizationUnavailable"))
+			downstreamCode+": "+localizedText)
 	case code >= http.StatusBadRequest && code < http.StatusInternalServerError &&
 		downstreamCode != "" && description != "":
 		return infraErr.DefaultHTTPError(ctx, code, downstreamCode+": "+description)
@@ -166,16 +194,20 @@ func classifyFunctionExecuteError(ctx context.Context, code int, err error) erro
 // Execution Factory error body. Both are empty when the body is not its envelope,
 // for example a gateway page.
 func executionFactoryError(err error) (code, description string) {
-	var he *infraErr.HTTPError
-	if !errors.As(err, &he) || len(he.DownstreamBody) == 0 {
+	var he *infraErr.DependencyError
+	if !errors.As(err, &he) || len(he.Body) == 0 {
 		return "", ""
 	}
 	var envelope struct {
-		Code        string `json:"code"`
+		Code        string `json:"error_code"`
+		LegacyCode  string `json:"code"`
 		Description string `json:"description"`
 	}
-	if json.Unmarshal(he.DownstreamBody, &envelope) != nil {
+	if json.Unmarshal(he.Body, &envelope) != nil {
 		return "", ""
+	}
+	if envelope.Code == "" {
+		envelope.Code = envelope.LegacyCode
 	}
 	return envelope.Code, envelope.Description
 }
@@ -184,4 +216,114 @@ func executionFactoryError(err error) (code, description string) {
 // "AgentOperatorIntegration.Forbidden.CommonUseForbidden".
 func isExecutionFactoryCode(code, extension string) bool {
 	return strings.HasSuffix(code, "."+extension)
+}
+
+// executionFailureEnvelope decodes only the public fields relevant to execution
+// failures. Arbitrary dependency details never become caller-visible metadata.
+type executionFailureEnvelope struct {
+	Details       json.RawMessage `json:"error_details"`
+	LegacyDetails json.RawMessage `json:"details"`
+	Metadata      json.RawMessage `json:"metadata"`
+}
+
+type executionFailureDetails struct {
+	Reason      string `json:"reason"`
+	Stage       string `json:"stage"`
+	Actual      int    `json:"actual"`
+	Max         int    `json:"max"`
+	Unit        string `json:"unit"`
+	Timeout     int    `json:"timeout_seconds"`
+	SessionID   string `json:"session_id"`
+	ExecutionID string `json:"execution_id"`
+}
+
+func functionFailureEnvelope(err error) executionFailureEnvelope {
+	var he *infraErr.DependencyError
+	var envelope executionFailureEnvelope
+	if errors.As(err, &he) {
+		_ = json.Unmarshal(he.Body, &envelope)
+	}
+	if len(envelope.Details) == 0 {
+		envelope.Details = envelope.LegacyDetails
+	}
+	return envelope
+}
+
+func classifyFunctionValidationError(ctx context.Context, err error) *httperrors.HTTPError {
+	envelope := functionFailureEnvelope(err)
+	var details executionFailureDetails
+	_ = json.Unmarshal(envelope.Details, &details)
+	result := infraErr.ExecutionInputValidationError(ctx,
+		functionFailureDetail(ctx, "FunctionExecutionInputInvalid", nil))
+	result.Metadata = map[string]any{"reason": "invalid_execution_input", "stage": "validation"}
+	if details.Reason == "code_too_long" && details.Stage == "validation" &&
+		details.Unit == "unicode_characters" && details.Max > 0 && details.Actual > details.Max {
+		result.ErrorDetails = functionFailureDetail(ctx, "FunctionCodeTooLong", map[string]any{"Actual": details.Actual, "Max": details.Max})
+		result.Metadata["reason"] = "code_too_long"
+		result.Metadata["actual"] = details.Actual
+		result.Metadata["max"] = details.Max
+		result.Metadata["unit"] = details.Unit
+	}
+	attachFunctionFailureCorrelation(ctx, result.Metadata, details)
+	return result
+}
+
+var legacyFunctionTimeout = regexp.MustCompile(`^function execution timed out(?: after ([1-9][0-9]*) seconds)?$`)
+
+// Only the known execution timeout envelope is forwarded as 504. A gateway's
+// arbitrary 504 body is still a dependency failure, with no retry advice inferred.
+func classifyFunctionTimeoutError(ctx context.Context, err error) error {
+	envelope := functionFailureEnvelope(err)
+	var details executionFailureDetails
+	metadataErr := json.Unmarshal(envelope.Metadata, &details)
+	if metadataErr != nil || details.Reason != "execution_timeout" || details.Stage != "execution" || details.Timeout < 0 {
+		var legacy string
+		if json.Unmarshal(envelope.Details, &legacy) != nil {
+			return nil
+		}
+		parts := legacyFunctionTimeout.FindStringSubmatch(legacy)
+		if len(parts) != 2 {
+			return nil
+		}
+		seconds := 0
+		if parts[1] != "" {
+			var parseErr error
+			seconds, parseErr = strconv.Atoi(parts[1])
+			if parseErr != nil {
+				return nil
+			}
+		}
+		details = executionFailureDetails{Reason: "execution_timeout", Stage: "execution", Timeout: seconds}
+	}
+	result := infraErr.DefaultHTTPError(ctx, http.StatusGatewayTimeout, nil)
+	result.ErrorDetails = functionFailureDetail(ctx, "FunctionExecutionTimeoutUnknown", nil)
+	result.Metadata = map[string]any{"reason": "execution_timeout", "stage": "execution"}
+	if details.Timeout > 0 {
+		result.ErrorDetails = functionFailureDetail(ctx, "FunctionExecutionTimeout", map[string]any{"Timeout": details.Timeout})
+		result.Metadata["timeout_seconds"] = details.Timeout
+	}
+	attachFunctionFailureCorrelation(ctx, result.Metadata, details)
+	return result
+}
+
+func attachFunctionFailureCorrelation(ctx context.Context, metadata map[string]any, details executionFailureDetails) {
+	if id := strings.TrimSpace(details.SessionID); common.IsValidCorrelationID(id) {
+		metadata["session_id"] = id
+	}
+	if id := strings.TrimSpace(details.ExecutionID); common.IsValidCorrelationID(id) {
+		metadata["execution_id"] = id
+	}
+	if trace, ok := common.GetTraceContextFromCtx(ctx); ok && common.IsValidBKNRequestID(trace.RequestID) {
+		metadata["request_id"] = trace.RequestID
+	}
+}
+
+// functionFailureDetail uses the deployed shared locale registry without exposing
+// a dependency's untrusted description or rendering parameters.
+func functionFailureDetail(ctx context.Context, key string, params map[string]any) string {
+	text, err := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail."+key, params)
+	if err != nil {
+		logger.Errorf("execution failure message rendering failed: %v", err)
+	}
+	return text
 }

@@ -506,6 +506,8 @@ func retryableTransactionError(err error) bool {
 }
 
 type transaction struct {
+	callSummaries      map[string][]sessionvo.OperationCallSummary
+	derivedGraphs      map[string]derivedCausationGraph
 	integrityDirty     map[string]struct{}
 	strictEvidenceJSON bool
 	ctx                context.Context
@@ -1117,6 +1119,57 @@ func (t *transaction) ListOperationCallFacts(interactionID string) []sessionvo.O
 	return result
 }
 
+const operationCallSummarySelect = `SELECT operation_id, attempt_no, conversation_id,
+	interaction_id, COALESCE(receipt_id, ''), tool_name, protocol, source_module,
+	COALESCE(parent_operation_id, ''), COALESCE(request_id, ''), COALESCE(trace_id, ''),
+	COALESCE(span_id, ''), started_at, finished_at, status, retryable
+	FROM bkn_trace_operation_call_facts `
+
+func (t *transaction) ListOperationCallSummaries(interactionID string) []sessionvo.OperationCallSummary {
+	if cached, ok := t.callSummaries[interactionID]; ok && t.err == nil {
+		return cloneCallSummaries(cached)
+	}
+	if t.err != nil {
+		return nil
+	}
+	rows, err := t.tx.QueryContext(t.ctx, operationCallSummarySelect+
+		`WHERE interaction_id=? ORDER BY started_at, operation_id, attempt_no`, interactionID)
+	if err != nil {
+		t.err = err
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]sessionvo.OperationCallSummary, 0)
+	for rows.Next() {
+		var value sessionvo.OperationCallSummary
+		var finishedAt sql.NullTime
+		if err := rows.Scan(
+			&value.OperationID, &value.Attempt, &value.ConversationID, &value.InteractionID,
+			&value.ReceiptID, &value.ToolName, &value.Protocol, &value.SourceModule,
+			&value.ParentOperationID, &value.RequestID, &value.TraceID, &value.SpanID,
+			&value.StartedAt, &finishedAt, &value.Status, &value.Retryable,
+		); err != nil {
+			t.err = err
+			return nil
+		}
+		if finishedAt.Valid {
+			value.FinishedAt = &finishedAt.Time
+		}
+		result = append(result, value)
+	}
+	t.err = rows.Err()
+	if t.err == nil {
+		if t.callSummaries == nil {
+			t.callSummaries = make(map[string][]sessionvo.OperationCallSummary)
+		}
+		// Batch workers may seal many interactions in one transaction.
+		// Retain only the current interaction's metadata, never the whole batch.
+		clear(t.callSummaries)
+		t.callSummaries[interactionID] = cloneCallSummaries(result)
+	}
+	return result
+}
+
 func (t *transaction) ListOperationCallFactsByTraceID(traceID string) []sessionvo.OperationCallFact {
 	if t.err != nil {
 		return nil
@@ -1189,7 +1242,20 @@ func (t *transaction) ListFirstOperationSourceModulesByTraceIDs(traceIDs []strin
 	return result
 }
 
+// Summaries are reused only inside this transaction and invalidated on writes.
+func cloneCallSummaries(values []sessionvo.OperationCallSummary) []sessionvo.OperationCallSummary {
+	result := append([]sessionvo.OperationCallSummary(nil), values...)
+	for i := range result {
+		if result[i].FinishedAt != nil {
+			v := *result[i].FinishedAt
+			result[i].FinishedAt = &v
+		}
+	}
+	return result
+}
+
 func (t *transaction) SaveOperationCallFact(fact sessionvo.OperationCallFact) {
+	delete(t.callSummaries, fact.InteractionID)
 	if t.err != nil {
 		return
 	}
@@ -1547,6 +1613,11 @@ func (t *transaction) AppendProjection(mutation sessionvo.ProjectionMutation) {
 	if t.err != nil {
 		return
 	}
+	if mutation.EventType == "artifact.persist_requested" {
+		if t.err = t.checkAnswerPacketBudget(mutation); t.err != nil {
+			return
+		}
+	}
 	_, t.err = t.tx.ExecContext(t.ctx, `
 		INSERT INTO bkn_trace_projection_outbox (
 			aggregate_type, aggregate_id, aggregate_version, event_type, event_id, payload,
@@ -1747,6 +1818,12 @@ func (t *transaction) scanInteraction(row rowScanner) (sessionvo.Interaction, bo
 }
 
 func scanInteractionRows(row rowScanner) (sessionvo.Interaction, error) {
+	return scanInteractionRowsWithRawIntegrity(row, nil)
+}
+
+// Archive capture reuses the same row and size checks, preserving metadata fields
+// that an older binary cannot represent in its typed read model.
+func scanInteractionRowsWithRawIntegrity(row rowScanner, rawIntegrity *json.RawMessage) (sessionvo.Interaction, error) {
 	var value sessionvo.Interaction
 	var manifest string
 	var terminalAt sql.NullTime
@@ -1780,6 +1857,13 @@ func scanInteractionRows(row rowScanner) (sessionvo.Interaction, error) {
 			return sessionvo.Interaction{}, fmt.Errorf("%w: interaction.record_integrity", isessionstore.ErrInvalidEvidenceJSON)
 		}
 	}
+	if rawIntegrity != nil {
+		*rawIntegrity = nil
+		if integrityJSON.Valid {
+			*rawIntegrity = json.RawMessage(integrityJSON.String)
+		}
+	}
+
 	return value, nil
 }
 

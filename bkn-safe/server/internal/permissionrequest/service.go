@@ -117,7 +117,7 @@ func normalizePage(page PageOptions) PageOptions {
 		page.ResourceType = ""
 	}
 	page.ResourceID = strings.TrimSpace(page.ResourceID)
-	if len(page.ResourceID) > 128 {
+	if len(page.ResourceID) > 257 {
 		page.ResourceID = ""
 	}
 	page.Status = strings.TrimSpace(page.Status)
@@ -355,13 +355,18 @@ func requestFingerprint(in CreateInput) string {
 }
 
 func validCreate(in *CreateInput) bool {
-	for _, field := range []*string{&in.RequesterID, &in.ResourceType, &in.ResourceID} {
+	for _, field := range []*string{&in.RequesterID, &in.ResourceType} {
 		v, ok := clean(*field, 128)
 		if !ok {
 			return false
 		}
 		*field = v
 	}
+	resourceID, ok := clean(in.ResourceID, 257)
+	if !ok {
+		return false
+	}
+	in.ResourceID = resourceID
 	if strings.ContainsAny(in.ResourceName, "\x00\r\n") {
 		return false
 	}
@@ -763,14 +768,20 @@ func (s *Service) validateRequestOperations(ctx context.Context, resourceType st
 		}
 		return nil
 	}
-	var count int64
-	if err := s.db.WithContext(ctx).Model(&model.Operation{}).
-		Where("resource_type_id = ? AND id IN ? AND grantable = ?", resourceType, operations, true).
-		Count(&count).Error; err != nil {
+	registered, err := s.enforcer.Registry().Operations(ctx, resourceType)
+	if err != nil {
 		return err
 	}
-	if count != int64(len(operations)) {
-		return ErrInvalidRequest
+	available := make(map[string]bool, len(registered))
+	for _, operation := range registered {
+		available[operation.ID] = operation.IsGrantable()
+	}
+	seen := make(map[string]bool, len(operations))
+	for _, operation := range operations {
+		if seen[operation] || !available[operation] {
+			return ErrInvalidRequest
+		}
+		seen[operation] = true
 	}
 	return nil
 }
@@ -812,7 +823,7 @@ func (s *Service) hasRequestedPermission(ctx context.Context, accessorID, resour
 // still be usable when they are granted. A prerequisite included in the same
 // request is valid because the approval writes both grants atomically.
 func missingUnrequestedPrerequisites(ctx context.Context, tx *authz.PolicyTransaction, accessorID, resourceType, resourceID string, operations []string) ([]string, error) {
-	requirements, err := tx.DirectRequirements(ctx, resourceType, operations)
+	requirements, err := tx.Requirements(ctx, resourceType, operations)
 	if err != nil {
 		return nil, err
 	}

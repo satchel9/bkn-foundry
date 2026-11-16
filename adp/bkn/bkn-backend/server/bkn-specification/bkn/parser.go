@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"strings"
 
-	"bkn-backend/common/maskrule"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/maskrule"
 
 	"gopkg.in/yaml.v3"
 )
@@ -38,6 +38,7 @@ var knownRelationTypeSections = map[string]bool{
 }
 
 var knownActionTypeSections = map[string]bool{
+	"Operation Config":  true,
 	"Bound Object":      true,
 	"Affect Object":     true,
 	"Impact Contracts":  true,
@@ -51,14 +52,6 @@ var knownRiskTypeSections = map[string]bool{}
 
 var knownConceptGroupSections = map[string]bool{
 	"Object Types": true,
-}
-
-var knownMetricSections = map[string]bool{
-	"Metric attributes":   true,
-	"Scope":               true,
-	"Calculation Formula": true,
-	"Time Dimension":      true,
-	"Analysis Dimensions": true,
 }
 
 var h1HeadingRE = regexp.MustCompile(`(?m)^#\s+(.+)$`)
@@ -291,9 +284,10 @@ func parseDataSource(sectionText string) *ResourceInfo {
 	}
 }
 
-func parseDataProperties(sectionText string) ([]*DataProperty, error) {
+// parseDataProperties reads the Data Properties table. Under 3.0 it also reads the Semantic,
+// Required and Aliases columns; explicitFalse names the properties whose Required is written false.
+func parseDataProperties(sectionText string, opts parseOptions) (props []*DataProperty, explicitFalse []string, err error) {
 	rows := parseTable(strings.Split(sectionText, "\n"))
-	var props []*DataProperty
 	for _, row := range rows {
 		property := &DataProperty{
 			Name:        row["Name"],
@@ -306,18 +300,30 @@ func parseDataProperties(sectionText string) ([]*DataProperty, error) {
 			// A row without a name is a row the table reader could not rebuild. Refusing it
 			// here is what makes a broken file visible; dropping the row would import an
 			// object type that is quietly missing a property.
-			return nil, fmt.Errorf("data property row %d is malformed: empty Name", len(props)+1)
+			return nil, nil, fmt.Errorf("data property row %d is malformed: empty Name", len(props)+1)
 		}
 		if rawRule := strings.TrimSpace(row["Mask Rule"]); rawRule != "" {
 			var rule maskrule.Rule
 			if err := json.Unmarshal([]byte(rawRule), &rule); err != nil {
-				return nil, fmt.Errorf("data property %q has invalid Mask Rule JSON: %w", property.Name, err)
+				return nil, nil, fmt.Errorf("data property %q has invalid Mask Rule JSON: %w", property.Name, err)
 			}
 			property.MaskRule = &rule
 		}
+		if opts.v3() {
+			property.Semantic = strings.TrimSpace(row["Semantic"])
+			property.Aliases = parseAliasesCell(row["Aliases"])
+			required, isFalse, err := parseRequired(property.Name, row["Required"])
+			if err != nil {
+				return nil, nil, err
+			}
+			property.Required = required
+			if isFalse {
+				explicitFalse = append(explicitFalse, property.Name)
+			}
+		}
 		props = append(props, property)
 	}
-	return props, nil
+	return props, explicitFalse, nil
 }
 
 func parseLogicProperties(sectionText string) []*LogicProperty {
@@ -515,6 +521,11 @@ func ParseNetworkFile(text string, sourcePath string) (*BknNetwork, error) {
 		return nil, fmt.Errorf("missing required field 'id' in network.bkn frontmatter")
 	}
 
+	spec, err := normalizeBknSpec(fmData["bkn_spec"])
+	if err != nil {
+		return nil, err
+	}
+
 	network := &BknNetwork{
 		BknNetworkFrontmatter: BknNetworkFrontmatter{
 			Type:         strVal(fmData, "type"),
@@ -523,33 +534,59 @@ func ParseNetworkFile(text string, sourcePath string) (*BknNetwork, error) {
 			Tags:         strSliceVal(fmData, "tags"),
 			Version:      strVal(fmData, "version"),
 			Branch:       strVal(fmData, "branch"),
+			BknSpec:      spec,
 			Capabilities: parseCapabilities(fmData),
 		},
 		Description: extractBodyDescription(text),
 		RawContent:  text,
+	}
+	if spec == BknSpecV3 {
+		fm, err := parseRawFrontmatter(text)
+		if err != nil {
+			return nil, err
+		}
+		if err := checkNetworkV3(text, fm); err != nil {
+			return nil, fmt.Errorf("network.bkn: %w", err)
+		}
+		network.ID, network.Name, network.Tags = fm.str("id"), fm.str("name"), fm.list("tags")
+		network.Version, network.Branch = fm.str("version"), fm.str("branch")
+		network.Description = unescapeDescriptionV3(network.Description)
+		if network.Capabilities, err = parseCapabilitiesV3(fm.values["capabilities"]); err != nil {
+			return nil, fmt.Errorf("network.bkn: %w", err)
+		}
 	}
 	network.Summary = ExtractSummary(network.Description)
 
 	return network, nil
 }
 
-// ParseObjectTypeFile parses an object_type definition file.
+// ParseObjectTypeFile parses an object_type definition file by the 2.x rules.
 func ParseObjectTypeFile(text string, sourcePath string) (*BknObjectType, error) {
+	return parseObjectTypeFile(text, sourcePath, parseOptions{})
+}
+
+func parseObjectTypeFile(text string, sourcePath string, opts parseOptions) (*BknObjectType, error) {
 	fmData, err := ParseFrontmatter(text)
 	if err != nil {
 		return nil, err
 	}
 
+	header, err := readDefinitionHeader(kindObjectType, text, fmData, opts)
+	if err != nil {
+		return nil, err
+	}
 	desc, sections, order := extractSectionsWithDesc(text)
 
 	obj := &BknObjectType{
 		BknObjectTypeFrontmatter: BknObjectTypeFrontmatter{
-			Type: "object_type",
-			ID:   strVal(fmData, "id"),
-			Name: strVal(fmData, "name"),
-			Tags: strSliceVal(fmData, "tags"),
+			Type:      "object_type",
+			ID:        header.id,
+			Name:      header.name,
+			Tags:      header.tags,
+			Aliases:   header.aliases,
+			Lifecycle: header.lifecycle,
 		},
-		Description: buildDescription(desc, sections, order, knownObjectTypeSections),
+		Description: header.description(buildDescription(desc, sections, order, opts.knownObjectSections())),
 		RawContent:  text,
 	}
 	obj.Summary = ExtractSummary(obj.Description)
@@ -560,14 +597,24 @@ func ParseObjectTypeFile(text string, sourcePath string) (*BknObjectType, error)
 	if s, ok := sections["Data Source"]; ok {
 		obj.DataSource = parseDataSource(s)
 	}
+	var explicitFalse []string
 	if s, ok := sections["Data Properties"]; ok {
-		obj.DataProperties, err = parseDataProperties(s)
+		obj.DataProperties, explicitFalse, err = parseDataProperties(s, opts)
 		if err != nil {
 			return nil, err
 		}
 	}
 	if s, ok := sections["Logic Properties"]; ok {
 		obj.LogicProperties = parseLogicProperties(s)
+		if opts.v3() {
+			for _, lp := range obj.LogicProperties {
+				for _, p := range lp.Parameters {
+					if err := checkParameterValueSource(fmt.Sprintf("logic property %q", lp.Name), p); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
 	if s, ok := sections["Keys"]; ok {
 		pks, dk, ik := parseKeys(s)
@@ -575,13 +622,47 @@ func ParseObjectTypeFile(text string, sourcePath string) (*BknObjectType, error)
 		obj.DisplayKey = dk
 		obj.IncrementalKey = ik
 	}
+	if opts.v3() {
+		if err := parseObjectTypeDeclarationsV3(obj, sections, explicitFalse); err != nil {
+			return nil, err
+		}
+	}
 
 	return obj, nil
 }
 
-// ParseRelationTypeFile parses a relation_type definition file.
+// parseObjectTypeDeclarationsV3 reads ### Property Constraints and checks the property declarations
+// of a 3.0 object type.
+func parseObjectTypeDeclarationsV3(obj *BknObjectType, sections map[string]string, explicitFalse []string) error {
+	for _, name := range explicitFalse {
+		if containsString(obj.PrimaryKeys, name) {
+			return specErrorf("data property %q: a primary key is required by definition; leave Required empty instead of writing false", name)
+		}
+	}
+	for _, p := range obj.DataProperties {
+		if containsString(obj.PrimaryKeys, p.Name) {
+			p.Required = true
+		}
+	}
+	if s, ok := sections["Property Constraints"]; ok {
+		if err := parsePropertyConstraintsV3(s, obj.DataProperties); err != nil {
+			return err
+		}
+	}
+	return ValidateObjectTypeDeclarations(obj)
+}
+
+// ParseRelationTypeFile parses a relation_type definition file by the 2.x rules.
 func ParseRelationTypeFile(text string, sourcePath string) (*BknRelationType, error) {
+	return parseRelationTypeFile(text, sourcePath, parseOptions{})
+}
+
+func parseRelationTypeFile(text string, sourcePath string, opts parseOptions) (*BknRelationType, error) {
 	fmData, err := ParseFrontmatter(text)
+	if err != nil {
+		return nil, err
+	}
+	header, err := readDefinitionHeader(kindRelationType, text, fmData, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -590,12 +671,14 @@ func ParseRelationTypeFile(text string, sourcePath string) (*BknRelationType, er
 
 	rel := &BknRelationType{
 		BknRelationTypeFrontmatter: BknRelationTypeFrontmatter{
-			Type: "relation_type",
-			ID:   strVal(fmData, "id"),
-			Name: strVal(fmData, "name"),
-			Tags: strSliceVal(fmData, "tags"),
+			Type:      "relation_type",
+			ID:        header.id,
+			Name:      header.name,
+			Tags:      header.tags,
+			Aliases:   header.aliases,
+			Lifecycle: header.lifecycle,
 		},
-		Description: buildDescription(desc, sections, order, knownRelationTypeSections),
+		Description: header.description(buildDescription(desc, sections, order, opts.knownRelationSections())),
 		RawContent:  text,
 	}
 	rel.Summary = ExtractSummary(rel.Description)
@@ -608,6 +691,9 @@ func ParseRelationTypeFile(text string, sourcePath string) (*BknRelationType, er
 				Source: row["Source"],
 				Target: row["Target"],
 				Type:   row["Type"],
+			}
+			if opts.v3() {
+				rel.Endpoint.Cardinality = strings.TrimSpace(row["Cardinality"])
 			}
 		}
 	}
@@ -665,33 +751,98 @@ func ParseRelationTypeFile(text string, sourcePath string) (*BknRelationType, er
 		}
 		rel.MappingRules = mapping
 	}
+	if opts.v3() {
+		if err := parseRelationDeclarationsV3(rel, header.raw, sections, opts); err != nil {
+			return nil, err
+		}
+	}
 
 	return rel, nil
 }
 
-// ParseActionTypeFile parses an action_type definition file.
+// parseRelationDeclarationsV3 reads the 3.0 relation declarations: the frontmatter fields, ### Relation
+// Constraints and the relation properties, then checks them.
+func parseRelationDeclarationsV3(rel *BknRelationType, fm rawFrontmatter, sections map[string]string, opts parseOptions) error {
+	if err := readRelationFrontmatterV3(rel, fm); err != nil {
+		return err
+	}
+	if s, ok := sections["Relation Constraints"]; ok {
+		if err := parseRelationConstraintsV3(rel, s); err != nil {
+			return err
+		}
+	}
+	if s, ok := sections["Data Properties"]; ok {
+		props, _, err := parseDataProperties(s, opts)
+		if err != nil {
+			return err
+		}
+		rel.DataProperties = props
+	}
+	if s, ok := sections["Property Constraints"]; ok {
+		if err := parsePropertyConstraintsV3(s, rel.DataProperties); err != nil {
+			return err
+		}
+	}
+	return ValidateRelationTypeDeclarations(rel)
+}
+
+// ParseActionTypeFile parses an action_type definition file by the 2.x rules.
 func ParseActionTypeFile(text string, sourcePath string) (*BknActionType, error) {
+	return parseActionTypeFile(text, sourcePath, parseOptions{})
+}
+
+func parseActionTypeFile(text string, sourcePath string, opts parseOptions) (*BknActionType, error) {
 	fmData, err := ParseFrontmatter(text)
 	if err != nil {
 		return nil, err
 	}
 
+	header, err := readDefinitionHeader(kindActionType, text, fmData, opts)
+	if err != nil {
+		return nil, err
+	}
 	desc, sections, order := extractSectionsWithDesc(text)
 
 	act := &BknActionType{
 		BknActionTypeFrontmatter: BknActionTypeFrontmatter{
 			Type:         "action_type",
-			ID:           strVal(fmData, "id"),
-			Name:         strVal(fmData, "name"),
-			Tags:         strSliceVal(fmData, "tags"),
+			ID:           header.id,
+			Name:         header.name,
+			Tags:         header.tags,
 			ActionType:   strVal(fmData, "action_type"),
 			ActionIntent: strVal(fmData, "action_intent"),
 		},
-		Description: buildDescription(desc, sections, order, knownActionTypeSections),
+		Description: header.description(buildDescription(desc, sections, order, opts.knownActionSections())),
 		RawContent:  text,
+	}
+	if opts.v3() {
+		act.ActionIntent = header.raw.str("action_intent")
+		act.Aliases = header.aliases
+		act.Lifecycle = header.lifecycle
+		if err := ValidateActionTypeDeclarations(act); err != nil {
+			return nil, err
+		}
 	}
 	act.Summary = ExtractSummary(act.Description)
 
+	if section, ok := sections["Operation Config"]; ok {
+		match := yamlBlockRE.FindStringSubmatch(section)
+		if len(match) != 2 {
+			return nil, specErrorf("Operation Config requires a YAML block")
+		}
+		var payload struct {
+			OperationConfig *ActionOperationConfig `yaml:"operation_config"`
+		}
+		decoder := yaml.NewDecoder(strings.NewReader(match[1]))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&payload); err != nil {
+			return nil, specErrorf("invalid Operation Config: %v", err)
+		}
+		if payload.OperationConfig == nil {
+			return nil, specErrorf("Operation Config requires operation_config")
+		}
+		act.OperationConfig = payload.OperationConfig
+	}
 	if s, ok := sections["Bound Object"]; ok {
 		bo, at := parseBoundObject(s)
 		act.BoundObject = bo
@@ -720,10 +871,55 @@ func ParseActionTypeFile(text string, sourcePath string) (*BknActionType, error)
 		act.ActionSource = parseActionSource(s)
 	}
 	if s, ok := sections["Parameter Binding"]; ok {
-		act.Parameters = parseParameterBinding(s)
+		act.Parameters, err = parseParameterBinding(s, opts)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if s, ok := sections["Schedule"]; ok {
 		act.Schedule = parseSchedule(s)
+	}
+	if act.OperationConfig != nil {
+		for index := range act.Parameters {
+			parameter := &act.Parameters[index]
+			if parameter.ValueFrom != "const" {
+				continue
+			}
+			raw, ok := parameter.Value.(string)
+			if !ok {
+				continue
+			}
+			if !json.Valid([]byte(raw)) {
+				switch strings.ToLower(parameter.Type) {
+				case "string", "text", "keyword", "date", "datetime", "":
+					continue
+				default:
+					return nil, specErrorf("action parameter %q has an invalid JSON constant", parameter.Name)
+				}
+			}
+			decoder := json.NewDecoder(strings.NewReader(raw))
+			decoder.UseNumber()
+			var value any
+			if err := decoder.Decode(&value); err != nil {
+				switch strings.ToLower(parameter.Type) {
+				case "string", "text", "keyword", "date", "datetime", "":
+					continue
+				default:
+					return nil, specErrorf("action parameter %q has an invalid JSON constant", parameter.Name)
+				}
+			}
+			switch strings.ToLower(parameter.Type) {
+			case "string", "text", "keyword", "date", "datetime":
+				if _, ok := value.(string); !ok {
+					// An unquoted JSON literal in a string parameter is text.
+					continue
+				}
+			}
+			if err := ValidateActionConstantType(parameter.Type, value); err != nil {
+				return nil, specErrorf("action parameter %q: %v", parameter.Name, err)
+			}
+			parameter.Value = value
+		}
 	}
 
 	return act, nil
@@ -843,7 +1039,10 @@ func parseActionCondition(sectionText string) *ActionCondCfg {
 // Current column headers: Name | Type | Source | Operation | ValueFrom | Value | Description.
 // Legacy aliases "Parameter" (for Name) and "Binding"/"Value From" (for ValueFrom) are
 // also accepted for backwards compatibility with older BKN files.
-func parseParameterBinding(sectionText string) []Parameter {
+//
+// Under 3.0 the table has a single layout (the legacy one is refused before parsing, see strict.go)
+// and a row whose value source would make execution drop the parameter is refused.
+func parseParameterBinding(sectionText string, opts parseOptions) ([]Parameter, error) {
 	rows := parseTable(strings.Split(sectionText, "\n"))
 	var params []Parameter
 	for _, row := range rows {
@@ -858,9 +1057,17 @@ func parseParameterBinding(sectionText string) []Parameter {
 			Value:       row["Value"],
 			Description: row["Description"],
 		}
+		if (param.ValueFrom == "source_identity" || param.ValueFrom == "target_identity") && param.Value == "" {
+			param.Value = nil
+		}
+		if opts.v3() {
+			if err := checkParameterValueSource("action", param); err != nil {
+				return nil, err
+			}
+		}
 		params = append(params, param)
 	}
-	return params
+	return params, nil
 }
 
 // parseActionSource parses the action source table.
@@ -900,23 +1107,31 @@ func parseSchedule(sectionText string) *Schedule {
 	}
 }
 
-// ParseRiskTypeFile parses a risk_type definition file.
+// ParseRiskTypeFile parses a risk_type definition file by the 2.x rules.
 func ParseRiskTypeFile(text string, sourcePath string) (*BknRiskType, error) {
+	return parseRiskTypeFile(text, sourcePath, parseOptions{})
+}
+
+func parseRiskTypeFile(text string, sourcePath string, opts parseOptions) (*BknRiskType, error) {
 	fmData, err := ParseFrontmatter(text)
 	if err != nil {
 		return nil, err
 	}
 
+	header, err := readDefinitionHeader(kindRiskType, text, fmData, opts)
+	if err != nil {
+		return nil, err
+	}
 	desc, sections, order := extractSectionsWithDesc(text)
 
 	risk := &BknRiskType{
 		BknRiskTypeFrontmatter: BknRiskTypeFrontmatter{
 			Type: "risk_type",
-			ID:   strVal(fmData, "id"),
-			Name: strVal(fmData, "name"),
-			Tags: strSliceVal(fmData, "tags"),
+			ID:   header.id,
+			Name: header.name,
+			Tags: header.tags,
 		},
-		Description: buildDescription(desc, sections, order, knownRiskTypeSections),
+		Description: header.description(buildDescription(desc, sections, order, knownRiskTypeSections)),
 		RawContent:  text,
 	}
 	risk.Summary = ExtractSummary(risk.Description)
@@ -924,131 +1139,17 @@ func ParseRiskTypeFile(text string, sourcePath string) (*BknRiskType, error) {
 	return risk, nil
 }
 
-// extractFirstMetricFormulaYAML returns the inner YAML of the first ```yaml fence in Calculation Formula body.
-func extractFirstMetricFormulaYAML(sectionText string) []byte {
-	m := yamlBlockRE.FindStringSubmatch(sectionText)
-	if len(m) < 2 {
-		return nil
-	}
-	return []byte(strings.TrimSpace(m[1]))
+// ParseConceptGroupFile parses a concept_group definition file by the 2.x rules.
+func ParseConceptGroupFile(text string, sourcePath string) (*BknConceptGroup, error) {
+	return parseConceptGroupFile(text, sourcePath, parseOptions{})
 }
 
-func parseMetricAttributes(sectionText string) MetricAttributes {
-	rows := parseTable(strings.Split(sectionText, "\n"))
-	if len(rows) == 0 {
-		return MetricAttributes{}
-	}
-
-	r0 := rows[0]
-	return MetricAttributes{
-		MetricType: strings.TrimSpace(firstNonEmpty(r0, "Metric Type", "MetricType", "指标类型")),
-		UnitType:   strings.TrimSpace(firstNonEmpty(r0, "Unit Type", "UnitType", "单位类型")),
-		Unit:       strings.TrimSpace(firstNonEmpty(r0, "Unit", "度量单位")),
-	}
-}
-
-func parseMetricScope(sectionText string) (scopeType, scopeRef string) {
-	rows := parseTable(strings.Split(sectionText, "\n"))
-	if len(rows) == 0 {
-		return "", ""
-	}
-	r := rows[0]
-	return strings.TrimSpace(r["Scope Type"]), strings.TrimSpace(r["Scope Ref"])
-}
-
-func parseMetricTimeDimensions(sectionText string) []MetricTimeDimRow {
-	rows := parseTable(strings.Split(sectionText, "\n"))
-	var out []MetricTimeDimRow
-	for _, row := range rows {
-		prop := firstNonEmpty(row, "Property")
-		pol := firstNonEmpty(row, "Default Range Policy")
-		if prop != "" || pol != "" {
-			out = append(out, MetricTimeDimRow{Property: prop, Policy: pol})
-		}
-	}
-	return out
-}
-
-func parseMetricAnalysisDimensions(sectionText string) []MetricAnalysisDimRow {
-	rows := parseTable(strings.Split(sectionText, "\n"))
-	var out []MetricAnalysisDimRow
-	for _, row := range rows {
-		n := row["Name"]
-		dn := firstNonEmpty(row, "Display Name", "DisplayName")
-		if n != "" || dn != "" {
-			out = append(out, MetricAnalysisDimRow{Name: n, DisplayName: dn})
-		}
-	}
-	return out
-}
-
-// ParseMetricFile parses a network-level metric file (metrics/*.bkn).
-func ParseMetricFile(text string, sourcePath string) (*BknMetric, error) {
+func parseConceptGroupFile(text string, sourcePath string, opts parseOptions) (*BknConceptGroup, error) {
 	fmData, err := ParseFrontmatter(text)
 	if err != nil {
 		return nil, err
 	}
-
-	desc, sections, order := extractSectionsWithDesc(text)
-
-	m := &BknMetric{
-		BknMetricFrontmatter: BknMetricFrontmatter{
-			Type: strVal(fmData, "type"),
-			ID:   strVal(fmData, "id"),
-			Name: strVal(fmData, "name"),
-			Tags: strSliceVal(fmData, "tags"),
-		},
-		Description: buildDescription(desc, sections, order, knownMetricSections),
-		RawContent:  text,
-	}
-	if strings.TrimSpace(m.Type) == "" {
-		m.Type = "metric"
-	}
-	m.Summary = ExtractSummary(m.Description)
-
-	_, m.HasScopeSection = sections["Scope"]
-	_, m.HasCalculationFormulaSection = sections["Calculation Formula"]
-	_, m.HasTimeDimensionSection = sections["Time Dimension"]
-	_, m.HasAnalysisDimensionsSection = sections["Analysis Dimensions"]
-	if _, ok := sections["Metric attributes"]; ok {
-		m.HasMetricAttributesSection = true
-	}
-
-	if s, ok := sections["Metric attributes"]; ok {
-		m.MetricAttributes = parseMetricAttributes(s)
-	}
-
-	if s, ok := sections["Scope"]; ok {
-		st, sr := parseMetricScope(s)
-		m.ScopeType, m.ScopeRef = st, sr
-	}
-	if s, ok := sections["Calculation Formula"]; ok {
-		yamlBytes := extractFirstMetricFormulaYAML(s)
-		if len(yamlBytes) > 0 {
-			var f MetricFormula
-			if err := yaml.Unmarshal(yamlBytes, &f); err != nil {
-				return nil, fmt.Errorf("calculation formula yaml: %w", err)
-			}
-			m.Formula = &f
-		}
-	}
-	if s, ok := sections["Time Dimension"]; ok {
-		m.TimeDimensions = parseMetricTimeDimensions(s)
-	}
-	if s, ok := sections["Analysis Dimensions"]; ok {
-		m.AnalysisDimensions = parseMetricAnalysisDimensions(s)
-	}
-
-	// If Metric Type column empty, derive from authoritative formula kind.
-	if strings.TrimSpace(m.MetricAttributes.MetricType) == "" && m.Formula != nil && strings.TrimSpace(m.Formula.Kind) != "" {
-		m.MetricAttributes.MetricType = strings.TrimSpace(m.Formula.Kind)
-	}
-
-	return m, nil
-}
-
-func ParseConceptGroupFile(text string, sourcePath string) (*BknConceptGroup, error) {
-	fmData, err := ParseFrontmatter(text)
+	header, err := readDefinitionHeader(kindConceptGroup, text, fmData, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1058,11 +1159,11 @@ func ParseConceptGroupFile(text string, sourcePath string) (*BknConceptGroup, er
 	cg := &BknConceptGroup{
 		BknConceptGroupFrontmatter: BknConceptGroupFrontmatter{
 			Type: "concept_group",
-			ID:   strVal(fmData, "id"),
-			Name: strVal(fmData, "name"),
-			Tags: strSliceVal(fmData, "tags"),
+			ID:   header.id,
+			Name: header.name,
+			Tags: header.tags,
 		},
-		Description: buildDescription(desc, sections, order, knownConceptGroupSections),
+		Description: header.description(buildDescription(desc, sections, order, knownConceptGroupSections)),
 		RawContent:  text,
 	}
 	cg.Summary = ExtractSummary(cg.Description)
@@ -1122,9 +1223,54 @@ func parseCapabilities(fmData map[string]any) *BknCapabilities {
 	if err := yaml.Unmarshal(encoded, capabilities); err != nil {
 		return nil
 	}
-	if len(capabilities.Skills) == 0 && len(capabilities.Functions) == 0 &&
-		len(capabilities.MCPTools) == 0 {
+	if capabilities.IsEmpty() {
 		return nil
 	}
 	return capabilities
+}
+
+// definitionHeader is what every definition file reads from its frontmatter, by the rules of the
+// package's specification.
+type definitionHeader struct {
+	id, name  string
+	tags      []string
+	aliases   []string
+	lifecycle *Lifecycle
+	v3        bool
+	raw       rawFrontmatter
+}
+
+// readDefinitionHeader reads id, name and tags. Under 3.0 it first applies the structure rules of
+// strict.go to the whole file and reads the fields as written.
+func readDefinitionHeader(kind, text string, fmData map[string]any, opts parseOptions) (definitionHeader, error) {
+	if !opts.v3() {
+		return definitionHeader{id: strVal(fmData, "id"), name: strVal(fmData, "name"), tags: strSliceVal(fmData, "tags")}, nil
+	}
+	raw, err := parseRawFrontmatter(text)
+	if err != nil {
+		return definitionHeader{}, err
+	}
+	if err := checkDefinitionV3(kind, text, raw); err != nil {
+		return definitionHeader{}, err
+	}
+	aliases, err := parseAliasesNode(raw.values["aliases"])
+	if err != nil {
+		return definitionHeader{}, err
+	}
+	lifecycle, err := parseLifecycleNode(raw.str("id"), raw.values["lifecycle"])
+	if err != nil {
+		return definitionHeader{}, err
+	}
+	return definitionHeader{
+		id: raw.str("id"), name: raw.str("name"), tags: raw.list("tags"), aliases: aliases, lifecycle: lifecycle, v3: true, raw: raw,
+	}, nil
+}
+
+// description returns a definition's description as stored: under 3.0 the exporter's escape of
+// lines that start with # is reversed.
+func (h definitionHeader) description(desc string) string {
+	if h.v3 {
+		return unescapeDescriptionV3(desc)
+	}
+	return desc
 }

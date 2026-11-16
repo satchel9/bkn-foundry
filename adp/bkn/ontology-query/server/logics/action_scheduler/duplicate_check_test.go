@@ -11,14 +11,14 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
-	"ontology-query/logics"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
 )
 
 func Test_computeDuplicateFingerprint(t *testing.T) {
@@ -154,14 +154,14 @@ func Test_ExecuteAction_DuplicateCheck(t *testing.T) {
 			ATID:         "at_001",
 			ATName:       "restart",
 			ObjectTypeID: "ot_001",
-			ActionType:   "update",
+			ActionType:   "modify",
 			ActionSource: interfaces.ActionSource{Type: interfaces.ActionSourceTypeTool, BoxID: "box", ToolID: "tool"},
-			Parameters:   []interfaces.Parameter{},
+			Parameters:   []interfaces.Parameter{}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 		}
 		omAccess.EXPECT().GetActionType(gomock.Any(), "kn_001", interfaces.MAIN_BRANCH, "at_001").
 			Return(actionType, map[string]any{}, true, nil)
 		omAccess.EXPECT().GetObjectType(gomock.Any(), "kn_001", interfaces.MAIN_BRANCH, "ot_001").
-			Return(interfaces.ObjectType{KNID: "kn_001"}, true, nil)
+			Return(actionTargetObject("ot_001", "id"), true, nil).AnyTimes()
 
 		ots.EXPECT().GetObjectsByObjectTypeID(gomock.Any(), gomock.Any()).Return(interfaces.Objects{
 			Datas: []map[string]any{
@@ -195,9 +195,9 @@ func Test_ExecuteAction_DuplicateCheck(t *testing.T) {
 			InstanceIdentities: []map[string]any{{"id": "pod-1"}},
 		})
 		So(err, ShouldNotBeNil)
-		httpErr, ok := err.(*rest.HTTPError)
+		httpErr, ok := err.(*httperrors.HTTPError)
 		So(ok, ShouldBeTrue)
 		So(httpErr.HTTPCode, ShouldEqual, http.StatusConflict)
-		So(httpErr.BaseError.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_DuplicateExecution)
+		So(httpErr.ErrorCode, ShouldEqual, oerrors.OntologyQuery_ActionExecution_DuplicateExecution)
 	})
 }

@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"reflect"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -22,15 +21,15 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/dlclark/regexp2"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	"ontology-query/common"
-	cond "ontology-query/common/condition"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	dtype "ontology-query/interfaces/data_type"
-	"ontology-query/locale"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/data_type"
 )
 
 // Build the default sort for views.
@@ -75,7 +74,11 @@ func MapSortFieldsForDataView(ctx context.Context, sort []*interfaces.SortParams
 	out := make([]*interfaces.SortParams, len(sort))
 	for i, sp := range sort {
 		if sp == nil {
-			return nil, fmt.Errorf("%s", locale.ValidationDetail(ctx, "SortConfigRequired", nil))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail.SortConfigRequired", nil)
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			return nil, fmt.Errorf("%s", localizedText)
 		}
 		field := sp.Field
 		if field == interfaces.SORT_FIELD_SCORE {
@@ -84,10 +87,18 @@ func MapSortFieldsForDataView(ctx context.Context, sort []*interfaces.SortParams
 		}
 		viewField, ok := propNameToViewField[field]
 		if !ok {
-			return nil, fmt.Errorf("%s", locale.ValidationDetail(ctx, "SortPropertyInvalid", map[string]any{"field": field}))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail.SortPropertyInvalid", map[string]any{"field": field})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			return nil, fmt.Errorf("%s", localizedText)
 		}
 		if viewField == "" {
-			return nil, fmt.Errorf("%s", locale.ValidationDetail(ctx, "SortMappedFieldRequired", map[string]any{"field": field}))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail.SortMappedFieldRequired", map[string]any{"field": field})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			return nil, fmt.Errorf("%s", localizedText)
 		}
 		out[i] = &interfaces.SortParams{Field: viewField, Direction: sp.Direction}
 	}
@@ -276,10 +287,12 @@ func BuildDirectBatchConditions(currentLevelObjects []interfaces.LevelObject,
 		// Build filter clauses by association relationship.
 		// For multi-field associations, join each object's filter conditions with AND, then join filters for different objects with OR.
 		// For one association field, use an IN operation for filters across multiple objects.
-		objectConditions, targetField, inValue := BuildCondition(nil, mappingRules, isForward, levelObj.ObjectData)
-		if inValue != nil {
-			inValues = append(inValues, inValue)
+		// An object with a null or missing key component joins nothing.
+		if !HasMappingValues(mappingRules, isForward, levelObj.ObjectData) {
+			continue
 		}
+		objectConditions, targetField, inValue := BuildCondition(nil, mappingRules, isForward, levelObj.ObjectData)
+		inValues = append(inValues, inValue)
 		inField = targetField
 
 		// If an object has multiple filter clauses, join them with AND.
@@ -298,15 +311,30 @@ func BuildDirectBatchConditions(currentLevelObjects []interfaces.LevelObject,
 			{
 				Name:      inField,
 				Operation: "in",
-				ValueOptCfg: cond.ValueOptCfg{
-					ValueFrom: "const",
-					Value:     inValues,
-				},
+				ValueFrom: "const",
+				Value:     inValues,
 			},
 		}, nil
 	}
 
 	return conditions, nil
+}
+
+// HasMappingValues reports whether data has a non-null value for every field
+// BuildCondition reads from it with the same rules and direction. Like SQL
+// equality, a null or missing component never joins, and a downstream filter
+// rejects it, so such data must not reach a condition.
+func HasMappingValues(mappingRules []interfaces.Mapping, isForward bool, data map[string]any) bool {
+	for _, mapping := range mappingRules {
+		name := mapping.SourceProp.Name
+		if !isForward {
+			name = mapping.TargetProp.Name
+		}
+		if value, exists := data[name]; !exists || value == nil {
+			return false
+		}
+	}
+	return true
 }
 
 func BuildCondition(viewQuery *interfaces.ViewQuery, mappingRules []interfaces.Mapping,
@@ -340,10 +368,8 @@ func BuildCondition(viewQuery *interfaces.ViewQuery, mappingRules []interfaces.M
 		conditions = append(conditions, &cond.CondCfg{
 			Name:      targetName, // Pay attention to the difference between forward and reverse directions.
 			Operation: "==",       // Relationships only support equality here.
-			ValueOptCfg: cond.ValueOptCfg{
-				ValueFrom: "const",
-				Value:     currentObjectData[sourceName], // Source property obtained from the source object.
-			},
+			ValueFrom: "const",
+			Value:     currentObjectData[sourceName], // Source property obtained from the source object.
 		})
 		sort = append(sort, &interfaces.SortParams{
 			Field:     targetName,
@@ -395,12 +421,18 @@ func CheckDirectMappingConditions(currentObjectData map[string]any,
 		}
 
 		// Compare whether values are equal.
-		if !CompareValues(sourceValue, targetValue) {
+		if !JoinValuesEqual(sourceValue, targetValue) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// JoinValuesEqual reports whether two mapped values join. Like SQL equality,
+// a null on either side never matches, not even another null.
+func JoinValuesEqual(a, b any) bool {
+	return a != nil && b != nil && CompareValues(a, b)
 }
 
 // Compare whether two values are equal while handling different types.
@@ -423,7 +455,26 @@ func CompareValues(a, b interface{}) bool {
 func CheckViewDataMatchesCondition(viewData map[string]any,
 	condition *cond.CondCfg, mappingRules []interfaces.Mapping, isForward bool) bool {
 
-	// Simplified implementation: check view data by mapping rules.
+	if condition == nil {
+		return false
+	}
+
+	if condition.Operation == cond.OperationAnd {
+		if len(condition.SubConds) == 0 {
+			return false
+		}
+		for _, subCondition := range condition.SubConds {
+			if !CheckViewDataMatchesCondition(viewData, subCondition, mappingRules, isForward) {
+				return false
+			}
+		}
+		return true
+	}
+
+	if condition.Operation != cond.OperationEq {
+		return false
+	}
+
 	for _, mapping := range mappingRules {
 		var fieldName string
 		if isForward {
@@ -431,21 +482,19 @@ func CheckViewDataMatchesCondition(viewData map[string]any,
 		} else {
 			fieldName = mapping.SourceProp.Name
 		}
+		if condition.Name != fieldName {
+			continue
+		}
 
-		expectedValue, exists := viewData[fieldName]
+		actualValue, exists := viewData[fieldName]
 		if !exists {
 			return false
 		}
 
-		// Compare values for equality. Relation associations are equality relations, so compare values directly.
-		// Read values from conditions; do not take only one value, because multi-field associations must also be considered.
-		conditionValue := condition.Value
-		if !CompareValues(expectedValue, conditionValue) {
-			return false
-		}
+		return CompareValues(actualValue, condition.Value)
 	}
 
-	return true
+	return false
 }
 
 // Use view data to check indirect mapping conditions.
@@ -476,7 +525,7 @@ func CheckIndirectMappingConditionsWithViewData(currentObjectData map[string]any
 			}
 			currentValue, ok1 := currentObjectData[sorcePropName]
 			viewValue, ok2 := viewRecord[targetPropName]
-			if !ok1 || !ok2 || !CompareValues(currentValue, viewValue) {
+			if !ok1 || !ok2 || !JoinValuesEqual(currentValue, viewValue) {
 				sourceMatch = false
 				break
 			}
@@ -507,7 +556,7 @@ func CheckIndirectMappingConditionsWithViewData(currentObjectData map[string]any
 
 			viewValue, ok1 := viewRecord[sorcePropName]
 			nextValue, ok2 := nextObject[targetPropName]
-			if !ok1 || !ok2 || !CompareValues(viewValue, nextValue) {
+			if !ok1 || !ok2 || !JoinValuesEqual(viewValue, nextValue) {
 				targetMatch = false
 				break
 			}
@@ -535,9 +584,7 @@ func BuildInstanceIdentitiesCondition(uks []map[string]any) *cond.CondCfg {
 			conds = append(conds, &cond.CondCfg{
 				Name:      k,
 				Operation: "==",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: v,
-				},
+				Value:     v,
 			})
 		}
 		ukSubConds = append(ukSubConds, &cond.CondCfg{
@@ -572,7 +619,7 @@ func BuildDslQuery(ctx context.Context, queryStr string, query *interfaces.Objec
 	var dslMap map[string]any
 	err := common.UnmarshalPreciseJSON([]byte(queryStr), &dslMap)
 	if err != nil {
-		return map[string]any{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return map[string]any{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 			WithErrorDetails(fmt.Sprintf("failed to unMarshal dslStr to map, %s", err.Error()))
 	}
@@ -751,9 +798,9 @@ func evaluateConditionRecursive(ctx context.Context,
 		return fieldExists && fieldValue != nil, nil
 	}
 
-	// For other operators, field must exist (except for != and not_like which can return true if field doesn't exist)
+	// Missing fields cannot satisfy LIKE or NOT LIKE.
 	if !fieldExists {
-		if condition.Operation == cond.OperationNotEq || condition.Operation == cond.OperationNotLike {
+		if condition.Operation == cond.OperationNotEq {
 			return true, nil
 		}
 		return false, nil
@@ -814,6 +861,9 @@ func evaluateConditionRecursive(ctx context.Context,
 		pattern, ok := condition.Value.(string)
 		if !ok {
 			return false, fmt.Errorf("not_like operation requires string value")
+		}
+		if fieldValue == nil {
+			return false, nil
 		}
 		result, err := evaluateLike(fieldValue, pattern)
 		if err != nil {
@@ -981,19 +1031,13 @@ func evaluateBefore(fieldValue any, conditionValue any) (bool, error) {
 	return fieldTime.Before(condTime), nil
 }
 
-// evaluateLike checks if fieldValue matches the like pattern (pattern is wrapped as %pattern% for contains semantics)
+// evaluateLike matches the entire value against a complete SQL LIKE pattern.
 func evaluateLike(fieldValue any, pattern string) (bool, error) {
 	if fieldValue == nil {
 		return false, nil
 	}
 	fieldStr := fmt.Sprintf("%v", fieldValue)
-	// Like semantics: %pattern% means contains; use ReplaceLikeWildcards then wrap with .* for full match
-	regexPattern := common.ReplaceLikeWildcards(pattern)
-	re, err := regexp.Compile(regexPattern)
-	if err != nil {
-		return false, fmt.Errorf("like pattern invalid: %w", err)
-	}
-	return re.MatchString(fieldStr), nil
+	return common.MatchSQLLikePattern(fieldStr, pattern)
 }
 
 // evaluatePrefix checks if fieldValue has the given prefix

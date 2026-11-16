@@ -19,12 +19,18 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/adminwrite"
+
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
 
 const adminPathPrefix = "/api/safe/v1/admin/"
+
+// A committed directory change can be followed by failed external cleanup.
+// Preserve its business fact independently of the cleanup's HTTP response.
+const ctxAuditCommittedStatus = "audit_committed_status"
 
 // maxAuditBody caps how much of the request body the audit middleware buffers
 // for the Detail snapshot — enough for any normal admin payload, bounded so a
@@ -40,7 +46,31 @@ const auditRecordTimeout = 10 * time.Second
 
 // sensitiveBodyKeys are masked in the audit Detail snapshot so credentials never
 // land in the trail.
-var sensitiveBodyKeys = []string{"password", "new_password", "old_password"}
+var auditKeyNormalizer = strings.NewReplacer("_", "", "-", "")
+var sensitiveBodyKeys = map[string]bool{
+	"password": true, "newpassword": true, "oldpassword": true, "secret": true,
+	"clientsecret": true, "webhooksecret": true, "accesstoken": true,
+	"refreshtoken": true, "idtoken": true, "token": true, "assertion": true,
+	"privatekey": true, "apikey": true,
+}
+
+func redactAuditSecrets(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			canonical := auditKeyNormalizer.Replace(strings.ToLower(key))
+			if sensitiveBodyKeys[canonical] {
+				value[key] = "***"
+			} else {
+				redactAuditSecrets(child)
+			}
+		}
+	case []any:
+		for _, child := range value {
+			redactAuditSecrets(child)
+		}
+	}
+}
 
 // auditMiddleware records every mutating (non-GET) admin request that reaches a
 // handler — i.e. one that already passed RequireAdmin, so the accessor id is
@@ -107,15 +137,18 @@ func auditMiddleware(store auditBatchRecorder, dir *directory.Service, db *gorm.
 		if !isAuditedManagementOperation(c.Request.Method, c.FullPath()) {
 			return
 		}
-		// A rejected or failed request did not commit a business operation. Its
-		// HTTP outcome belongs to the caller, not to the business audit stream.
-		if status := c.Writer.Status(); status < http.StatusOK || status >= http.StatusMultipleChoices {
+		status := c.Writer.Status()
+		if committed := c.GetInt(ctxAuditCommittedStatus); committed != 0 {
+			status = committed
+		}
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
 			return
 		}
 		if requestOperation.Handled() {
 			return
 		}
 		explicitTargetName := ""
+		extensionTargetType := ""
 		var snapshotErr error
 		explicitOperation := false
 		if rawOperation, ok := c.Get(ctxAuditOperation); ok {
@@ -129,13 +162,14 @@ func auditMiddleware(store auditBatchRecorder, dir *directory.Service, db *gorm.
 				}
 				targetID = operation.TargetID
 				explicitTargetName = operation.TargetName
+				extensionTargetType = operation.TargetType
 				snapshotErr = operation.SnapshotErr
 			}
 		}
 		targetName := beforeName
 		if explicitOperation && explicitTargetName != "" {
 			targetName = explicitTargetName
-		} else if snapshotErr == nil && c.Writer.Status() < http.StatusBadRequest {
+		} else if snapshotErr == nil && status < http.StatusBadRequest {
 			if name := auditTargetName(c.Request.Context(), dir, db, resource, targetID, detail); name != "" {
 				targetName = name
 			}
@@ -171,7 +205,8 @@ func auditMiddleware(store auditBatchRecorder, dir *directory.Service, db *gorm.
 			Action:            action,
 			TargetID:          targetID,
 			TargetName:        targetName,
-			Status:            c.Writer.Status(),
+			TargetType:        extensionTargetType,
+			Status:            status,
 			ClientIP:          c.ClientIP(),
 		}
 		baseEntry.Detail = withAuditGate(withAuditOutcome(detail, c), c)
@@ -253,11 +288,7 @@ func auditDetail(raw []byte) string {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return "" // array/scalar/invalid — nothing structured to summarize
 	}
-	for _, k := range sensitiveBodyKeys {
-		if _, ok := m[k]; ok {
-			m[k] = "***"
-		}
-	}
+	redactAuditSecrets(m)
 	b, err := json.Marshal(m)
 	if err != nil {
 		return ""
@@ -303,11 +334,7 @@ func auditDetailFromPrefix(raw []byte) string {
 		}
 		m[key] = value
 	}
-	for _, k := range sensitiveBodyKeys {
-		if _, ok := m[k]; ok {
-			m[k] = "***"
-		}
-	}
+	redactAuditSecrets(m)
 	b, err := json.Marshal(m)
 	if err != nil || len(b) > maxAuditDetail {
 		return marker
@@ -322,13 +349,7 @@ const ctxAuditOutcome = "audit_outcome"
 
 const ctxAuditOperation = "audit_operation"
 
-type auditOperation struct {
-	Action      string
-	TargetID    string
-	TargetName  string
-	SnapshotErr error
-	Suppress    bool
-}
+type auditOperation = adminwrite.AuditOperation
 
 func setAuditOperation(c *gin.Context, action, targetID, targetName string) {
 	c.Set(ctxAuditOperation, auditOperation{Action: action, TargetID: targetID, TargetName: targetName})
@@ -742,6 +763,10 @@ func auditAction(method, fullPath string) string {
 		return "reconcile_access_origins"
 	case "/api/safe/v1/admin/oauth/access-origins/:id":
 		return "remove_access_origin"
+	case "/api/safe/v1/admin/oauth/clients/:client_id":
+		return "remove_client"
+	case "/api/safe/v1/me/oauth/clients/:client_id":
+		return "disconnect_client"
 	case "/api/safe/v1/me/permission-requests/:id/cancel":
 		return "cancel"
 	case "/api/safe/v1/me/permission-requests/:id/decision":

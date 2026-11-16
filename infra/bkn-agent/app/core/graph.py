@@ -6,15 +6,20 @@ from typing import AsyncIterator
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langgraph.errors import GraphRecursionError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import dao, evidence, observability
 from app.config import config
-from app.core import context_loader
+from app.core import builtin_tools, context_loader
 from app.core.checkpoint import open_checkpointer
 from app.core.llm import build_chat_model
-from app.core.structured import structured_extract_with_path
+from app.core.structured import StructuredOutputError, structured_extract_with_path
 from app.core.prompt import resolve_prompt
+from app.core.agent_settings import instruction_block, shared_limits
+from app.core.context_budget import context_middleware
+from app.core.tool_budget import budget_instruction, budget_middleware
+from app.core.public_chat import PublicChat, classify_failure
 from app.core.skills import load_skills
 from app.core.tools import apply_tool_call_cap, instrument_tool_calls, load_tools
 from app.commons.i18n import build_error_content
@@ -56,6 +61,9 @@ async def stream_chat(
     req: ChatRequest,
     account_id: str,
     account_type: str,
+    *,
+    public: PublicChat | None = None,
+    system_extension: str | None = None,
 ) -> AsyncIterator[str]:
     thread_id = req.thread_id or str(uuid.uuid4())
     if thread_id in _busy_threads:
@@ -80,9 +88,19 @@ async def stream_chat(
                 )
         await dao.touch_thread(session, thread_id, agent.agent_id, account_id)
 
+        prompt_options = {"shared_only": True} if public else {}
         system_prompt, prompt_source, prompt_version = await resolve_prompt(
-            session, agent, account_id, req.prompt_override, req.prompt_vars
+            session, agent, account_id, req.prompt_override, req.prompt_vars, **prompt_options
         )
+        if system_extension:
+            system_prompt += "\n\n" + system_extension
+        if public:
+            public.prompt_version = prompt_version
+            system_prompt += (
+                f"\nThe selected knowledge network is {public.kn_id}. "
+                "Tools may only access this network. Do not claim a tool "
+                "succeeded when it returned an error."
+            ) + instruction_block(public.instructions)
         skill_ids = list(dict.fromkeys([*agent.skills, *req.skills]))
         system_prompt += await load_skills(skill_ids, account_id, account_type)
         # Same order as the runner: the Context Loader session opens first, and
@@ -93,9 +111,19 @@ async def stream_chat(
             # thread_id anchors the session, so every turn of one thread lands
             # in the same conversation.
             cl_session = await context_loader.open_session(
-                req.message, agent_name=agent.name, host_conversation_key=thread_id
+                req.message,
+                agent_name=agent.name,
+                host_conversation_key=thread_id,
+                profile=context_loader.profile_of(agent.tools),
+                **(
+                    {"kn_version": public.kn_version, "draft_revision": public.draft_revision}
+                    if public and public.kn_version is not None
+                    else {}
+                ),
             )
             if cl_session is not None:
+                if public:
+                    public.interaction_id = cl_session.interaction_id
                 # Set only when a session was really opened.
                 #
                 # An earlier version reset this in the finally of _events(). That
@@ -116,6 +144,8 @@ async def stream_chat(
                 # and dies with the request, whereas a cross-context reset (from
                 # the generator or an aclose task) always raises ValueError.
                 context_loader.set_current(cl_session)
+        if public and context_loader.wanted(agent.tools) and cl_session is None:
+            raise err(503, "BknAgent.Execution.Unavailable")
         tools = await load_tools(
             agent.tools,
             account_id,
@@ -124,6 +154,12 @@ async def stream_chat(
             parent_thread_id=thread_id,
             skill_ids=skill_ids,
         )
+        if public:
+            tools = public.guard_tools(tools)
+            # What the run's built-in tools are about, e.g. the network schema.
+            extra = await builtin_tools.instructions()
+            if extra:
+                system_prompt += "\n\n" + extra
         tools = instrument_tool_calls(tools, account_id, account_type)
         limits = agent.limits or None
         max_turns = (
@@ -138,12 +174,10 @@ async def stream_chat(
         )
         max_out = limits.max_output_tokens if limits else None
         model = build_chat_model(agent.model, max_output_tokens=max_out)
-        tools = apply_tool_call_cap(
-            tools,
-            limits.max_tool_calls if limits else None,
-            account_id,
-            account_type,
-        )
+        max_tool_calls = limits.max_tool_calls if limits else None
+        tool_calls_left: dict = {}
+        tools = apply_tool_call_cap(tools, max_tool_calls, account_id, account_type, tool_calls_left)
+        system_prompt += budget_instruction(max_tool_calls)
     except BaseException:
         _busy_threads.discard(thread_id)  # A failed setup must release the claim, or the thread answers 409 forever
         # When setup raises, _events() was never constructed, so its finally can
@@ -200,32 +234,108 @@ async def stream_chat(
                         tools,
                         system_prompt=system_prompt,
                         checkpointer=checkpointer,
+                        # Legacy callers keep the unbounded history they had.
+                        middleware=[
+                            *(
+                                context_middleware(
+                                    shared_limits(agent),
+                                    build_chat_model(
+                                        agent.model, streaming=False, max_output_tokens=max_out
+                                    ),
+                                )
+                                if public
+                                else ()
+                            ),
+                            *budget_middleware(max_tool_calls, tool_calls_left),
+                        ],
                     )
                     cfg = {
                         "configurable": {"thread_id": thread_id},
-                        "recursion_limit": max_turns * 2 + 1,
+                        # max_turns tool rounds plus the answering call. A round
+                        # is model + tools; the public surface adds the
+                        # summarization node before each model call.
+                        "recursion_limit": max_turns * 3 + 2 if public else max_turns * 2 + 1,
                     }
                     try:
                         async with asyncio.timeout(timeout_s):
-                            async for chunk, meta in graph.astream(
-                                {"messages": [("user", req.message)]},
-                                cfg,
-                                stream_mode="messages",
-                            ):
-                                if isinstance(chunk, AIMessageChunk):
-                                    if chunk.content:
-                                        answer_parts.append(
-                                            chunk.content
-                                            if isinstance(chunk.content, str)
-                                            else str(chunk.content)
-                                        )
-                                        yield _sse("token", {"content": chunk.content})
-                                    for tc in chunk.tool_call_chunks or []:
-                                        if tc.get("name"):
-                                            tool_names.append(tc["name"])
-                                            yield _sse(
-                                                "tool_call", {"name": tc["name"]}
-                                            )
+                            turn_messages = [("user", req.message)]
+                            if public:
+                                state = await graph.aget_state(cfg)
+                                turn_messages = public.interrupted_messages(
+                                    state.values.get("messages", [])
+                                ) + turn_messages
+                            out_of_steps = False
+                            # The public surface keeps part of the time budget to
+                            # close the turn with an answer; legacy callers never
+                            # hit this inner deadline.
+                            loop_deadline = asyncio.timeout(
+                                timeout_s - min(30, timeout_s * 0.2) if public else None
+                            )
+                            try:
+                                async with loop_deadline:
+                                    async for item in graph.astream(
+                                        {"messages": turn_messages},
+                                        cfg,
+                                        stream_mode=["messages", "updates"] if public else "messages",
+                                    ):
+                                        if public:
+                                            mode, payload = item
+                                            if mode == "updates":
+                                                for event in public.updates(payload):
+                                                    yield event
+                                                continue
+                                            chunk, meta = payload
+                                        else:
+                                            chunk, meta = item
+                                        if public and meta.get("langgraph_node") not in (None, "model"):
+                                            # Summarization calls a model inside middleware;
+                                            # that text is not part of the answer.
+                                            continue
+                                        if public and isinstance(chunk, AIMessageChunk):
+                                            thinking = chunk.additional_kwargs.get("reasoning_content")
+                                            if isinstance(thinking, str) and thinking:
+                                                if event := public.reasoning(thinking):
+                                                    yield event
+                                        if isinstance(chunk, AIMessageChunk) or (public and isinstance(chunk, AIMessage)):
+                                            content = public.text(chunk.content) if public else chunk.content
+                                            if content:
+                                                answer_parts.append(content if isinstance(content, str) else str(content))
+                                                if public:
+                                                    public.answer.append(content)
+                                                    yield public.event("token", {"content": content})
+                                                else:
+                                                    yield _sse("token", {"content": content})
+                                            for tc in getattr(chunk, "tool_call_chunks", []) or []:
+                                                if tc.get("name"):
+                                                    tool_names.append(tc["name"])
+                                                    if public:
+                                                        continue
+                                                    yield _sse(
+                                                        "tool_call", {"name": tc["name"]}
+                                                    )
+                            except GraphRecursionError:
+                                # Legacy callers keep the old failure; the public
+                                # surface closes the turn with an answer instead.
+                                if not public:
+                                    raise
+                                out_of_steps = True
+                            except TimeoutError:
+                                # Only the inner deadline is ours to absorb; the
+                                # overall timeout still fails the turn.
+                                if not (public and loop_deadline.expired()):
+                                    raise
+                                out_of_steps = True
+                            if public and (out_of_steps or not public.final):
+                                async for content in public.finalize(
+                                    graph, cfg, model, system_prompt, shared_limits(agent)
+                                ):
+                                    answer_parts.append(content)
+                                    public.answer.append(content)
+                                    yield public.event("token", {"content": content})
+                            if public:
+                                # Evidence and the lifecycle receipt record the
+                                # answer, not the narration streamed before tools.
+                                answer_parts[:] = [public.final] if public.final else []
                             if req.response_format:
                                 # Extract the structure separately after the tool loop (native first,
                                 # then the prompt fallback), under the same timeout.
@@ -300,7 +410,16 @@ async def stream_chat(
                     except TimeoutError:
                         yield _sse("error", _stream_error("BknAgent.Chat.Timeout", timeout=timeout_s))
                     except Exception as e:  # Errors must be sent explicitly onto the stream, never swallowed
-                        yield _sse("error", _stream_error("BknAgent.Chat.Failed", detail=str(e)))
+                        if public:
+                            logger.exception("public execution %s failed", public.run_id)
+                            code, upstream = (
+                                ("BknAgent.MetricDesign.ProposalInvalid", None)
+                                if system_extension and isinstance(e, StructuredOutputError)
+                                else classify_failure(e)
+                            )
+                            yield _sse("error", {**_stream_error(code), "upstream": upstream})
+                        else:
+                            yield _sse("error", _stream_error("BknAgent.Chat.Failed", detail=str(e)))
         except (
             Exception
         ) as e:  # An assembly-stage failure (building the checkpointer or graph) must also
@@ -416,6 +535,34 @@ def _text(content) -> str:
     return "".join(
         p.get("text", "") if isinstance(p, dict) else str(p) for p in content
     )
+
+
+def claim_thread(thread_id: str) -> bool:
+    """Take a thread out of use for a maintenance step such as deletion.
+
+    Same busy set as a running turn, so a turn arriving meanwhile answers 409
+    and a busy thread is not taken. Synchronous, like the claim in stream_chat.
+    """
+    if thread_id in _busy_threads:
+        return False
+    _busy_threads.add(thread_id)
+    return True
+
+
+def release_thread(thread_id: str) -> None:
+    _busy_threads.discard(thread_id)
+
+
+def thread_in_use(thread_id: str) -> bool:
+    """Whether a turn or a maintenance step such as deletion holds the thread."""
+    return thread_id in _busy_threads
+
+
+async def delete_thread_checkpoints(thread_id: str) -> None:
+    """Drop every checkpoint and pending write of a thread. The ownership check
+    lives in the router layer."""
+    async with open_checkpointer() as checkpointer:
+        await checkpointer.adelete_thread(thread_id)
 
 
 async def read_thread_messages(thread_id: str) -> list[ThreadMessage]:

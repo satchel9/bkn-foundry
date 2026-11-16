@@ -32,6 +32,8 @@ const (
 	ResourceQuerySourceLocalIndex = "local_index"
 	ResourceQuerySourceSource     = "source"
 
+	ResourceValueReasonNotRequested = "not_requested"
+
 	ResourceValueModeUnavailable = "unavailable"
 	ResourceValueModeMetadata    = "metadata"
 	ResourceValueModeContent     = "content"
@@ -48,6 +50,8 @@ type Aggregation struct {
 	Property string `json:"property"` // The name of the aggregated resource field
 	Aggr     string `json:"aggr"`     // Aggregation functions: count, count_distinct, sum, max, min, avg
 	Alias    string `json:"alias,omitempty"`
+	// AllowApproximate defaults to true for count_distinct. False requires exact execution.
+	AllowApproximate *bool `json:"allow_approximate,omitempty"`
 }
 
 // GroupByItem represents a group by dimension.
@@ -87,7 +91,8 @@ type ResourceDataQueryParams struct {
 	// It is internal query provenance and must never be accepted from the API.
 	FixedFilterCondCfg    *FilterCondCfg  `json:"-"`
 	FixedActualFilterCond FilterCondition `json:"-"`
-	ActualFilterCond      FilterCondition `json:"-"`
+	// ActualFilterCond 为包含固定条件的完整执行树；复用时仍校验原始条件和当前资源能力。
+	ActualFilterCond FilterCondition `json:"-"`
 
 	// CursorEncoded keyset cursor values are injected by the query session; When not empty, use WHERE (sort_cols) > cursor instead of OFFSET
 	CursorEncoded string `json:"-"`
@@ -98,22 +103,39 @@ type ResourceDataQueryParams struct {
 	Having      *HavingClause  `json:"having,omitempty"`      // Filter (HAVING) the aggregation results
 }
 
-// ResourceDataQueryResult is the common response model for resource-data and
-// logic-view queries. Paging follows the same single/cursor contract as raw
-// queries.
+// ResourceDataQueryResult 统一连接器、中间层和逻辑视图的资源数据查询结果。
+// 连接器返回执行结果，上层补充分页和查询来源；不通过请求对象回传结果元数据。
 type ResourceDataQueryResult struct {
-	Entries     []map[string]any
-	TotalCount  int64
-	Paging      *PagingResponse
-	NeedTotal   bool
-	QuerySource string
+	Columns       []string         `json:"columns,omitempty"`
+	Entries       []map[string]any `json:"entries"`
+	TotalCount    int64            `json:"total_count"`
+	Paging        *PagingResponse  `json:"paging,omitempty"`
+	NeedTotal     bool             `json:"-"`
+	QuerySource   string           `json:"query_source,omitempty"`
+	IsApproximate bool             `json:"is_approximate"`
+	SearchAfter   []any            `json:"-"` // OpenSearch 下一页的查询位置。
 }
 
 // ResourceValue is the JSON representation of a resource field that needs
 // special handling. Binary content uses Base64 data; byte_length applies only
 // to Binary fields.
 type ResourceValue struct {
+	Reason     string `json:"reason,omitempty"`
 	Mode       string `json:"mode"`
 	ByteLength *int64 `json:"byte_length,omitempty"`
 	Data       any    `json:"data,omitempty"`
+}
+
+// AggregateOutputAlias 解析实际输出的聚合列，包含 HAVING count(*) 生成的隐式计数列。
+func (params *ResourceDataQueryParams) AggregateOutputAlias() string {
+	if params.Aggregation != nil {
+		if params.Aggregation.Alias != "" {
+			return params.Aggregation.Alias
+		}
+		return "__value"
+	}
+	if params.Having != nil && params.Having.Field == "count(*)" {
+		return "__value"
+	}
+	return ""
 }

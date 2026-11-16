@@ -18,9 +18,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/drivenadapters"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/bkntrace"
-	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 )
 
@@ -41,6 +42,15 @@ type RunCypherReq struct {
 	Branch     string         `json:"branch"`
 	Query      string         `json:"query"`
 	Parameters map[string]any `json:"parameters"`
+	// ObjectProperties names, per returned node variable, the properties its
+	// node value should carry besides its identity.
+	ObjectProperties map[string][]string `json:"object_properties"`
+	// Explain asks for the plan instead of the rows; nothing is read.
+	Explain bool `json:"explain"`
+	// TimeoutSec asks for a shorter statement timeout than bkn-backend's
+	// configured one, in seconds. Only the REST face takes it; the MCP tool
+	// clears it, since an agent would set it as high as it could.
+	TimeoutSec int `json:"timeout_sec"`
 }
 
 // KnCypherService runs one read-only Cypher query against a knowledge network.
@@ -93,11 +103,19 @@ func (s *knCypherService) RunCypher(ctx context.Context, req *RunCypherReq) (*in
 	}
 
 	resp, err := s.bkn.RunCypherQuery(ctx, &interfaces.CypherQueryReq{
-		KnID:       knID,
-		Branch:     strings.TrimSpace(req.Branch),
-		Query:      query,
-		Parameters: req.Parameters,
+		KnID:             knID,
+		Branch:           strings.TrimSpace(req.Branch),
+		Query:            query,
+		Parameters:       req.Parameters,
+		ObjectProperties: req.ObjectProperties,
+		Explain:          req.Explain,
+		TimeoutSec:       req.TimeoutSec,
 	})
+	if req.Explain {
+		// An explained query reads nothing, so it is no evidence of a read
+		// and no failure of one.
+		return resp, err
+	}
 	if err != nil {
 		emitRunCypherFailure(ctx, nil, knID, query, classifyRunCypherFailure(err))
 		return nil, err
@@ -123,11 +141,15 @@ func classifyRunCypherFailure(err error) bkntrace.RunCypherFailure {
 		failure.Stage, failure.Code = "interrupted", "RUN_CYPHER_TIMEOUT"
 		return failure
 	}
-	var httpErr *infraErr.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
 		return failure
 	}
-	code := strings.ToLower(httpErr.Code)
+	code := httpErr.ErrorCode
+	if source, ok := httpErr.ErrorDetails.(httperrors.BaseError); ok {
+		code = source.ErrorCode
+	}
+	code = strings.ToLower(code)
 	switch {
 	case strings.Contains(code, "cypher.syntaxerror"):
 		failure.Stage, failure.Code = "parse", "RUN_CYPHER_PARSE_FAILED"

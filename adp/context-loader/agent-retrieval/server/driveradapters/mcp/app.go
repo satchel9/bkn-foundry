@@ -16,6 +16,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/drivenadapters"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/extension/mcptool"
@@ -27,14 +28,11 @@ import (
 	logicsKlp "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knlogicpropertyresolver"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knmetrics"
 	logicsKqs "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knquerysubgraph"
-	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knresources"
-	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knrunsql"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knsearch"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knskills"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/kntools"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permission"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permissionguide"
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 const (
@@ -48,6 +46,7 @@ const (
 	toolKeyExploreSubgraph          = "explore_subgraph"
 	toolKeyGetLogicPropertiesValues = "get_logic_properties_values"
 	toolKeyQueryMetric              = "query_metric"
+	toolKeyDrillThroughMetric       = "drill_through_metric"
 	toolKeyGetActionInfo            = "get_action_info"
 	toolKeyExecuteAction            = "execute_action"
 	toolKeyGetActionExecution       = "get_action_execution"
@@ -56,10 +55,7 @@ const (
 	toolKeyGetKnDetail              = "get_kn_detail"
 	toolKeyGetObjectTypes           = "get_object_types"
 	toolKeyGetRelationTypes         = "get_relation_types"
-	toolKeyRunSQL                   = "run_sql"
 	toolKeyRunCypher                = "run_cypher"
-	toolKeyListResources            = "list_resources"
-	toolKeyDescribeResource         = "describe_resource"
 	toolKeyListSkills               = "list_skills"
 	toolKeyGetSkillContent          = "get_skill_content"
 	toolKeyReadSkillFile            = "read_skill_file"
@@ -106,9 +102,9 @@ func newLocalizedMCPHandlerForProfile(
 	lifecycleClient *bkntrace.LifecycleClient, sandboxPort int, profile mcpProfile,
 ) http.Handler {
 	handlers := make(map[string]http.Handler, 2)
-	for _, locale := range []sharedrest.Language{sharedrest.SimplifiedChinese, sharedrest.AmericanEnglish} {
+	for _, locale := range []i18n.Language{i18n.SimplifiedChinese, i18n.AmericanEnglish} {
 		srv, _ := newMCPServerForProfile(lifecycleClient, string(locale), sandboxPort, profile)
-		handlers[normalizeMCPLocale(string(locale))] = newMCPStreamableHTTPHandler(srv, profile.endpointPath)
+		handlers[string(locale)] = newMCPStreamableHTTPHandler(srv, profile.endpointPath)
 	}
 	return &localizedMCPHandler{handlers: handlers}
 }
@@ -132,7 +128,7 @@ func (h *localizedMCPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 	// locale to Mcp-Session-Id, guarding against a client that changes language
 	// mid-session — which clients do not do, while the map itself became more
 	// per-replica session state to keep alive (#954).
-	locale := normalizeMCPLocale(string(sharedrest.ResolveLanguage(r.Header.Get(sharedrest.AcceptLanguageHeader))))
+	locale := string(i18n.ResolveLanguage(r.Header.Get(i18n.AcceptLanguageHeader)))
 	handler, ok := h.handlers[locale]
 	if !ok {
 		handler = h.handlers[defaultMCPLocale]
@@ -203,6 +199,7 @@ func newMCPServerForProfile(
 
 	metricsService := knmetrics.NewKnMetricsService()
 	b.add(toolKeyQueryMetric, handleQueryMetric(metricsService))
+	b.add(toolKeyDrillThroughMetric, handleDrillThroughMetric(metricsService))
 
 	b.add(toolKeyListKnowledgeNetworks, handleListKnowledgeNetworks(bknBackend))
 	b.add(toolKeyGetKnDetail, handleGetKnDetail(bknBackend, metricsService, schemaAccess,
@@ -210,15 +207,8 @@ func newMCPServerForProfile(
 	b.add(toolKeyGetObjectTypes, handleGetObjectTypes(bknBackend, metricsService, schemaAccess))
 	b.add(toolKeyGetRelationTypes, handleGetRelationTypes(bknBackend))
 
-	runSQLService := knrunsql.NewKnRunSQLService()
-	b.add(toolKeyRunSQL, handleRunSQL(runSQLService))
-
 	cypherService := kncypher.NewKnCypherService()
 	b.add(toolKeyRunCypher, handleRunCypher(cypherService, guide))
-
-	resourcesService := knresources.NewKnResourcesService()
-	b.add(toolKeyListResources, handleListResources(resourcesService))
-	b.add(toolKeyDescribeResource, handleDescribeResource(resourcesService))
 
 	// The skill surface: search_capabilities returns only ID, name, and description; the
 	// following tools are used after a client has selected a skill.

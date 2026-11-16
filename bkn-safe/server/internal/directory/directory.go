@@ -4,7 +4,7 @@
 
 // Package directory is bkn-safe's user/organization directory: users,
 // departments, groups, and name resolution. This is a CLEAN redesign of the
-// ISF user-management surface (no GET-in-body, no array-vs-map quirks) — the
+// legacy user-management surface (no GET-in-body, no array-vs-map quirks) — the
 // consuming services are migrated to call it.
 package directory
 
@@ -17,6 +17,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/identity"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 )
 
@@ -206,23 +207,24 @@ func (s *Service) DepartmentMembers(ctx context.Context, deptID string) ([]UserS
 // reference an existing user (else ErrUnknownUser) — nothing is written when
 // either check fails.
 func (s *Service) AddDepartmentMembers(ctx context.Context, deptID string, userIDs []string) error {
-	if err := s.requireDepartment(ctx, deptID); err != nil {
-		return err
-	}
-	ids := dedupeNonEmpty(userIDs)
-	if len(ids) == 0 {
-		return nil
-	}
-	if err := s.requireUsersExist(ctx, ids); err != nil {
-		return err
-	}
-	rows := make([]model.UserDepartment, 0, len(ids))
-	for _, uid := range ids {
-		rows = append(rows, model.UserDepartment{UserID: uid, DepartmentID: deptID})
-	}
-	// Composite PK (user_id, department_id): skip rows already present so the
-	// call is idempotent rather than erroring on a duplicate key.
-	return s.db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var department model.Department
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&department, "id = ?", deptID).Error; err != nil {
+			return err
+		}
+		ids := dedupeNonEmpty(userIDs)
+		if len(ids) == 0 {
+			return nil
+		}
+		if err := New(tx).requireUsersExist(ctx, ids); err != nil {
+			return err
+		}
+		rows := make([]model.UserDepartment, 0, len(ids))
+		for _, uid := range ids {
+			rows = append(rows, model.UserDepartment{UserID: uid, DepartmentID: deptID})
+		}
+		return tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&rows).Error
+	})
 }
 
 // RemoveDepartmentMembers removes the given users from the department.
@@ -308,10 +310,16 @@ func (s *Service) SetUserDepartments(ctx context.Context, userID string, deptIDs
 		return err
 	}
 	ids := dedupeNonEmpty(deptIDs)
-	if err := s.DepartmentsExist(ctx, ids); err != nil {
-		return err
-	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if len(ids) > 0 {
+			var locked []model.Department
+			if err := tx.Select("id").Where("id IN ?", ids).Order("id").Clauses(clause.Locking{Strength: "UPDATE"}).Find(&locked).Error; err != nil {
+				return err
+			}
+			if len(locked) != len(ids) {
+				return ErrUnknownDepartment
+			}
+		}
 		if err := tx.Where("user_id = ?", userID).Delete(&model.UserDepartment{}).Error; err != nil {
 			return err
 		}
@@ -372,48 +380,108 @@ func (s *Service) DepartmentsExist(ctx context.Context, ids []string) error {
 // (or sets it beforehand); ParentID "" makes it a root. Type defaults to
 // "department" at the DB layer when empty.
 func (s *Service) CreateDepartment(ctx context.Context, d *model.Department) error {
-	return s.db.WithContext(ctx).Create(d).Error
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		parents, err := lockDepartmentHierarchy(tx)
+		if err != nil {
+			return err
+		}
+		if err := validateDepartmentParent(parents, d.ID, d.ParentID); err != nil {
+			return err
+		}
+		return tx.Create(d).Error
+	})
 }
 
 // UpdateDepartment patches the given mutable fields (name/parent_id/type) of a
 // department. A no-op update may report zero affected rows on MySQL, so it is
 // still successful when the department exists. Returns gorm.ErrRecordNotFound
-// only when no row matches.
+// only when no row matches. Ordinary edits, including an unchanged parent,
+// access only the target department; actual parent changes lock the hierarchy.
 func (s *Service) UpdateDepartment(ctx context.Context, id string, fields map[string]any) error {
-	res := s.db.WithContext(ctx).Model(&model.Department{}).Where("id = ?", id).Updates(fields)
-	if res.Error != nil {
-		return res.Error
+	db := s.db.WithContext(ctx)
+	if _, hasParent := fields["parent_id"]; !hasParent {
+		res := db.Model(&model.Department{}).Where("id = ?", id).Updates(fields)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return s.requireDepartment(ctx, id)
+		}
+		return nil
 	}
-	if res.RowsAffected == 0 {
-		return s.requireDepartment(ctx, id)
+	if parentID, ok := fields["parent_id"].(string); ok {
+		// Editors may submit the current parent along with ordinary fields.
+		// Check and update under the target row's lock so concurrent moves
+		// cannot turn an ordinary edit into an unchecked hierarchy write.
+		unchangedParent := false
+		err := db.Transaction(func(tx *gorm.DB) error {
+			var current model.Department
+			if err := tx.Select("id", "parent_id").Clauses(clause.Locking{Strength: "UPDATE"}).
+				First(&current, "id = ?", id).Error; err != nil {
+				return err
+			}
+			if current.ParentID != parentID {
+				return nil
+			}
+			unchangedParent = true
+			return tx.Model(&model.Department{}).Where("id = ?", id).Updates(fields).Error
+		})
+		if err != nil || unchangedParent {
+			return err
+		}
+		// Release the target lock before acquiring hierarchy locks. Moves lock
+		// the forest consistently and revalidate its current state below.
 	}
-	return nil
+	return db.Transaction(func(tx *gorm.DB) error {
+		parents, err := lockDepartmentHierarchy(tx)
+		if err != nil {
+			return err
+		}
+		if _, ok := parents[id]; !ok {
+			return gorm.ErrRecordNotFound
+		}
+		if parentID, ok := fields["parent_id"].(string); ok {
+			if err := validateDepartmentParent(parents, id, parentID); err != nil {
+				return err
+			}
+		}
+		return tx.Model(&model.Department{}).Where("id = ?", id).Updates(fields).Error
+	})
 }
 
 // DeleteDepartment removes a department, but only if it is empty: no child
-// departments and no member users. Returns ErrDepartmentNotEmpty otherwise, or
-// gorm.ErrRecordNotFound if the id doesn't exist.
+// departments and no member users. Extension companion cleanup runs in the same
+// transaction so any cleanup failure rolls the deletion back.
+// Returns ErrDepartmentNotEmpty otherwise, or gorm.ErrRecordNotFound if the id
+// doesn't exist.
 func (s *Service) DeleteDepartment(ctx context.Context, id string) error {
-	db := s.db.WithContext(ctx)
-	var children int64
-	if err := db.Model(&model.Department{}).Where("parent_id = ?", id).Count(&children).Error; err != nil {
-		return err
-	}
-	var members int64
-	if err := db.Model(&model.UserDepartment{}).Where("department_id = ?", id).Count(&members).Error; err != nil {
-		return err
-	}
-	if children > 0 || members > 0 {
-		return ErrDepartmentNotEmpty
-	}
-	res := db.Where("id = ?", id).Delete(&model.Department{})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Coordinate deletion with creates/moves so a validated parent cannot
+		// disappear before its child is attached.
+		parents, err := lockDepartmentHierarchy(tx)
+		if err != nil {
+			return err
+		}
+		if _, ok := parents[id]; !ok {
+			return gorm.ErrRecordNotFound
+		}
+		for _, parentID := range parents {
+			if parentID == id {
+				return ErrDepartmentNotEmpty
+			}
+		}
+		var members int64
+		if err := tx.Model(&model.UserDepartment{}).Where("department_id = ?", id).Count(&members).Error; err != nil {
+			return err
+		}
+		if members > 0 {
+			return ErrDepartmentNotEmpty
+		}
+		if err := identity.CleanupDepartment(tx, id); err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&model.Department{}).Error
+	})
 }
 
 // GroupMembers returns the member user ids of a group.
@@ -432,7 +500,7 @@ func (s *Service) GroupMembers(ctx context.Context, groupID string) ([]string, e
 
 // SearchOrg returns, from the given user ids, those that belong to any
 // department in scope (membership check against the org subtree). Mirrors the
-// ISF search-org intent with a clean signature.
+// legacy search-org intent with a clean signature.
 func (s *Service) SearchOrg(ctx context.Context, userIDs, scopeDeptIDs []string) ([]string, error) {
 	if len(userIDs) == 0 || len(scopeDeptIDs) == 0 {
 		return []string{}, nil

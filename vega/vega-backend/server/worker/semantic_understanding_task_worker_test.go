@@ -461,7 +461,7 @@ func TestSemanticUnderstandingTaskWorkerRun(t *testing.T) {
 		taskService.EXPECT().InternalGetByID(gomock.Any(), "semantic-task-1").Return(taskInfo, nil)
 		taskService.EXPECT().InternalMarkRunning(gomock.Any(), "semantic-task-1").Return(true, nil)
 		catalogService.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", false).
-			Return(nil, &rest.HTTPError{HTTPCode: http.StatusNotFound})
+			Return(nil, &httperrors.HTTPError{HTTPCode: http.StatusNotFound})
 		taskService.EXPECT().InternalMarkCancelled(gomock.Any(), "semantic-task-1", "catalog or resource deleted").
 			Return(true, nil)
 
@@ -633,6 +633,53 @@ func TestSemanticUnderstandingTaskWorkerRun(t *testing.T) {
 }
 
 func TestSemanticUnderstandingTaskWorkerApplyResourceResult(t *testing.T) {
+	for _, tc := range []struct{ language, name, description string }{
+		{"en-US", "Order Identifier", "Unique order identifier"},
+		{"zh-CN", "订单标识", "订单唯一标识"},
+	} {
+		for _, mode := range []string{"dry_run", "fill_empty", "force"} {
+			t.Run(tc.language+"/"+mode, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				resources := vmock.NewMockResourceService(ctrl)
+				worker := &SemanticUnderstandingTaskWorker{rs: resources}
+				resource := &interfaces.Resource{
+					ID: "resource-1", Name: "orders", Description: "Existing description",
+					Category: interfaces.ResourceCategoryDataset, SourceIdentifier: "orders",
+					SchemaDefinition: []*interfaces.Property{{Name: "order_id", Type: interfaces.DataType_String, Description: "Existing field description"}},
+				}
+				if mode != "dry_run" {
+					resources.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil)
+					resources.EXPECT().InternalUpdateSemanticMetadata(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+						DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+							assert.Equal(t, "resource-1", got.ID)
+							assert.Equal(t, "orders", got.SourceIdentifier)
+							assert.Equal(t, "order_id", got.SchemaDefinition[0].Name)
+							assert.Equal(t, interfaces.DataType_String, got.SchemaDefinition[0].Type)
+							assert.Equal(t, tc.name, got.SchemaDefinition[0].DisplayName)
+							if mode == "force" {
+								assert.Equal(t, tc.description, got.Description)
+								assert.Equal(t, tc.description, got.SchemaDefinition[0].Description)
+							} else {
+								assert.Equal(t, "Existing description", got.Description)
+								assert.Equal(t, "Existing field description", got.SchemaDefinition[0].Description)
+							}
+							return nil
+						})
+				}
+				result := fmt.Sprintf(`{"resource":{"description":%q},"fields":[{"name":"order_id","display_name":%q,"description":%q}]}`, tc.description, tc.name, tc.description)
+				got, err := worker.applyResult(context.Background(), &sql.Tx{}, &interfaces.SemanticUnderstandingTask{
+					Scope: "resource", ResourceID: "resource-1", ApplyMode: mode, ConfidenceThreshold: 0.75,
+					Input: fmt.Sprintf(`{"options":{"language":%q}}`, tc.language),
+				}, result, 0.9)
+				require.NoError(t, err)
+				assert.Equal(t, mode != "dry_run", got.Applied)
+				if mode == "dry_run" {
+					assert.JSONEq(t, `{"reason":"dry_run","apply_mode":"dry_run","scope":"resource"}`, got.DetailJSON)
+				}
+			})
+		}
+	}
+
 	for _, category := range []string{
 		interfaces.ResourceCategoryTable,
 		interfaces.ResourceCategoryDataset,
@@ -1094,9 +1141,9 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 		ApplyMode:           interfaces.SemanticUnderstandingApplyModeForce,
 		ConfidenceThreshold: 0.75,
 	}
-	logicDefinition := []*interfaces.LogicDefinitionNode{
-		{ID: "source", Type: interfaces.LogicDefinitionNodeType_Resource},
-		{ID: "output", Type: interfaces.LogicDefinitionNodeType_Output, Inputs: []string{"source"}},
+	logicDefinition := []*interfaces.LogicalViewDefinitionNode{
+		{ID: "source", Type: interfaces.LogicalViewDefinitionNodeType_Resource},
+		{ID: "output", Type: interfaces.LogicalViewDefinitionNodeType_Output, Inputs: []string{"source"}},
 	}
 	catalogService.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", false).
 		Return(&interfaces.Catalog{ID: "catalog-1", Builtin: true}, nil)
@@ -1108,14 +1155,14 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 			{ID: "view-2", CatalogID: "catalog-1", Name: "old_view", Category: interfaces.ResourceCategoryLogicalView},
 		}, nil)
 	resourceService.EXPECT().
-		InternalCreate(gomock.Any(), gomock.Not(gomock.Nil()), gomock.AssignableToTypeOf(&interfaces.ResourceRequest{})).
-		DoAndReturn(func(_ context.Context, _ *sql.Tx, req *interfaces.ResourceRequest) (*interfaces.Resource, error) {
+		InternalCreate(gomock.Any(), gomock.AssignableToTypeOf(&interfaces.ResourceRequest{})).
+		DoAndReturn(func(_ context.Context, req *interfaces.ResourceRequest) (*interfaces.Resource, error) {
 			assert.Equal(t, "catalog-1", req.CatalogID)
 			assert.Equal(t, "customer_order_summary", req.Name)
 			assert.Equal(t, "customer_order_summary", req.SourceIdentifier)
 			assert.Equal(t, "summary view", req.Description)
 			assert.Equal(t, interfaces.ResourceCategoryLogicalView, req.Category)
-			assert.Equal(t, logicDefinition, req.LogicDefinition)
+			assert.Equal(t, logicDefinition, req.LogicalViewDefinition)
 			require.NotNil(t, req.Builtin)
 			assert.True(t, *req.Builtin)
 			return &interfaces.Resource{ID: "view-1"}, nil
@@ -1124,7 +1171,7 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResult(t *testing.T) {
 		InternalUpdateStatus(gomock.Any(), gomock.Not(gomock.Nil()), "view-2", interfaces.ResourceStatusStale, "obsolete").
 		Return(nil)
 
-	resultJSON := `{"confidence":0.84,"logical_views":[{"action":"create","name":"customer_order_summary","source_identifier":"customer_order_summary","description":"summary view","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"},{"id":"output","type":"output","inputs":["source"]}],"confidence":0.82}],"obsolete_logical_views":[{"target_resource_id":"view-2","reason":"obsolete","confidence":0.91}]}`
+	resultJSON := `{"confidence":0.84,"logical_views":[{"action":"create","name":"customer_order_summary","source_identifier":"customer_order_summary","description":"summary view","source_resources":["resource-1"],"logical_view_definition":[{"id":"source","type":"resource"},{"id":"output","type":"output","inputs":["source"]}],"confidence":0.82}],"obsolete_logical_views":[{"target_resource_id":"view-2","reason":"obsolete","confidence":0.91}]}`
 	got, err := worker.applyResult(context.Background(), &sql.Tx{}, task, resultJSON, 0.84)
 
 	require.NoError(t, err)
@@ -1151,7 +1198,7 @@ func TestSemanticUnderstandingTaskWorkerApplyCatalogResultRejectsInvalidSourceId
 		InternalGetByCatalogID(gomock.Any(), "catalog-1").
 		Return([]*interfaces.Resource{{ID: "resource-1", CatalogID: "catalog-1", Category: interfaces.ResourceCategoryTable}}, nil)
 
-	resultJSON := `{"logical_views":[{"action":"create","name":"订单汇总","source_identifier":"order-summary","source_resources":["resource-1"],"logic_definition":[{"id":"source","type":"resource"}]}]}`
+	resultJSON := `{"logical_views":[{"action":"create","name":"订单汇总","source_identifier":"order-summary","source_resources":["resource-1"],"logical_view_definition":[{"id":"source","type":"resource"}]}]}`
 	_, err := worker.applyCatalogResult(context.Background(), &sql.Tx{}, task, resultJSON)
 
 	require.ErrorContains(t, err, "source_identifier must be lower snake_case")

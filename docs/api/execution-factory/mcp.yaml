@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: MCP
+  title: 执行工厂 · MCP API
   description: |
     MCP（Model Context Protocol）Server 的注册、管理与代理调用。这里的 MCP 有**两个
     方向**，别混：
@@ -76,7 +76,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   /mcp/:
     post:
@@ -321,7 +321,6 @@ paths:
       operationId: updateMCPServerStatus
       description: |
         发布 / 下架。改成 `published` 后该服务出现在 MCP 市场，`offline` 则下架。
-        与算子共用同一套生命周期状态。
       parameters:
         - $ref: '#/components/parameters/MCPID'
       requestBody:
@@ -400,7 +399,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -585,7 +584,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   /mcp/proxy/{mcp_id}/tool/call:
     post:
@@ -643,7 +642,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -806,31 +805,31 @@ components:
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Unauthorized:
       description: 凭据缺失或无效
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Forbidden:
       description: 当前主体缺少所需资源权限
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     NotFound:
       description: MCP Server 或工具不存在
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     InternalError:
       description: 服务内部错误
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   schemas:
     MCPMode:
@@ -859,7 +858,7 @@ components:
         - published
         - offline
         - editing
-      description: 生命周期状态，与算子共用同一套。
+      description: 生命周期状态。
 
     CommonPage:
       type: object

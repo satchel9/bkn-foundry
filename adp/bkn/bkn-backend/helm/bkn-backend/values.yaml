@@ -9,6 +9,16 @@ env:
 # bkn-safe service base URL. Authentication requires an absolute HTTP(S) URL with a host.
 bknSafe:
   url: "http://bkn-safe:3000"
+  # Timeout for resource policy teardown only. Other authorization calls keep their short timeout.
+  resourceCleanupTimeout: "30s"
+
+# Enterprise knowledge base (kb-api) base URL, e.g. http://kb-api.openbkn:8001. Empty where
+# kb-api is not deployed: a knowledge network then cannot mount a knowledge base.
+knowledgeBase:
+  url: ""
+
+# Additional runtime configuration for explicitly installed extensions.
+extraEnv: []
 
 replicaCount: 1
 
@@ -31,7 +41,7 @@ service:
       interface:
         path:
           - /api/bkn-backend/v1
-          - /api/ontology-manager/v1
+          - /api/bkn-backend/v2
 
 # Anti-affinity settings.
 antiAffinity:

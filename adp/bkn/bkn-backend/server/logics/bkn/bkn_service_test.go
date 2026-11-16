@@ -9,20 +9,53 @@ package bkn
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
+
+type archiveAccessStub struct {
+	records []*interfaces.ObjectMetricRecordV1
+}
+
+func (stub archiveAccessStub) ListObjectMetricArchive(context.Context, string, string) ([]*interfaces.ObjectMetricRecordV1, error) {
+	return stub.records, nil
+}
+func (archiveAccessStub) ImportObjectMetricArchive(context.Context, *sql.Tx, string, string, []*interfaces.ObjectMetricRecordV1) error {
+	return nil
+}
+func (archiveAccessStub) DeleteObjectMetricArchive(context.Context, *sql.Tx, string, string) error {
+	return nil
+}
+
+type archivePermissionStub struct {
+	interfaces.PermissionService
+	visible map[string]bool
+}
+
+func (stub archivePermissionStub) FilterVisibleResources(_ context.Context, _ string, ids []string,
+	_ []string) (map[string]interfaces.PermissionResourceOps, error) {
+	result := make(map[string]interfaces.PermissionResourceOps, len(ids))
+	for _, id := range ids {
+		if stub.visible == nil || stub.visible[id] {
+			result[id] = interfaces.PermissionResourceOps{ResourceID: id}
+		}
+	}
+	return result, nil
+}
 
 func newTestBKNService(t *testing.T) (*bknService, *gomock.Controller, *bmock.MockKNService) {
 	t.Helper()
@@ -49,6 +82,7 @@ func newTestBKNServiceWithCapabilities(t *testing.T) (*bknService, *gomock.Contr
 		appSetting: &common.AppSetting{},
 		kns:        kns,
 		cbs:        cbs,
+		ps:         archivePermissionStub{},
 	}
 	return svc, mockCtrl, kns, cbs
 }
@@ -65,7 +99,7 @@ func Test_bknService_ExportToTar(t *testing.T) {
 			}
 			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 
 			So(err, ShouldBeNil)
 			So(len(data), ShouldBeGreaterThan, 0)
@@ -90,59 +124,99 @@ func Test_bknService_ExportToTar(t *testing.T) {
 			}
 			kns.EXPECT().GetKNByID(gomock.Any(), "kn2", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn2", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn2", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 
 			So(err, ShouldBeNil)
 			So(len(data), ShouldBeGreaterThan, 0)
 		})
 
 		Convey("Failed when GetKNByID returns error\n", func() {
-			getErr := &rest.HTTPError{
+			getErr := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError,
 				},
 			}
 			kns.EXPECT().GetKNByID(gomock.Any(), "kn-err", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(nil, getErr)
 
-			data, err := svc.ExportToTar(context.Background(), "kn-err", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn-err", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 
 			So(err, ShouldNotBeNil)
 			So(errors.Is(err, getErr), ShouldBeTrue)
 			So(data, ShouldBeNil)
 		})
 
-		Convey("Export tar preserves metrics readable by LoadNetworkFromTar\n", func() {
+		Convey("Export tar preserves object metric V1 versions readable by LoadNetworkFromTar\n", func() {
 			kn := &interfaces.KN{
 				KNID:   "kn-metrics",
 				KNName: "KN With Metrics",
 				Branch: interfaces.MAIN_BRANCH,
-				Metrics: []*interfaces.MetricDefinition{
-					{
-						ID:         "pod_running_count",
-						Name:       "Running Pods",
-						MetricType: interfaces.MetricTypeAtomic,
-						ScopeRef:   "pod",
-						CalculationFormula: &interfaces.MetricCalculationFormula{
-							Aggregation: interfaces.MetricAggregation{
-								Property: "id",
-								Aggr:     interfaces.MetricAggrCount,
-							},
-						},
-					},
-				},
+				ObjectTypes: []*interfaces.ObjectType{{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+					OTID: "pod", OTName: "Pod",
+				}}},
 			}
+			svc.archive = archiveAccessStub{records: []*interfaces.ObjectMetricRecordV1{{
+				KNID: "kn-metrics", Branch: interfaces.MAIN_BRANCH,
+				Definition: interfaces.ObjectMetricDefinitionV1{
+					ID: "pod_running_count", Version: 2, Code: "running_pods",
+					Name: "Running Pods", OwnerObjectTypeID: "pod",
+					MetricType: interfaces.ObjectMetricTypeAtomic,
+					Lifecycle:  interfaces.ObjectMetricLifecycleV1{Status: "published"},
+				},
+			}}}
 			kns.EXPECT().GetKNByID(gomock.Any(), "kn-metrics", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn-metrics", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn-metrics", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 			So(err, ShouldBeNil)
 			loaded, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
 			So(err, ShouldBeNil)
-			So(len(loaded.Metrics), ShouldEqual, 1)
-			So(loaded.Metrics[0].ID, ShouldEqual, "pod_running_count")
+			So(len(loaded.ObjectMetrics), ShouldEqual, 1)
+			var record interfaces.ObjectMetricRecordV1
+			So(json.Unmarshal(loaded.ObjectMetrics[0], &record), ShouldBeNil)
+			So(record.Definition.ID, ShouldEqual, "pod_running_count")
+			So(record.Definition.Version, ShouldEqual, 2)
+			So(record.Definition.Lifecycle.Status, ShouldEqual, "published")
 		})
 	})
+}
+
+func TestBKNServiceExportFiltersObjectMetricArchiveByMetricAndOwnerVisibility(t *testing.T) {
+	svc, mockCtrl, kns := newTestBKNService(t)
+	defer mockCtrl.Finish()
+	svc.archive = archiveAccessStub{records: []*interfaces.ObjectMetricRecordV1{
+		{Definition: interfaces.ObjectMetricDefinitionV1{ID: "visible", Version: 1, OwnerObjectTypeID: "owner-visible"}},
+		{Definition: interfaces.ObjectMetricDefinitionV1{ID: "visible", Version: 2, OwnerObjectTypeID: "owner-visible"}},
+		{Definition: interfaces.ObjectMetricDefinitionV1{ID: "metric-hidden", Version: 1, OwnerObjectTypeID: "owner-visible"}},
+		{Definition: interfaces.ObjectMetricDefinitionV1{ID: "owner-hidden", Version: 1, OwnerObjectTypeID: "owner-hidden"}},
+	}}
+	svc.ps = archivePermissionStub{visible: map[string]bool{
+		"kn-1/visible":      true,
+		"kn-1/owner-hidden": true,
+	}}
+	kns.EXPECT().GetKNByID(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(&interfaces.KN{
+		KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
+		ObjectTypes: []*interfaces.ObjectType{{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+			OTID: "owner-visible", OTName: "Visible Owner",
+		}}},
+	}, nil)
+
+	network, err := svc.buildNetwork(context.Background(), "kn-1", interfaces.MAIN_BRANCH)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(network.ObjectMetrics) != 2 {
+		t.Fatalf("exported object metrics = %d, want both visible versions", len(network.ObjectMetrics))
+	}
+	for index, raw := range network.ObjectMetrics {
+		var record interfaces.ObjectMetricRecordV1
+		if err := json.Unmarshal(raw, &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Definition.ID != "visible" || record.Definition.Version != index+1 {
+			t.Fatalf("exported metric[%d] = %+v", index, record.Definition)
+		}
+	}
 }
 
 // Test_bknService_ExportCapabilities covers the dependency section riding along with the model.
@@ -169,7 +243,7 @@ func Test_bknService_ExportCapabilities(t *testing.T) {
 						}}, nil
 				})
 
-			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 			So(err, ShouldBeNil)
 
 			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
@@ -190,7 +264,7 @@ func Test_bknService_ExportCapabilities(t *testing.T) {
 			cbs.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
 				Return(&interfaces.CapabilityBindingsList{}, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn2", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn2", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 			So(err, ShouldBeNil)
 			So(string(data), ShouldNotContainSubstring, "capabilities")
 		})
@@ -204,7 +278,7 @@ func Test_bknService_ExportCapabilities(t *testing.T) {
 						{ID: "b5", CapabilityType: interfaces.CAPABILITY_TYPE_SKILL, CapabilityID: "skill-1"},
 					}}, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn3", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn3", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 			So(err, ShouldNotBeNil)
 			So(data, ShouldBeNil)
 		})
@@ -220,13 +294,61 @@ func Test_bknService_ExportCapabilities(t *testing.T) {
 							Status: interfaces.CAPABILITY_STATUS_MISSING},
 					}}, nil)
 
-			data, err := svc.ExportToTar(context.Background(), "kn4", interfaces.MAIN_BRANCH)
+			data, err := svc.ExportToTar(context.Background(), "kn4", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 			So(err, ShouldBeNil)
 			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
 			So(err, ShouldBeNil)
 			So(len(network.Capabilities.Skills), ShouldEqual, 1)
 			So(network.Capabilities.Skills[0].ID, ShouldEqual, "skill-live")
 		})
+	})
+}
+
+// Test_bknService_ExportKnowledgeBaseCapabilities pins mounted knowledge bases in the dependency
+// section (#2576): without it a release or rollback through the lineage git drops the mount.
+func Test_bknService_ExportKnowledgeBaseCapabilities(t *testing.T) {
+	Convey("导出带知识库依赖声明", t, func() {
+		svc, mockCtrl, kns, cbs := newTestBKNServiceWithCapabilities(t)
+		defer mockCtrl.Finish()
+
+		kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).
+			Return(&interfaces.KN{KNID: "kn1", KNName: "合同网络"}, nil)
+		cbs.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
+			Return(&interfaces.CapabilityBindingsList{MetadataAvailable: true,
+				Entries: []*interfaces.CapabilityBinding{
+					{ID: "b1", CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE, CapabilityID: "7", Name: "合同库"},
+					{ID: "b2", CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE, CapabilityID: "8",
+						Status: interfaces.CAPABILITY_STATUS_MISSING},
+				}}, nil)
+
+		data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+		So(err, ShouldBeNil)
+		network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+		So(err, ShouldBeNil)
+		So(network.Capabilities, ShouldNotBeNil)
+		So(len(network.Capabilities.KnowledgeBases), ShouldEqual, 1)
+		So(network.Capabilities.KnowledgeBases[0].ID, ShouldEqual, "7")
+		So(network.Capabilities.KnowledgeBases[0].Name, ShouldEqual, "合同库")
+	})
+}
+
+// Unavailable knowledge-base metadata must not silently drop mounted dependencies from exports.
+func Test_bknService_ExportUnavailableKnowledgeBase(t *testing.T) {
+	Convey("知识库元数据不可用时导出失败，避免静默丢失挂载", t, func() {
+		svc, mockCtrl, kns, cbs := newTestBKNServiceWithCapabilities(t)
+		defer mockCtrl.Finish()
+		kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).
+			Return(&interfaces.KN{KNID: "kn1", KNName: "合同网络"}, nil)
+		cbs.EXPECT().ListCapabilities(gomock.Any(), gomock.Any()).
+			Return(&interfaces.CapabilityBindingsList{MetadataAvailable: false,
+				Entries: []*interfaces.CapabilityBinding{
+					{ID: "b1", CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE, CapabilityID: "7"},
+				}}, nil)
+
+		data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+		So(err, ShouldNotBeNil)
+		So(data, ShouldBeNil)
+		So(err.Error(), ShouldContainSubstring, "ExportMetadataUnavailable")
 	})
 }
 
@@ -247,7 +369,7 @@ func Test_bknService_ExportMCPCapabilities(t *testing.T) {
 						CapabilityID: "expedite", OwnerName: "供应链 MCP", Name: "expedite"},
 				}}, nil)
 
-		data, err := svc.ExportToTar(context.Background(), "kn-mcp", interfaces.MAIN_BRANCH)
+		data, err := svc.ExportToTar(context.Background(), "kn-mcp", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 		So(err, ShouldBeNil)
 
 		network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
@@ -282,7 +404,7 @@ func Test_bknService_ExportSkipsModelReferences(t *testing.T) {
 						CapabilityID: "referenced", Name: "只被引用的"},
 				}}, nil)
 
-		data, err := svc.ExportToTar(context.Background(), "kn5", interfaces.MAIN_BRANCH)
+		data, err := svc.ExportToTar(context.Background(), "kn5", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
 		So(err, ShouldBeNil)
 
 		network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
@@ -333,7 +455,7 @@ func Test_bknService_DiffNetworks(t *testing.T) {
 		})
 
 		Convey("A caller who cannot read the base network is refused before the target is touched\n", func() {
-			denied := rest.NewHTTPError(context.Background(), http.StatusForbidden, berrors.BknBackend_KnowledgeNetwork_InvalidParameter)
+			denied := httperrors.NewHTTPError(context.Background(), http.StatusForbidden, berrors.BknBackend_KnowledgeNetwork_InvalidParameter)
 			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", "main", interfaces.Mode_Export).Return(nil, denied)
 
 			result, err := svc.DiffNetworks(context.Background(), interfaces.KNDiffRequest{
@@ -364,6 +486,247 @@ func Test_bknService_DiffNetworks(t *testing.T) {
 			So(result.Entries[0].PairedBy, ShouldEqual, "name")
 			So(result.Entries[0].BaseID, ShouldEqual, "bom")
 			So(result.Entries[0].TargetID, ShouldEqual, "0193-uuid")
+		})
+	})
+}
+
+// misplacedKN has an action type whose parameter carries the value source in Source, as a legacy
+// parameter table read by 2.x stores it.
+func misplacedKN(knID string) *interfaces.KN {
+	return &interfaces.KN{
+		KNID:   knID,
+		KNName: "错位参数",
+		ActionTypes: []*interfaces.ActionType{{
+			ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
+				ATID: "restart_pod", ATName: "重启Pod",
+				Parameters: []interfaces.Parameter{{Name: "pod", Type: "string", Source: "property", ValueFrom: "pod_name"}},
+			},
+		}},
+	}
+}
+
+func Test_bknService_ExportSpec(t *testing.T) {
+	Convey("Test bknService ExportToTar spec selection\n", t, func() {
+		svc, mockCtrl, kns := newTestBKNService(t)
+		defer mockCtrl.Finish()
+
+		Convey("A network without 3.0 declarations is written as 2.x when nothing is asked for\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(misplacedKN("kn1"), nil)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+			So(err, ShouldBeNil)
+			So(network.BknSpec, ShouldEqual, bknsdk.BknSpecLegacy)
+		})
+
+		Convey("2.0 is written as 2.x\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(misplacedKN("kn1"), nil)
+			_, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_2)
+			So(err, ShouldBeNil)
+		})
+
+		Convey("3.0 is refused while the network check finds misplaced parameters, and names them\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(misplacedKN("kn1"), nil)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_3)
+			So(data, ShouldBeNil)
+			var httpErr *httperrors.HTTPError
+			So(errors.As(err, &httpErr), ShouldBeTrue)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_KnowledgeNetwork_ExportNeedsNetworkCheck)
+			found := httpErr.ErrorDetails.(*interfaces.NetworkCheckResult)
+			So(found.MisplacedParameters, ShouldHaveLength, 1)
+			So(found.MisplacedParameters[0].ActionTypeID, ShouldEqual, "restart_pod")
+		})
+
+		Convey("3.0 is refused for a parameter whose value source is invalid, which has no rewrite\n", func() {
+			kn := misplacedKN("kn3")
+			kn.ActionTypes[0].Parameters[0] = interfaces.Parameter{Name: "pod", Type: "string", Source: "Body"}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn3", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
+			_, err := svc.ExportToTar(context.Background(), "kn3", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_3)
+			var httpErr *httperrors.HTTPError
+			So(errors.As(err, &httpErr), ShouldBeTrue)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_KnowledgeNetwork_ExportNeedsNetworkCheck)
+			found := httpErr.ErrorDetails.(*interfaces.NetworkCheckResult)
+			So(found.MisplacedParameters, ShouldBeEmpty)
+			So(found.InvalidParameters, ShouldResemble, []interfaces.NetworkCheckInvalidParameter{{
+				ActionTypeID: "restart_pod", Parameter: "pod", Current: interfaces.NetworkCheckParameterValue{Source: "Body"},
+			}})
+		})
+
+		Convey("3.0 is refused when the written package does not read back under 3.0\n", func() {
+			kn := &interfaces.KN{KNID: "kn4", KNName: "空属性名", ObjectTypes: []*interfaces.ObjectType{{
+				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+					OTID: "pod", OTName: "Pod",
+					DataProperties: []*interfaces.DataProperty{{Name: "", Type: "string"}},
+				},
+			}}}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn4", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
+			data, err := svc.ExportToTar(context.Background(), "kn4", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_3)
+			So(data, ShouldBeNil)
+			var httpErr *httperrors.HTTPError
+			So(errors.As(err, &httpErr), ShouldBeTrue)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_KnowledgeNetwork_ExportNotReadableAsV3)
+			So(httpErr.ErrorDetails, ShouldContainSubstring, "pod")
+		})
+
+		Convey("3.0 is written as 3.0 when the check finds nothing\n", func() {
+			kn := misplacedKN("kn2")
+			kn.ActionTypes[0].Parameters[0] = interfaces.Parameter{Name: "pod", Type: "string", Source: "Body", ValueFrom: "property", Value: "pod_name"}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn2", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
+			data, err := svc.ExportToTar(context.Background(), "kn2", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_3)
+			So(err, ShouldBeNil)
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+			So(err, ShouldBeNil) // the 3.0 export reads back under 3.0
+			So(network.BknSpec, ShouldEqual, bknsdk.BknSpecV3)
+		})
+	})
+}
+
+func Test_bknService_CheckNetwork(t *testing.T) {
+	Convey("Test bknService CheckNetwork\n", t, func() {
+		svc, mockCtrl, kns := newTestBKNService(t)
+		defer mockCtrl.Finish()
+
+		kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(misplacedKN("kn1"), nil)
+		result, err := svc.CheckNetwork(context.Background(), "kn1", interfaces.MAIN_BRANCH)
+		So(err, ShouldBeNil)
+		So(result.MisplacedParameters, ShouldResemble, []interfaces.NetworkCheckParameter{{
+			ActionTypeID: "restart_pod",
+			Parameter:    "pod",
+			Current:      interfaces.NetworkCheckParameterValue{Source: "property", ValueFrom: "pod_name"},
+			Suggested:    interfaces.NetworkCheckParameterValue{ValueFrom: "property", Value: "pod_name"},
+		}})
+
+		kns.EXPECT().GetKNByID(gomock.Any(), "kn2", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(&interfaces.KN{KNID: "kn2"}, nil)
+		result, err = svc.CheckNetwork(context.Background(), "kn2", interfaces.MAIN_BRANCH)
+		So(err, ShouldBeNil)
+		So(result.MisplacedParameters, ShouldBeEmpty)
+		So(result.MisplacedParameters, ShouldNotBeNil) // an empty list, not null, in the response
+	})
+}
+
+// declaredKN has an object type with property declarations.
+func declaredKN(knID string, declared bool) *interfaces.KN {
+	props := []*interfaces.DataProperty{
+		{Name: "id", DisplayName: "编号", Type: "string", MappedField: &interfaces.Field{Name: "id"}},
+		{Name: "placed_at", DisplayName: "下单时间", Type: "datetime", MappedField: &interfaces.Field{Name: "placed_at"}},
+		{Name: "amount", DisplayName: "金额", Type: "decimal", MappedField: &interfaces.Field{Name: "amount"}},
+	}
+	if declared {
+		props[1].Semantic, props[1].Required = "event_time", true
+		props[2].Constraints = &interfaces.PropertyConstraints{Range: &interfaces.ValueRange{Min: float64(0)}, Unit: "元"}
+	}
+	return &interfaces.KN{KNID: knID, KNName: "订单", ObjectTypes: []*interfaces.ObjectType{{
+		ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+			OTID: "order", OTName: "订单", PrimaryKeys: []string{"id"}, DisplayKey: "id", DataProperties: props,
+		},
+	}}}
+}
+
+// exportedFiles reads every file of an exported archive except CHECKSUM, whose header carries the
+// time it was generated.
+func exportedFiles(t *testing.T, data []byte) map[string]string {
+	t.Helper()
+	mfs, root, err := bknsdk.ExtractTarToMemory(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	for _, path := range []string{"network.bkn", "object_types/order.bkn", "SKILL.md"} {
+		content, err := mfs.ReadFile(mfs.Join(root, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[path] = string(content)
+	}
+	return files
+}
+
+func Test_bknService_ExportDeclarations(t *testing.T) {
+	Convey("Test bknService ExportToTar with stored property declarations\n", t, func() {
+		svc, mockCtrl, kns := newTestBKNService(t)
+		defer mockCtrl.Finish()
+
+		Convey("A network with declarations is written as 3.0 and keeps them\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(declaredKN("kn1", true), nil)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+			So(err, ShouldBeNil)
+			So(network.BknSpec, ShouldEqual, bknsdk.BknSpecV3)
+			props := network.ObjectTypes[0].DataProperties
+			So(props[1].Semantic, ShouldEqual, "event_time")
+			So(props[1].Required, ShouldBeTrue)
+			So(props[2].Constraints, ShouldResemble, &bknsdk.PropertyConstraints{Range: &bknsdk.ValueRange{Min: int64(0)}, Unit: "元"})
+		})
+
+		Convey("A property naming a value type is written with the value type\n", func() {
+			kn := declaredKN("kn1", true)
+			kn.ObjectTypes[0].DataProperties[2].Constraints = &interfaces.PropertyConstraints{ValueType: "amount_cny"}
+			kn.ValueTypes = []*interfaces.ValueType{{
+				VTID: "amount_cny", VTName: "人民币金额", BaseType: "decimal",
+				ValueTypeDefinition: interfaces.ValueTypeDefinition{Range: &interfaces.ValueRange{Min: float64(0)}, Unit: "元"},
+			}}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(kn, nil)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+			So(err, ShouldBeNil)
+			So(network.BknSpec, ShouldEqual, bknsdk.BknSpecV3)
+			So(len(network.ValueTypes), ShouldEqual, 1)
+			So(network.ValueTypes[0].Range, ShouldResemble, &bknsdk.ValueRange{Min: int64(0)})
+			So(network.ObjectTypes[0].DataProperties[2].Constraints.ValueType, ShouldEqual, "amount_cny")
+		})
+
+		Convey("Aliases are written as 3.0 and read back; 2.0 leaves them out\n", func() {
+			aliased := func() *interfaces.KN {
+				kn := declaredKN("kn1", false)
+				kn.ObjectTypes[0].Aliases = []string{"订货单"}
+				kn.ObjectTypes[0].DataProperties[2].Aliases = []string{"价款"}
+				return kn
+			}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(aliased(), nil)
+			data, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(data))
+			So(err, ShouldBeNil)
+			So(network.BknSpec, ShouldEqual, bknsdk.BknSpecV3)
+			So(network.ObjectTypes[0].Aliases, ShouldResemble, []string{"订货单"})
+			So(network.ObjectTypes[0].DataProperties[2].Aliases, ShouldResemble, []string{"价款"})
+
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(aliased(), nil)
+			withAliases, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_2)
+			So(err, ShouldBeNil)
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(declaredKN("kn1", false), nil)
+			plain, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			So(exportedFiles(t, withAliases), ShouldResemble, exportedFiles(t, plain))
+		})
+
+		Convey("2.0 leaves value types out, byte for byte as a network that never had them\n", func() {
+			withVT := declaredKN("kn1", false)
+			withVT.ValueTypes = []*interfaces.ValueType{{VTID: "amount_cny", VTName: "人民币金额", BaseType: "decimal"}}
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(withVT, nil)
+			withValueTypes, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_2)
+			So(err, ShouldBeNil)
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(declaredKN("kn1", false), nil)
+			plain, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			So(exportedFiles(t, withValueTypes), ShouldResemble, exportedFiles(t, plain))
+			network, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(withValueTypes))
+			So(err, ShouldBeNil)
+			So(network.ValueTypes, ShouldBeEmpty)
+			So(string(withValueTypes), ShouldNotContainSubstring, "value_type")
+		})
+
+		Convey("2.0 leaves the declarations out, byte for byte as a network that never had them\n", func() {
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(declaredKN("kn1", true), nil)
+			kns.EXPECT().GetKNByID(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.Mode_Export).Return(declaredKN("kn1", false), nil)
+			declared, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_2)
+			So(err, ShouldBeNil)
+			plain, err := svc.ExportToTar(context.Background(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO)
+			So(err, ShouldBeNil)
+			So(exportedFiles(t, declared), ShouldResemble, exportedFiles(t, plain))
 		})
 	})
 }

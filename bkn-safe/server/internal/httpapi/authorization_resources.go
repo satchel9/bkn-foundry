@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/config"
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/authzresource"
 )
 
 const (
@@ -34,7 +35,6 @@ const (
 	functionResourceType         = "function"
 	mcpResourceType              = "mcp"
 	skillResourceType            = "skill"
-	operatorResourceType         = "operator"
 )
 
 type AuthorizationResource struct {
@@ -131,10 +131,6 @@ func NewAuthorizationResourceCatalog(bknBackend, bknAgent, executionFactory, veg
 	if err != nil {
 		return nil, err
 	}
-	operators, err := newAuthorizationResourceProvider(executionFactory, "/api/agent-operator-integration/internal-v1/authorization-resources", "execution factory", operatorResourceType)
-	if err != nil {
-		return nil, err
-	}
 	return &authorizationResourceCatalog{providers: map[string]AuthorizationResourceProvider{
 		knowledgeNetworkResourceType: knowledgeNetworks,
 		agentResourceType:            agents,
@@ -151,14 +147,13 @@ func NewAuthorizationResourceCatalog(bknBackend, bknAgent, executionFactory, veg
 		functionResourceType:         functions,
 		mcpResourceType:              mcp,
 		skillResourceType:            skills,
-		operatorResourceType:         operators,
 	}}, nil
 }
 
 func (c *authorizationResourceCatalog) List(ctx context.Context, resourceType string, query AuthorizationResourceQuery) (AuthorizationResourceList, error) {
 	provider, ok := c.providers[resourceType]
 	if !ok {
-		return AuthorizationResourceList{}, errUnsupportedResourceType
+		return listExtensionResources(ctx, resourceType, query)
 	}
 	if query.ParentType != "" {
 		expectedParentType := map[string]string{
@@ -213,6 +208,35 @@ func (c *authorizationResourceCatalog) Resolve(ctx context.Context, resourceType
 			return AuthorizationResource{}, errAuthorizationResourceNotFound
 		}
 	}
+}
+
+// listExtensionResources serves a type an edition build registered through
+// extension/authzresource. Those types are roots: they have no parent.
+func listExtensionResources(ctx context.Context, resourceType string, query AuthorizationResourceQuery) (AuthorizationResourceList, error) {
+	provider, ok := authzresource.Lookup(resourceType)
+	if !ok {
+		return AuthorizationResourceList{}, errUnsupportedResourceType
+	}
+	if query.ParentType != "" || query.ParentID != "" {
+		return AuthorizationResourceList{}, errInvalidAuthorizationResourceParent
+	}
+	ctx, cancel := context.WithTimeout(ctx, authzresource.CallTimeout)
+	defer cancel()
+	page, err := provider.List(ctx, authzresource.Query{
+		Name:      query.Name,
+		Sort:      query.Sort,
+		Direction: query.Direction,
+		Offset:    query.Offset,
+		Limit:     query.Limit,
+	})
+	if err != nil {
+		return AuthorizationResourceList{}, err
+	}
+	entries := make([]AuthorizationResource, 0, len(page.Entries))
+	for _, item := range page.Entries {
+		entries = append(entries, AuthorizationResource{ID: item.ID, Name: item.Name})
+	}
+	return AuthorizationResourceList{Entries: entries, Total: page.Total}, nil
 }
 
 func isKnowledgeNetworkChildResource(resourceType string) bool {
@@ -301,6 +325,11 @@ func registerAuthorizationResources(g *gin.RouterGroup, catalog AuthorizationRes
 	g.GET("/authorization-resources", func(c *gin.Context) {
 		query, ok := parseAuthorizationResourceQuery(c)
 		if !ok {
+			return
+		}
+		if !authzresource.Entitled(c.Query("resource_type")) {
+			// Answered like a type no provider serves (#2512).
+			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
 		result, err := catalog.List(c.Request.Context(), c.Query("resource_type"), query)

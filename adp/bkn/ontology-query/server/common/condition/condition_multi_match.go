@@ -10,8 +10,8 @@ import (
 	"context"
 	"fmt"
 
-	"ontology-query/common"
-	dtype "ontology-query/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/data_type"
 
 	"github.com/bytedance/sonic"
 )
@@ -193,8 +193,9 @@ func rewriteMultiMatchCond(ctx context.Context, cfg *CondCfg, fieldsMap map[stri
 			"fields":     fields,
 			"match_type": matchType,
 		},
-		Operation:   cfg.Operation,
-		ValueOptCfg: cfg.ValueOptCfg,
+		Operation: cfg.Operation,
+		ValueFrom: cfg.ValueFrom,
+		Value:     cfg.Value,
 	}, nil
 }
 

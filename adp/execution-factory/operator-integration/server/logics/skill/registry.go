@@ -40,6 +40,7 @@ type skillRegistry struct {
 	releaseHistoryRepo model.ISkillReleaseHistoryDB
 	assetStore         skillAssetStore
 	indexSync          interfaces.SkillIndexSyncService
+	notifyIndexSync    func()
 	sandboxClient      interfaces.SandBoxControlPlane
 	sessionPool        sandbox.SessionPool
 	dbTx               model.DBTx
@@ -68,6 +69,7 @@ func NewSkillRegistry() interfaces.SkillRegistry {
 			releaseHistoryRepo: dbaccess.NewSkillReleaseHistoryDB(),
 			assetStore:         newOSSGatewaySkillAssetStore(),
 			indexSync:          NewSkillIndexSyncService(),
+			notifyIndexSync:    notifySkillCapabilitiesChanged,
 			sandboxClient:      drivenadapters.NewSandBoxControlPlaneClient(),
 			sessionPool:        sandbox.GetSessionPool(),
 			dbTx:               dbaccess.NewBaseTx(),
@@ -288,18 +290,7 @@ func (r *skillRegistry) UpdateSkillPackage(ctx context.Context, req *interfaces.
 	if err != nil {
 		return nil, fmt.Errorf("get tx failed: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				r.Logger.WithContext(ctx).Errorf("rollback skill package update failed, skill_id=%s, err=%v", req.SkillID, rollbackErr)
-			}
-		} else {
-			commitErr := tx.Commit()
-			if commitErr != nil {
-				r.Logger.WithContext(ctx).Errorf("commit skill package update failed, skill_id=%s, err=%v", req.SkillID, commitErr)
-			}
-		}
-	}()
+	defer r.finishIndexedSkillWrite(ctx, tx, &err, req.SkillID, false)
 
 	skill.Name = parsedSkill.Name
 	skill.Description = parsedSkill.Description
@@ -346,11 +337,7 @@ func (r *skillRegistry) UpdateSkillPackage(ctx context.Context, req *interfaces.
 		Version: skill.Version,
 		Status:  interfaces.BizStatus(skill.Status),
 	}
-	if r.indexSync != nil {
-		if syncErr := r.indexSync.UpdateSkill(ctx, skill); syncErr != nil {
-			r.Logger.WithContext(ctx).Errorf("update skill index failed after package update, skill_id=%s, err=%v", req.SkillID, syncErr)
-		}
-	}
+
 	return resp, nil
 }
 
@@ -476,18 +463,7 @@ func (r *skillRegistry) PublishSkillHistory(ctx context.Context, req *interfaces
 	if err != nil {
 		return nil, fmt.Errorf("get tx failed: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				r.Logger.WithContext(ctx).Errorf("rollback skill history publish failed, skill_id=%s, version=%s, err=%v", req.SkillID, req.Version, rollbackErr)
-			}
-		} else {
-			commitErr := tx.Commit()
-			if commitErr != nil {
-				r.Logger.WithContext(ctx).Errorf("commit skill history publish failed, skill_id=%s, version=%s, err=%v", req.SkillID, req.Version, commitErr)
-			}
-		}
-	}()
+	defer r.finishIndexedSkillWrite(ctx, tx, &err, req.SkillID, false)
 
 	skill.Name = release.Name
 	skill.Description = release.Description
@@ -506,11 +482,7 @@ func (r *skillRegistry) PublishSkillHistory(ctx context.Context, req *interfaces
 	if err = r.publishSkillSnapshot(ctx, tx, skill, req.UserID); err != nil {
 		return nil, err
 	}
-	if r.indexSync != nil {
-		if syncErr := r.indexSync.UpsertSkill(ctx, skill); syncErr != nil {
-			r.Logger.WithContext(ctx).Errorf("sync published historical skill index failed, skill_id=%s, version=%s, err=%v", req.SkillID, req.Version, syncErr)
-		}
-	}
+
 	return &interfaces.PublishSkillHistoryResp{
 		SkillID: skill.SkillID,
 		Version: skill.Version,
@@ -527,12 +499,11 @@ func (r *skillRegistry) DeleteSkill(ctx context.Context, req *interfaces.DeleteS
 		"skill_id": req.SkillID,
 		"user_id":  req.UserID,
 	})
-	// Check delete permissions.
+	// Load the durable deletion marker before authorization. Once Safe cleanup
+	// has succeeded, the initiating user must still be able to resume local and
+	// object-store cleanup without the policy that was just removed.
 	accessor, err := r.AuthService.GetAccessor(ctx, req.UserID)
 	if err != nil {
-		return err
-	}
-	if err = r.AuthService.CheckDeletePermission(ctx, accessor, req.SkillID, interfaces.AuthResourceTypeSkill); err != nil {
 		return err
 	}
 	skill, err := r.skillRepo.SelectSkillByID(ctx, nil, req.SkillID)
@@ -540,45 +511,42 @@ func (r *skillRegistry) DeleteSkill(ctx context.Context, req *interfaces.DeleteS
 		err = errors.DefaultHTTPError(ctx, http.StatusInternalServerError, fmt.Sprintf("select skill by id failed: %s", err.Error()))
 		return
 	}
-	// The skill does not exist or has been deleted.
-	if skill == nil || skill.IsDeleted {
+	if skill == nil {
 		err = errors.DefaultHTTPError(ctx, http.StatusNotFound, fmt.Sprintf("skill not found: %s", req.SkillID))
 		return
 	}
-	// Delete status verification and use public status management.
-	if !common.CanDelete(interfaces.BizStatus(skill.Status)) {
+	if !skill.IsDeleted || skill.UpdateUser != req.UserID {
+		if err = r.AuthService.CheckDeletePermission(ctx, accessor, req.SkillID, interfaces.AuthResourceTypeSkill); err != nil {
+			return err
+		}
+	}
+	// A persisted deletion marker means an earlier request stopped during an
+	// external cleanup. Re-entering the same DELETE resumes that cleanup.
+	if !skill.IsDeleted && !common.CanDelete(interfaces.BizStatus(skill.Status)) {
 		err = errors.NewHTTPError(ctx, http.StatusBadRequest, errors.ErrExtSkillUnSupportDelete,
 			fmt.Sprintf("skill can not be deleted in status: %s", skill.Status))
 		return
 	}
-	tx, err := r.dbTx.GetTx(ctx)
-	if err != nil {
-		return fmt.Errorf("get tx failed: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				r.Logger.WithContext(ctx).Errorf("rollback skill delete failed, skill_id=%s, err=%v", req.SkillID, rollbackErr)
-				return
-			}
-		} else {
-			if commitErr := tx.Commit(); commitErr != nil {
-				r.Logger.WithContext(ctx).Errorf("commit skill delete failed, skill_id=%s, err=%v", req.SkillID, commitErr)
-				return
-			}
+	if !skill.IsDeleted {
+		if err = r.runSkillDeleteTransaction(ctx, func(tx *sql.Tx) error {
+			return r.skillRepo.UpdateSkillDeleted(ctx, tx, req.SkillID, true, req.UserID)
+		}); err != nil {
+			return err
 		}
-	}()
-
-	// Mark the skill as being deleted, TODO: You need to design a separate coroutine to handle the deletion interruption strategy.
-	if err = r.skillRepo.UpdateSkillDeleted(ctx, tx, req.SkillID, true, req.UserID); err != nil {
+	}
+	// Safe cleanup runs before any irreversible asset deletion. A managed-proxy
+	// conflict therefore leaves a complete tombstone that can continue after the
+	// resource is unbound; a timeout can be replayed by the initiating user.
+	if err = r.AuthService.DeletePolicy(ctx, []string{req.SkillID}, interfaces.AuthResourceTypeSkill); err != nil {
 		return err
 	}
-	// Find index file.
-	files, err := r.fileRepo.SelectSkillFileBySkillID(ctx, tx, req.SkillID, skill.Version)
+
+	// Keep file metadata until every object has been removed. A retry can then
+	// rediscover the same storage keys after a partial object-store failure.
+	files, err := r.fileRepo.SelectSkillFileBySkillID(ctx, nil, req.SkillID, skill.Version)
 	if err != nil {
 		return err
 	}
-	// Delete records in object storage first, then delete records in database.
 	for _, file := range files {
 		if err = r.assetStore.Delete(ctx, &interfaces.OssObject{
 			StorageID:  file.StorageID,
@@ -588,30 +556,50 @@ func (r *skillRegistry) DeleteSkill(ctx context.Context, req *interfaces.DeleteS
 			return err
 		}
 	}
-	if err = r.fileRepo.DeleteSkillFileBySkillID(ctx, tx, req.SkillID, skill.Version); err != nil {
-		return err
-	}
-	if r.releaseRepo != nil {
-		if err = r.deletePublishedSkillSnapshot(ctx, tx, req.SkillID); err != nil {
+	if err = r.runSkillDeleteTransaction(ctx, func(tx *sql.Tx) error {
+		if err := r.fileRepo.DeleteSkillFileBySkillID(ctx, tx, req.SkillID, skill.Version); err != nil {
 			return err
 		}
-	}
-	if r.releaseHistoryRepo != nil {
-		if err = r.releaseHistoryRepo.DeleteBySkillID(ctx, tx, req.SkillID); err != nil {
-			return err
+		if r.releaseRepo != nil {
+			if err := r.deletePublishedSkillSnapshot(ctx, tx, req.SkillID); err != nil {
+				return err
+			}
 		}
-	}
-	if err = r.skillRepo.DeleteSkillByID(ctx, tx, req.SkillID); err != nil {
+		if r.releaseHistoryRepo != nil {
+			if err := r.releaseHistoryRepo.DeleteBySkillID(ctx, tx, req.SkillID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	// Delete the permission policy of a skill.
-	if err = r.AuthService.DeletePolicy(ctx, []string{req.SkillID}, interfaces.AuthResourceTypeSkill); err != nil {
-		return err
-	}
+
 	if r.indexSync != nil {
-		if syncErr := r.indexSync.DeleteSkill(ctx, req.SkillID); syncErr != nil {
-			r.Logger.WithContext(ctx).Errorf("delete skill index failed after skill delete, skill_id=%s, err=%v", req.SkillID, syncErr)
+		indexCtx, cancel := context.WithTimeout(ctx, skillIndexOperationTimeout)
+		defer cancel()
+		if err = r.indexSync.DeleteSkill(indexCtx, req.SkillID); err != nil {
+			return err
 		}
+	}
+	if r.notifyIndexSync != nil {
+		r.notifyIndexSync()
+	}
+	return nil
+}
+
+func (r *skillRegistry) runSkillDeleteTransaction(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := r.dbTx.GetTx(ctx)
+	if err != nil {
+		return fmt.Errorf("get tx failed: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		return err
 	}
 	return nil
 }
@@ -670,18 +658,7 @@ func (r *skillRegistry) UpdateSkillStatus(ctx context.Context, req *interfaces.U
 	if err != nil {
 		return nil, fmt.Errorf("get tx failed: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				r.Logger.WithContext(ctx).Errorf("rollback skill status update failed, skill_id=%s, err=%v", req.SkillID, rollbackErr)
-			}
-		} else {
-			if commitErr := tx.Commit(); commitErr != nil {
-				r.Logger.WithContext(ctx).Errorf("commit skill status update failed, skill_id=%s, err=%v", req.SkillID, commitErr)
-				return
-			}
-		}
-	}()
+	defer r.finishIndexedSkillWrite(ctx, tx, &err, req.SkillID, req.Status == interfaces.BizStatusOffline)
 	// Update skill status.
 	if err = r.skillRepo.UpdateSkillStatus(ctx, tx, req.SkillID, string(req.Status), req.UserID); err != nil {
 		return nil, err
@@ -700,21 +677,7 @@ func (r *skillRegistry) UpdateSkillStatus(ctx context.Context, req *interfaces.U
 		SkillID: req.SkillID,
 		Status:  req.Status,
 	}
-	// Write skill data to dataset without blocking the main process.
-	switch req.Status {
-	case interfaces.BizStatusPublished:
-		if r.indexSync != nil {
-			if syncErr := r.indexSync.UpsertSkill(ctx, skill); syncErr != nil {
-				r.Logger.WithContext(ctx).Errorf("sync published skill index failed, skill_id=%s, err=%v", req.SkillID, syncErr)
-			}
-		}
-	case interfaces.BizStatusOffline:
-		if r.indexSync != nil {
-			if syncErr := r.indexSync.DeleteSkill(ctx, req.SkillID); syncErr != nil {
-				r.Logger.WithContext(ctx).Errorf("delete skill index failed after status update, skill_id=%s, err=%v", req.SkillID, syncErr)
-			}
-		}
-	}
+
 	return resp, nil
 }
 
@@ -788,7 +751,16 @@ func (r *skillRegistry) ExecuteSkill(ctx context.Context, req *interfaces.Execut
 		return nil, err
 	}
 
-	skill, fileName, archive, err := r.buildSkillArchive(ctx, req.SkillID)
+	skillDB, files, err := r.selectSkillSnapshot(ctx, req.SkillID)
+	if err != nil {
+		return nil, err
+	}
+	// Refuse anything that is not a Python script of the package before a session is spent on it.
+	entry, args, err := resolveSkillEntry(ctx, req, manifestPaths(files))
+	if err != nil {
+		return nil, err
+	}
+	skill, fileName, archive, err := r.buildSkillArchiveFromSnapshot(ctx, skillDB, files)
 	if err != nil {
 		return nil, err
 	}
@@ -811,7 +783,7 @@ func (r *skillRegistry) ExecuteSkill(ctx context.Context, req *interfaces.Execut
 	}
 	execResp, err := r.sandboxClient.ExecuteShell(ctx, sessionID, &interfaces.ExecuteShellReq{
 		WorkDir: uploadResp.WorkDir,
-		Command: req.EntryShell,
+		Command: pythonCommand(entry, args),
 		Timeout: req.Timeout,
 	})
 	if err != nil {
@@ -834,18 +806,27 @@ func (r *skillRegistry) ExecuteSkill(ctx context.Context, req *interfaces.Execut
 }
 
 func (r *skillRegistry) buildSkillArchive(ctx context.Context, skillID string) (*model.SkillRepositoryDB, string, []byte, error) {
-	skillDB, err := r.skillRepo.SelectSkillByID(ctx, nil, skillID)
-	if err != nil {
-		return nil, "", nil, err
-	}
-	if skillDB == nil {
-		return nil, "", nil, fmt.Errorf("skill not found: %s", skillID)
-	}
-	files, err := r.fileRepo.SelectSkillFileBySkillID(ctx, nil, skillID, skillDB.Version)
+	skillDB, files, err := r.selectSkillSnapshot(ctx, skillID)
 	if err != nil {
 		return nil, "", nil, err
 	}
 	return r.buildSkillArchiveFromSnapshot(ctx, skillDB, files)
+}
+
+// selectSkillSnapshot loads a Skill and the files of its current version.
+func (r *skillRegistry) selectSkillSnapshot(ctx context.Context, skillID string) (*model.SkillRepositoryDB, []*model.SkillFileIndexDB, error) {
+	skillDB, err := r.skillRepo.SelectSkillByID(ctx, nil, skillID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if skillDB == nil {
+		return nil, nil, fmt.Errorf("skill not found: %s", skillID)
+	}
+	files, err := r.fileRepo.SelectSkillFileBySkillID(ctx, nil, skillID, skillDB.Version)
+	if err != nil {
+		return nil, nil, err
+	}
+	return skillDB, files, nil
 }
 
 func (r *skillRegistry) buildSkillArchiveFromSnapshot(ctx context.Context, skill *model.SkillRepositoryDB,

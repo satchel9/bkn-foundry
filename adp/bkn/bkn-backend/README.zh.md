@@ -58,7 +58,7 @@
 | 指标 | `/knowledge-networks/{kn_id}/metrics` |
 | 风险类 | `/knowledge-networks/{kn_id}/risk-types` |
 | 行动调度 | `/knowledge-networks/{kn_id}/action-schedules` |
-| BKN 导入导出 | `/bkns`、`/bkns/{kn_id}` |
+| BKN 导入导出 | `/bkns`、`/bkns/{kn_id}`、`/bkns/{kn_id}/check` |
 | 资源 | `/resources` |
 
 权威 OpenAPI 源文件位于仓库根目录：
@@ -86,6 +86,7 @@ bkn-backend/
     driveradapters/      # HTTP handler、router 和请求校验
     errors/              # BKN Backend 错误定义
     interfaces/          # DTO 和服务接口
+    knevent/             # 知识网络事件：事件账本、变更流水、事件类
     locale/              # 国际化资源
     logics/              # 业务逻辑
     version/             # 构建和版本元数据
@@ -112,7 +113,7 @@ bkn-backend/
 
 依赖要求：
 
-- Go 1.25+
+- Go 1.26.0+
 - MariaDB 11.4+ 或 DM8
 - OpenSearch 2.x
 - 调试集成路径时，需要可访问的 VEGA、model-factory 和 bkn-safe 依赖。
@@ -135,6 +136,7 @@ Helm values：
 | Value | 默认值 | 含义 |
 | --- | --- | --- |
 | `bknSafe.url` | `http://bkn-safe:3000` | bkn-safe 服务根地址 |
+| `knowledgeBase.url` | `""` | 企业版 kb-api 根地址（`KB_API_URL`），知识网络挂载知识库时读取；未部署 kb-api 时留空，此时挂载知识库会被拒绝 |
 | `auth.knChildResourceFilterChunkSize` | `0` | 可选调用方分块大小；`0` 表示单次发送，不是服务端限制 |
 
 资源、操作和错误语义见

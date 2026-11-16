@@ -10,30 +10,33 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/PaesslerAG/jsonpath"
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"github.com/tidwall/sjson"
 	"go.opentelemetry.io/otel/attribute"
 
-	"ontology-query/common"
-	cond "ontology-query/common/condition"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	"ontology-query/locale"
-	"ontology-query/logics"
-	"ontology-query/logics/metric"
-	permissionlogic "ontology-query/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
+	permissionlogic "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/permission"
 )
 
 var (
@@ -47,11 +50,18 @@ type objectTypeService struct {
 	mfa            interfaces.ModelFactoryAccess
 	omAccess       interfaces.OntologyManagerAccess
 	vba            interfaces.VegaBackendAccess
-	mqs            interfaces.MetricQueryService
 	proxy          interfaces.ProxyContextResolver
 	propertyAccess interfaces.PropertyAccessService
 	rowFilters     interfaces.RowFilterService
 	cursor         *queryCursorCodec
+}
+
+type objectAggregateSpec struct {
+	measureProperty string
+	operation       string
+	groupBy         []string
+	propertyValue   bool
+	having          *interfaces.ObjectAggregateHaving
 }
 
 func NewObjectTypeService(appSetting *common.AppSetting) interfaces.ObjectTypeService {
@@ -62,7 +72,6 @@ func NewObjectTypeService(appSetting *common.AppSetting) interfaces.ObjectTypeSe
 			mfa:            logics.MFA,
 			omAccess:       logics.OMA,
 			vba:            logics.VBA,
-			mqs:            metric.NewMetricQueryService(appSetting),
 			proxy:          logics.PCR,
 			propertyAccess: permissionlogic.NewPropertyAccessService(appSetting),
 			rowFilters:     permissionlogic.NewRowFilterService(appSetting),
@@ -75,20 +84,23 @@ func NewObjectTypeService(appSetting *common.AppSetting) interfaces.ObjectTypeSe
 func (ots *objectTypeService) GetObjectTypeSchema(ctx context.Context,
 	knID, branch, objectTypeID string) (*interfaces.ResourceSchemaResponse, error) {
 	if branch != interfaces.MAIN_BRANCH {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter).
 			WithErrorDetails("only the published main branch can be queried")
 	}
 	objectType, exists, err := ots.omAccess.GetObjectType(ctx, knID, branch, objectTypeID)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		if versionErr, ok := logics.KNVersionError(ctx, err); ok {
+			return nil, versionErr
+		}
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed).WithErrorDetails(err.Error())
 	}
 	if !exists {
-		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
 	}
 	if objectType.KNID != "" && objectType.KNID != knID {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("object type belongs to another knowledge network")
 	}
 	objectType.KNID = knID
@@ -99,15 +111,15 @@ func (ots *objectTypeService) GetObjectTypeSchema(ctx context.Context,
 	if objectType.DataSource == nil || strings.TrimSpace(objectType.DataSource.ID) == "" ||
 		(strings.TrimSpace(objectType.DataSource.Type) != "" &&
 			objectType.DataSource.Type != interfaces.DATA_SOURCE_TYPE_RESOURCE) {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("object type has no published resource data source")
 	}
 	if ots.proxy == nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_InternalError_CheckPermissionFailed).
 			WithErrorDetails("knowledge network proxy resolver is not configured")
 	}
-	proxyContext, err := ots.proxy.Resolve(ctx, interfaces.TrustedProxyBinding{
+	proxyContext, err := logics.ResolveDataProxy(ctx, ots.proxy, interfaces.TrustedProxyBinding{
 		KNID:       knID,
 		ChildType:  interfaces.PermissionResourceTypeObjectType,
 		ChildID:    objectType.OTID,
@@ -118,12 +130,16 @@ func (ots *objectTypeService) GetObjectTypeSchema(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	response, err := ots.vba.GetResourceSchema(interfaces.WithTrustedProxyContext(ctx, proxyContext), objectType.DataSource.ID)
+	// A nil proxy context means the draft or a history version: read as the caller.
+	if proxyContext != nil {
+		ctx = interfaces.WithTrustedProxyContext(ctx, proxyContext)
+	}
+	response, err := ots.vba.GetResourceSchema(ctx, objectType.DataSource.ID)
 	if err != nil {
 		if downstream, ok := interfaces.AsVegaDownstreamError(err); ok && downstream.IsClientError() {
-			return nil, rest.NewHTTPError(ctx, downstream.StatusCode, proxyDownstreamErrorCode(downstream.StatusCode))
+			return nil, httperrors.NewHTTPError(ctx, downstream.StatusCode, proxyDownstreamErrorCode(downstream.StatusCode))
 		}
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed)
 	}
 	plan.filterResourceSchema(response)
@@ -133,7 +149,7 @@ func (ots *objectTypeService) GetObjectTypeSchema(ctx context.Context,
 func (ots *objectTypeService) GetObjectTypeSampleData(ctx context.Context,
 	query *interfaces.ObjectQueryBaseOnObjectType) (*interfaces.ObjectTypeSampleData, error) {
 	if query == nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter)
 	}
 	if query.Limit <= 0 {
 		query.Limit = 20
@@ -156,7 +172,7 @@ func (ots *objectTypeService) GetObjectTypeSampleData(ctx context.Context,
 		return nil, err
 	}
 	if objects.ObjectType == nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed)
 	}
 	result := &interfaces.ObjectTypeSampleData{
@@ -187,6 +203,195 @@ func (ots *objectTypeService) GetObjectTypeSampleData(ctx context.Context,
 
 func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 	query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+	return ots.getObjectsByObjectTypeID(ctx, query, false, nil, nil)
+}
+
+// GetObjectsByObjectTypeIDForScan keeps a Vega cursor from the first page for
+// callers that will consume the entire result. Ordinary one-shot object queries
+// continue to use stateless first pages so they do not exhaust cursor sessions.
+func (ots *objectTypeService) GetObjectsByObjectTypeIDForScan(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+	return ots.getObjectsByObjectTypeID(ctx, query, true, nil, nil)
+}
+
+// StreamObjectsByObjectTypeID maps and authorizes each Vega-managed batch
+// before handing it to the metric executor. No physical cursor is exposed.
+func (ots *objectTypeService) StreamObjectsByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, consume func(interfaces.Objects) error) error {
+	if consume == nil {
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("object stream consumer is required")
+	}
+	_, err := ots.getObjectsByObjectTypeID(ctx, query, true, nil, consume)
+	return err
+}
+
+// ScanObjectsByObjectTypeID reads query page by page so callers that act on a
+// whole match set never mistake its first page for all of it. Reading stops
+// once more than maxObjects objects are collected: the result then holds
+// maxObjects+1 objects, which is how callers learn the set is over their limit
+// without loading the rest of it. The first page supplies the type info and
+// the total count; the result carries no continuation. Incomplete marks a
+// match set that could not be read to the end.
+func (ots *objectTypeService) ScanObjectsByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, maxObjects int) (interfaces.Objects, error) {
+	if query == nil || maxObjects < 0 {
+		return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("invalid object scan")
+	}
+	var result interfaces.Objects
+	cursor := ""
+	for {
+		// Every page is read from a fresh copy: a read rewrites its query (row
+		// filter, default sort), and the continuation is bound to the original.
+		page := *query
+		page.Limit = interfaces.MAX_LIMIT
+		page.NeedTotal = true
+		page.Cursor = cursor
+		objects, err := ots.GetObjectsByObjectTypeIDForScan(ctx, &page)
+		if err != nil {
+			return interfaces.Objects{}, err
+		}
+		if cursor == "" {
+			result = objects
+			result.Datas = make([]map[string]any, 0, len(objects.Datas))
+		}
+		result.Datas = append(result.Datas, objects.Datas...)
+		if len(result.Datas) > maxObjects {
+			result.Datas = result.Datas[:maxObjects+1]
+			break
+		}
+		if objects.Paging != nil && objects.Paging.NextCursor != nil && len(objects.Datas) > 0 {
+			cursor = *objects.Paging.NextCursor
+			continue
+		}
+		// A full page without a continuation comes from an object type whose
+		// sort cannot be made total (see appendResourceSortTieBreakers). Its
+		// remaining rows cannot be addressed, so the result is flagged rather
+		// than passed off as complete.
+		result.Incomplete = len(objects.Datas) >= page.Limit && result.TotalCount > int64(len(result.Datas))
+		break
+	}
+	result.SearchAfter, result.ResourceCursor, result.ResourceCursorExpiry = nil, "", nil
+	result.ResourceNextOffset, result.Cursor = 0, ""
+	result.Paging = &interfaces.ObjectPagingResponse{}
+	return result, nil
+}
+
+// AggregateObjectsByObjectTypeID uses the same proxy, property and row-filter
+// decisions as object reads. It is intentionally an internal opt-in operation;
+// public callers cannot construct its aggregate specification.
+func (ots *objectTypeService) AggregateObjectsByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, measureProperty, operation string,
+	groupBy []string) (interfaces.Objects, error) {
+	countRows := operation == "count_rows" && measureProperty == ""
+	countPresent := operation == "count_present" && measureProperty != "" && len(groupBy) == 0
+	if query == nil || !countRows && !countPresent && (measureProperty == "" || operation != "count" || len(groupBy) > 1) {
+		return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("unsupported object aggregate")
+	}
+	queryCopy := *query
+	if countRows {
+		// Row count has no property operand. Grouping properties, when present,
+		// are still required in full so the aggregate follows the same property
+		// authorization and logical-to-physical mapping as object reads.
+		queryCopy.Properties = append([]string(nil), groupBy...)
+		queryCopy.RequiredFullProperties = append([]string(nil), groupBy...)
+		queryCopy.ObjectQueryInfo = nil
+		queryCopy.ExcludeSystemProperties = nil
+	} else {
+		queryCopy.Properties = append([]string{measureProperty}, groupBy...)
+		queryCopy.RequiredFullProperties = append([]string(nil), queryCopy.Properties...)
+		if countPresent {
+			queryCopy.ObjectQueryInfo = nil
+			queryCopy.ExcludeSystemProperties = nil
+		}
+	}
+	queryCopy.Cursor = ""
+	queryCopy.ResourceCursor = ""
+	queryCopy.ResourceOffset = 0
+	queryCopy.Offset = 0
+	queryCopy.Sort = nil
+	return ots.getObjectsByObjectTypeID(ctx, &queryCopy, false, &objectAggregateSpec{
+		measureProperty: measureProperty, operation: operation, groupBy: append([]string(nil), groupBy...),
+	}, nil)
+}
+
+// AggregateObjectMetricByObjectTypeID executes one authorized metric aggregate
+// through Vega's existing resource-query contract. It deliberately accepts
+// logical property names so authorization and physical mapping cannot be
+// bypassed by an internal caller.
+func (ots *objectTypeService) AggregateObjectMetricByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, aggregate interfaces.ObjectAggregateQuery) (interfaces.Objects, error) {
+	operations := map[string]bool{
+		"count_rows": true, "count": true, "count_distinct": true,
+		"sum": true, "avg": true, "min": true, "max": true,
+	}
+	countRows := aggregate.Operation == "count_rows"
+	if query == nil || !operations[aggregate.Operation] ||
+		(countRows && aggregate.MeasureProperty != "") || (!countRows && aggregate.MeasureProperty == "") {
+		return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("unsupported object metric aggregate")
+	}
+	if aggregate.Having != nil {
+		switch aggregate.Having.Operation {
+		case cond.OperationEq, cond.OperationNotEq, cond.OperationGt, cond.OperationGte,
+			cond.OperationLt, cond.OperationLte:
+		default:
+			return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+				oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("unsupported object metric having")
+		}
+	}
+	queryCopy := *query
+	queryCopy.Properties = append([]string(nil), aggregate.GroupBy...)
+	if !countRows {
+		queryCopy.Properties = append([]string{aggregate.MeasureProperty}, queryCopy.Properties...)
+	}
+	queryCopy.RequiredFullProperties = append([]string(nil), queryCopy.Properties...)
+	queryCopy.ObjectQueryInfo = nil
+	queryCopy.ExcludeSystemProperties = nil
+	queryCopy.Cursor = ""
+	queryCopy.ResourceCursor = ""
+	queryCopy.ResourceOffset = 0
+	queryCopy.Offset = 0
+	queryCopy.Sort = nil
+	return ots.getObjectsByObjectTypeID(ctx, &queryCopy, false, &objectAggregateSpec{
+		measureProperty: aggregate.MeasureProperty,
+		operation:       aggregate.Operation,
+		groupBy:         append([]string(nil), aggregate.GroupBy...),
+		propertyValue:   !countRows,
+		having:          aggregate.Having,
+	}, nil)
+}
+
+// AggregatePropertyByObjectTypeID keeps object authorization, property mapping
+// and row filters in the object-query boundary. Vega owns the physical path and
+// guarantees a successful aggregate result or returns an unsupported error.
+func (ots *objectTypeService) AggregatePropertyByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, measureProperty, operation string) (interfaces.Objects, error) {
+	if query == nil || measureProperty == "" ||
+		(operation != "sum" && operation != "avg" && operation != "min" && operation != "max" && operation != "count_distinct") {
+		return interfaces.Objects{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+			oerrors.OntologyQuery_ObjectType_InvalidParameter).WithErrorDetails("unsupported property aggregate")
+	}
+	queryCopy := *query
+	queryCopy.Properties = []string{measureProperty}
+	queryCopy.RequiredFullProperties = []string{measureProperty}
+	queryCopy.ObjectQueryInfo = nil
+	queryCopy.ExcludeSystemProperties = nil
+	queryCopy.Cursor = ""
+	queryCopy.ResourceCursor = ""
+	queryCopy.ResourceOffset = 0
+	queryCopy.Offset = 0
+	queryCopy.Sort = nil
+	return ots.getObjectsByObjectTypeID(ctx, &queryCopy, false, &objectAggregateSpec{
+		measureProperty: measureProperty, operation: operation, propertyValue: true,
+	}, nil)
+}
+
+func (ots *objectTypeService) getObjectsByObjectTypeID(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, continuousScan bool, aggregate *objectAggregateSpec,
+	streamConsumer func(interfaces.Objects) error) (interfaces.Objects, error) {
 
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "查询对象类的对象数据")
 	defer span.End()
@@ -195,24 +400,27 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 
 	var resps interfaces.Objects
 	if query == nil || query.Branch != interfaces.MAIN_BRANCH {
-		return resps, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return resps, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter).
 			WithErrorDetails("only the published main branch can be queried")
 	}
 
 	objectType, exists, err := ots.omAccess.GetObjectType(ctx, query.KNID, query.Branch, query.ObjectTypeID)
 	if err != nil {
+		if versionErr, ok := logics.KNVersionError(ctx, err); ok {
+			return resps, versionErr
+		}
 		span.SetAttributes(attribute.Key("model_id").String(query.ObjectTypeID))
 		otellog.LogError(ctx, fmt.Sprintf("Get Object Type error: %v", err), err)
 
-		return resps, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return resps, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetObjectTypesByIDFailed).WithErrorDetails(err.Error())
 	}
 	if !exists {
 		logger.Debugf("Object Type %d not found!", query.ObjectTypeID)
 
 		span.SetAttributes(attribute.Key("model_id").String(query.ObjectTypeID))
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
 		otellog.LogError(ctx, fmt.Sprintf("Object Type [%s] not found!", query.ObjectTypeID), httpErr)
 
 		return resps, httpErr
@@ -222,7 +430,7 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		for _, instanceIdentity := range query.ObjectQueryInfo.InstanceIdentity {
 			for _, key := range objectType.PrimaryKeys {
 				if _, exists := instanceIdentity[key]; !exists {
-					return resps, rest.NewHTTPError(ctx, http.StatusBadRequest,
+					return resps, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 						oerrors.OntologyQuery_ObjectType_InvalidParameter).
 						WithErrorDetails("one or more instance identities are invalid")
 				}
@@ -248,11 +456,11 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		return resps, logics.UnsupportedObjectTypeDataSourceError(ctx, objectType.OTID, dataSourceType)
 	}
 	if ots.proxy == nil {
-		return resps, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return resps, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_InternalError_CheckPermissionFailed).
 			WithErrorDetails("knowledge network proxy resolver is not configured")
 	}
-	proxyContext, err := ots.proxy.Resolve(ctx, interfaces.TrustedProxyBinding{
+	proxyContext, err := logics.ResolveDataProxy(ctx, ots.proxy, interfaces.TrustedProxyBinding{
 		KNID:       query.KNID,
 		ChildType:  interfaces.PermissionResourceTypeObjectType,
 		ChildID:    objectType.OTID,
@@ -263,7 +471,12 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 	if err != nil {
 		return resps, err
 	}
-	ctx = interfaces.WithTrustedProxyContext(ctx, proxyContext)
+	// A nil proxy context means the draft or a history version: read as the caller.
+	if proxyContext != nil {
+		ctx = interfaces.WithTrustedProxyContext(ctx, proxyContext)
+	}
+	// The version token ties cursors to the version they were read from.
+	versionToken := logics.ReadVersionToken(ctx, proxyContext)
 
 	if ots.rowFilters == nil {
 		return resps, propertyDecisionUnavailable(ctx, fmt.Errorf("row-filter resolver is not configured"))
@@ -295,8 +508,9 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 	// rejected user operation.
 	// A missing or explicitly empty sort both need the stable default used by
 	// Vega cursor paging. JSON clients commonly encode an optional empty list
-	// as [], which must not bypass this default.
-	if len(query.Sort) == 0 {
+	// as [], which must not bypass this default. Aggregates have no object-row
+	// continuation and must not inherit this sort.
+	if len(query.Sort) == 0 && aggregate == nil {
 		query.Sort = logics.BuildViewSort(objectType)
 	}
 
@@ -310,13 +524,13 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 			return resps, invalidQueryCursorError(ctx)
 		}
 		if dataSourceType == interfaces.DATA_SOURCE_TYPE_RESOURCE {
-			resourceCursor, resourceOffset, err := ots.cursor.decodeResource(ctx, query, proxyContext.PublishedModelVersion, query.Cursor)
+			resourceCursor, resourceOffset, err := ots.cursor.decodeResource(ctx, query, versionToken, query.Cursor)
 			if err != nil {
 				return resps, invalidQueryCursorError(ctx)
 			}
 			query.ResourceCursor, query.ResourceOffset = resourceCursor, resourceOffset
 		} else {
-			searchAfter, err := ots.cursor.decode(ctx, query, proxyContext.PublishedModelVersion, query.Cursor)
+			searchAfter, err := ots.cursor.decode(ctx, query, versionToken, query.Cursor)
 			if err != nil {
 				return resps, invalidQueryCursorError(ctx)
 			}
@@ -328,9 +542,16 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 	// an empty set directly; this is not post-query filtering.
 	if !query.RowFilterNoResults {
 		// 3. Request Vega Resource to get data.
-		err = ots.getObjectsFromResource(ctx, query, objectType, &resps, viewFieldPropMap, plan)
+		err = ots.getObjectsFromResource(ctx, query, objectType, &resps, viewFieldPropMap, plan,
+			continuousScan, aggregate, streamConsumer)
 		if err != nil {
 			return resps, err
+		}
+	} else {
+		// A false authorized predicate is complete without reading a resource.
+		// No physical query path was chosen, so provenance remains empty.
+		if aggregate != nil && aggregate.operation == "count_rows" && len(aggregate.groupBy) == 0 {
+			resps.Datas = []map[string]any{{"__value": json.Number("0")}}
 		}
 	}
 
@@ -343,7 +564,7 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		if ots.cursor == nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, fmt.Errorf("query cursor codec is not configured"))
 		}
-		resps.Cursor, err = ots.cursor.encodeResource(ctx, query, proxyContext.PublishedModelVersion,
+		resps.Cursor, err = ots.cursor.encodeResource(ctx, query, versionToken,
 			resps.ResourceCursor, resps.ResourceCursorExpiry)
 		if err != nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, err)
@@ -352,7 +573,7 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		if ots.cursor == nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, fmt.Errorf("query cursor codec is not configured"))
 		}
-		resps.Cursor, err = ots.cursor.encodeResourceOffset(ctx, query, proxyContext.PublishedModelVersion, resps.ResourceNextOffset)
+		resps.Cursor, err = ots.cursor.encodeResourceOffset(ctx, query, versionToken, resps.ResourceNextOffset)
 		if err != nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, err)
 		}
@@ -360,7 +581,7 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 		if ots.cursor == nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, fmt.Errorf("query cursor codec is not configured"))
 		}
-		resps.Cursor, err = ots.cursor.encode(ctx, query, proxyContext.PublishedModelVersion, resps.SearchAfter)
+		resps.Cursor, err = ots.cursor.encode(ctx, query, versionToken, resps.SearchAfter)
 		if err != nil {
 			return interfaces.Objects{}, propertyDecisionUnavailable(ctx, err)
 		}
@@ -386,49 +607,12 @@ func (ots *objectTypeService) GetObjectsByObjectTypeID(ctx context.Context,
 // approved by the access plan. The raw dependency values stay in this local
 // row and are discarded immediately after projection.
 func (*objectTypeService) addLogicProperties(ctx context.Context, object map[string]any,
-	objectType interfaces.ObjectType, plan *propertyAccessPlan) error {
+	logicProperties []*interfaces.LogicProperty) error {
 
 	var err error
 
-	for _, logicProp := range objectType.LogicProperties {
-		if _, allowed := plan.returnLogic[logicProp.Name]; !allowed {
-			continue
-		}
+	for _, logicProp := range logicProperties {
 		switch logicProp.Type {
-		case interfaces.LOGIC_PROPERTY_TYPE_METRIC:
-			filters := []interfaces.Filter{}
-			dynamicParams := map[string]any{}
-			for _, param := range logicProp.Parameters {
-				switch param.ValueFrom {
-				case interfaces.LOGIC_PARAMS_VALUE_FROM_PROP:
-					value := object[param.Value.(string)]
-					filters = append(filters, interfaces.Filter{
-						Name:      param.Name,
-						Operation: param.Operation,
-						Value:     value,
-					})
-				case interfaces.LOGIC_PARAMS_VALUE_FROM_CONST:
-					// Fixed parameter and.
-					filters = append(filters, interfaces.Filter{
-						Name:      param.Name,
-						Operation: "==",
-						Value:     param.Value,
-					})
-				case interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT:
-					dynamicParams[param.Name] = param
-				}
-			}
-
-			mProp := interfaces.MetricProperty{
-				PropertyType:    logicProp.Type,
-				MappingSourceId: logicProp.DataSource.ID,
-				Parameters: interfaces.MetricFilters{
-					Filters: filters,
-				},
-				DynamicParams: dynamicParams,
-			}
-			object[logicProp.Name] = mProp
-
 		case interfaces.LOGIC_PROPERTY_TYPE_TOOL:
 			paramsJson := "{}"
 			dynamicParamsJson := "{}"
@@ -438,7 +622,7 @@ func (*objectTypeService) addLogicProperties(ctx context.Context, object map[str
 					value := object[param.Value.(string)]
 					paramsJson, err = sjson.Set(paramsJson, param.Name, value)
 					if err != nil {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 							WithErrorDetails(fmt.Sprintf("Error setting logic property[%s]'s parameter path %s: %v",
 								logicProp.Name, param.Name, err.Error()))
 					}
@@ -446,14 +630,14 @@ func (*objectTypeService) addLogicProperties(ctx context.Context, object map[str
 				case interfaces.LOGIC_PARAMS_VALUE_FROM_CONST:
 					paramsJson, err = sjson.Set(paramsJson, param.Name, param.Value)
 					if err != nil {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 							WithErrorDetails(fmt.Sprintf("Error setting logic property[%s]'s parameter path %s: %v",
 								logicProp.Name, param.Name, err.Error()))
 					}
 				case interfaces.LOGIC_PARAMS_VALUE_FROM_INPUT:
 					dynamicParamsJson, err = sjson.Set(dynamicParamsJson, param.Name, param)
 					if err != nil {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 							WithErrorDetails(fmt.Sprintf("Error setting logic property[%s]'s dynamic parameter path %s: %v",
 								logicProp.Name, param.Name, err.Error()))
 					}
@@ -462,7 +646,7 @@ func (*objectTypeService) addLogicProperties(ctx context.Context, object map[str
 			params := map[string]any{}
 			err = sonic.Unmarshal([]byte(paramsJson), &params)
 			if err != nil {
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 					WithErrorDetails(fmt.Sprintf("failed to Unmarshal logic property[%s]'s paramtersJson to map, %s",
 						logicProp.Name, err.Error()))
 			}
@@ -470,7 +654,7 @@ func (*objectTypeService) addLogicProperties(ctx context.Context, object map[str
 			dynamicParams := map[string]any{}
 			err = sonic.Unmarshal([]byte(dynamicParamsJson), &dynamicParams)
 			if err != nil {
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_InternalError_UnMarshalDataFailed).
 					WithErrorDetails(fmt.Sprintf("failed to Unmarshal logic property[%s]'s dynamicParamsJson to map, %s",
 						logicProp.Name, err.Error()))
 			}
@@ -489,6 +673,16 @@ func (*objectTypeService) addLogicProperties(ctx context.Context, object map[str
 	return nil
 }
 
+func selectedObjectLogicProperties(objectType interfaces.ObjectType, plan *propertyAccessPlan) []*interfaces.LogicProperty {
+	selected := make([]*interfaces.LogicProperty, 0, len(plan.returnLogic))
+	for _, property := range objectType.LogicProperties {
+		if _, allowed := plan.returnLogic[property.Name]; allowed {
+			selected = append(selected, property)
+		}
+	}
+	return selected
+}
+
 // getObjectsFromResource queries vega-backend resource data (same row mapping as view path).
 // downstreamErrorCode selects the error code by downstream status code.
 //
@@ -500,18 +694,18 @@ func downstreamErrorCode(statusCode int) string {
 	case http.StatusBadRequest:
 		return oerrors.OntologyQuery_ObjectType_InvalidParameter
 	case http.StatusUnauthorized:
-		return rest.PublicError_Unauthorized
+		return httperrors.PublicError_Unauthorized
 	case http.StatusForbidden:
-		return rest.PublicError_Forbidden
+		return httperrors.PublicError_Forbidden
 	case http.StatusNotFound:
-		return rest.PublicError_NotFound
+		return httperrors.PublicError_NotFound
 	case http.StatusConflict:
-		return rest.PublicError_Conflict
+		return httperrors.PublicError_Conflict
 	case http.StatusTooManyRequests:
 		return oerrors.OntologyQuery_ObjectType_TooManyRequests
 	default:
 		// Other 4xx statuses (405/413/422, etc.) do not have semantically corresponding public error codes. Do not fall back here to
-		// rest.PublicError_BadRequest: its en-US message is "Internal Server Error",
+		// httperrors.PublicError_BadRequest: its en-US message is "Internal Server Error",
 		// English callers would read "Internal Server Error" for a 413, which is exactly the misleading behavior this change avoids.
 		// Fall back to this service's parameter error code: messages in both languages are correct and behavior stays consistent with before. The real
 		// semantics are carried by the faithfully passed-through status code and the reason returned by downstream.
@@ -529,23 +723,47 @@ func proxyDownstreamErrorCode(statusCode int) string {
 	return downstreamErrorCode(statusCode)
 }
 
+// resourceQueryClientError reports keyword-limit fields in the object's property namespace.
+func resourceQueryClientError(ctx context.Context, downstream *interfaces.VegaDownstreamError, properties []cond.DataProperty) *httperrors.HTTPError {
+	mapped := *downstream
+	metadata := downstream.ClientMetadata()
+	if metadata != nil {
+		name, matches := "", 0
+		for _, property := range properties {
+			if property.MappedField.Name == metadata["field"] {
+				name = property.Name
+				matches++
+			}
+		}
+		if matches == 1 && name != "" {
+			metadata["field"] = name
+		} else {
+			// Ambiguous or unknown bindings cannot identify a caller property reliably.
+			delete(metadata, "field")
+		}
+		mapped.Metadata = metadata
+	}
+	return httperrors.NewHTTPError(ctx, downstream.StatusCode, proxyDownstreamErrorCode(downstream.StatusCode)).
+		WithErrorDetails(mapped.ClientMessage()).WithMetadata(metadata)
+}
+
 func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query *interfaces.ObjectQueryBaseOnObjectType,
 	objectType interfaces.ObjectType, resps *interfaces.Objects, fieldPropMap map[string]string,
-	plan *propertyAccessPlan) error {
+	plan *propertyAccessPlan, continuousScan bool, aggregate *objectAggregateSpec,
+	streamConsumer func(interfaces.Objects) error) error {
 
 	resourceSort, err := logics.MapSortFieldsForDataView(ctx, query.Sort, objectType)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
 			WithErrorDetails(err.Error())
 	}
 	// A legacy object type may expose a schema-only primary key without a
 	// physical resource mapping. Its sort cannot be made total, so it keeps the
 	// historical single-page behavior and never returns a continuation.
 	stable := true
-	if query.ResourceCursor == "" {
+	if query.ResourceCursor == "" && aggregate == nil {
 		resourceSort, stable = appendResourceSortTieBreakers(resourceSort, objectType)
 	}
-
 	viewQuery := interfaces.ViewQuery{
 		NeedTotal:         query.NeedTotal,
 		Limit:             query.Limit,
@@ -560,14 +778,14 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 				return ots.handlerVector(ctx, property, word)
 			}))
 		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusBadRequest,
+			return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 				oerrors.OntologyQuery_InvalidParameter_Condition).
 				WithErrorDetails(fmt.Sprintf("failed to rewrite ontology condition for resource, %s", err.Error()))
 		}
 		viewQuery.Filters = rewriteCondition
 	}
 	if objectType.DataSource == nil || objectType.DataSource.ID == "" {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("object type [%s] has empty data source", objectType.OTID))
 	}
@@ -581,52 +799,227 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 	}
 	sort.Strings(outputFields)
 	params := &interfaces.ResourceDataQueryParams{
-		IgnoreLocalIndex: &query.IgnoreLocalIndex,
-		NeedTotal:        query.NeedTotal,
-		Sort:             resourceSort,
-		SearchAfter:      query.SearchAfter,
-		FilterCondition:  logics.CondCfgToFilterMap(viewQuery.Filters),
-		OutputFields:     outputFields,
+		NeedTotal:       query.NeedTotal,
+		Sort:            resourceSort,
+		SearchAfter:     query.SearchAfter,
+		FilterCondition: logics.CondCfgToFilterMap(viewQuery.Filters),
+		OutputFields:    outputFields,
 	}
-	resp, nextOffset, err := ots.queryResourcePage(ctx, objectType.DataSource.ID, query, params, stable)
+	if streamConsumer != nil {
+		if !stable {
+			return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
+				oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).
+				WithErrorDetails("object resource has no stable sort for a complete cursor scan")
+		}
+		page := *params
+		if query.IgnoreLocalIndex {
+			page.IgnoreLocalIndex = &query.IgnoreLocalIndex
+		}
+		page.Paging = interfaces.ResourceDataPagingRequest{
+			Mode: interfaces.ResourceDataPagingModeCursor, Limit: interfaces.MAX_LIMIT,
+			KeepAliveSec: int(continuousScanCursorTTL / time.Second),
+		}
+		activeCursor := ""
+		var scanned int64
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			response, readErr := ots.vba.QueryResourceData(ctx, objectType.DataSource.ID, &page)
+			if readErr != nil {
+				return ots.objectResourceQueryError(ctx, readErr, objectType)
+			}
+			if response == nil {
+				return ots.objectResourceQueryError(ctx, fmt.Errorf("vega resource cursor returned no page"), objectType)
+			}
+			if response.Paging == nil {
+				return ots.objectResourceQueryError(ctx, fmt.Errorf("vega resource cursor returned no paging envelope"), objectType)
+			}
+			activeCursor = ""
+			if response.Paging.NextCursor != nil {
+				activeCursor = *response.Paging.NextCursor
+			}
+			if len(response.Entries) == 0 && activeCursor != "" {
+				return ots.objectResourceQueryError(ctx, fmt.Errorf("vega resource cursor returned an empty nonterminal page"), objectType)
+			}
+			decisions, err := ots.rowFilters.ResolveRowFilters(ctx, []string{query.KNID + "/" + objectType.OTID})
+			if err != nil {
+				return err
+			}
+			if len(decisions) != 1 || decisions[0].ObjectTypeRef != query.KNID+"/"+objectType.OTID ||
+				decisions[0].EffectiveRowFilterDigest != query.EffectiveRowFilterDigest {
+				return httperrors.NewHTTPError(ctx, http.StatusConflict, httperrors.PublicError_Conflict).
+					WithErrorDetails("row-filter authorization changed during the object scan")
+			}
+			currentPlan, err := buildPropertyAccessPlan(ctx, ots.propertyAccess, objectType, query, true)
+			if err != nil {
+				return err
+			}
+			if !maps.Equal(currentPlan.decisions, plan.decisions) {
+				return httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden).
+					WithErrorDetails("property authorization changed during the object scan")
+			}
+			if len(response.Entries) > 0 {
+				objects, err := ots.projectResourceObjectEntries(ctx, query, objectType, fieldPropMap, plan, response.Entries)
+				if err != nil {
+					return err
+				}
+				batch := interfaces.Objects{Datas: objects,
+					RowFilterApplied: resps.RowFilterApplied, EffectivePermissions: plan.effective}
+				if query.IncludeTypeInfo {
+					filteredObjectType := plan.filterObjectType(objectType)
+					batch.ObjectType = &filteredObjectType
+				}
+				if err := streamConsumer(batch); err != nil {
+					return err
+				}
+				scanned += int64(len(response.Entries))
+			}
+			if activeCursor == "" {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				resps.QuerySource = response.QuerySource
+				resps.TotalCount = scanned
+				return nil
+			}
+			page = interfaces.ResourceDataQueryParams{Paging: interfaces.ResourceDataPagingRequest{Cursor: activeCursor}}
+		}
+	}
+	var resp *interfaces.DatasetQueryResponse
+	var nextOffset int
+	if aggregate == nil {
+		// Preserve the established object-query source preference. Aggregate
+		// execution deliberately leaves physical source selection to Vega.
+		params.IgnoreLocalIndex = &query.IgnoreLocalIndex
+		resp, nextOffset, err = ots.queryResourcePage(ctx, objectType.DataSource.ID, query, params, stable, continuousScan)
+	} else if aggregate.operation == "count_rows" && len(aggregate.groupBy) == 0 {
+		// Vega's existing need_total contract counts the authorized filtered
+		// resource rows. Only one detail row is requested and never returned to
+		// the metric caller; the physical count and source remain Vega's choice.
+		params.Sort = nil
+		params.NeedTotal = true
+		params.Paging = interfaces.ResourceDataPagingRequest{
+			Mode: interfaces.ResourceDataPagingModeSingle, Limit: 1,
+		}
+		resp, err = ots.vba.QueryResourceData(ctx, objectType.DataSource.ID, params)
+	} else {
+		measureField := "*"
+		params.Sort = nil
+		operation := aggregate.operation
+		if operation == "count_rows" {
+			operation = "count"
+			params.NeedTotal = true
+		} else {
+			measure, exists := plan.properties[aggregate.measureProperty]
+			if !exists || measure.MappedField.Name == "" {
+				return unavailableOperationPropertyError(ctx)
+			}
+			measureField = measure.MappedField.Name
+			if operation == "count_present" {
+				operation = "count"
+			}
+		}
+		params.Aggregation = map[string]any{"property": measureField,
+			"aggr": operation, "alias": "__value"}
+		if operation == "count_distinct" && query.AggregateAllowApproximate != nil {
+			params.Aggregation["allow_approximate"] = *query.AggregateAllowApproximate
+		}
+		if len(aggregate.groupBy) == 0 && (aggregate.operation == "count_present" || aggregate.propertyValue) {
+			params.Having = map[string]any{"field": "count(*)", "operation": ">", "value": 0}
+		}
+		params.OutputFields = []string{"__value"}
+		for _, name := range aggregate.groupBy {
+			property, found := plan.properties[name]
+			if !found || property.MappedField.Name == "" {
+				return unavailableOperationPropertyError(ctx)
+			}
+			params.GroupBy = append(params.GroupBy, map[string]any{"property": property.MappedField.Name})
+			params.OutputFields = append(params.OutputFields, property.MappedField.Name)
+		}
+		if len(aggregate.groupBy) > 0 && aggregate.having != nil {
+			params.Having = map[string]any{"field": "__value", "operation": aggregate.having.Operation,
+				"value": aggregate.having.Value}
+		}
+		limit := query.Limit
+		if len(aggregate.groupBy) > 0 {
+			// Public metric page_size is final-result pagination. Read one complete
+			// bounded aggregate page and fall back when Vega reports more groups.
+			limit = interfaces.MAX_LIMIT
+		}
+		params.Paging = interfaces.ResourceDataPagingRequest{Mode: interfaces.ResourceDataPagingModeSingle, Limit: limit}
+		resp, err = ots.vba.QueryResourceData(ctx, objectType.DataSource.ID, params)
+	}
 	if err != nil {
 		// When downstream identifies a caller-side issue (4xx), pass through the original status code and carry its reason upward.
 		// Upgrading everything to 500 makes self-correctable problems such as unsupported operators or resources without built indexes look
 		// like service failures, preventing callers from self-correcting and sending manual investigation in the wrong direction.
 		if downstream, ok := interfaces.AsVegaDownstreamError(err); ok && downstream.IsClientError() {
-			return rest.NewHTTPError(ctx, downstream.StatusCode,
-				proxyDownstreamErrorCode(downstream.StatusCode)).
-				WithErrorDetails(downstream.ClientMessage())
+			return resourceQueryClientError(ctx, downstream, objectType.DataProperties)
 		}
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).
 			WithErrorDetails("object resource query failed")
 	}
 	if resp == nil {
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).WithErrorDetails("vega resource query returned nil")
 	}
-
-	objects := make([]map[string]any, 0, len(resp.Entries))
-	for _, col := range resp.Entries {
-		rawObject := map[string]any{}
-		for k, v := range col {
-			if k == interfaces.SORT_FIELD_SCORE {
-				// Score is query metadata; projectRow applies its visibility policy.
-				rawObject[k] = v
-			} else if propName, exists := fieldPropMap[k]; exists {
-				rawObject[propName] = v
+	if aggregate != nil {
+		if resp.IsApproximate != nil {
+			resps.IsApproximate = *resp.IsApproximate
+		}
+		if aggregate.operation == "count_distinct" && resp.IsApproximate == nil {
+			if query.AggregateAllowApproximate != nil && !*query.AggregateAllowApproximate {
+				return httperrors.NewHTTPError(ctx, http.StatusBadGateway, oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).
+					WithErrorDetails("resource distinct count response is missing accuracy metadata; upgrade Vega before using exact distinct aggregates")
+			}
+			// Older Vega responses cannot prove exactness; preserve default approximate queries.
+			resps.IsApproximate = true
+		}
+		if aggregate.operation == "count_rows" && len(aggregate.groupBy) == 0 {
+			resps.Datas = []map[string]any{{"__value": json.Number(strconv.FormatInt(resp.TotalCount, 10))}}
+			resps.QuerySource = resp.QuerySource
+			resps.TotalCount = resp.TotalCount
+			return nil
+		}
+		if len(aggregate.groupBy) > 0 {
+			returned := int64(len(resp.Entries))
+			if returned > int64(params.Paging.Limit) {
+				return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+					oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).
+					WithErrorDetails("Vega grouped aggregate exceeded the requested page limit")
+			}
+			if returned == int64(params.Paging.Limit) {
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
+					oerrors.OntologyQuery_ObjectType_InvalidParameter).
+					WithErrorDetails("complete grouped aggregate is unavailable in one Vega page")
 			}
 		}
-		if err := ots.addLogicProperties(ctx, rawObject, objectType, plan); err != nil {
-			return err
+		resps.Datas = make([]map[string]any, 0, len(resp.Entries))
+		for _, entry := range resp.Entries {
+			row := map[string]any{"__value": entry["__value"]}
+			for _, name := range aggregate.groupBy {
+				row[name] = entry[plan.properties[name].MappedField.Name]
+			}
+			resps.Datas = append(resps.Datas, row)
 		}
-		object := plan.projectRow(rawObject, &objectType, query)
-		if len(object) > 0 {
-			objects = append(objects, object)
+		resps.QuerySource = resp.QuerySource
+		if len(aggregate.groupBy) > 0 {
+			// Resource connectors do not expose one uniform aggregate-total
+			// meaning: source tables report groups while local indexes report
+			// matched documents. A short single page is complete by the paging
+			// contract, and the aggregate boundary exposes its returned groups.
+			resps.TotalCount = int64(len(resps.Datas))
 		} else {
-			logger.Warnf("resource row could not produce a sanitized object for object type [%s/%s]", query.KNID, objectType.OTID)
+			resps.TotalCount = resp.TotalCount
 		}
+		return nil
+	}
+
+	objects, err := ots.projectResourceObjectEntries(ctx, query, objectType, fieldPropMap, plan, resp.Entries)
+	if err != nil {
+		return err
 	}
 	resps.QuerySource = resp.QuerySource
 	resps.TotalCount = resp.TotalCount
@@ -643,8 +1036,59 @@ func (ots *objectTypeService) getObjectsFromResource(ctx context.Context, query 
 	return nil
 }
 
+func (ots *objectTypeService) projectResourceObjectEntries(ctx context.Context,
+	query *interfaces.ObjectQueryBaseOnObjectType, objectType interfaces.ObjectType,
+	fieldPropMap map[string]string, plan *propertyAccessPlan, entries []map[string]any) ([]map[string]any, error) {
+	// The access plan is fixed for this request. Preserve declaration order,
+	// but do not recheck every unrequested logical property on every row.
+	selectedLogicProperties := selectedObjectLogicProperties(objectType, plan)
+	objects := make([]map[string]any, 0, len(entries))
+	for _, col := range entries {
+		rawObject := map[string]any{}
+		for k, v := range col {
+			if k == interfaces.SORT_FIELD_SCORE {
+				// Score is query metadata; projectRow applies its visibility policy.
+				rawObject[k] = v
+			} else if propName, exists := fieldPropMap[k]; exists {
+				rawObject[propName] = v
+			}
+		}
+		if err := ots.addLogicProperties(ctx, rawObject, selectedLogicProperties); err != nil {
+			return nil, err
+		}
+		object := plan.projectRow(rawObject, &objectType, query)
+		if len(object) > 0 {
+			objects = append(objects, object)
+		} else {
+			logger.Warnf("resource row could not produce a sanitized object for object type [%s/%s]", query.KNID, objectType.OTID)
+		}
+	}
+	return objects, nil
+}
+
+func (ots *objectTypeService) objectResourceQueryError(ctx context.Context, err error,
+	objectType interfaces.ObjectType) error {
+	var localHTTPError *httperrors.HTTPError
+	if errors.As(err, &localHTTPError) {
+		return localHTTPError
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if downstream, ok := interfaces.AsVegaDownstreamError(err); ok && downstream.IsClientError() {
+		return resourceQueryClientError(ctx, downstream, objectType.DataProperties)
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+		oerrors.OntologyQuery_ObjectType_InternalError_GetViewDataByIDFailed).
+		WithErrorDetails("object resource query failed")
+}
+
 // vegaIndexResultWindow is Vega's bound on offset+limit for index-backed reads.
 const vegaIndexResultWindow = 10000
+
+// Metric-style scans consume cursor pages immediately. A short idle lifetime
+// bounds sessions left behind if a scan stops early at its row limit or fails.
+const continuousScanCursorTTL = 2 * time.Minute
 
 // queryResourcePage reads one page and returns the stateless next-row offset,
 // if any.
@@ -657,7 +1101,7 @@ const vegaIndexResultWindow = 10000
 // beyond the offset window working.
 func (ots *objectTypeService) queryResourcePage(ctx context.Context, resourceID string,
 	query *interfaces.ObjectQueryBaseOnObjectType, params *interfaces.ResourceDataQueryParams,
-	stable bool) (*interfaces.DatasetQueryResponse, int, error) {
+	stable, continuousScan bool) (*interfaces.DatasetQueryResponse, int, error) {
 	if query.ResourceCursor != "" {
 		resp, err := ots.vba.QueryResourceData(ctx, resourceID, &interfaces.ResourceDataQueryParams{
 			Paging: interfaces.ResourceDataPagingRequest{Cursor: query.ResourceCursor},
@@ -665,6 +1109,17 @@ func (ots *objectTypeService) queryResourcePage(ctx context.Context, resourceID 
 		return resp, 0, err
 	}
 	if query.ResourceOffset <= 0 {
+		if continuousScan && stable {
+			cursorParams := *params
+			cursorParams.Paging = interfaces.ResourceDataPagingRequest{
+				Mode: interfaces.ResourceDataPagingModeCursor, Limit: query.Limit,
+				Offset: query.Offset, KeepAliveSec: int(continuousScanCursorTTL / time.Second),
+			}
+			resp, err := ots.vba.QueryResourceData(ctx, resourceID, &cursorParams)
+			if err == nil || !isCursorPagingUnsupported(err) {
+				return resp, 0, err
+			}
+		}
 		return ots.querySingleResourcePage(ctx, resourceID, query, params, query.Offset, stable)
 	}
 
@@ -776,9 +1231,11 @@ func appendResourceSortTieBreakers(sorts []*interfaces.SortParams, objectType in
 }
 
 // Vectorize the query statement.
-func (ots *objectTypeService) handlerVector(ctx context.Context, property *cond.DataProperty, word string) ([]cond.VectorResp, error) {
+func (ots *objectTypeService) handlerVector(_ context.Context, property *cond.DataProperty, _ string) ([]cond.VectorResp, error) {
 	return nil, fmt.Errorf("ontology-query no longer vectorizes property %q; Vega Resource resolves vector conditions", property.Name)
 }
+
+const maxConcurrentLogicProperties = 16
 
 func (ots *objectTypeService) GetObjectPropertyValue(ctx context.Context,
 	query *interfaces.ObjectPropertyValueQuery) (interfaces.Objects, error) {
@@ -862,56 +1319,64 @@ func (ots *objectTypeService) GetObjectPropertyValue(ctx context.Context,
 
 		datas[i] = newObject
 	}
-	// Step 2: concurrently process all logical properties for all objects.
+	// Step 2: process tool-backed logical properties with bounded concurrency.
+	// A page may contain thousands of objects, and one goroutine per property
+	// would overload the downstream execution service.
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	errChan := make(chan error, len(objects.Datas)*len(logicProperties)) // Large enough buffer.
+	var processErrors []error
+	semaphore := make(chan struct{}, maxConcurrentLogicProperties)
 
-	for i, object := range objects.Datas {
-		for prop, value := range object {
-			if !propertyNames[prop] {
-				continue
+	launchProperty := func(i int, prop string, value any, logicProp *interfaces.LogicProperty) {
+		semaphore <- struct{}{}
+		wg.Add(1)
+		go func(objIndex int, propName string, propValue any, logicProp *interfaces.LogicProperty) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			logger.Debugf("Processing logical property of object [%d]: %s", objIndex, propName)
+			resultValue, err := ots.processLogicProperty(ctx, query.KNID, query.Branch, query.ObjectTypeID,
+				propName, propValue, logicProp, query.DynamicParams)
+			if err != nil {
+				localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx),
+					"OntologyQuery.Validation.Detail.LogicPropertyProcessFailed", map[string]any{
+						"index":    objIndex,
+						"property": propName,
+					})
+				if renderErr != nil {
+					logger.Errorf("localized message rendering failed: %v", renderErr)
+				}
+				mu.Lock()
+				processErrors = append(processErrors, fmt.Errorf("%s: %w", localizedText, err))
+				mu.Unlock()
+				return
 			}
 
-			// Process only logical properties.
-			if logicProp, exist := logicProperties[prop]; exist {
-				wg.Add(1)
-				go func(objIndex int, propName string, propValue any, logicProp *interfaces.LogicProperty) {
-					defer wg.Done()
+			// Safely write the result to the corresponding object.
+			mu.Lock()
+			datas[objIndex][propName] = resultValue
+			mu.Unlock()
 
-					logger.Debugf("处理对象[%d]的逻辑属性: %s", i, propName)
-					resultValue, err := ots.processLogicProperty(ctx, query.KNID, query.Branch, query.ObjectTypeID,
-						propName, propValue, logicProp, query.DynamicParams)
-					if err != nil {
-						detail := locale.ValidationDetail(ctx, "LogicPropertyProcessFailed", map[string]any{
-							"index":    objIndex,
-							"property": propName,
-						})
-						errChan <- fmt.Errorf("%s: %w", detail, err)
-						return
-					}
-
-					// Safely write the result to the corresponding object.
-					mu.Lock()
-					datas[objIndex][propName] = resultValue
-					mu.Unlock()
-
-				}(i, prop, value, logicProp)
+		}(i, prop, value, logicProp)
+	}
+	for i, object := range objects.Datas {
+		for prop, value := range object {
+			if logicProp := logicProperties[prop]; propertyNames[prop] && logicProp != nil {
+				launchProperty(i, prop, value, logicProp)
 			}
 		}
 	}
 
 	// Wait for all logical-property processing to complete.
 	wg.Wait()
-	close(errChan)
 
 	// Check errors.
-	if len(errChan) > 0 {
-		var errors []string
-		for err := range errChan {
+	if len(processErrors) > 0 {
+		errors := make([]string, 0, len(processErrors))
+		for _, err := range processErrors {
 			errors = append(errors, err.Error())
 		}
-		return resps, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return resps, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			oerrors.OntologyQuery_ObjectType_InternalError_ProcessLogicPropertiesFailed).
 			WithErrorDetails(strings.Join(errors, "; "))
 	}
@@ -929,102 +1394,19 @@ func (ots *objectTypeService) GetObjectPropertyValue(ctx context.Context,
 
 // processLogicProperty handles a single logical property and wraps the original processing logic.
 func (ots *objectTypeService) processLogicProperty(ctx context.Context,
-	knID, branch, otID string,
+	knID, _, otID string,
 	propName string,
 	propValue any,
 	logicProp *interfaces.LogicProperty,
 	dynamicParams map[string]map[string]any) (any, error) {
 
 	switch logicProp.Type {
-	case interfaces.PROPERTY_TYPE_METRIC:
-		return ots.handleMetricProperty(ctx, knID, branch, otID, propName, propValue, logicProp, dynamicParams)
 	case interfaces.LOGIC_PROPERTY_TYPE_TOOL:
 		return ots.handleToolProperty(ctx, knID, otID, propName, propValue, logicProp, dynamicParams)
 	default:
 		logger.Warnf("不支持的逻辑属性类型: %s", logicProp.Type)
 		return nil, nil
 	}
-}
-
-// handleMetricProperty handles metric-type logical properties using KN MetricDefinition plus the Vega value-computation kernel.
-func (ots *objectTypeService) handleMetricProperty(ctx context.Context,
-	knID, branch, otID string,
-	propName string,
-	propValue any,
-	logicProp *interfaces.LogicProperty,
-	dynamicParams map[string]map[string]any) (interfaces.MetricData, error) {
-
-	var (
-		// start and end stay nil unless the caller asks for a time range.
-		// They used to default to the last thirty minutes, which made every
-		// call look like a time-filtered one: a metric without a
-		// time_dimension was then refused for a filter nobody had asked for,
-		// and a metric with one silently answered for half an hour instead of
-		// its own default_range_policy.
-		start     *int64
-		end       *int64
-		isInstant bool
-		step      string
-	)
-
-	metricValue := propValue.(interfaces.MetricProperty)
-	isInstant = true
-
-	var metricParams interfaces.MetricPropertyDynamicParams
-	paramBytes, err := sonic.Marshal(dynamicParams[propName])
-	if err != nil {
-		return interfaces.MetricData{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
-			oerrors.OntologyQuery_ObjectType_InvalidParameter_DynamicParams).
-			WithErrorDetails(locale.ValidationDetail(ctx, "DynamicParamDecodeFailed", map[string]any{
-				"property": propName, "error": err.Error(),
-			}))
-	}
-	if err = sonic.Unmarshal(paramBytes, &metricParams); err != nil {
-		return interfaces.MetricData{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
-			oerrors.OntologyQuery_ObjectType_InvalidParameter_DynamicParams).
-			WithErrorDetails(locale.ValidationDetail(ctx, "DynamicParamDecodeFailed", map[string]any{
-				"property": propName, "error": err.Error(),
-			}))
-	}
-
-	start, end = logicMetricTimeWindow(metricParams, time.Now().UnixMilli())
-	if metricParams.Instant != nil {
-		isInstant = *metricParams.Instant
-	}
-	if metricParams.Step != nil {
-		step = *metricParams.Step
-	}
-
-	for paramK := range metricValue.DynamicParams {
-		switch paramK {
-		case "start", "end", "instant", "step":
-			continue
-		default:
-			paramValue, paramExist := dynamicParams[propName][paramK]
-			if !paramExist {
-				return interfaces.MetricData{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
-					oerrors.OntologyQuery_ObjectType_InvalidParameter_DynamicParams).
-					WithErrorDetails(locale.ValidationDetail(ctx, "MetricDynamicParamRequired", map[string]any{
-						"property": propName, "parameter": paramK,
-					}))
-			}
-			operation := "=="
-			for _, configParam := range logicProp.Parameters {
-				if configParam.Name == paramK && configParam.Operation != "" {
-					operation = configParam.Operation
-				}
-			}
-			metricValue.Parameters.Filters = append(metricValue.Parameters.Filters,
-				interfaces.Filter{
-					Name:      paramK,
-					Operation: operation,
-					Value:     paramValue,
-				})
-		}
-	}
-
-	return ots.queryLogicMetricViaKN(ctx, knID, branch, otID, logicProp,
-		metricValue.Parameters.Filters, metricParams, start, end, isInstant, step)
 }
 
 // handleToolProperty handles logic properties backed by ToolBox tools.
@@ -1038,11 +1420,13 @@ func (ots *objectTypeService) handleToolProperty(ctx context.Context,
 
 	toolValue := propValue.(interfaces.ToolProperty)
 	if _, dynamicParamExist := dynamicParams[propName]; !dynamicParamExist && len(toolValue.DynamicParams) > 0 {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail.LogicPropertyDynamicParamsRequired", map[string]any{"property": propName, "parameters": toolValue.DynamicParams})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			oerrors.OntologyQuery_ObjectType_InvalidParameter_DynamicParams).
-			WithErrorDetails(locale.ValidationDetail(ctx, "LogicPropertyDynamicParamsRequired", map[string]any{
-				"property": propName, "parameters": toolValue.DynamicParams,
-			}))
+			WithErrorDetails(localizedText)
 	}
 
 	toolRequest := generateToolExecutionRequest(logicProp.Parameters, toolValue.Parameters, dynamicParams[propName])
@@ -1054,11 +1438,11 @@ func (ots *objectTypeService) handleToolProperty(ctx context.Context,
 		Timeout: 300,
 	}
 	if ots.proxy == nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			oerrors.OntologyQuery_InternalError_CheckPermissionFailed).
 			WithErrorDetails("knowledge network proxy resolver is not configured")
 	}
-	proxyContext, err := ots.proxy.Resolve(ctx, interfaces.TrustedProxyBinding{
+	proxyContext, err := logics.ResolveDataProxy(ctx, ots.proxy, interfaces.TrustedProxyBinding{
 		KNID:      knID,
 		ChildType: interfaces.PermissionResourceTypeLogicProperty,
 		ChildID:   logicPropertyBindingID(knID, objectTypeID, propName),
@@ -1068,15 +1452,23 @@ func (ots *objectTypeService) handleToolProperty(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	toolResult, err := ots.aoAccess.ExecuteToolAsProxy(interfaces.WithTrustedProxyContext(ctx, proxyContext),
-		logicProp.DataSource.BoxID, logicProp.DataSource.ToolID, request)
+	var toolResult any
+	if proxyContext == nil {
+		// The draft or a history version: the tool runs with the caller's own permissions.
+		toolResult, err = ots.aoAccess.ExecuteTool(ctx, logicProp.DataSource.BoxID, logicProp.DataSource.ToolID, request)
+	} else {
+		toolResult, err = ots.aoAccess.ExecuteToolAsProxy(interfaces.WithTrustedProxyContext(ctx, proxyContext),
+			logicProp.DataSource.BoxID, logicProp.DataSource.ToolID, request)
+	}
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
-			oerrors.OntologyQuery_ObjectType_InternalError_ExecuteToolFailed).
-			WithErrorDetails(locale.ValidationDetail(ctx, "ToolExecutionFailed", map[string]any{
-				"property": propName, "toolbox": logicProp.DataSource.BoxID, "tool": logicProp.DataSource.ToolID,
-				"error": "tool execution failed",
-			}))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "OntologyQuery.Validation.Detail.ToolExecutionFailed", map[string]any{
+			"property": propName, "toolbox": logicProp.DataSource.BoxID, "tool": logicProp.DataSource.ToolID,
+			"error": "tool execution failed",
+		})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, oerrors.OntologyQuery_ObjectType_InternalError_ExecuteToolFailed).WithErrorDetails(localizedText)
 	}
 
 	if logicProp.DataSource.ResultPath != "" {

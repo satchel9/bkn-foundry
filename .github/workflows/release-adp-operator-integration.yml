@@ -1,12 +1,13 @@
 name: release-adp-operator-integration
 
 on:
+  # A new release branch has no service-path diff; build the complete release set.
+  create:
   push:
     tags:
       - 'v*'
     branches: ['**']
     paths:
-      - 'comm-go/**'
       - 'adp/execution-factory/operator-integration/**'
       - '.github/workflows/release-adp-operator-integration.yml'
       - '.github/workflows/reusable-*.yml'
@@ -24,6 +25,7 @@ permissions:
 
 jobs:
   version:
+    if: (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.created && startsWith(github.ref_name, 'release/'))
     uses: ./.github/workflows/reusable-version.yml
 
   verify:
@@ -43,7 +45,7 @@ jobs:
       context: '../../..'
       image-name: agent-operator-integration
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
   chart:
     needs: [version, verify, build]
@@ -53,4 +55,4 @@ jobs:
       chart-path: helm/agent-operator-integration
       chart-name: agent-operator-integration
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

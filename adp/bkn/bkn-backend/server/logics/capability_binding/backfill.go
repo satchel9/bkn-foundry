@@ -1,8 +1,6 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
-// Licensed under the Apache License, Version 2.0.
-// See the LICENSE file in the project root for details.
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 
 package capability_binding
 
@@ -11,13 +9,13 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // backfillResult carries what a page of bindings needs beyond the stored rows.
 type backfillResult struct {
 	boxes []*interfaces.CapabilityBoxSummary
-	// available is false when any execution-factory call failed. The bindings are still returned;
+	// available is false when any metadata service call failed. The bindings are still returned;
 	// the flag stops an empty name from being read as a deleted capability.
 	available bool
 }
@@ -50,6 +48,7 @@ func (cbs *capabilityBindingService) backfillMetadata(ctx context.Context,
 	boxBindings := map[string][]*interfaces.CapabilityBinding{}
 	skillBindings := map[string][]*interfaces.CapabilityBinding{}
 	mcpBindings := map[string][]*interfaces.CapabilityBinding{}
+	kbBindings := map[string][]*interfaces.CapabilityBinding{}
 	for _, binding := range bindings {
 		switch binding.CapabilityType {
 		case interfaces.CAPABILITY_TYPE_FUNCTION:
@@ -58,6 +57,8 @@ func (cbs *capabilityBindingService) backfillMetadata(ctx context.Context,
 			skillBindings[binding.CapabilityID] = append(skillBindings[binding.CapabilityID], binding)
 		case interfaces.CAPABILITY_TYPE_MCP_TOOL:
 			mcpBindings[binding.OwnerID] = append(mcpBindings[binding.OwnerID], binding)
+		case interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE:
+			kbBindings[binding.CapabilityID] = append(kbBindings[binding.CapabilityID], binding)
 		}
 	}
 
@@ -72,7 +73,38 @@ func (cbs *capabilityBindingService) backfillMetadata(ctx context.Context,
 	if len(mcpBindings) > 0 {
 		result.available = cbs.backfillMCPTools(ctx, mcpBindings, withDetail) && result.available
 	}
+	if len(kbBindings) > 0 {
+		result.available = cbs.backfillKnowledgeBases(ctx, kbBindings) && result.available
+	}
 	return result
+}
+
+// backfillKnowledgeBases names mounted knowledge bases and marks only confirmed absent targets
+// missing. An unconfigured client cannot distinguish an absent service from lost deployment
+// configuration, so it degrades exactly like an unreachable kb-api and retains every binding.
+func (cbs *capabilityBindingService) backfillKnowledgeBases(ctx context.Context,
+	kbBindings map[string][]*interfaces.CapabilityBinding) bool {
+	available := true
+	for kbID, bindings := range kbBindings {
+		var kb *interfaces.KnowledgeBaseBrief
+		err := interfaces.ErrKnowledgeBaseUnavailable
+		if cbs.kba != nil {
+			kb, err = cbs.kba.GetKnowledgeBase(ctx, kbID)
+		}
+		if err != nil {
+			logger.Warnf("capability metadata backfill: knowledge base %s unreachable: %v", kbID, err)
+			available = false
+			continue
+		}
+		for _, binding := range bindings {
+			if kb == nil {
+				binding.Status = interfaces.CAPABILITY_STATUS_MISSING
+				continue
+			}
+			binding.Name = kb.Name
+		}
+	}
+	return available
 }
 
 // backfillFunctions resolves one tool box per call and reports what is bound versus what the box

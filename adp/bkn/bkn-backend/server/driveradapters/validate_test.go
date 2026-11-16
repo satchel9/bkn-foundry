@@ -9,14 +9,17 @@ package driveradapters
 import (
 	"context"
 	"net/http"
+	"regexp"
+	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 
-	cond "bkn-backend/common/condition"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func Test_validateImportMode(t *testing.T) {
@@ -42,7 +45,7 @@ func Test_validateImportMode(t *testing.T) {
 			httpErr := validateImportMode(ctx, "invalid_mode")
 			So(httpErr, ShouldNotBeNil)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_InvalidParameter_ImportMode)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_InvalidParameter_ImportMode)
 		})
 	})
 }
@@ -50,6 +53,15 @@ func Test_validateImportMode(t *testing.T) {
 func Test_validateObjectName(t *testing.T) {
 	Convey("Test validateObjectName\n", t, func() {
 		ctx := context.Background()
+		resourceTypes := []string{
+			interfaces.MODULE_TYPE_KN,
+			interfaces.MODULE_TYPE_OBJECT_TYPE,
+			interfaces.MODULE_TYPE_RELATION_TYPE,
+			interfaces.MODULE_TYPE_ACTION_TYPE,
+			interfaces.MODULE_TYPE_CONCEPT_GROUP,
+			interfaces.MODULE_TYPE_RISK_TYPE,
+			interfaces.MODULE_TYPE_VALUE_TYPE,
+		}
 
 		Convey("Success with valid name\n", func() {
 			err := validateObjectName(ctx, "test_name", interfaces.MODULE_TYPE_OBJECT_TYPE)
@@ -59,22 +71,27 @@ func Test_validateObjectName(t *testing.T) {
 		Convey("Failed with empty name\n", func() {
 			err := validateObjectName(ctx, "", interfaces.MODULE_TYPE_OBJECT_TYPE)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_Name)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_Name)
 		})
 
-		Convey("Failed with name too long\n", func() {
-			longName := ""
-			for i := 0; i < interfaces.OBJECT_NAME_MAX_LENGTH+1; i++ {
-				longName += "a"
+		Convey("Accepts 128-character resource names for every shared resource type\n", func() {
+			name := strings.Repeat("名", interfaces.RESOURCE_NAME_MAX_LENGTH)
+			for _, resourceType := range resourceTypes {
+				So(validateObjectName(ctx, name, resourceType), ShouldBeNil)
 			}
-			err := validateObjectName(ctx, longName, interfaces.MODULE_TYPE_OBJECT_TYPE)
-			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
-			So(ok, ShouldBeTrue)
-			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_LengthExceeded_Name)
+		})
+
+		Convey("Rejects 129-character resource names for every shared resource type\n", func() {
+			name := strings.Repeat("名", interfaces.RESOURCE_NAME_MAX_LENGTH+1)
+			for _, resourceType := range resourceTypes {
+				err := validateObjectName(ctx, name, resourceType)
+				So(err, ShouldNotBeNil)
+				httpErr, ok := err.(*httperrors.HTTPError)
+				So(ok, ShouldBeTrue)
+				So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
+			}
 		})
 	})
 }
@@ -102,16 +119,16 @@ func Test_ValidateTags(t *testing.T) {
 			}
 			err := ValidateTags(ctx, tags)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_CountExceeded_TagTotal)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_CountExceeded_TagTotal)
 		})
 
 		Convey("Failed with invalid tag name\n", func() {
 			tags := []string{""}
 			err := ValidateTags(ctx, tags)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 	})
@@ -129,7 +146,7 @@ func Test_validateDataTagName(t *testing.T) {
 		Convey("Failed with empty tag name\n", func() {
 			err := validateDataTagName(ctx, "")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -140,14 +157,14 @@ func Test_validateDataTagName(t *testing.T) {
 			}
 			err := validateDataTagName(ctx, longTag)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with invalid characters\n", func() {
 			err := validateDataTagName(ctx, "tag/name")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 	})
@@ -168,35 +185,35 @@ func Test_validatePaginationQueryParameters(t *testing.T) {
 		Convey("Failed with invalid offset\n", func() {
 			_, err := validatePaginationQueryParameters(ctx, "invalid", "10", "name", "desc", supportedSortTypes)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with negative offset\n", func() {
 			_, err := validatePaginationQueryParameters(ctx, "-1", "10", "name", "desc", supportedSortTypes)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with invalid limit\n", func() {
 			_, err := validatePaginationQueryParameters(ctx, "0", "invalid", "name", "desc", supportedSortTypes)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with invalid sort\n", func() {
 			_, err := validatePaginationQueryParameters(ctx, "0", "10", "invalid_sort", "desc", supportedSortTypes)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with invalid direction\n", func() {
 			_, err := validatePaginationQueryParameters(ctx, "0", "10", "name", "invalid", supportedSortTypes)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -225,26 +242,35 @@ func Test_validateID(t *testing.T) {
 		Convey("Failed with ID starting with underscore\n", func() {
 			err := validateID(ctx, "_invalid_id")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with ID containing invalid characters\n", func() {
 			err := validateID(ctx, "invalid@id")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with ID too long\n", func() {
-			longID := ""
-			for i := 0; i < 41; i++ {
-				longID += "a"
-			}
+			longID := strings.Repeat("a", interfaces.RESOURCE_ID_MAX_LENGTH+1)
 			err := validateID(ctx, longID)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
+		})
+
+		Convey("Success with a 128-character ID\n", func() {
+			err := validateID(ctx, strings.Repeat("a", interfaces.RESOURCE_ID_MAX_LENGTH))
+			So(err, ShouldBeNil)
+		})
+
+		Convey("Built-in IDs retain their underscore exception and 128-character limit\n", func() {
+			pattern := regexp.MustCompile(interfaces.RegexPattern_Builtin_ID)
+			So(pattern.MatchString("_"+strings.Repeat("a", interfaces.RESOURCE_ID_MAX_LENGTH-1)), ShouldBeTrue)
+			So(pattern.MatchString("_"+strings.Repeat("a", interfaces.RESOURCE_ID_MAX_LENGTH)), ShouldBeFalse)
+			So(pattern.MatchString("Builtin"), ShouldBeFalse)
 		})
 	})
 }
@@ -261,14 +287,14 @@ func Test_ValidateHeaderMethodOverride(t *testing.T) {
 		Convey("Failed with empty method\n", func() {
 			err := ValidateHeaderMethodOverride(ctx, "")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
 		Convey("Failed with invalid method\n", func() {
 			err := ValidateHeaderMethodOverride(ctx, "POST")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 	})
@@ -313,7 +339,7 @@ func Test_validateConceptsQuery(t *testing.T) {
 			}
 			err := validateConceptsQuery(ctx, query)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 	})
@@ -335,9 +361,7 @@ func Test_validateCond(t *testing.T) {
 					{
 						Operation: cond.OperationEq,
 						Field:     "field1",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
+						Value:     "value1",
 					},
 				},
 			}
@@ -349,13 +373,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: "",
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -363,13 +385,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: "invalid_operation",
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -377,13 +397,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationEq,
 				Field:     "",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -391,14 +409,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationEq,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{"value1", "value2"},
-				},
+				Value:     []any{"value1", "value2"},
 			}
-			// ValueOptCfg is embedded, so Value can be accessed directly.
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -406,13 +421,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationIn,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -420,13 +433,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationIn,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{},
-				},
+				Value:     []any{},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -434,13 +445,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationRange,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1},
-				},
+				Value:     []any{1},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -448,13 +457,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationRegex,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "[invalid regex",
-				},
+				Value:     "[invalid regex",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -465,9 +472,7 @@ func Test_validateCond(t *testing.T) {
 					{
 						Operation: cond.OperationEq,
 						Field:     "field1",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
+						Value:     "value1",
 					},
 				},
 			}
@@ -482,9 +487,7 @@ func Test_validateCond(t *testing.T) {
 					{
 						Operation: cond.OperationEq,
 						Field:     "field1",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
+						Value:     "value1",
 					},
 				},
 			}
@@ -498,9 +501,7 @@ func Test_validateCond(t *testing.T) {
 				subConds[i] = &cond.CondCfg{
 					Operation: cond.OperationEq,
 					Field:     "field1",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "value1",
-					},
+					Value:     "value1",
 				}
 			}
 			cfg := &cond.CondCfg{
@@ -509,7 +510,7 @@ func Test_validateCond(t *testing.T) {
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -517,9 +518,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationMultiMatch,
 				Field:     "",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -529,13 +528,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationLike,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 123,
-				},
+				Value:     123,
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -543,13 +540,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationNotLike,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 123,
-				},
+				Value:     123,
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -557,13 +552,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationPrefix,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 123,
-				},
+				Value:     123,
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -571,13 +564,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationNotPrefix,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: 123,
-				},
+				Value:     123,
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -585,9 +576,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationLike,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -597,13 +586,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationNotIn,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -611,13 +598,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationNotIn,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{},
-				},
+				Value:     []any{},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -625,13 +610,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationOutRange,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -639,13 +622,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationOutRange,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1},
-				},
+				Value:     []any{1},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -653,13 +634,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBefore,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -667,13 +646,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBefore,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1},
-				},
+				Value:     []any{1},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -681,13 +658,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBetween,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "value1",
-				},
+				Value:     "value1",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -695,13 +670,11 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBetween,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1},
-				},
+				Value:     []any{1},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
+			httpErr := err.(*httperrors.HTTPError)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
 		})
 
@@ -709,9 +682,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationRange,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1, 2},
-				},
+				Value:     []any{1, 2},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -721,9 +692,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationOutRange,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1, 2},
-				},
+				Value:     []any{1, 2},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -733,9 +702,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBefore,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1, 2},
-				},
+				Value:     []any{1, 2},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -745,9 +712,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationBetween,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: []any{1, 2},
-				},
+				Value:     []any{1, 2},
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -757,9 +722,7 @@ func Test_validateCond(t *testing.T) {
 			cfg := &cond.CondCfg{
 				Operation: cond.OperationRegex,
 				Field:     "field1",
-				ValueOptCfg: cond.ValueOptCfg{
-					Value: "^test.*",
-				},
+				Value:     "^test.*",
 			}
 			err := validateCond(ctx, cfg)
 			So(err, ShouldBeNil)
@@ -775,9 +738,7 @@ func Test_validateCond(t *testing.T) {
 				cfg := &cond.CondCfg{
 					Operation: op,
 					Field:     "field1",
-					ValueOptCfg: cond.ValueOptCfg{
-						Value: "value1",
-					},
+					Value:     "value1",
 				}
 				err := validateCond(ctx, cfg)
 				So(err, ShouldBeNil)
@@ -789,11 +750,11 @@ func Test_validateCond(t *testing.T) {
 func TestValidateRiskTypesLocalizesInvalidParameterDetails(t *testing.T) {
 	testCases := []struct {
 		name     string
-		language string
+		language i18n.Language
 		want     string
 	}{
-		{"English", rest.AmericanEnglish, "Risk type ID 'risk-1' already exists in the request body."},
-		{"SimplifiedChinese", rest.SimplifiedChinese, "请求体中已存在风险类 ID 'risk-1'。"},
+		{"English", i18n.AmericanEnglish, "Risk type ID 'risk-1' already exists in the request body."},
+		{"SimplifiedChinese", i18n.SimplifiedChinese, "请求体中已存在风险类 ID 'risk-1'。"},
 	}
 
 	for _, testCase := range testCases {
@@ -803,19 +764,19 @@ func TestValidateRiskTypesLocalizesInvalidParameterDetails(t *testing.T) {
 				{RTID: "risk-1", RTName: "risk-two"},
 			}
 			err := ValidateRiskTypes(
-				rest.WithLanguage(context.Background(), testCase.language),
+				i18n.WithLanguage(context.Background(), testCase.language),
 				"kn-1",
 				riskTypes,
 			)
 			if err == nil {
 				t.Fatal("ValidateRiskTypes() error = nil, want duplicated ID error")
 			}
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			if !ok {
-				t.Fatalf("error type = %T, want *rest.HTTPError", err)
+				t.Fatalf("error type = %T, want *httperrors.HTTPError", err)
 			}
-			if got, ok := httpErr.BaseError.ErrorDetails.(string); !ok || got != testCase.want {
-				t.Fatalf("error_details = %#v, want %q", httpErr.BaseError.ErrorDetails, testCase.want)
+			if got, ok := httpErr.ErrorDetails.(string); !ok || got != testCase.want {
+				t.Fatalf("error_details = %#v, want %q", httpErr.ErrorDetails, testCase.want)
 			}
 		})
 	}
@@ -824,28 +785,28 @@ func TestValidateRiskTypesLocalizesInvalidParameterDetails(t *testing.T) {
 func TestCommonValidationDetailsRespectLanguage(t *testing.T) {
 	testCases := []struct {
 		name     string
-		language string
+		language i18n.Language
 		want     string
 	}{
-		{"English", rest.AmericanEnglish, "x-http-method-override must be GET; got POST."},
-		{"SimplifiedChinese", rest.SimplifiedChinese, "x-http-method-override 必须为 GET，当前为 POST。"},
+		{"English", i18n.AmericanEnglish, "x-http-method-override must be GET; got POST."},
+		{"SimplifiedChinese", i18n.SimplifiedChinese, "x-http-method-override 必须为 GET，当前为 POST。"},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := ValidateHeaderMethodOverride(
-				rest.WithLanguage(context.Background(), testCase.language),
+				i18n.WithLanguage(context.Background(), testCase.language),
 				"POST",
 			)
 			if err == nil {
 				t.Fatal("ValidateHeaderMethodOverride() error = nil, want invalid method error")
 			}
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			if !ok {
-				t.Fatalf("error type = %T, want *rest.HTTPError", err)
+				t.Fatalf("error type = %T, want *httperrors.HTTPError", err)
 			}
-			if got, ok := httpErr.BaseError.ErrorDetails.(string); !ok || got != testCase.want {
-				t.Fatalf("error_details = %#v, want %q", httpErr.BaseError.ErrorDetails, testCase.want)
+			if got, ok := httpErr.ErrorDetails.(string); !ok || got != testCase.want {
+				t.Fatalf("error_details = %#v, want %q", httpErr.ErrorDetails, testCase.want)
 			}
 		})
 	}

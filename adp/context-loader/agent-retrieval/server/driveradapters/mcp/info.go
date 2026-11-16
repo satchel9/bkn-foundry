@@ -71,6 +71,7 @@ func tryLoadToolSchemas(locale *mcpLocaleBundle, toolKey string) (input, output 
 	if isBusinessTool(toolKey) {
 		wrapper.InputSchema = offerBKNContext(wrapper.InputSchema)
 	}
+	wrapper.InputSchema = offerKnVersion(wrapper.InputSchema)
 	return locale.OverlaySchemas(toolKey, wrapper.InputSchema, wrapper.OutputSchema)
 }
 
@@ -121,14 +122,6 @@ func buildMCPInfoForLocale(endpoint, localeName string, withToolkitVersion bool)
 		if _, gateway := gatewayTools[key]; gateway {
 			continue
 		}
-		// A retired tool is assembled but published by nothing, and this
-		// endpoint exists so a reader can see the callable surface without a
-		// handshake. The sandbox toolkit is rendered from this list too, so
-		// leaving one here would put a function in the stub that every call
-		// refuses.
-		if _, gone := retiredTools[key]; gone {
-			continue
-		}
 		m := locale.ToolMeta(key)
 		in, out := tryLoadToolSchemas(locale, key)
 		if d, ok := mcptool.DecoratorFor(key); ok && d.Allowed() {
@@ -158,10 +151,9 @@ func buildMCPInfoForLocale(endpoint, localeName string, withToolkitVersion bool)
 			Order:       t.Order,
 			Description: t.Desc,
 			// Same as tools/list (addExtras of assemble.go): Enterprise tools are based on this service.
-			// Its own definition is a business tool, and the lifecycle guard will ask it for bkn_context. this endpoint.
-			// The reason for existence is "to see the capabilities clearly without shaking hands". Broadcasting a schema that cannot be called is better than not broadcasting at all.
-			// Even worse - integrating it will get conversation_required directly.
-			InputSchema:  offerBKNContext(t.Input),
+			// Discovery and tools/list must advertise the same lifecycle
+			// requirements for business and control-plane extensions.
+			InputSchema:  extraInputSchema(t),
 			OutputSchema: t.Output,
 		}})
 	}

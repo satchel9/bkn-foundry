@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
@@ -107,11 +109,52 @@ func TestGenerateDocumentID(t *testing.T) {
 	require.ErrorContains(t, err, `build key field "id" is missing`)
 }
 
-func TestNormalizeJSONDocumentFields(t *testing.T) {
+func TestNormalizeBuildDocumentFields(t *testing.T) {
+	t.Run("calendar dates keep source days and durations remain source values", func(t *testing.T) {
+		native := time.Date(2026, 10, 19, 0, 0, 0, 0, time.FixedZone("test", 8*3600))
+		doc := map[string]any{"day": native}
+		require.NoError(t, normalizeBuildDocumentFields(doc, []*interfaces.Property{{Name: "day", Type: interfaces.DataType_Date}}, nil))
+		assert.Equal(t, "2026-10-19", doc["day"])
+		for _, value := range []any{"100:00:00", "-01:02:03.400000", json.Number("43200123456")} {
+			doc := map[string]any{"clock": value}
+			require.NoError(t, normalizeBuildDocumentFields(doc, []*interfaces.Property{{Name: "clock", Type: interfaces.DataType_Time}}, nil))
+			assert.Equal(t, value, doc["clock"])
+		}
+	})
+	t.Run("normalizes source clocks and preserves other fields", func(t *testing.T) {
+		for _, input := range []any{"12:00:00.100000", []byte("12:00:00.100"), time.Date(2026, 10, 19, 12, 0, 0, 100000000, time.UTC)} {
+			doc := map[string]any{"clock": input, "label": "12:00:00.100", "empty": nil}
+			require.NoError(t, normalizeBuildDocumentFields(doc, []*interfaces.Property{{Name: "clock", Type: interfaces.DataType_Time}, {Name: "label", Type: interfaces.DataType_String}, {Name: "empty", Type: interfaces.DataType_Time}, {Name: "missing", Type: interfaces.DataType_Time}}, nil))
+			assert.Equal(t, "12:00:00.1", doc["clock"])
+			assert.Equal(t, "12:00:00.100", doc["label"])
+			assert.Nil(t, doc["empty"])
+			assert.NotContains(t, doc, "missing")
+		}
+	})
 	schema := []*interfaces.Property{
 		{Name: "payload", Type: interfaces.DataType_Json},
 		{Name: "name", Type: interfaces.DataType_String},
 	}
+
+	t.Run("normalizes nulls and preserves string contents through storage and preview", func(t *testing.T) {
+		for _, tc := range []struct{ source, stored, preview any }{
+			{nil, nil, nil}, {"null", nil, nil}, {[]byte("null"), nil, nil},
+			{`"null"`, "null", "null"}, {`""`, "", ""}, {"", "", ""},
+			{`"scalar"`, "scalar", "scalar"}, {`42`, json.Number("42"), "42"},
+		} {
+			document := map[string]any{"payload": tc.source}
+			require.NoError(t, normalizeBuildDocumentFields(document, schema, nil))
+			assert.Equal(t, tc.stored, document["payload"])
+			encoded, err := json.Marshal(document)
+			require.NoError(t, err)
+			var stored map[string]any
+			require.NoError(t, common.UnmarshalPreciseJSON(encoded, &stored))
+			assert.Contains(t, stored, "payload")
+			preview, err := common.JSONQueryValueText(stored["payload"])
+			require.NoError(t, err)
+			assert.Equal(t, tc.preview, preview)
+		}
+	})
 
 	t.Run("normalizes objects JSON text bytes null and empty values", func(t *testing.T) {
 		document := map[string]any{
@@ -130,12 +173,12 @@ func TestNormalizeJSONDocumentFields(t *testing.T) {
 		document["null_value"] = "null"
 		document["empty_value"] = "  "
 
-		require.NoError(t, normalizeJSONDocumentFields(document, schemaWithValues))
+		require.NoError(t, normalizeBuildDocumentFields(document, schemaWithValues, nil))
 		assert.Equal(t, map[string]any{"region": "cn"}, document["object"])
 		assert.Equal(t, map[string]any{"region": "cn"}, document["payload"])
 		assert.Equal(t, map[string]any{"tier": json.Number("2")}, document["bytes"])
 		assert.Nil(t, document["null_value"])
-		assert.Nil(t, document["empty_value"])
+		assert.Equal(t, "  ", document["empty_value"])
 		assert.Equal(t, "unchanged", document["name"])
 	})
 
@@ -143,7 +186,7 @@ func TestNormalizeJSONDocumentFields(t *testing.T) {
 		for _, text := range []string{`{"items":[{"sku":"BOX-01","count":2}]}`, `{"items":["SENSOR-A","SENSOR-B"]}`, `{"items":[]}`, `{"items":null}`, `[{"id":9007199254740993}]`, `"value"`, `true`, `42`, `null`} {
 			t.Run(text, func(t *testing.T) {
 				doc := map[string]any{"payload": text}
-				require.NoError(t, normalizeJSONDocumentFields(doc, schema))
+				require.NoError(t, normalizeBuildDocumentFields(doc, schema, nil))
 				encoded, err := json.Marshal(doc["payload"])
 				require.NoError(t, err)
 				assert.JSONEq(t, text, string(encoded))
@@ -155,7 +198,7 @@ func TestNormalizeJSONDocumentFields(t *testing.T) {
 		values := []any{map[string]any{"items": []any{"a", map[string]any{"sku": "b"}}}, []any{1, true}, true, int64(9007199254740993)}
 		for _, value := range values {
 			doc := map[string]any{"payload": value}
-			require.NoError(t, normalizeJSONDocumentFields(doc, schema))
+			require.NoError(t, normalizeBuildDocumentFields(doc, schema, nil))
 			assert.Equal(t, value, doc["payload"])
 		}
 	})
@@ -167,7 +210,7 @@ func TestNormalizeJSONDocumentFields(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			document := map[string]any{"payload": value}
 
-			err := normalizeJSONDocumentFields(document, schema)
+			err := normalizeBuildDocumentFields(document, schema, nil)
 
 			require.Error(t, err)
 			assert.ErrorContains(t, err, `JSON field "payload"`)
@@ -297,6 +340,21 @@ func TestBuildLocalIndexSchemaExcludesBinaryAndOtherFields(t *testing.T) {
 }
 
 func TestBuildLocalIndexSchemaDisablesJSONOnCopy(t *testing.T) {
+	t.Run("corrupt columns do not produce a local index schema", func(t *testing.T) {
+		resource := &interfaces.Resource{Category: interfaces.ResourceCategoryTable, SourceMetadata: map[string]any{"columns": "invalid metadata"}, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(12,2)"}}}
+		schema, err := buildLocalIndexSchema(&interfaces.BuildTask{}, resource)
+		require.Error(t, err)
+		assert.Nil(t, schema)
+		assert.Nil(t, resource.SchemaDefinition[0].Attributes)
+	})
+	t.Run("decimal uses authoritative source metadata on the copy", func(t *testing.T) {
+		resource := &interfaces.Resource{Category: interfaces.ResourceCategoryTable, SchemaDefinition: []*interfaces.Property{{Name: "amount", OriginalName: "AMOUNT", OriginalType: "numeric", Type: interfaces.DataType_Decimal}}, SourceMetadata: map[string]any{"columns": []interfaces.TableColumnMeta{{Name: "AMOUNT", NumPrecision: 12, NumScale: 2}}}}
+		schema, err := buildLocalIndexSchema(&interfaces.BuildTask{}, resource)
+		require.NoError(t, err)
+		assert.Equal(t, 12, schema[0].Attributes["precision"])
+		assert.Equal(t, 2, schema[0].Attributes["scale"])
+		assert.Nil(t, resource.SchemaDefinition[0].Attributes)
+	})
 	for _, attributes := range []map[string]any{nil, {"enabled": true, "source": "jsonb"}} {
 		t.Run(fmt.Sprintf("source attributes %v", attributes), func(t *testing.T) {
 			resource := &interfaces.Resource{Category: interfaces.ResourceCategoryTable, SchemaDefinition: []*interfaces.Property{
@@ -493,5 +551,44 @@ func workerTestFullTask(t *testing.T, resource *interfaces.Resource) *interfaces
 				Fields:            fields,
 			},
 		},
+	}
+}
+
+// successfulIndexDocuments 为构建测试返回与请求逐条对应的成功响应。
+func successfulIndexDocuments(_ context.Context, _ string, documents []interfaces.DocumentWrite) ([]interfaces.DocumentWriteResult, error) {
+	results := make([]interfaces.DocumentWriteResult, len(documents))
+	for i, document := range documents {
+		results[i] = interfaces.DocumentWriteResult{ID: document.ID, Status: 201}
+	}
+	return results, nil
+}
+
+func TestIndexBuildDocuments(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		results []interfaces.DocumentWriteResult
+		err     error
+		ok      bool
+	}{
+		{"success", []interfaces.DocumentWriteResult{{ID: "doc", Status: 201}}, nil, true},
+		{"partial failure", []interfaces.DocumentWriteResult{{ID: "doc", Status: 429}}, nil, false},
+		{"unknown outcome", []interfaces.DocumentWriteResult{{ID: "doc", Status: 503, ErrorCode: interfaces.DocumentOutcomeUnknown, Retryable: true}}, nil, false},
+		{"missing result", nil, nil, false},
+		{"mismatched ID", []interfaces.DocumentWriteResult{{ID: "other", Status: 201}}, nil, false},
+		{"request error", nil, errors.New("index unavailable"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lim := vmock.NewMockLocalIndexManager(gomock.NewController(t))
+			lim.EXPECT().IndexDocuments(gomock.Any(), "index", []interfaces.DocumentWrite{{ID: "doc", Document: map[string]any{"content": "hello"}}}).Return(tc.results, tc.err)
+			err := indexBuildDocuments(context.Background(), lim, "index", map[string]map[string]any{"doc": {"content": "hello"}})
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				if tc.err != nil {
+					assert.ErrorIs(t, err, tc.err)
+				}
+			}
+		})
 	}
 }

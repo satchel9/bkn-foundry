@@ -1,8 +1,6 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
-// Licensed under the Apache License, Version 2.0.
-// See the LICENSE file in the project root for details.
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 
 package capability_binding
 
@@ -14,8 +12,8 @@ import (
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 func listQuery() interfaces.CapabilityBindingsQueryParams {
@@ -375,9 +373,7 @@ func TestAPIFunctionSplit(t *testing.T) {
 
 		Convey("计数按工具集类型分流，且一个工具集只问一次", func() {
 			service, cba, aoa := newTestServiceWithFactory(t, ctrl)
-			// The count also covers capabilities the model uses but nobody mounted, so it reads
-			// the stored rows once to know which of them are already counted.
-			cba.EXPECT().ListBindings(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+			// Statistics count stored bindings only; no model provenance read is needed.
 			cba.EXPECT().GetBindingsTotalByType(gomock.Any(), "kn1", "main").
 				Return(map[string]int{interfaces.CAPABILITY_TYPE_FUNCTION: 5}, nil)
 			cba.EXPECT().GetFunctionTotalsByOwner(gomock.Any(), "kn1", "main").

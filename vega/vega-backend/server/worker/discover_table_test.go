@@ -10,11 +10,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
@@ -58,8 +63,10 @@ func TestReconcileTableResources(t *testing.T) {
 		connector := vmock.NewMockTableConnector(ctrl)
 		dh := &DiscoverTaskWorker{rs: rs}
 		created := &interfaces.Resource{ID: "r1", SourceIdentifier: "users", Status: interfaces.ResourceStatusActive}
-		rs.EXPECT().Create(gomock.Any(), gomock.AssignableToTypeOf(&interfaces.ResourceRequest{})).
+		rs.EXPECT().Create(gomock.Any(), gomock.Any()).Times(0)
+		rs.EXPECT().InternalCreate(gomock.Any(), gomock.AssignableToTypeOf(&interfaces.ResourceRequest{})).
 			DoAndReturn(func(_ context.Context, req *interfaces.ResourceRequest) (*interfaces.Resource, error) {
+				assert.Empty(t, req.SchemaDefinition)
 				require.NotNil(t, req.Builtin)
 				assert.True(t, *req.Builtin)
 				assert.Equal(t, "users", req.Name)
@@ -170,11 +177,11 @@ func TestEnrichTableMetadataContinuesWhenOneTableFails(t *testing.T) {
 		}
 		connector := vmock.NewMockTableConnector(ctrl)
 		connector.EXPECT().
-			GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "no_access", Schema: "public"}).
+			GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "no_access", Schema: "public"}, false).
 			Return(errors.New("permission denied"))
 		connector.EXPECT().
-			GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "erp_material", Schema: "public"}).
-			DoAndReturn(func(_ context.Context, table *interfaces.TableMeta) error {
+			GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "erp_material", Schema: "public"}, false).
+			DoAndReturn(func(_ context.Context, table *interfaces.TableMeta, _ bool) error {
 				table.Columns = []interfaces.TableColumnMeta{{Name: "id", Type: "int4"}}
 				return nil
 			})
@@ -213,6 +220,43 @@ func TestEnrichTableMetadataContinuesWhenOneTableFails(t *testing.T) {
 }
 
 func TestEnrichTableMetadataPreservesBusinessMetadata(t *testing.T) {
+	t.Run("does not preserve a previous type default as a stored override", func(t *testing.T) {
+		for _, nextType := range []string{interfaces.DataType_Binary, interfaces.DataType_Integer} {
+			t.Run(nextType, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				rs := vmock.NewMockResourceService(ctrl)
+				connector := vmock.NewMockTableConnector(ctrl)
+				nextDefault := (&interfaces.Property{Type: nextType}).EffectiveFilterable()
+				previousType := interfaces.DataType_Integer
+				if nextType == interfaces.DataType_Integer {
+					previousType = interfaces.DataType_Binary
+				}
+				// Internal reads complete the historical missing flag for the old type.
+				property := &interfaces.Property{Name: "field", Type: previousType}
+				property.SetDefaultFilterable()
+				resource := &interfaces.Resource{ID: "r1", SchemaDefinition: []*interfaces.Property{property}}
+				table := &interfaces.TableMeta{Name: "orders"}
+				connector.EXPECT().GetTableMeta(gomock.Any(), table, false).DoAndReturn(
+					func(_ context.Context, metadata *interfaces.TableMeta, _ bool) error {
+						metadata.Columns = []interfaces.TableColumnMeta{{Name: "field", Type: "new_source_type", Filterable: &nextDefault}}
+						return nil
+					})
+				connector.EXPECT().MapType("new_source_type").Return(nextType)
+				rs.EXPECT().InternalUpdateDiscoveryMetadata(gomock.Any(), nil, resource, gomock.Any()).DoAndReturn(
+					func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) error {
+						require.Len(t, got.SchemaDefinition, 1)
+						assert.Equal(t, nextType, got.SchemaDefinition[0].Type)
+						require.NotNil(t, got.SchemaDefinition[0].Filterable)
+						assert.Equal(t, nextDefault, *got.SchemaDefinition[0].Filterable)
+						return nil
+					})
+				require.NoError(t, (&DiscoverTaskWorker{rs: rs}).enrichTableMetadata(t.Context(), &interfaces.DiscoverTask{}, connector,
+					[]tableDiscoverItem{{resource: resource, tableMeta: table}}, &interfaces.DiscoverResult{},
+					&discoverTaskReconcileProgress{lastProgress: 95}))
+			})
+		}
+	})
+
 	ctrl := gomock.NewController(t)
 	rs := vmock.NewMockResourceService(ctrl)
 	dh := &DiscoverTaskWorker{rs: rs}
@@ -247,8 +291,8 @@ func TestEnrichTableMetadataPreservesBusinessMetadata(t *testing.T) {
 	}
 	connector := vmock.NewMockTableConnector(ctrl)
 	connector.EXPECT().
-		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "departments", Schema: "public"}).
-		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta) error {
+		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "departments", Schema: "public"}, false).
+		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta, _ bool) error {
 			table.Description = "最新源端表注释"
 			table.Properties = map[string]any{"estimated_row_count": int64(99)}
 			table.Columns = []interfaces.TableColumnMeta{
@@ -314,8 +358,8 @@ func TestEnrichTableMetadataUsesNormalizedEnumType(t *testing.T) {
 	resource := &interfaces.Resource{ID: "r1", SourceIdentifier: "public.orders"}
 	connector := vmock.NewMockTableConnector(ctrl)
 	connector.EXPECT().
-		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "orders", Schema: "public"}).
-		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta) error {
+		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "orders", Schema: "public"}, false).
+		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta, _ bool) error {
 			table.Columns = []interfaces.TableColumnMeta{{
 				Name: "status", Type: "enum", AliasType: "order_status",
 			}}
@@ -357,8 +401,8 @@ func TestEnrichTableMetadataSynchronizesSourceDescriptions(t *testing.T) {
 	}
 	connector := vmock.NewMockTableConnector(ctrl)
 	connector.EXPECT().
-		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "departments", Schema: "public"}).
-		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta) error {
+		GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "departments", Schema: "public"}, false).
+		DoAndReturn(func(_ context.Context, table *interfaces.TableMeta, _ bool) error {
 			table.Description = "最新源端表注释"
 			table.Columns = []interfaces.TableColumnMeta{
 				{Name: "empty_description", Type: "varchar", Description: "最新空字段注释"},
@@ -431,7 +475,7 @@ func TestEnrichTableMetadataCountFailure(t *testing.T) {
 				resource.SourceMetadata = map[string]any{"name": "orders", "schema": "sales", "description": "old comment"}
 			}
 			table := &interfaces.TableMeta{Name: "orders", Schema: "sales", Database: "app"}
-			connector.EXPECT().GetTableMeta(gomock.Any(), table).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta) error {
+			connector.EXPECT().GetTableMeta(gomock.Any(), table, false).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta, _ bool) error {
 				meta.Description = "new comment"
 				meta.Columns = []interfaces.TableColumnMeta{{Name: "id", Type: "int4"}}
 				return nil
@@ -481,3 +525,150 @@ func TestEnrichTableMetadataCountFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestEnrichTableMetadataDoris(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	rs := vmock.NewMockResourceService(ctrl)
+	connector := vmock.NewMockTableConnector(ctrl)
+	worker := &DiscoverTaskWorker{rs: rs}
+	reference := "`hive`.`sales.eu`.`order.items`"
+	resource := &interfaces.Resource{ID: "r1", SourceIdentifier: reference, SchemaDefinition: []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json, Attributes: map[string]any{"enabled": true}}, {Name: "wide", Type: interfaces.DataType_LargeInteger, OriginalType: "LARGEINT", Features: []interfaces.PropertyFeature{{FeatureName: "keyword", FeatureType: interfaces.PropertyFeatureType_Keyword, IsDefault: true}}}}}
+	table := &interfaces.TableMeta{SourceCatalog: "hive", Database: "sales.eu", Schema: "sales.eu", Name: "order.items"}
+	connector.EXPECT().GetTableMeta(gomock.Any(), table, false).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta, _ bool) error {
+		meta.Columns = []interfaces.TableColumnMeta{{Name: "wide", Type: "LARGEINT"}, {Name: "payload", Type: "JSON"}, {Name: "new_payload", Type: "JSON"}}
+		return nil
+	})
+	connector.EXPECT().MapType("LARGEINT").Return(interfaces.DataType_LargeInteger)
+	connector.EXPECT().MapType("JSON").Return(interfaces.DataType_Json).Times(2)
+	rs.EXPECT().InternalUpdateDiscoveryMetadata(gomock.Any(), nil, resource, gomock.Any()).DoAndReturn(func(_ context.Context, _ *sql.Tx, saved *interfaces.Resource, _ int64) error {
+		assert.Equal(t, reference, saved.SourceIdentifier)
+		assert.Equal(t, "hive", saved.SourceMetadata["source_catalog"])
+		assert.Equal(t, "sales.eu", saved.SourceMetadata["database"])
+		assert.Equal(t, "order.items", saved.SourceMetadata["name"])
+		require.Len(t, saved.SchemaDefinition, 3)
+		assert.Equal(t, false, saved.SchemaDefinition[1].Attributes["enabled"])
+		assert.Equal(t, false, saved.SchemaDefinition[2].Attributes["enabled"])
+		assert.Equal(t, interfaces.DataType_LargeInteger, saved.SchemaDefinition[0].Type)
+		require.Len(t, saved.SchemaDefinition[0].Features, 1)
+		assert.Equal(t, interfaces.PropertyFeatureType_Keyword, saved.SchemaDefinition[0].Features[0].FeatureType)
+		require.NoError(t, validateBuildTaskSchemaFeatures(interfaces.ResourceCategoryTable, saved.SchemaDefinition))
+		assert.Equal(t, "LARGEINT", saved.SchemaDefinition[0].OriginalType)
+		return nil
+	})
+	err := worker.enrichTableMetadata(context.Background(), &interfaces.DiscoverTask{}, connector, []tableDiscoverItem{{resource: resource, tableMeta: table}}, &interfaces.DiscoverResult{}, &discoverTaskReconcileProgress{lastProgress: 95})
+	require.NoError(t, err)
+}
+
+func TestEnrichTableMetadataJSON(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	rs := vmock.NewMockResourceService(ctrl)
+	connector := vmock.NewMockTableConnector(ctrl)
+	resource := &interfaces.Resource{ID: "r1", SchemaDefinition: []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json, Attributes: map[string]any{"enabled": true}}}}
+	table := &interfaces.TableMeta{Name: "orders", Schema: "public"}
+	connector.EXPECT().GetTableMeta(gomock.Any(), table, false).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta, _ bool) error {
+		meta.Columns = []interfaces.TableColumnMeta{{Name: "payload", Type: "jsonb"}, {Name: "added", Type: "jsonb"}}
+		return nil
+	})
+	connector.EXPECT().MapType("jsonb").Return(interfaces.DataType_Json).Times(2)
+	rs.EXPECT().InternalUpdateDiscoveryMetadata(gomock.Any(), nil, resource, gomock.Any()).DoAndReturn(func(_ context.Context, _ *sql.Tx, saved *interfaces.Resource, _ int64) error {
+		require.Len(t, saved.SchemaDefinition, 2)
+		for _, prop := range saved.SchemaDefinition {
+			assert.Equal(t, false, prop.Attributes["enabled"])
+		}
+		return nil
+	})
+	err := (&DiscoverTaskWorker{rs: rs}).enrichTableMetadata(context.Background(), &interfaces.DiscoverTask{}, connector, []tableDiscoverItem{{resource: resource, tableMeta: table}}, &interfaces.DiscoverResult{}, &discoverTaskReconcileProgress{lastProgress: 95})
+	require.NoError(t, err)
+}
+
+func TestDiscoverTaskWorkerEnrichResourceTableRowCount(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		batch             bool
+		skipped           int
+		count             int64
+		countErr, saveErr error
+		code              string
+	}{
+		{name: "source memory limit", countErr: fmt.Errorf("read row count: %w", interfaces.NewSourceMemoryLimitError(&testCountDiagnosticError{cause: errors.New("[MEM_ALLOC_FAILED] private-value")})), code: "source_memory_limit"},
+		{name: "timeout", countErr: context.DeadlineExceeded, code: "timeout"},
+		{name: "unknown source failure", countErr: errors.New("mysql://user:private-value@source.invalid/db"), code: "count_failed"},
+		{name: "save failure", count: 5, saveErr: errors.New("database private-value"), code: "save_failed"},
+		{name: "negative count", count: -1, code: "invalid_count"},
+		{name: "unsupported single resource", countErr: interfaces.ErrRowCountUnavailable, code: "count_unavailable"},
+		{name: "unsupported batch resource is skipped", batch: true, countErr: interfaces.ErrRowCountUnavailable, skipped: 1},
+		{name: "batch save failure is not skipped", batch: true, count: 5, saveErr: interfaces.ErrRowCountUnavailable, code: "save_failed"},
+		{name: "empty table", count: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var observed *observer.ObservedLogs
+			if tc.name == "source memory limit" {
+				core, logs := observer.New(zap.WarnLevel)
+				observed = logs
+				sharedLogger := logger.GetLogger()
+				original := *sharedLogger
+				*sharedLogger = *zap.New(core).Sugar()
+				t.Cleanup(func() { *sharedLogger = original })
+			}
+			ctrl := gomock.NewController(t)
+			rs := vmock.NewMockResourceService(ctrl)
+			connector := vmock.NewMockTableConnector(ctrl)
+			oldCount, oldTime := int64(7), int64(10)
+			resource := &interfaces.Resource{ID: "r1", Name: "Orders", SourceIdentifier: "orders", RowCount: &oldCount, RowCountTime: &oldTime}
+			connector.EXPECT().CountRows(gomock.Any(), "orders").Return(tc.count, tc.countErr)
+			if tc.countErr == nil && tc.count >= 0 {
+				rs.EXPECT().InternalUpdateRowCount(gomock.Any(), nil, resource, tc.count, gomock.Any()).Return(tc.saveErr)
+			}
+			result := &interfaces.DiscoverResult{}
+			task := &interfaces.DiscoverTask{ResourceID: "r1"}
+			if tc.batch {
+				task.ResourceID = ""
+			}
+			require.NoError(t, (&DiscoverTaskWorker{rs: rs}).enrichResourceTableRowCount(context.Background(), task, resource, connector, result))
+			assert.Equal(t, tc.skipped, result.SkippedCount)
+			encoded, err := json.Marshal(result)
+			require.NoError(t, err)
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(encoded, &payload))
+			if tc.skipped > 0 {
+				assert.Zero(t, result.UpdatedCount)
+				assert.Zero(t, result.FailedCount)
+				assert.NotContains(t, payload, "failures")
+				return
+			}
+			if tc.code == "" {
+				assert.Equal(t, 1, result.UpdatedCount)
+				assert.Zero(t, result.FailedCount)
+				assert.NotContains(t, payload, "failures")
+				return
+			}
+			assert.Equal(t, 1, result.FailedCount)
+			assert.Zero(t, result.UpdatedCount)
+			require.Contains(t, payload, "failures")
+			failures := payload["failures"].([]any)
+			require.Len(t, failures, 1)
+			failure := failures[0].(map[string]any)
+			assert.Equal(t, "r1", failure["resource_id"])
+			assert.Equal(t, "Orders", failure["resource_name"])
+			assert.NotContains(t, failure, "stage")
+			assert.Equal(t, tc.code, failure["code"])
+			assert.NotEmpty(t, failure["message"])
+			assert.NotContains(t, string(encoded), "private-value")
+			if observed != nil {
+				require.Len(t, observed.All(), 1)
+				message := observed.All()[0].Message
+				assert.Contains(t, message, "resource_id=r1")
+				assert.Contains(t, message, "[MEM_ALLOC_FAILED] private-value")
+				assert.NotContains(t, tc.countErr.Error(), "private-value")
+			}
+			assert.Equal(t, int64(7), *resource.RowCount)
+			assert.Equal(t, int64(10), *resource.RowCountTime)
+		})
+	}
+}
+
+// testCountDiagnosticError 模拟连接器对外安全、但可解包取得原始诊断的错误。
+type testCountDiagnosticError struct{ cause error }
+
+func (e *testCountDiagnosticError) Error() string { return "source query failed" }
+func (e *testCountDiagnosticError) Unwrap() error { return e.cause }

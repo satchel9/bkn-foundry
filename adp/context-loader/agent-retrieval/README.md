@@ -17,23 +17,112 @@ Core features are five tools and the Context Loader MCP server:
 5. **get_logic_properties_values**: Resolve logic properties and get property values
 6. **Context Loader MCP Server**: Exposes the five tools above to MCP clients (e.g. Cursor, Claude Desktop)
 
+## Durable answer handoff
+
+After every Core replica/worker has upgraded and Core's durable-answer option is
+enabled, set `observability.lifecycle.durable_answer_enabled=true` in this
+service's Helm values (or `BKN_TRACE_DURABLE_ANSWER_ENABLED=true`). It defaults to
+false. Completed MCP finish calls then send the governed answer artifact to
+Core's SQL transaction instead of waiting for an artifact upload. Preparation
+retains the one-second Trace observation budget. The authoritative
+Interaction finish POST/replay has a separate five-second total budget; tool-attempt
+finalization retains its existing post budget. The model's input schema and
+business execution are unchanged.
+
+Use the returned execution and evidence statuses independently: `completed`
+with `assembling` means the business turn ended and its evidence is being
+delivered. A Core rejection or uncertain response is not a completion ACK and
+must not trigger re-execution of business tools. Disabling the option restores
+the legacy synchronous answer path. Question artifacts and other artifact
+writers retain their existing endpoint and credentials.
+
+Interaction finish uses at most three identical POSTs within
+`observability.lifecycle.finish_timeout_ms` / `BKN_TRACE_INTERACTION_FINISH_TIMEOUT_MS`
+(default 5000 ms, accepted range 1–30000; invalid values fall back to 5000).
+This is one total budget, including backoff, not a timeout per retry. Authorized
+submission retains this finite budget across caller disconnects. Only Core's
+matching Interaction ID and requested terminal status confirm success.
+`interaction_finish_unconfirmed` is an MCP tool error with `retry_same_finish`:
+repeat the original finish, never business tools. Error details identify stage,
+cause code and request ID. Domain refusals are not retried or overwritten.
+There is no durable client-side retry queue; process loss or a persistent outage
+can still leave an unaccepted Interaction active until Core's normal lease expiry.
+
 ## Authorization Boundaries
 
 Object surfaces (`search_schema`, `get_kn_detail`, `get_object_types`, object instances, subgraphs, and logic properties) consume ontology-query's authorization-safe results. Properties at `none` are omitted, `schema` properties expose metadata only, and `masked` instance values use Column Masking: the configured rule is applied only to the returned property value and never modifies source data. Only `full` properties may be used for filters, sorting, identities, or logic-property dependencies. REST and MCP adapters share these services; schema, object-instance, and logic-property responses expose the effective-permission summary supplied by ontology-query.
 
-`list_resources`, `describe_resource`, and `run_sql` are a separate physical-resource surface. They use the caller's own Vega resource permissions, are not constrained by object-property levels, and can expose raw physical columns. Object-query implementations must never call this surface internally; use it only when the caller explicitly requests physical-resource analysis.
+`list_resources`, `describe_resource`, and `run_sql` have been removed. They used the caller's own Vega resource permissions, were not constrained by object-property levels, and could expose raw physical columns. Aggregate with `run_cypher`; read a modelled figure with `query_metric`.
+
+## Object Metric MCP tools
+
+`query_metric` and `drill_through_metric` return published object metric data
+through the full and compact MCP profiles. Numeric entries include an exact
+`display_value` string for presentation while retaining the original `value`.
+Both tools accept the knowledge-network `branch` and default it to `main`, so a
+published version is never silently read from a different branch. `get_kn_detail`
+and `get_object_types` use that same branch for metric discovery; on a large
+non-main branch, page through `get_object_types` without ids to find object
+types before requesting their definitions. Clients can render metric results
+using their own capabilities.
+
+## Optional HTTP MCP extensions
+
+Context Loader can load paid tools from an HTTP extension provider without
+embedding that provider's business logic. Set the Helm value
+`mcpExtensionManifestURL` (environment variable
+`CONTEXT_LOADER_EXTENSION_MANIFEST_URL`) to its manifest URL. The default is empty,
+which keeps the existing tool catalogue unchanged. Restart Context Loader after
+changing the manifest or its URL; a configured provider that cannot be loaded
+prevents startup rather than advertising unusable tools.
+
+For providers whose discovery endpoint is edition-gated, supply the provider-owned
+JSON deployment artifact using Helm `mcpExtensionManifestJSON` (environment
+`CONTEXT_LOADER_EXTENSION_MANIFEST_JSON`) alongside the URL. This registers the
+schemas before the registry freezes, without an HTTP discovery request. Tool
+visibility and calls still recheck the current licence; activation and revocation
+take effect without a restart. The artifact must match the deployed provider.
+Empty JSON retains the existing HTTP discovery mode, including startup failure
+when that configured provider is unavailable. Community defaults stay empty.
+
+For licensed providers, set Helm `licenseHub.url` to the licence hub, for example
+`--set-string licenseHub.url=http://bkn-safe:3000`. The Chart injects `BKN_SAFE_URL`
+only when this value is nonempty. The default is empty, including when the shared
+platform `bknSafe.url` is configured. A hub address does not grant capabilities:
+discovery and invocation still require a valid licence and the current user's
+permissions. Retain this value in Helm values on upgrades; a manual Pod patch is
+not an installation configuration.
+
+For Eval, the enterprise bundle supplies its generated artifact and the EE backend manifest
+`http://<bkn-backend-host>:<port>/api/bkn-backend/v1/eval-mcp/tools` and enable
+`OPENBKN_EVAL_ENABLED=true` in that backend. Its delivery profile also supplies
+Retrieval's `licenseHub.url`; the community installer retains existing Helm and
+nonempty custom hub addresses on upgrades. Clients continue connecting to
+`/api/agent-retrieval/v1/mcp/` or the compact MCP entry. Professional-or-higher licensing and backend user permissions
+still apply. The provider publishes `bkn_eval_list_suites`, `bkn_eval_start_run`,
+`bkn_eval_next_case`, `bkn_eval_submit_result`, and `bkn_eval_get_progress`.
+
+The manifest owns tool schemas and a call path on the same origin. Context Loader
+forwards only the authenticated transport's `Authorization` header to that path;
+it does not trust account headers or credentials supplied as tool arguments and
+does not follow redirects. Eval control tools can bootstrap a run without an
+existing Interaction; business tools continue to require their normal lifecycle
+context. Eval creates and verifies each question's Interaction and Trace in its
+own backend. Existing business tools and their evidence handling are unchanged.
 
 ## Technical Architecture
 
 ### Tech Stack
-- **Language**: Go 1.25
+
+- **Language**: Go 1.26.0
 - **Web framework**: Gin 1.11
 - **Observability**: OpenTelemetry
 - **Cache**: Redis (optional, sentinel mode supported)
 - **Validation**: go-playground/validator
 
 ### Project Structure
-```
+
+``` bash
 server/
 ├── driveradapters/     # HTTP/MCP adapters
 │   ├── knactionrecall/
@@ -67,12 +156,14 @@ server/
 ## Quick Start
 
 ### Requirements
-- Go 1.25+
+
+- Go 1.26.0+
 - Access to ontology-query, ontology-manager, and other configured backends (or use ktctl to connect to a remote cluster)
 
 ### Local Development
 
 1. **Clone**
+
    ```bash
    git clone <repo-url>
    cd context-loader/agent-retrieval
@@ -82,11 +173,13 @@ server/
    Edit `server/infra/config/agent-retrieval.yaml` (and optionally `agent-retrieval-secret.yaml`) with service hosts and ports. For local runs against a remote cluster, use ktctl and then `make build` so configs are copied to `/sysvol/config` and `/sysvol/secret`.
 
 3. **Dependencies**
+
    ```bash
    go mod download
    ```
 
 4. **Run**
+
    ```bash
    # Option A: with ktctl and make (recommended for dev)
    make build
@@ -94,11 +187,13 @@ server/
    # Option B: run from server dir (config from default paths)
    cd server && go run main.go
    ```
+
    The service listens on `http://0.0.0.0:30779` by default. A second listener
    on port `30780` exposes only authenticated public routes for sandbox
    workloads; trusted `/in` routes remain exclusive to port `30779`.
 
 ### Make Targets
+
 - `make help` – List targets
 - `make lint` – Run golangci-lint
 - `make test` – Unit tests
@@ -137,6 +232,7 @@ helm template agent-retrieval ./helm/agent-retrieval -n <namespace> -f ./helm/ag
 Main config file: `server/infra/config/agent-retrieval.yaml`.
 
 Key sections:
+
 - **project**: `host`, `port` (default 30779), `sandbox_port` (default 30780), `language`, `logger_level`, `debug`
 - **ontology_query**, **ontology_manager**, **data_retrieval**, **operator_integration**: backend service URLs/ports
 - **oauth**: Hydra OAuth (for public API)
@@ -173,5 +269,5 @@ See `VERSION` in the project root.
 
 ## Support
 
-- **Team**: AISHU ADP
+- **Team**: OpenBKN
 - **Docs**: See `docs/` (PRD, APIs, releases).

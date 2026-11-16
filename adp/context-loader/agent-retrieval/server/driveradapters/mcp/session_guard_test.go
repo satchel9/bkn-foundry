@@ -795,7 +795,7 @@ func TestSessionGuardAttachesOnlyTheReceiptFieldsACallerReads(t *testing.T) {
 		OperationID:          "op-1",
 		Attempt:              1,
 		OperationKey:         "mcp:abc",
-		ToolName:             "run_sql",
+		ToolName:             "run_cypher",
 		ReceiptStatus:        "completed",
 		EvidenceDurability:   "durable",
 		Required:             true,
@@ -1219,16 +1219,21 @@ func TestObservedToolBusinessRefsAddsMetricScopeWithoutDomainKnowledge(t *testin
 	refs := derivedToolBusinessRefs(toolKeyQueryMetric, map[string]any{
 		"kn_id":     "network-any",
 		"metric_id": "metric-any",
+		"version":   3,
 	}, "network-any")
 
 	want := map[string]bool{
-		"knowledge_network\x00kn:network-any":     true,
-		"metric\x00metric:network-any:metric-any": true,
+		"knowledge_network\x00kn:network-any":        true,
+		"metric\x00metric:network-any:metric-any:v3": true,
 	}
 	for _, ref := range refs {
 		delete(want, ref.RefType+"\x00"+ref.RefID)
-		if ref.Version != "unversioned" {
-			t.Fatalf("derived ref version = %q", ref.Version)
+		wantVersion := "unversioned"
+		if ref.RefType == "metric" {
+			wantVersion = "v3"
+		}
+		if ref.Version != wantVersion {
+			t.Fatalf("derived ref %s version = %q, want %q", ref.RefID, ref.Version, wantVersion)
 		}
 	}
 	if len(want) != 0 {
@@ -1422,5 +1427,55 @@ func TestLifecycleRequestDropsCallerSuppliedOwnerIdentity(t *testing.T) {
 		if _, exists := body[field]; exists {
 			t.Fatalf("caller-supplied trusted field %s leaked into Core JSON: %#v", field, body)
 		}
+	}
+}
+
+func TestArtifactOutageClassificationDoesNotChangeCoreOutage(t *testing.T) {
+	for _, failure := range []error{context.DeadlineExceeded, &bkntrace.CoreHTTPError{StatusCode: http.StatusServiceUnavailable, Code: "UNAVAILABLE"}} {
+		core := lifecycleUnavailable(context.Background(), toolKeyStartInteraction, "core_call", failure)
+		value := lifecycleErrorFromResult(t, core)
+		if value["code"] != "trace_core_unavailable" || value["retryable"] != true {
+			t.Fatalf("Core outage classification changed: %#v", value)
+		}
+		artifact := lifecycleUnavailable(context.Background(), toolKeyFinishInteraction, "answer_artifact", failure)
+		if artifact == nil || !artifact.IsError {
+			t.Fatalf("unconfirmed finish must remain an error: %#v", artifact)
+		}
+		view := lifecycleErrorFromResult(t, artifact)
+		text, _ := mcpsdk.AsTextContent(artifact.Content[0])
+		var envelope map[string]any
+		if json.Unmarshal([]byte(text.Text), &envelope) != nil || envelope["cause_code"] != "evidence_store_unavailable" || envelope["finish_confirmed"] != false || view["code"] != "interaction_finish_unconfirmed" || view["required_action"] != "retry_same_finish" {
+			t.Fatalf("artifact outage incorrectly attributed: %#v", envelope)
+		}
+	}
+}
+
+func TestArtifactLocalFailureAndThrottlingRemainToolErrors(t *testing.T) {
+	cases := []struct {
+		name      string
+		failure   error
+		code      string
+		action    string
+		retryable bool
+	}{
+		{name: "local capture failure", failure: errors.New("current request, trace and trusted account context are required"), code: "evidence_capture_failed", action: "contact_platform_operator"},
+		{name: "artifact throttled", failure: &bkntrace.CoreHTTPError{StatusCode: http.StatusTooManyRequests, Code: "TOO_MANY_REQUESTS"}, code: "interaction_finish_unconfirmed", action: "retry_same_finish", retryable: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := lifecycleUnavailable(context.Background(), toolKeyFinishInteraction, "answer_artifact", tc.failure)
+			if result == nil || !result.IsError {
+				t.Fatalf("artifact refusal must remain a tool error: %#v", result)
+			}
+			value := lifecycleErrorFromResult(t, result)
+			if value["code"] != tc.code || value["required_action"] != tc.action {
+				t.Fatalf("incorrect artifact error: %#v", value)
+			}
+			// False may be omitted by the JSON encoder; either form must be non-retryable.
+			retryable, _ := value["retryable"].(bool)
+			if retryable != tc.retryable {
+				t.Fatalf("incorrect retry guidance: %#v", value)
+			}
+		})
 	}
 }

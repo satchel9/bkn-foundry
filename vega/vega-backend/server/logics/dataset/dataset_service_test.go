@@ -11,12 +11,16 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
@@ -25,6 +29,31 @@ import (
 )
 
 func TestDatasetServiceIndexLifecycle(t *testing.T) {
+	t.Run("corrupt source columns fail before index writes", func(t *testing.T) {
+		for _, operation := range []string{"create", "update"} {
+			t.Run(operation, func(t *testing.T) {
+				ds, _ := newDatasetServiceMock(t)
+				resource := &interfaces.Resource{ID: "dataset-corrupt", LocalIndexName: "index-unchanged", LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
+					SourceMetadata: map[string]any{"columns": "private source details"}, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(12,2)"}}}
+				var err error
+				wantCode := verrors.VegaBackend_Resource_InternalError_CreateFailed
+				if operation == "create" {
+					err = ds.Create(context.Background(), resource)
+				} else {
+					err = ds.Update(context.Background(), resource)
+					wantCode = verrors.VegaBackend_Resource_InternalError_UpdateFailed
+				}
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
+				assert.Equal(t, wantCode, httpErr.ErrorCode)
+				assert.NotContains(t, httpErr.Error(), "private source details")
+				assert.Equal(t, "index-unchanged", resource.LocalIndexName)
+				assert.Equal(t, interfaces.ResourceLocalIndexStatusAvailable, resource.LocalIndexStatus)
+				assert.Nil(t, resource.SchemaDefinition[0].Attributes)
+			})
+		}
+	})
 	ctx := context.Background()
 	resource := &interfaces.Resource{
 		ID:               "dataset-1",
@@ -100,25 +129,200 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 	resource := &interfaces.Resource{ID: "dataset-1", LocalIndexName: "dataset-1"}
 	params := &interfaces.ResourceDataQueryParams{}
 	docs := []map[string]any{{"id": 1}}
+	t.Run("delete filters use the capability of the feature target physical field", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, kind, operation, feature, featureName, physicalName, physicalType string
+			parent, child, allowed                                                  bool
+		}{
+			{"fulltext uses enabled child", interfaces.DataType_String, "match", interfaces.PropertyFeatureType_Fulltext, "search", "field.search", interfaces.DataType_Text, false, true, true},
+			{"fulltext rejects disabled child", interfaces.DataType_String, "match", interfaces.PropertyFeatureType_Fulltext, "search", "field.search", interfaces.DataType_Text, true, false, false},
+			{"text exact uses enabled keyword", interfaces.DataType_Text, "eq", interfaces.PropertyFeatureType_Keyword, "raw", "field.raw", interfaces.DataType_String, false, true, true},
+			{"text exact rejects disabled keyword", interfaces.DataType_Text, "eq", interfaces.PropertyFeatureType_Keyword, "raw", "field.raw", interfaces.DataType_String, true, false, false},
+			{"main exact cannot borrow fulltext child", interfaces.DataType_String, "eq", interfaces.PropertyFeatureType_Fulltext, "search", "field.search", interfaces.DataType_Text, false, true, false},
+			{"main fulltext cannot borrow keyword child", interfaces.DataType_Text, "match", interfaces.PropertyFeatureType_Keyword, "raw", "field.raw", interfaces.DataType_String, false, true, false},
+			{"knn uses enabled generated field", interfaces.DataType_String, "knn_vector", interfaces.PropertyFeatureType_Vector, "embedding", "field_vector", interfaces.DataType_Vector, false, true, true},
+			{"knn rejects disabled generated field", interfaces.DataType_String, "knn_vector", interfaces.PropertyFeatureType_Vector, "embedding", "field_vector", interfaces.DataType_Vector, true, false, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				lim := vmock.NewMockLocalIndexManager(ctrl)
+				rs := vmock.NewMockResourceService(ctrl)
+				feature := interfaces.PropertyFeature{FeatureType: tc.feature, FeatureName: tc.featureName}
+				main := &interfaces.Property{Name: "field", OriginalName: "field", Type: tc.kind, Filterable: &tc.parent, Features: []interfaces.PropertyFeature{feature}}
+				physical := &interfaces.Property{Name: tc.physicalName, OriginalName: tc.physicalName, Type: tc.physicalType, Filterable: &tc.child}
+				resource := &interfaces.Resource{ID: "dataset", LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{main}}
+				rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID, interfaces.OPERATION_TYPE_DATA_WRITE).Return(nil)
+				lim.EXPECT().SchemaForQuery(resource.SchemaDefinition).Return([]*interfaces.Property{main, physical}, nil)
+				var value any = "query"
+				queryField := "field"
+				if tc.operation == "knn_vector" {
+					value = []float32{1, 2}
+					queryField = tc.physicalName
+				}
+				params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: queryField, Operation: tc.operation, Value: value}}
+				if tc.allowed {
+					lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "index", resource, params).DoAndReturn(
+						func(_ context.Context, _ string, _ *interfaces.Resource, query *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
+							require.NotNil(t, query.ActualFilterCond)
+							assert.Equal(t, queryField, query.FilterCondCfg.Field)
+							return &interfaces.DeleteByQueryResult{Deleted: 1}, nil
+						})
+				}
+				result, err := (&datasetService{lim: lim, rs: rs}).DeleteDocumentsByQuery(ctx, resource, params)
+				if tc.allowed {
+					require.NoError(t, err)
+					assert.EqualValues(t, 1, result.Deleted)
+				} else {
+					var httpErr *httperrors.HTTPError
+					require.ErrorAs(t, err, &httpErr)
+					assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+					assert.Contains(t, httpErr.ErrorDetails, "not filterable")
+					assert.Nil(t, result)
+				}
+				assert.Equal(t, tc.parent, *main.Filterable)
+				assert.Equal(t, tc.child, *physical.Filterable)
+			})
+		}
+	})
+
+	t.Run("delete by query stops on LIM metadata failures before deleting", func(t *testing.T) {
+		for _, failure := range []struct {
+			name   string
+			cause  error
+			status int
+		}{
+			{"decimal mapping", interfaces.NewDecimalIndexError("amount", "invalid_scale"), http.StatusBadRequest},
+			{"unknown mapping", errors.New("private mapping diagnostic"), http.StatusInternalServerError},
+		} {
+			t.Run(failure.name, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				lim := vmock.NewMockLocalIndexManager(ctrl)
+				rs := vmock.NewMockResourceService(ctrl)
+				resource := &interfaces.Resource{ID: "dataset", LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{{Name: "title", Type: interfaces.DataType_String}}}
+				rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID, interfaces.OPERATION_TYPE_DATA_WRITE).Return(nil)
+				lim.EXPECT().SchemaForQuery(resource.SchemaDefinition).Return(nil, failure.cause)
+				params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: "title", Operation: "eq", Value: "value"}}
+				result, err := (&datasetService{lim: lim, rs: rs}).DeleteDocumentsByQuery(ctx, resource, params)
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, failure.status, httpErr.HTTPCode)
+				assert.Nil(t, result)
+				assert.Nil(t, params.ActualFilterCond)
+				if failure.status == http.StatusBadRequest {
+					assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.ErrorCode)
+					assert.Equal(t, "amount", httpErr.Metadata["field"])
+					assert.Equal(t, "invalid_scale", httpErr.Metadata["reason"])
+				} else {
+					assert.NotContains(t, httpErr.ErrorDetails, "private mapping diagnostic")
+				}
+			})
+		}
+	})
+
+	t.Run("delete by query honors disabled metadata returned by the injected LIM", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		rs := vmock.NewMockResourceService(ctrl)
+		ds := &datasetService{lim: lim, rs: rs}
+		resource := &interfaces.Resource{ID: "dataset-1", LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{
+			{Name: "title", Type: interfaces.DataType_String, Filterable: new(true)},
+		}}
+		projected := *resource.SchemaDefinition[0]
+		projected.Filterable = new(false)
+		rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID, interfaces.OPERATION_TYPE_DATA_WRITE).Return(nil)
+		lim.EXPECT().SchemaForQuery(resource.SchemaDefinition).Return([]*interfaces.Property{&projected}, nil)
+		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: "title", Operation: filter_condition.OperationEqual, Value: "value"}}
+		result, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		var httpErr *httperrors.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.ErrorCode)
+		assert.Contains(t, httpErr.ErrorDetails, "not filterable")
+		assert.Nil(t, result)
+		assert.Nil(t, params.ActualFilterCond)
+		assert.True(t, *resource.SchemaDefinition[0].Filterable)
+	})
+
+	t.Run("delete by query uses LIM filterability without changing resource flags", func(t *testing.T) {
+		ds, lim := newDatasetServiceMock(t)
+		resource := &interfaces.Resource{ID: "dataset-1", Category: interfaces.ResourceCategoryDataset,
+			LocalIndexName: "dataset-1", SchemaDefinition: []*interfaces.Property{
+				{Name: "title", Type: interfaces.DataType_String, Filterable: new(false)},
+			}}
+		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
+			Operation: filter_condition.OperationAnd, SubConds: []*interfaces.FilterCondCfg{
+				{Field: "title", Operation: filter_condition.OperationEqual, Value: "protected"},
+			},
+		}}
+		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), resource.LocalIndexName, resource, params).
+			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, query *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
+				require.NotNil(t, query.ActualFilterCond)
+				return &interfaces.DeleteByQueryResult{Deleted: 1}, nil
+			})
+		result, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, result.Deleted)
+		assert.False(t, *resource.SchemaDefinition[0].Filterable)
+	})
+
+	t.Run("temporal range errors preserve the actionable code", func(t *testing.T) {
+		ds, lim := newDatasetServiceMock(t)
+		cause := interfaces.NewTemporalRangeError("created", "date", 2147483647, "year")
+		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(nil, cause)
+		page, err := ds.ListDocuments(ctx, resource, params)
+		var rows []map[string]any
+		var total int64
+		if page != nil {
+			rows = page.Entries
+			total = page.TotalCount
+		}
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *httperrors.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_QueryTimeOutOfRange, httpErr.ErrorCode)
+		assert.Equal(t, "created", httpErr.Metadata["field"])
+		dated := &interfaces.Resource{LocalIndexName: "dataset-1", SchemaDefinition: []*interfaces.Property{{Name: "created", Type: interfaces.DataType_Datetime}}}
+		query := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: "created", Operation: "before", Value: []any{2147483647, "year"}}}
+		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "dataset-1", dated, query).Return(nil, cause)
+		result, err := ds.DeleteDocumentsByQuery(ctx, dated, query)
+		assert.Nil(t, result)
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_QueryTimeOutOfRange, httpErr.ErrorCode)
+		assert.Equal(t, "created", httpErr.Metadata["field"])
+	})
 
 	t.Run("list documents", func(t *testing.T) {
 		ds, lim := newDatasetServiceMock(t)
-		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(docs, int64(1), nil)
+		page := &interfaces.ResourceDataQueryResult{Entries: docs, TotalCount: 1, IsApproximate: true, SearchAfter: []any{"next"}}
+		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(page, nil)
 
-		got, total, err := ds.ListDocuments(ctx, resource, params)
+		gotResult, err := ds.ListDocuments(ctx, resource, params)
+		var got []map[string]any
+		var total int64
+		if gotResult != nil {
+			got = gotResult.Entries
+			total = gotResult.TotalCount
+		}
 
 		require.NoError(t, err)
 		assert.Equal(t, docs, got)
 		assert.Equal(t, int64(1), total)
+		assert.Same(t, page, gotResult)
+		assert.True(t, gotResult.IsApproximate)
+		assert.Equal(t, []any{"next"}, gotResult.SearchAfter)
+		assert.Empty(t, params.SearchAfter)
 	})
 
 	t.Run("count documents requests an exact total", func(t *testing.T) {
 		ds, lim := newDatasetServiceMock(t)
 		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				assert.True(t, got.NeedTotal)
 				assert.Equal(t, 1, got.Paging.Limit)
-				return nil, 42, nil
+				return &interfaces.ResourceDataQueryResult{Entries: nil, TotalCount: 42}, nil
 			})
 
 		total, err := ds.CountDocuments(ctx, resource)
@@ -127,19 +331,38 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 		assert.Equal(t, int64(42), total)
 	})
 
+	t.Run("list documents preserves keyword limit code and metadata", func(t *testing.T) {
+		ds, lim := newDatasetServiceMock(t)
+		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(nil, fmt.Errorf("build: %w", interfaces.NewKeywordLimitError("status", 256)))
+		rowsResult, err := ds.ListDocuments(ctx, resource, params)
+		var rows []map[string]any
+		var total int64
+		if rowsResult != nil {
+			rows = rowsResult.Entries
+			total = rowsResult.TotalCount
+		}
+		assert.Nil(t, rows)
+		assert.Zero(t, total)
+		var httpErr *httperrors.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, "VegaBackend.Resource.QueryValueExceedsKeywordLimit", httpErr.ErrorCode)
+		assert.Equal(t, map[string]any{"field": "status", "limit": 256}, httpErr.Metadata)
+	})
+
 	t.Run("list documents answers 400 for a condition the index cannot build", func(t *testing.T) {
 		ds, lim := newDatasetServiceMock(t)
 		cause := fmt.Errorf("failed to build filter query: %w",
 			interfaces.NewConditionBuildError("text field body has no keyword feature; re-save the resource configuration and rebuild the local index, or use match"))
-		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(nil, int64(0), cause)
+		lim.EXPECT().ListDocuments(gomock.Any(), "dataset-1", resource, params).Return(nil, cause)
 
-		_, _, err := ds.ListDocuments(ctx, resource, params)
+		_, err := ds.ListDocuments(ctx, resource, params)
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
-		assert.Contains(t, httpErr.BaseError.ErrorDetails, "re-save the resource configuration")
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.ErrorCode)
+		assert.Contains(t, httpErr.ErrorDetails, "re-save the resource configuration")
 	})
 
 	t.Run("get documents preserves positions for ignored missing documents", func(t *testing.T) {
@@ -153,9 +376,34 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 		assert.Equal(t, []map[string]any{{"id": "doc-1"}, nil}, got)
 	})
 
+	t.Run("get documents preserves dataset JSON types", func(t *testing.T) {
+		ds, lim := newDatasetServiceMock(t)
+		resource := &interfaces.Resource{ID: "dataset-1", LocalIndexName: "dataset-1", Category: interfaces.ResourceCategoryDataset,
+			SchemaDefinition: []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json}}}
+		values := []any{map[string]any{"id": "creator"}, []any{"value", true}, int64(42), true, "{incomplete", nil}
+		documents := make([]map[string]any, len(values)+1)
+		ids := make([]string, len(documents))
+		for i := range documents {
+			ids[i] = fmt.Sprintf("doc-%d", i)
+			if i < len(values) {
+				documents[i] = map[string]any{"payload": values[i]}
+			}
+		}
+		lim.EXPECT().GetDocuments(gomock.Any(), "dataset-1", ids).Return(documents, nil)
+
+		got, err := ds.GetDocuments(ctx, resource, ids, true)
+
+		require.NoError(t, err)
+		require.Len(t, got, len(documents))
+		for i, value := range values {
+			assert.Equal(t, value, got[i]["payload"])
+		}
+		assert.Nil(t, got[len(values)])
+	})
+
 	t.Run("get documents allows resource-level query permission", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
 		rs := vmock.NewMockResourceService(ctrl)
 		ds := &datasetService{lim: lim, rs: rs}
 		resource := &interfaces.Resource{ID: "dataset-1", CatalogID: "catalog-1", LocalIndexName: "dataset-1"}
@@ -185,7 +433,7 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		rs := vmock.NewMockResourceService(ctrl)
 		ds := &datasetService{rs: rs}
-		denied := rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		denied := httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 		rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID,
 			interfaces.OPERATION_TYPE_QUERY_DATA).Return(denied)
 
@@ -235,17 +483,17 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 
 		_, err := ds.CreateDocument(ctx, resource, map[string]any{"_id": "doc-1"})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
 	})
 
 	t.Run("requires data_write permission for document mutations", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
 		rs := vmock.NewMockResourceService(ctrl)
 		ds := &datasetService{lim: lim, rs: rs}
-		denied := rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+		denied := httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden).
 			WithErrorDetails("Access denied: insufficient permissions for[data_write]")
 		rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID,
 			interfaces.OPERATION_TYPE_DATA_WRITE).Return(denied)
@@ -259,11 +507,11 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 		ds, _ := newDatasetServiceMock(t)
 		resource := &interfaces.Resource{ID: "dataset-1", LocalIndexName: "dataset-1", SchemaDefinition: []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json}}}
 		for _, operation := range []string{filter_condition.OperationNotExist, filter_condition.OperationNull} {
-			err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Name: "payload", Operation: operation}})
-			var httpErr *rest.HTTPError
+			_, err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: "payload", Operation: operation}})
+			var httpErr *httperrors.HTTPError
 			require.ErrorAs(t, err, &httpErr)
 			assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-			assert.Contains(t, httpErr.BaseError.ErrorDetails, "not found")
+			assert.Contains(t, httpErr.ErrorDetails, "not found")
 		}
 	})
 
@@ -278,19 +526,18 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 			}},
 		}
 		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
-			Name:      "id",
+			Field:     "id",
 			Operation: filter_condition.OperationEqual,
-			ValueOptCfg: interfaces.ValueOptCfg{
-				ValueFrom: interfaces.ValueFrom_Const,
-				Value:     1,
-			},
+			ValueFrom: interfaces.ValueFrom_Const,
+			Value:     1,
 		}}
-		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "dataset-1", resource, params).Return(errors.New("delete failed"))
+		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "dataset-1", resource, params).Return(nil, errors.New("delete failed"))
 
-		err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
 
 		assertHTTPError(t, err)
-		assert.Contains(t, err.Error(), "delete failed")
+		assert.Contains(t, err.Error(), "completion is unknown")
+		assert.NotContains(t, err.Error(), "delete failed")
 	})
 
 	t.Run("delete by query defaults nested value sources before index access", func(t *testing.T) {
@@ -302,18 +549,19 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
 			Operation: filter_condition.OperationAnd,
 			SubConds: []*interfaces.FilterCondCfg{{
-				Name: "title", Operation: filter_condition.OperationLike,
-				ValueOptCfg: interfaces.ValueOptCfg{Value: "old"},
+				Field: "title", Operation: filter_condition.OperationLike,
+				Value: "old",
 			}},
 		}}
 		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "dataset-1", resource, params).
-			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) error {
+			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
 				assert.Equal(t, interfaces.ValueFrom_Const, got.FilterCondCfg.SubConds[0].ValueFrom)
 				require.NotNil(t, got.ActualFilterCond)
-				return nil
+				return &interfaces.DeleteByQueryResult{}, nil
 			})
 
-		require.NoError(t, ds.DeleteDocumentsByQuery(ctx, resource, params))
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		require.NoError(t, err)
 	})
 
 	t.Run("delete by query distinguishes invalid operations before index access", func(t *testing.T) {
@@ -332,8 +580,8 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 				ds, _ := newDatasetServiceMock(t)
 				resource := &interfaces.Resource{ID: "dataset-1", LocalIndexName: "dataset-1"}
 				condition := &interfaces.FilterCondCfg{
-					Name: "title", Operation: tc.operation,
-					ValueOptCfg: interfaces.ValueOptCfg{Value: "old"},
+					Field: "title", Operation: tc.operation,
+					Value: "old",
 				}
 				if tc.nested {
 					condition = &interfaces.FilterCondCfg{
@@ -342,12 +590,12 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 				}
 				params := &interfaces.ResourceDataQueryParams{FilterCondCfg: condition}
 
-				err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+				_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
 
-				var httpErr *rest.HTTPError
+				var httpErr *httperrors.HTTPError
 				require.ErrorAs(t, err, &httpErr)
 				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-				assert.Equal(t, tc.code, httpErr.BaseError.ErrorCode)
+				assert.Equal(t, tc.code, httpErr.ErrorCode)
 				assert.Nil(t, params.ActualFilterCond)
 			})
 		}
@@ -360,50 +608,55 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "title", Type: interfaces.DataType_String}},
 		}
 		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
-			Name: "title", Operation: filter_condition.OperationEqual,
-			ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: "unknown", Value: "old"},
+			Field: "title", Operation: filter_condition.OperationEqual,
+			ValueFrom: "unknown", Value: "old",
 		}}
 
-		err := ds.DeleteDocumentsByQuery(ctx, resource, params)
-		var httpErr *rest.HTTPError
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_InvalidParameter_FilterConditionValueFrom, httpErr.BaseError.ErrorCode)
-		assert.Contains(t, httpErr.BaseError.ErrorDetails, "value_from")
+		assert.Equal(t, verrors.VegaBackend_InvalidParameter_FilterConditionValueFrom, httpErr.ErrorCode)
+		assert.Contains(t, httpErr.ErrorDetails, "value_from")
 		assert.Nil(t, params.ActualFilterCond)
 	})
 
 	t.Run("delete by query rejects an empty filter without calling the index", func(t *testing.T) {
 		ds, _ := newDatasetServiceMock(t)
 
-		err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{
 			FilterCondCfg: &interfaces.FilterCondCfg{},
 		})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Contains(t, httpErr.BaseError.ErrorDetails, "non-empty filter")
+		assert.Contains(t, httpErr.ErrorDetails, "non-empty filter")
 	})
 
-	t.Run("delete by query rejects an and condition containing only empty filters", func(t *testing.T) {
-		ds, _ := newDatasetServiceMock(t)
+	for _, operation := range []string{filter_condition.OperationAnd, filter_condition.OperationOr} {
+		t.Run("delete by query rejects an "+operation+" condition containing only empty filters", func(t *testing.T) {
+			ds, _ := newDatasetServiceMock(t)
 
-		err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{
-			FilterCondCfg: &interfaces.FilterCondCfg{
-				Operation: filter_condition.OperationAnd,
-				SubConds:  []*interfaces.FilterCondCfg{{}},
-			},
+			_, err := ds.DeleteDocumentsByQuery(ctx, resource, &interfaces.ResourceDataQueryParams{
+				FilterCondCfg: &interfaces.FilterCondCfg{
+					Operation: operation,
+					SubConds:  []*interfaces.FilterCondCfg{{}},
+				},
+			})
+
+			var httpErr *httperrors.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+			assert.Contains(t, httpErr.ErrorDetails, "no effective child conditions")
 		})
+	}
 
-		var httpErr *rest.HTTPError
-		require.ErrorAs(t, err, &httpErr)
-		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Contains(t, httpErr.BaseError.ErrorDetails, "non-empty filter")
-	})
-
-	t.Run("delete by query resolves resource generated fields before local index access", func(t *testing.T) {
-		ds, lim := newDatasetServiceMock(t)
+	t.Run("delete by query uses generated vector from one complete query schema", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		rs := vmock.NewMockResourceService(ctrl)
+		ds := &datasetService{lim: lim, rs: rs}
 		resource := &interfaces.Resource{
 			ID:             "dataset-1",
 			LocalIndexName: "dataset-1",
@@ -415,22 +668,29 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 				}},
 			}},
 		}
+		vector := &interfaces.Property{Name: "content_vector", OriginalName: "content_vector", Type: interfaces.DataType_Vector, Filterable: new(true),
+			Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}
+		rs.EXPECT().CheckResourcePermission(gomock.Any(), resource.ID, interfaces.OPERATION_TYPE_DATA_WRITE).Return(nil)
+		lim.EXPECT().SchemaForQuery(resource.SchemaDefinition).Return([]*interfaces.Property{resource.SchemaDefinition[0], vector}, nil)
+		lim.EXPECT().GeneratedFields(gomock.Any()).Times(0)
 		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
-			Name:      "content_vector",
+			Field:     "content_vector",
 			Operation: filter_condition.OperationKnnVector,
-			ValueOptCfg: interfaces.ValueOptCfg{
-				ValueFrom: interfaces.ValueFrom_Const,
-				Value:     []float32{0.1, 0.2},
-			},
+			ValueFrom: interfaces.ValueFrom_Const,
+			Value:     []float32{0.1, 0.2},
 		}}
 		lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "dataset-1", resource, params).
-			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) error {
+			DoAndReturn(func(_ context.Context, _ string, _ *interfaces.Resource, got *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
 				require.NotNil(t, got.ActualFilterCond)
 				assert.Equal(t, filter_condition.OperationKnnVector, got.ActualFilterCond.GetOperation())
-				return nil
+				actual, ok := got.ActualFilterCond.(*filter_condition.KnnVectorCond)
+				require.True(t, ok)
+				assert.Equal(t, "content_vector", actual.FilterFieldName)
+				return &interfaces.DeleteByQueryResult{}, nil
 			})
 
-		require.NoError(t, ds.DeleteDocumentsByQuery(ctx, resource, params))
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		require.NoError(t, err)
 	})
 
 	t.Run("delete by query returns bad request for an invalid condition", func(t *testing.T) {
@@ -444,28 +704,53 @@ func TestDatasetServiceDocumentOperations(t *testing.T) {
 			}},
 		}
 		params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{
-			Name:      "missing",
+			Field:     "missing",
 			Operation: filter_condition.OperationEqual,
-			ValueOptCfg: interfaces.ValueOptCfg{
-				ValueFrom: interfaces.ValueFrom_Const,
-				Value:     "value",
-			},
+			ValueFrom: interfaces.ValueFrom_Const,
+			Value:     "value",
 		}}
 
-		err := ds.DeleteDocumentsByQuery(ctx, resource, params)
+		_, err := ds.DeleteDocumentsByQuery(ctx, resource, params)
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, verrors.VegaBackend_Resource_InvalidParameter, httpErr.ErrorCode)
 	})
+}
+
+// Ordinary document fixtures do not exercise physical schema projection.
+func newDatasetLocalIndexManagerMock(ctrl *gomock.Controller) *vmock.MockLocalIndexManager {
+	manager := vmock.NewMockLocalIndexManager(ctrl)
+	manager.EXPECT().SchemaForQuery(gomock.Any()).DoAndReturn(func(schema []*interfaces.Property) ([]*interfaces.Property, error) {
+		projected := make([]*interfaces.Property, 0, len(schema))
+		for _, source := range schema {
+			if source.Type == interfaces.DataType_Json {
+				continue
+			}
+			field := *source
+			field.Filterable = new(true)
+			projected = append(projected, &field)
+		}
+
+		for _, source := range schema {
+			for _, feature := range source.Features {
+				if feature.FeatureType == interfaces.PropertyFeatureType_Vector && feature.RefProperty == "" {
+					name := source.Name + "_vector"
+					projected = append(projected, &interfaces.Property{Name: name, Type: interfaces.DataType_Vector, Filterable: new(true), Features: []interfaces.PropertyFeature{feature}})
+				}
+			}
+		}
+		return projected, nil
+	}).AnyTimes()
+	return manager
 }
 
 func newDatasetServiceMock(t *testing.T) (*datasetService, *vmock.MockLocalIndexManager) {
 	t.Helper()
 
 	ctrl := gomock.NewController(t)
-	lim := vmock.NewMockLocalIndexManager(ctrl)
+	lim := newDatasetLocalIndexManagerMock(ctrl)
 	rs := vmock.NewMockResourceService(ctrl)
 	rs.EXPECT().CheckResourcePermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	return &datasetService{lim: lim, rs: rs}, lim
@@ -475,7 +760,190 @@ func assertHTTPError(t *testing.T, err error) {
 	t.Helper()
 
 	require.Error(t, err)
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	require.ErrorAs(t, err, &httpErr)
-	assert.NotEmpty(t, httpErr.BaseError.ErrorCode)
+	assert.NotEmpty(t, httpErr.ErrorCode)
+}
+
+func TestDatasetServiceBulkReplaceDocuments(t *testing.T) {
+	ctx := context.Background()
+	t.Run("uses supplied resource and preserves individual results", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
+		ds := &datasetService{lim: lim}
+		resource := &interfaces.Resource{ID: "dataset", Category: interfaces.ResourceCategoryDataset, LocalIndexName: "index"}
+
+		input := []map[string]any{
+			{"_id": "ok", "new": "value"},
+			{"_id": "conflict"},
+		}
+		lim.EXPECT().IndexDocuments(ctx, "index", []interfaces.DocumentWrite{{ID: "ok", Document: map[string]any{"new": "value"}}, {ID: "conflict", Document: map[string]any{}}}).Return([]interfaces.DocumentWriteResult{
+			{ID: "ok", Status: 201}, {ID: "conflict", Status: 409, ErrorCode: interfaces.DocumentConflict},
+		}, nil)
+		results, err := ds.BulkReplaceDocuments(ctx, resource, input)
+		require.NoError(t, err)
+		require.Len(t, results, 2)
+		assert.Equal(t, 201, results[0].Status)
+		assert.Equal(t, interfaces.DocumentConflict, results[1].ErrorCode)
+		assert.Equal(t, map[string]any{"_id": "ok", "new": "value"}, input[0])
+	})
+
+	t.Run("duplicate IDs reject entire batch before inference or writes", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
+		mfs := vmock.NewMockModelFactoryService(ctrl)
+		ds := &datasetService{lim: lim, mfs: mfs}
+		resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+		result, err := ds.BulkReplaceDocuments(ctx, resource, []map[string]any{
+			{"_id": "valid", "content": "hello"}, {"_id": "duplicate"}, {"_id": "duplicate"},
+		})
+		require.Nil(t, result)
+		var httpErr *httperrors.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, 400, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_InvalidParameter_RequestBody, httpErr.ErrorCode)
+	})
+	t.Run("write error is returned for entire request", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
+		resource := &interfaces.Resource{Category: interfaces.ResourceCategoryDataset, LocalIndexName: "index"}
+
+		writeErr := errors.New("index unavailable")
+		lim.EXPECT().IndexDocuments(ctx, "index", gomock.Any()).Return(nil, writeErr)
+		results, err := (&datasetService{lim: lim}).BulkReplaceDocuments(ctx, resource, []map[string]any{{"_id": "doc"}})
+		require.ErrorIs(t, err, writeErr)
+		assert.Nil(t, results)
+	})
+
+	for _, tc := range []struct {
+		name  string
+		entry map[string]any
+	}{
+		{"null entry", nil}, {"missing ID", map[string]any{}}, {"null ID", map[string]any{"_id": nil}},
+		{"numeric ID", map[string]any{"_id": 123}}, {"empty ID", map[string]any{"_id": ""}},
+		{"blank ID", map[string]any{"_id": " \t\n"}},
+		{"oversized ID", map[string]any{"_id": strings.Repeat("a", 513)}},
+		{"oversized UTF8 ID", map[string]any{"_id": strings.Repeat("界", 171)}},
+		{"invalid UTF8 ID", map[string]any{"_id": string([]byte{0xff})}},
+	} {
+		t.Run(tc.name+" rejects entire batch", func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			ds := &datasetService{lim: newDatasetLocalIndexManagerMock(ctrl), mfs: vmock.NewMockModelFactoryService(ctrl)}
+			resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+			results, err := ds.BulkReplaceDocuments(ctx, resource, []map[string]any{{"_id": "valid", "content": "hello"}, tc.entry})
+			assert.Nil(t, results)
+			var httpErr *httperrors.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, 400, httpErr.HTTPCode)
+			assert.Equal(t, verrors.VegaBackend_InvalidParameter_RequestBody, httpErr.ErrorCode)
+		})
+	}
+
+	t.Run("constructs writes from materialized documents", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := newDatasetLocalIndexManagerMock(ctrl)
+		mfs := vmock.NewMockModelFactoryService(ctrl)
+		ds := &datasetService{lim: lim, mfs: mfs}
+		resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+		model := &interfaces.SmallModel{ModelID: "model"}
+		mfs.EXPECT().GetModelByID(ctx, "model").Return(model, nil)
+		mfs.EXPECT().GetVector(ctx, model, []string{"hello"}).Return([]*interfaces.VectorResp{{Vector: []float32{1, 2}}}, nil)
+		lim.EXPECT().IndexDocuments(ctx, "index", []interfaces.DocumentWrite{{ID: "doc", Document: map[string]any{"content": "hello", "content_vector": []float32{1, 2}}}}).Return([]interfaces.DocumentWriteResult{{ID: "doc", Status: 201}}, nil)
+		entries := []map[string]any{{"_id": "doc", "content": "hello"}}
+		results, err := ds.BulkReplaceDocuments(ctx, resource, entries)
+		require.NoError(t, err)
+		require.Len(t, results, 1)
+		assert.Equal(t, 201, results[0].Status)
+		assert.NotContains(t, entries[0], "content_vector")
+	})
+
+	for _, failure := range []string{"invalid vector", "registry", "inference"} {
+		t.Run(failure+" prevents entire batch write", func(t *testing.T) {
+			core, logs := observer.New(zap.ErrorLevel)
+			sharedLogger := logger.GetLogger()
+			original := *sharedLogger
+			*sharedLogger = *zap.New(core).Sugar()
+			t.Cleanup(func() { *sharedLogger = original })
+			ctrl := gomock.NewController(t)
+			lim := newDatasetLocalIndexManagerMock(ctrl)
+			mfs := vmock.NewMockModelFactoryService(ctrl)
+			resource := &interfaces.Resource{LocalIndexName: "index", IndexConfig: &interfaces.ResourceIndexConfig{DefaultEmbeddingModel: "model"}, SchemaDefinition: []*interfaces.Property{{Name: "content", Type: interfaces.DataType_Text, Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Vector, Config: map[string]any{"dimension": 2}}}}}}
+			entries := []map[string]any{{"_id": "explicit", "content_vector": []float32{1, 2}}, {"_id": "infer", "content": "hello"}}
+			status := 500
+			if failure == "invalid vector" {
+				entries = append(entries, map[string]any{"_id": "bad", "content_vector": []float32{1}})
+				status = 400
+			} else {
+				model := &interfaces.SmallModel{ModelID: "model"}
+				if failure == "registry" {
+					mfs.EXPECT().GetModelByID(ctx, "model").Return(nil, errors.New("secret registry detail"))
+				} else {
+					mfs.EXPECT().GetModelByID(ctx, "model").Return(model, nil)
+					mfs.EXPECT().GetVector(ctx, model, []string{"hello"}).Return(nil, errors.New("secret model detail"))
+				}
+			}
+			results, err := (&datasetService{lim: lim, mfs: mfs}).BulkReplaceDocuments(ctx, resource, entries)
+			assert.Nil(t, results)
+			var httpErr *httperrors.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, status, httpErr.HTTPCode)
+			if status == 400 {
+				assert.Empty(t, logs.All())
+			} else {
+				require.Len(t, logs.All(), 1)
+				assert.Contains(t, logs.All()[0].Message, "secret")
+			}
+			assert.NotContains(t, httpErr.Error(), "secret")
+			assert.NotContains(t, entries[1], "content_vector")
+		})
+	}
+
+}
+
+func TestDatasetServiceDeleteDocumentsByQueryIncompleteResult(t *testing.T) {
+	ds, lim := newDatasetServiceMock(t)
+	resource := &interfaces.Resource{ID: "dataset", LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{{Name: "kind", Type: interfaces.DataType_String}}}
+	params := &interfaces.ResourceDataQueryParams{FilterCondCfg: &interfaces.FilterCondCfg{Field: "kind", Operation: filter_condition.OperationEqual2, Value: "old"}}
+	progress := &interfaces.DeleteByQueryResult{Deleted: 2, TimedOut: true, VersionConflicts: 1, Failures: []interfaces.DocumentWriteResult{{ID: "", Status: 400, ErrorCode: interfaces.DocumentInvalid}}}
+	lim.EXPECT().DeleteDocumentsByQuery(gomock.Any(), "index", resource, params).Return(progress, interfaces.NewDeleteByQueryIncompleteError(progress))
+	result, err := ds.DeleteDocumentsByQuery(context.Background(), resource, params)
+	require.Same(t, progress, result)
+	var httpErr *httperrors.HTTPError
+	require.ErrorAs(t, err, &httpErr)
+	assert.Equal(t, verrors.VegaBackend_Dataset_DeleteIncomplete, httpErr.ErrorCode)
+	assert.Equal(t, 500, httpErr.HTTPCode)
+	assert.Same(t, progress, httpErr.ErrorDetails)
+}
+
+func TestDatasetServiceReplaceDocumentChecksIndexResults(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		results []interfaces.DocumentWriteResult
+		err     error
+		ok      bool
+	}{
+		{"success", []interfaces.DocumentWriteResult{{ID: "doc", Status: 201}}, nil, true},
+		{"item failure", []interfaces.DocumentWriteResult{{ID: "doc", Status: 429}}, nil, false},
+		{"missing result", nil, nil, false},
+		{"wrong ID", []interfaces.DocumentWriteResult{{ID: "other", Status: 201}}, nil, false},
+		{"request failure", nil, errors.New("secret index detail"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			rs := vmock.NewMockResourceService(ctrl)
+			lim := newDatasetLocalIndexManagerMock(ctrl)
+			resource := &interfaces.Resource{ID: "dataset", LocalIndexName: "index"}
+			rs.EXPECT().CheckResourcePermission(gomock.Any(), "dataset", interfaces.OPERATION_TYPE_DATA_WRITE).Return(nil)
+			lim.EXPECT().IndexDocuments(gomock.Any(), "index", []interfaces.DocumentWrite{{ID: "doc", Document: map[string]any{"content": "hello"}}}).Return(tc.results, tc.err)
+			err := (&datasetService{rs: rs, lim: lim}).ReplaceDocument(context.Background(), resource, "doc", map[string]any{"content": "hello"})
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, 500, httpErr.HTTPCode)
+				assert.NotContains(t, httpErr.Error(), "secret")
+			}
+		})
+	}
 }

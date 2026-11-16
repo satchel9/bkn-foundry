@@ -28,8 +28,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 )
 
-// TestRESTExecutionRequiresManagedContext verifies that side-effecting REST calls
-// cannot reach their handlers without an Operation, while reads still run ad hoc.
+// Action and skill REST execution still requires managed context; REST tool
+// execution and reads allow ad-hoc calls with the caller's existing permissions.
 func TestRESTExecutionRequiresManagedContext(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cases := []struct {
@@ -40,11 +40,10 @@ func TestRESTExecutionRequiresManagedContext(t *testing.T) {
 	}{
 		{"/api/agent-retrieval/v1/kn/execute_action", `{"query":"q"}`, 0, "conversation_required"},
 		{"/api/agent-retrieval/v1/kn/execute_action", `{"query":"q","bkn_context":{}}`, 0, "conversation_required"},
-		{"/api/agent-retrieval/in/v1/kn/execute_tool", `{"query":"q"}`, 0, "conversation_required"},
-		{"/api/agent-retrieval/in/v1/kn/execute_tool", `{"query":"q","bkn_context":{}}`, 0, "conversation_required"},
+		{"/api/agent-retrieval/in/v1/kn/execute_tool", `{"query":"q"}`, 1, ""},
+		{"/api/agent-retrieval/in/v1/kn/execute_tool", `{"query":"q","bkn_context":{}}`, 1, ""},
 		{"/api/agent-retrieval/v1/kn/execute_skill", `{"query":"q"}`, 0, "conversation_required"},
 		{"/api/agent-retrieval/v1/kn/execute_skill", `{"query":"q","bkn_context":{}}`, 0, "conversation_required"},
-		{"/api/agent-retrieval/v1/kn/run_sql", `{"query":"q"}`, 1, ""},
 		{"/api/agent-retrieval/v1/kn/run_cypher", `{"query":"q"}`, 1, ""},
 		{"/api/agent-retrieval/internal-v1/kn/search_schema", `{"query":"q"}`, 1, ""},
 		{"/api/agent-retrieval/internal-v1/mcp/proxy/mcp-1/tools/tool-1/call", `{"query":"q"}`, 1, ""},
@@ -92,6 +91,48 @@ func TestRESTExecutionRequiresManagedContext(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestQueryMetricLifecycleContextIsRemovedBeforeStrictBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(trustedLifecycleHTTPContext(), middlewareLifecycle(inProcessLifecycleClient(t)))
+	router.POST("/api/agent-retrieval/v1/kn/query_metric", func(c *gin.Context) {
+		decoder := json.NewDecoder(c.Request.Body)
+		decoder.DisallowUnknownFields()
+		var input interfaces.QueryMetricReq
+		if err := decoder.Decode(&input); err != nil {
+			c.String(http.StatusBadRequest, err.Error())
+			return
+		}
+		if input.KnID != "kn-1" || input.Branch != "release" ||
+			input.MetricID != "metric-1" || input.Version != 2 {
+			c.JSON(http.StatusBadRequest, gin.H{"input": input})
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/agent-retrieval/v1/kn/query_metric",
+		bytes.NewBufferString(`{
+			"kn_id":"kn-1",
+			"branch":"release",
+			"metric_id":"metric-1",
+			"version":2,
+			"query":{},
+			"bkn_context":{"conversation_id":"conv-route","interaction_id":"int-route"}
+		}`),
+	)
+	setRouteLifecycleHeaders(request)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("strict query_metric binding failed after lifecycle stripping: status=%d body=%s",
+			response.Code, response.Body.String())
 	}
 }
 
@@ -152,7 +193,6 @@ func TestRESTExecutionFallsBackWhenTraceCoreUnavailable(t *testing.T) {
 		}))
 		for _, path := range []string{
 			"/api/agent-retrieval/v1/kn/execute_action",
-			"/api/agent-retrieval/in/v1/kn/execute_tool",
 			"/api/agent-retrieval/v1/kn/execute_skill",
 		} {
 			for _, body := range []string{`{"query":"q"}`, `{"query":"q","bkn_context":{}}`} {
@@ -219,7 +259,7 @@ func TestRESTContextOptionalityBoundary(t *testing.T) {
 
 			request := httptest.NewRequest(
 				http.MethodPost,
-				"/api/agent-retrieval/v1/kn/run_sql",
+				"/api/agent-retrieval/v1/kn/run_cypher",
 				bytes.NewBufferString(tc.body),
 			)
 			request.Header.Set("Content-Type", "application/json")
@@ -276,7 +316,7 @@ type countingQueryToolsHandler struct {
 	calls int
 }
 
-func (h *countingQueryToolsHandler) RunSQL(c *gin.Context) {
+func (h *countingQueryToolsHandler) RunCypher(c *gin.Context) {
 	h.calls++
 	c.Status(http.StatusNoContent)
 }
@@ -301,8 +341,8 @@ func TestRegisteredProxyRouteDoesNotRequireTrace(t *testing.T) {
 	public.RegisterRouter(publicEngine.Group("/api/agent-retrieval/v1"))
 	publicRequest := httptest.NewRequest(
 		http.MethodPost,
-		"/api/agent-retrieval/v1/kn/run_sql",
-		bytes.NewBufferString(`{"sql":"select 1"}`),
+		"/api/agent-retrieval/v1/kn/run_cypher",
+		bytes.NewBufferString(`{"query":"MATCH (n:x) RETURN count(*) AS n"}`),
 	)
 	publicRequest.Header.Set("Authorization", "Bearer token")
 	publicRequest.Header.Set("Content-Type", "application/json")
@@ -533,12 +573,12 @@ func TestLifecycleMiddlewarePendingReplaySkipsOperatorSideEffect(t *testing.T) {
 	router := gin.New()
 	router.Use(trustedLifecycleHTTPContext())
 	router.Use(middlewareLifecycle(bkntrace.NewLifecycleClient(core.URL, core.Client())))
-	router.POST("/kn/run_sql", func(c *gin.Context) {
+	router.POST("/kn/run_cypher", func(c *gin.Context) {
 		downstreamCalls++
 		c.JSON(http.StatusOK, gin.H{"unsafe": true})
 	})
-	request := httptest.NewRequest(http.MethodPost, "/kn/run_sql", bytes.NewBufferString(`{
-		"sql":"select side_effect()",
+	request := httptest.NewRequest(http.MethodPost, "/kn/run_cypher", bytes.NewBufferString(`{
+		"query":"MATCH (n:side_effect) RETURN n.code",
 		"bkn_context":{"conversation_id":"conv-1","interaction_id":"int-1"}
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -583,12 +623,11 @@ func TestLifecycleMiddlewarePreservesBusinessResponseWhenTerminalTraceWriteFails
 	router := gin.New()
 	router.Use(trustedLifecycleHTTPContext())
 	router.Use(middlewareLifecycle(bkntrace.NewLifecycleClient(core.URL, core.Client())))
-	router.POST("/kn/run_sql", func(c *gin.Context) {
+	router.POST("/kn/run_cypher", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"rows": []any{map[string]any{"material_code": "101-000015"}}})
 	})
-	request := httptest.NewRequest(http.MethodPost, "/kn/run_sql", bytes.NewBufferString(`{
-		"resource_id":"resource-1",
-		"sql":"SELECT material_code FROM material WHERE material_code = '101-000015'",
+	request := httptest.NewRequest(http.MethodPost, "/kn/run_cypher", bytes.NewBufferString(`{
+		"query":"MATCH (m:material) WHERE m.material_code = '101-000015' RETURN m.material_code",
 		"bkn_context":{"conversation_id":"conv-1","interaction_id":"int-1"}
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -844,4 +883,42 @@ func setRouteLifecycleHeaders(request *http.Request) {
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set(common.HeaderBKNRequestID, "req_route_lifecycle_0001")
 	request.Header.Set(common.HeaderTraceparent, "00-4b3d59daeff5bfbb23d46c47a5051ec9-00f067aa0ba902b7-01")
+}
+
+func TestRESTExecuteToolMatchesSearchSchemaContextOptionality(t *testing.T) {
+	for _, prefix := range []string{"/api/agent-retrieval/v1/kn/", "/api/agent-retrieval/in/v1/kn/"} {
+		for _, tool := range []string{"execute_tool", "search_schema"} {
+			for _, body := range []string{`{"query":"q"}`, `{"query":"q","bkn_context":{}}`} {
+				t.Run(prefix+tool+body, func(t *testing.T) {
+					core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						t.Error("ad-hoc REST execution must not depend on Core")
+						w.WriteHeader(http.StatusServiceUnavailable)
+					}))
+					defer core.Close()
+					called := false
+					router := gin.New()
+					router.Use(trustedLifecycleHTTPContext(), middlewareLifecycle(bkntrace.NewLifecycleClient(core.URL, core.Client())))
+					router.POST("/*path", func(c *gin.Context) {
+						called = true
+						var input map[string]any
+						if err := c.ShouldBindJSON(&input); err != nil || input["query"] != "q" {
+							t.Error("request body was lost")
+						}
+						if c.GetHeader("Authorization") != "Bearer caller-token" {
+							t.Error("caller credential was lost")
+						}
+						c.Status(http.StatusNoContent)
+					})
+					request := httptest.NewRequest(http.MethodPost, prefix+tool, strings.NewReader(body))
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set("Authorization", "Bearer caller-token")
+					response := httptest.NewRecorder()
+					router.ServeHTTP(response, request)
+					if !called || response.Code != http.StatusNoContent {
+						t.Fatalf("status=%d called=%v", response.Code, called)
+					}
+				})
+			}
+		}
+	}
 }

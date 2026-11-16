@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 type navigationFixture struct {
@@ -36,6 +36,7 @@ func newNavigationFixture(t *testing.T, visibleObjectTypes []string, objectTypeE
 		ata: bmock.NewMockActionTypeAccess(ctrl),
 	}
 	ps := bmock.NewMockPermissionService(ctrl)
+	filterAllChildren(ps)
 	visible := map[string]struct{}{}
 	for _, id := range visibleObjectTypes {
 		visible[interfaces.KNChildResourceID("kn1", id)] = struct{}{}
@@ -95,7 +96,7 @@ func TestNavigation_ARelationTypeWithAHiddenEndpointDoesNotOpenTheNetwork(t *tes
 
 	_, err := f.service.GetKNByID(context.Background(), "kn1", interfaces.MAIN_BRANCH, "")
 
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusForbidden {
 		t.Fatalf("GetKNByID() error = %v, want 403", err)
 	}
@@ -158,6 +159,7 @@ func TestNavigation_ReferencesAcrossNetworksCostOneAuthorizationCall(t *testing.
 	kna := bmock.NewMockKNAccess(ctrl)
 	rta := bmock.NewMockRelationTypeAccess(ctrl)
 	ps := bmock.NewMockPermissionService(ctrl)
+	filterAllChildren(ps)
 	service := &knowledgeNetworkService{kna: kna, ps: ps, rta: rta}
 
 	parameter := interfaces.KNsQueryParams{

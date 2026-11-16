@@ -10,6 +10,9 @@ package errors
 // Query error code
 const (
 	// 400 Bad Request
+	VegaBackend_Query_InvalidParameter_OutputField          = "VegaBackend.Query.InvalidParameter.OutputField"
+	VegaBackend_Query_UnsupportedOutputField                = "VegaBackend.Query.UnsupportedOutputField"
+	VegaBackend_Query_NoQueryableFields                     = "VegaBackend.Query.NoQueryableFields"
 	VegaBackend_Query_InvalidParameter                      = "VegaBackend.Query.InvalidParameter"
 	VegaBackend_Query_InvalidParameter_LimitExceeded        = "VegaBackend.Query.InvalidParameter.LimitExceeded"
 	VegaBackend_Query_InvalidParameter_JoinTableNotInTables = "VegaBackend.Query.InvalidParameter.JoinTableNotInTables"
@@ -31,7 +34,8 @@ const (
 	VegaBackend_Query_CursorSessionLimitExceeded = "VegaBackend.Query.CursorSessionLimitExceeded"
 
 	// 500 Internal Server Error
-	VegaBackend_Query_ExecuteFailed = "VegaBackend.Query.ExecuteFailed"
+	VegaBackend_Query_ExecuteFailed           = "VegaBackend.Query.ExecuteFailed"
+	VegaBackend_Query_ExecutionBudgetExceeded = "VegaBackend.Query.ExecutionBudgetExceeded"
 
 	// 501 Not Implemented
 	VegaBackend_Query_MultiCatalogNotSupported = "VegaBackend.Query.MultiCatalogNotSupported"
@@ -39,6 +43,9 @@ const (
 
 var QueryErrCodeList = []string{
 	// 400 Bad Request
+	VegaBackend_Query_InvalidParameter_OutputField,
+	VegaBackend_Query_UnsupportedOutputField,
+	VegaBackend_Query_NoQueryableFields,
 	VegaBackend_Query_InvalidParameter,
 	VegaBackend_Query_InvalidParameter_LimitExceeded,
 	VegaBackend_Query_InvalidParameter_JoinTableNotInTables,
@@ -61,6 +68,7 @@ var QueryErrCodeList = []string{
 
 	// 500 Internal Server Error
 	VegaBackend_Query_ExecuteFailed,
+	VegaBackend_Query_ExecutionBudgetExceeded,
 
 	// 501 Not Implemented
 	VegaBackend_Query_MultiCatalogNotSupported,

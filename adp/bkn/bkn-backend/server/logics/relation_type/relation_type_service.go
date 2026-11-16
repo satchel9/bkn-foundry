@@ -17,25 +17,25 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	cond "bkn-backend/common/condition"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/batchindex"
-	"bkn-backend/logics/model_factory"
-	"bkn-backend/logics/object_type"
-	"bkn-backend/logics/permission"
-	"bkn-backend/logics/user_mgmt"
-	"bkn-backend/logics/vega_backend"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/batchindex"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/model_factory"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/user_mgmt"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/vega_backend"
 )
 
 var (
@@ -50,13 +50,10 @@ type relationTypeService struct {
 	mfs        interfaces.ModelFactoryService
 	ots        interfaces.ObjectTypeService
 	ps         interfaces.PermissionService
+	nr         *logics.NetworkRelations
 	rta        interfaces.RelationTypeAccess
 	ums        interfaces.UserMgmtService
 	vbs        interfaces.VegaBackendService
-}
-
-func invalidParameterDetail(ctx context.Context, name string, templateData map[string]any) string {
-	return i18n.Translate(rest.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail."+name, templateData)
 }
 
 func NewRelationTypeService(appSetting *common.AppSetting) interfaces.RelationTypeService {
@@ -68,6 +65,7 @@ func NewRelationTypeService(appSetting *common.AppSetting) interfaces.RelationTy
 			mfs:        model_factory.NewModelFactoryService(appSetting, logics.MFA),
 			ots:        object_type.NewObjectTypeService(appSetting),
 			ps:         permission.NewPermissionService(appSetting),
+			nr:         logics.NewNetworkRelations(),
 			rta:        logics.RTA,
 			ums:        user_mgmt.NewUserMgmtService(appSetting),
 			vbs:        vega_backend.NewVegaBackendService(appSetting, logics.VBA),
@@ -84,7 +82,7 @@ func (rts *relationTypeService) CheckRelationTypeExistByID(ctx context.Context, 
 	rtName, exist, err := rts.rta.CheckRelationTypeExistByID(ctx, knID, branch, rtID)
 	if err != nil {
 		otellog.LogError(ctx, fmt.Sprintf("按ID[%s]获取关系类失败", rtID), err)
-		return "", exist, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return "", exist, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_CheckRelationTypeIfExistFailed).WithErrorDetails(err.Error())
 	}
 
@@ -109,9 +107,15 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 		tx, err = rts.db.Begin()
 		if err != nil {
 			otellog.LogError(ctx, "Begin transaction error", err)
-			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return []string{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError_BeginTransactionFailed).
 				WithErrorDetails(err.Error())
+		}
+		if len(relationTypes) > 0 {
+			if err = logics.GuardDefinitionWrite(ctx, tx, relationTypes[0].KNID, relationTypes[0].Branch, false); err != nil {
+				_ = tx.Rollback()
+				return []string{}, err
+			}
 		}
 		// 0.1 On failure.
 		defer func() {
@@ -158,6 +162,9 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 		if err != nil {
 			return []string{}, err
 		}
+		if err = validateDeclarations(ctx, relationType); err != nil {
+			return []string{}, err
+		}
 
 		bknRel := logics.ToBKNRelationType(relationType)
 		relationType.BKNRawContent = bknsdk.SerializeRelationType(bknRel)
@@ -186,6 +193,16 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 			return []string{}, err
 		}
 	}
+	// After the permission check: the refusal lists stored declarations, which only a caller allowed
+	// to modify these relation types may see.
+	if err = rts.checkOverwriteKeepsDeclarations(ctx, updateRelationTypes, false); err != nil {
+		return []string{}, err
+	}
+	if err = rts.nr.SaveRefusal(ctx, relationTypes[0].KNID, relationTypes[0].Branch,
+		logics.SavedDefinitions{RelationTypes: append(append([]*interfaces.RelationType{}, createRelationTypes...), updateRelationTypes...)},
+		berrors.BknBackend_RelationType_InvalidParameter_Declarations, berrors.BknBackend_RelationType_InternalError); err != nil {
+		return []string{}, err
+	}
 
 	// 1. Create the model.
 	rtIDs := make([]string, 0, len(createRelationTypes))
@@ -197,7 +214,7 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 		if err != nil {
 			logger.Errorf("CreateRelationType error: %s", err.Error())
 			span.SetStatus(codes.Error, "创建关系类失败")
-			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return []string{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).
 				WithErrorDetails(err.Error())
 		}
@@ -207,11 +224,11 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 			logger.Errorf("CreateRelationTypes error: %s", err.Error())
 			span.SetStatus(codes.Error, "Batch create relation types failed")
 			if _, duplicate := common.DatabaseUniqueConstraint(err); duplicate {
-				return []string{}, rest.NewHTTPError(ctx, http.StatusBadRequest,
+				return []string{}, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 					berrors.BknBackend_RelationType_RelationTypeIDExisted).
 					WithErrorDetails("One or more relation type IDs already exist")
 			}
-			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return []string{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).
 				WithErrorDetails(err.Error())
 		}
@@ -226,7 +243,7 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 
 	// Update.
 	if len(updateRelationTypes) == 1 {
-		err = rts.UpdateRelationType(ctx, tx, updateRelationTypes[0], strictMode)
+		err = rts.updateRelationType(ctx, tx, updateRelationTypes[0], strictMode, false)
 		if err != nil {
 			return []string{}, err
 		}
@@ -235,7 +252,7 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 		if err != nil {
 			logger.Errorf("UpdateRelationTypes error: %s", err.Error())
 			span.SetStatus(codes.Error, "Batch update relation types failed")
-			return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return []string{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).
 				WithErrorDetails(err.Error())
 		}
@@ -247,13 +264,37 @@ func (rts *relationTypeService) CreateRelationTypes(ctx context.Context, tx *sql
 	if err != nil {
 		logger.Errorf("InsertDatasetData error: %s", err.Error())
 		span.SetStatus(codes.Error, "关系类索引写入失败")
-		return []string{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return []string{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_InsertOpenSearchDataFailed).
 			WithErrorDetails(err.Error())
 	}
 
 	span.SetStatus(codes.Ok, "")
 	return rtIDs, nil
+}
+
+// CheckOverwriteDeclarations lists what an overwrite import of relationTypes would clear, and
+// records the definitions it would write for the network check, before the import writes anything.
+// See the object type service.
+func (rts *relationTypeService) CheckOverwriteDeclarations(ctx context.Context, knID string, branch string,
+	relationTypes []*interfaces.RelationType, mode string) error {
+	if len(relationTypes) == 0 {
+		return nil
+	}
+	for _, relationType := range relationTypes {
+		relationType.KNID = knID
+		relationType.Branch = branch
+	}
+	creates, updates, err := rts.handleRelationTypeImportMode(ctx, mode, relationTypes)
+	if err != nil {
+		return err
+	}
+	if err = rts.checkOverwriteKeepsDeclarations(ctx, updates, !permission.KNImportPermissionPrechecked(ctx)); err != nil {
+		return err
+	}
+	_, err = rts.nr.CheckSave(ctx, knID, branch,
+		logics.SavedDefinitions{RelationTypes: append(append([]*interfaces.RelationType{}, creates...), updates...)})
+	return err
 }
 
 // ValidateRelationTypes authorizes the validation request and checks dependency
@@ -280,8 +321,11 @@ func (rts *relationTypeService) ValidateRelationTypes(ctx context.Context, knID 
 		}
 	}
 	ctx = permission.WithDependencyValidationPermissionPrechecked(ctx)
-	_, _, err = rts.handleRelationTypeImportMode(ctx, mode, relationTypes)
+	creates, updates, err := rts.handleRelationTypeImportMode(ctx, mode, relationTypes)
 	if err != nil {
+		return err
+	}
+	if err = rts.checkOverwriteKeepsDeclarations(ctx, updates, !permission.KNImportPermissionPrechecked(ctx)); err != nil {
 		return err
 	}
 
@@ -292,6 +336,15 @@ func (rts *relationTypeService) ValidateRelationTypes(ctx context.Context, knID 
 		if err != nil {
 			return err
 		}
+		if err = validateDeclarations(ctx, relationType); err != nil {
+			return err
+		}
+	}
+
+	if err = rts.nr.SaveRefusal(ctx, knID, branch,
+		logics.SavedDefinitions{RelationTypes: append(append([]*interfaces.RelationType{}, creates...), updates...)},
+		berrors.BknBackend_RelationType_InvalidParameter_Declarations, berrors.BknBackend_RelationType_InternalError); err != nil {
+		return err
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -317,7 +370,7 @@ func (rts *relationTypeService) ListRelationTypes(ctx context.Context,
 		logger.Errorf("ListRelationTypes error: %s", err.Error())
 		span.SetStatus(codes.Error, "List relation types error")
 
-		return []*interfaces.RelationType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return []*interfaces.RelationType{}, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 	}
 	if interfaces.IsAuthorizationResourceCatalog(ctx) {
@@ -394,7 +447,7 @@ func (rts *relationTypeService) ListRelationTypes(ctx context.Context,
 		if err != nil {
 			span.SetStatus(codes.Error, "GetAccountNames error")
 
-			return []*interfaces.RelationType{}, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return []*interfaces.RelationType{}, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 		}
 	}
@@ -423,7 +476,7 @@ func (rts *relationTypeService) GetRelationTypesByIDs(ctx context.Context, knID 
 		logger.Errorf("GetRelationTypesByRTIDs error: %s", err.Error())
 		span.SetStatus(codes.Error, fmt.Sprintf("Get relation types[%v] error: %v", rtIDs, err))
 
-		return []*interfaces.RelationType{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return []*interfaces.RelationType{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed).
 			WithErrorDetails(err.Error())
 	}
@@ -433,7 +486,7 @@ func (rts *relationTypeService) GetRelationTypesByIDs(ctx context.Context, knID 
 		logger.Errorf(errStr)
 		span.SetStatus(codes.Error, errStr)
 
-		return []*interfaces.RelationType{}, rest.NewHTTPError(ctx, http.StatusNotFound,
+		return []*interfaces.RelationType{}, httperrors.NewHTTPError(ctx, http.StatusNotFound,
 			berrors.BknBackend_RelationType_RelationTypeNotFound).WithErrorDetails(errStr)
 	}
 	if len(rtIDs) == 1 {
@@ -454,7 +507,7 @@ func (rts *relationTypeService) GetRelationTypesByIDs(ctx context.Context, knID 
 		return nil, err
 	}
 	if len(visibleRelationTypes) != len(relationTypes) {
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 
 	// Retrieve source and target object type names.
@@ -573,7 +626,7 @@ func (rts *relationTypeService) GetRelationTypesByIDs(ctx context.Context, knID 
 	if err != nil {
 		span.SetStatus(codes.Error, "GetAccountNames error")
 
-		return []*interfaces.RelationType{}, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return []*interfaces.RelationType{}, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 	}
 
@@ -582,7 +635,16 @@ func (rts *relationTypeService) GetRelationTypesByIDs(ctx context.Context, knID 
 }
 
 // Update relation types.
+// UpdateRelationType is an interactive update: it keeps the stored declarations its request leaves
+// out.
 func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.Tx, relationType *interfaces.RelationType, strictMode bool) error {
+	return rts.updateRelationType(ctx, tx, relationType, strictMode, true)
+}
+
+// updateRelationType saves a relation type over the stored one. keepStoredDeclarations is set for an
+// interactive update; an overwrite import takes its file as the whole state.
+func (rts *relationTypeService) updateRelationType(ctx context.Context, tx *sql.Tx,
+	relationType *interfaces.RelationType, strictMode bool, keepStoredDeclarations bool) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Update relation type")
 	defer span.End()
 
@@ -594,13 +656,33 @@ func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.
 		return err
 	}
 	if !exists {
-		return rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
+		return httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
 	}
 	resource := interfaces.KNChildPermissionResource(interfaces.RESOURCE_TYPE_RELATION_TYPE,
 		relationType.KNID, relationType.RTID)
 	err = rts.ps.CheckPermission(ctx, resource, []string{interfaces.OPERATION_TYPE_MODIFY})
 	if err != nil {
 		return err
+	}
+	if keepStoredDeclarations {
+		stored, err := rts.rta.GetRelationTypeByID(ctx, relationType.KNID, relationType.Branch, relationType.RTID)
+		if err != nil {
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed).
+				WithErrorDetails(err.Error())
+		}
+		relationType.KeepUndeclared(stored)
+	}
+	if err = validateDeclarations(ctx, relationType); err != nil {
+		return err
+	}
+	// An overwrite import checks in CreateRelationTypes, with the rest of its save.
+	if keepStoredDeclarations {
+		if err = rts.nr.SaveRefusal(ctx, relationType.KNID, relationType.Branch,
+			logics.SavedDefinitions{RelationTypes: []*interfaces.RelationType{relationType}},
+			berrors.BknBackend_RelationType_InvalidParameter_Declarations, berrors.BknBackend_RelationType_InternalError); err != nil {
+			return err
+		}
 	}
 
 	accountInfo := interfaces.AccountInfo{}
@@ -621,9 +703,13 @@ func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.
 		if err != nil {
 			otellog.LogError(ctx, "Begin transaction error", err)
 
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError_BeginTransactionFailed).
 				WithErrorDetails(err.Error())
+		}
+		if err = logics.GuardDefinitionWrite(ctx, tx, relationType.KNID, relationType.Branch, false); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
 		// 0.1 On failure.
 		defer func() {
@@ -644,6 +730,9 @@ func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.
 			}
 		}()
 	}
+	if err = logics.CheckDefinitionRevision(ctx, tx, interfaces.RevisionKindRelationType, relationType.KNID, relationType.Branch, relationType.RTID); err != nil {
+		return err
+	}
 
 	// Validate source and target object type existence when present, controlled by strict_mode.
 	err = rts.validateDependency(ctx, tx, relationType, strictMode, nil)
@@ -657,7 +746,11 @@ func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.
 		logger.Errorf("relationType error: %s", err.Error())
 		span.SetStatus(codes.Error, "修改关系类失败")
 
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		if errors.Is(err, common.ErrRowNotFound) {
+			return httperrors.NewHTTPError(ctx, http.StatusNotFound,
+				berrors.BknBackend_RelationType_RelationTypeNotFound).WithErrorDetails(err.Error())
+		}
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).
 			WithErrorDetails(err.Error())
 	}
@@ -667,7 +760,7 @@ func (rts *relationTypeService) UpdateRelationType(ctx context.Context, tx *sql.
 		logger.Errorf("InsertDatasetData error: %s", err.Error())
 		span.SetStatus(codes.Error, "关系类索引写入失败")
 
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_InsertOpenSearchDataFailed).
 			WithErrorDetails(err.Error())
 	}
@@ -685,7 +778,7 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 		ctx, cleanupTracker, trackerOwner = permission.WithAuthorizationCleanupTracker(ctx)
 		defer func() {
 			if trackerOwner && err == nil {
-				_ = cleanupTracker.Cleanup(ctx, rts.ps)
+				err = cleanupTracker.Cleanup(ctx, rts.ps)
 			}
 		}()
 	}
@@ -700,7 +793,7 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 			return err
 		}
 		if !exists {
-			return rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
+			return httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
 		}
 		resource := interfaces.KNChildPermissionResource(interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, rtIDs[0])
 		if err := rts.ps.CheckPermission(ctx, resource, []string{interfaces.OPERATION_TYPE_DELETE}); err != nil {
@@ -709,16 +802,21 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 	} else {
 		relationTypes, err := rts.rta.GetRelationTypesByIDs(ctx, knID, branch, rtIDs)
 		if err != nil {
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed).WithErrorDetails(err.Error())
 		}
 		if len(relationTypes) != len(rtIDs) {
-			return rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
+			return httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_RelationType_RelationTypeNotFound)
 		}
 		if err := permission.CheckKNChildBatchPermission(ctx, rts.ps,
 			interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, rtIDs, interfaces.OPERATION_TYPE_DELETE); err != nil {
 			return err
 		}
+	}
+	// A definition another one still refers to stays: deleting it would leave the reference dangling.
+	if err := rts.nr.DeleteRefusal(ctx, knID, branch, interfaces.RESOURCE_TYPE_RELATION_TYPE, rtIDs,
+		berrors.BknBackend_RelationType_StillReferenced, berrors.BknBackend_RelationType_InternalError); err != nil {
+		return err
 	}
 	if tx == nil {
 		// 0. Begin the transaction.
@@ -726,9 +824,13 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 		if err != nil {
 			otellog.LogError(ctx, "Begin transaction error", err)
 
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError_BeginTransactionFailed).
 				WithErrorDetails(err.Error())
+		}
+		if err = logics.GuardDefinitionWrite(ctx, tx, knID, branch, false); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
 		// 0.1 On failure.
 		defer func() {
@@ -749,6 +851,9 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 			}
 		}()
 	}
+	if err = logics.CheckDefinitionRevision(ctx, tx, interfaces.RevisionKindRelationType, knID, branch, rtIDs...); err != nil {
+		return err
+	}
 
 	// Delete metric models.
 	rowsAffect, err := rts.rta.DeleteRelationTypesByIDs(ctx, tx, knID, branch, rtIDs)
@@ -756,7 +861,7 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 		logger.Errorf("DeleteRelationTypes error: %s", err.Error())
 		span.SetStatus(codes.Error, "删除关系类失败")
 
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 	}
 
@@ -775,7 +880,7 @@ func (rts *relationTypeService) DeleteRelationTypesByIDs(ctx context.Context, tx
 		}
 	}
 	permission.TrackKNChildAuthorizationCleanup(ctx,
-		interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, rtIDs)
+		interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, branch, rtIDs)
 
 	span.SetStatus(codes.Ok, "")
 	return nil
@@ -788,13 +893,13 @@ func (rts *relationTypeService) DeleteRelationTypesByKnID(ctx context.Context, t
 
 	if tx == nil {
 		otellog.LogError(ctx, "missing transaction", nil)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_MissingTransaction).
 			WithErrorDetails("missing transaction")
 	}
 	rtIDs, err := rts.rta.GetRelationTypeIDsByKnID(ctx, knID, branch)
 	if err != nil {
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 	}
 
@@ -803,14 +908,14 @@ func (rts *relationTypeService) DeleteRelationTypesByKnID(ctx context.Context, t
 	if err != nil {
 		logger.Errorf("DeleteRelationTypesByKnID error: %s", err.Error())
 		span.SetStatus(codes.Error, "删除关系类失败")
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 	}
 
 	logger.Infof("DeleteRelationTypesByKnID success, the kn_id is [%s], branch is [%s], rowsAffect is [%d]",
 		knID, branch, rowsAffect)
 	permission.TrackKNChildAuthorizationCleanup(ctx,
-		interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, rtIDs)
+		interfaces.RESOURCE_TYPE_RELATION_TYPE, knID, branch, rtIDs)
 	span.SetStatus(codes.Ok, "")
 	return nil
 }
@@ -830,7 +935,7 @@ func (rts *relationTypeService) handleRelationTypeImportMode(ctx context.Context
 		requestedIDs := make([]string, 0, len(relationTypes))
 		for _, relationType := range relationTypes {
 			if relationType.KNID != knID || relationType.Branch != branch {
-				return nil, nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+				return nil, nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 					berrors.BknBackend_RelationType_InvalidParameter)
 			}
 			requestedIDs = append(requestedIDs, relationType.RTID)
@@ -838,7 +943,7 @@ func (rts *relationTypeService) handleRelationTypeImportMode(ctx context.Context
 		ids, err := rts.rta.GetRelationTypeIDsByIDs(ctx, knID, branch, requestedIDs)
 		if err != nil {
 			otellog.LogError(ctx, fmt.Sprintf("Batch query relation type IDs in knowledge network [%s] failed", knID), err)
-			return creates, updates, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return creates, updates, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError_CheckRelationTypeIfExistFailed).
 				WithErrorDetails(err.Error())
 		}
@@ -867,7 +972,7 @@ func (rts *relationTypeService) handleRelationTypeImportMode(ctx context.Context
 				errDetails := fmt.Sprintf("The relation type with id [%s] already exists!", relationType.RTID)
 				logger.Error(errDetails)
 				span.SetStatus(codes.Error, errDetails)
-				return creates, updates, rest.NewHTTPError(ctx, http.StatusBadRequest,
+				return creates, updates, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 					berrors.BknBackend_RelationType_RelationTypeIDExisted).
 					WithErrorDetails(errDetails)
 
@@ -899,6 +1004,11 @@ func (rts *relationTypeService) InsertDatasetData(ctx context.Context, relationT
 		words := []string{}
 		for _, relationType := range relationTypes {
 			arr := []string{relationType.RTName}
+			// Declarations come right after the name; without them the text is what it was.
+			if relationType.ReverseName != "" {
+				arr = append(arr, relationType.ReverseName)
+			}
+			arr = append(arr, relationType.Aliases...)
 			arr = append(arr, relationType.Tags...)
 			arr = append(arr, relationType.Comment, relationType.BKNRawContent)
 			word := strings.Join(arr, "\n")
@@ -937,6 +1047,10 @@ func (rts *relationTypeService) InsertDatasetData(ctx context.Context, relationT
 
 		document, err := vega_backend.NewDatasetDocument(docid, relationType)
 		if err != nil {
+			return err
+		}
+		interfaces.IndexLifecycleStatus(document.Document)
+		if err := interfaces.EncodeIndexedConstraints(document.Document); err != nil {
 			return err
 		}
 		documents = append(documents, document)
@@ -986,7 +1100,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 				if !rts.appSetting.ServerSetting.DefaultSmallModelEnabled {
 					err = errors.New(cond.DEFAULT_SMALL_MODEL_ENABLED_FALSE_ERROR)
 					span.SetStatus(codes.Error, err.Error())
-					return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+					return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 						berrors.BknBackend_RelationType_InternalError).
 						WithErrorDetails(err.Error())
 				}
@@ -994,7 +1108,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 				if err != nil {
 					logger.Errorf("GetDefaultModel error: %s", err.Error())
 					span.SetStatus(codes.Error, "获取默认模型失败")
-					return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+					return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 						berrors.BknBackend_RelationType_InternalError).
 						WithErrorDetails(err.Error())
 				}
@@ -1002,7 +1116,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 				if err != nil {
 					logger.Errorf("GetVector error: %s", err.Error())
 					span.SetStatus(codes.Error, "获取业务知识网络向量失败")
-					return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+					return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 						berrors.BknBackend_RelationType_InternalError).
 						WithErrorDetails(err.Error())
 				}
@@ -1010,9 +1124,13 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 			})
 		if err != nil {
 			logger.Errorf("convert relation type condition to filter condition failed: %v", err)
-			return response, rest.NewHTTPError(ctx, http.StatusBadRequest,
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.ConditionDecodeFailed", nil)
+			if renderErr != nil {
+				logger.Errorf("localized service message failed: %v", renderErr)
+			}
+			return response, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 				berrors.BknBackend_RelationType_InvalidParameter_ConceptCondition).
-				WithErrorDetails(i18n.Translate(rest.GetLanguageByCtx(ctx), "BknBackend.Validation.Detail.ConditionDecodeFailed", nil))
+				WithErrorDetails(localizedText)
 		}
 	}
 	filterCondition = permission.RestrictDatasetFilterToIDs(filterCondition, visibleIDs)
@@ -1031,7 +1149,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 			logger.Errorf("GetConceptGroupsTotal in knowledge network[%s] error: %s", query.KNID, err.Error())
 			span.SetStatus(codes.Error, fmt.Sprintf("GetConceptGroupsTotal in knowledge network[%s], error: %v", query.KNID, err))
 
-			return response, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return response, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).WithErrorDetails(err.Error())
 		}
 		if cgCnt == 0 {
@@ -1040,7 +1158,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 			logger.Errorf(errStr)
 
 			// Return 404 when all requested concept groups are missing.
-			return response, rest.NewHTTPError(ctx, http.StatusNotFound,
+			return response, httperrors.NewHTTPError(ctx, http.StatusNotFound,
 				berrors.BknBackend_ConceptGroup_ConceptGroupNotFound).
 				WithErrorDetails(errStr)
 		}
@@ -1058,7 +1176,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 			span.SetStatus(codes.Error, errStr)
 			span.End()
 
-			return response, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return response, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).WithErrorDetails(errStr)
 		}
 		// Return empty when the concept groups contain no relation types.
@@ -1090,7 +1208,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 			if err != nil {
 				logger.Errorf("QueryDatasetData error: %s", err.Error())
 				span.SetStatus(codes.Error, "业务知识网络关系类检索查询总数失败")
-				return response, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				return response, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 					berrors.BknBackend_RelationType_InternalError).
 					WithErrorDetails(err.Error())
 			}
@@ -1135,7 +1253,7 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 		if err != nil {
 			logger.Errorf("QueryResourceData error: %s", err.Error())
 			span.SetStatus(codes.Error, "业务知识网络关系类检索查询失败")
-			return response, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return response, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError).
 				WithErrorDetails(err.Error())
 		}
@@ -1147,17 +1265,21 @@ func (rts *relationTypeService) SearchRelationTypes(ctx context.Context,
 
 		// 5. Process query results.
 		for _, entry := range datasetResp.Entries {
+			if err := interfaces.DecodeIndexedConstraints(entry); err != nil {
+				return response, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+					berrors.BknBackend_InternalError_UnMarshalDataFailed).WithErrorDetails(err.Error())
+			}
 			// Convert to a relation type struct.
 			jsonByte, err := json.Marshal(entry)
 			if err != nil {
-				return response, rest.NewHTTPError(ctx, http.StatusBadRequest,
+				return response, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 					berrors.BknBackend_InternalError_MarshalDataFailed).
 					WithErrorDetails(fmt.Sprintf("failed to Marshal dataset entry, %s", err.Error()))
 			}
 			var relationType interfaces.RelationType
 			err = json.Unmarshal(jsonByte, &relationType)
 			if err != nil {
-				return response, rest.NewHTTPError(ctx, http.StatusBadRequest,
+				return response, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 					berrors.BknBackend_InternalError_UnMarshalDataFailed).
 					WithErrorDetails(fmt.Sprintf("failed to Unmarshal dataset entry to Relation Type, %s", err.Error()))
 			}
@@ -1214,7 +1336,7 @@ func (rts *relationTypeService) GetTotal(ctx context.Context, filterCondition ma
 	datasetResp, err := rts.vbs.QueryResourceData(ctx, interfaces.BKN_DATASET_ID, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "Search total documents count failed")
-		return total, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_RelationType_InternalError).
+		return total, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_RelationType_InternalError).
 			WithErrorDetails(err.Error())
 	}
 
@@ -1238,7 +1360,7 @@ func (rts *relationTypeService) GetRelationTypeIDsByKnID(ctx context.Context, kn
 		logger.Errorf("GetRelationTypeIDsByKnID error: %s", err.Error())
 		span.SetStatus(codes.Error, fmt.Sprintf("Get relation type ids by kn_id[%s] error: %v", knID, err))
 
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed).WithErrorDetails(err.Error())
 	}
 
@@ -1365,24 +1487,34 @@ func (rts *relationTypeService) validateDependency(ctx context.Context, tx *sql.
 				if sourceObjectType != nil {
 					// Check that source properties exist in source object type data properties.
 					if _, exist := sourceObjectType.PropertyMap[mapping.SourceProp.Name]; !exist {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-							WithErrorDetails(invalidParameterDetail(ctx, "SourcePropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "objectType": sourceObjectType.OTName}))
+						localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.SourcePropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "objectType": sourceObjectType.OTName})
+						if renderErr != nil {
+							logger.Errorf("localized message rendering failed: %v", renderErr)
+						}
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 					}
 				}
 
 				if targetObjectType != nil {
 					// Check that target properties exist in target object type data properties.
 					if _, exist := targetObjectType.PropertyMap[mapping.TargetProp.Name]; !exist {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-							WithErrorDetails(invalidParameterDetail(ctx, "TargetPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "objectType": targetObjectType.OTName}))
+						localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.TargetPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "objectType": targetObjectType.OTName})
+						if renderErr != nil {
+							logger.Errorf("localized message rendering failed: %v", renderErr)
+						}
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 					}
 				}
 			}
 		case interfaces.RELATION_TYPE_INDIRECT:
 			mappingRules := relationType.MappingRules.(*interfaces.InDirectMapping)
 			if mappingRules.BackingDataSource == nil {
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-					WithErrorDetails(invalidParameterDetail(ctx, "BackingDataSourceRequired", nil))
+				localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingDataSourceRequired", nil)
+				if renderErr != nil {
+					logger.Errorf("localized message rendering failed: %v", renderErr)
+				}
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
+					WithErrorDetails(localizedText)
 			}
 			if mappingRules.BackingDataSource.Type != interfaces.DATA_SOURCE_TYPE_RESOURCE {
 				return logics.UnsupportedRelationBackingDataSourceError(ctx, relationType.RTID, mappingRules.BackingDataSource.Type)
@@ -1394,52 +1526,94 @@ func (rts *relationTypeService) validateDependency(ctx context.Context, tx *sql.
 			res, err := rts.vbs.GetResourceSchema(lookupCtx, mappingRules.BackingDataSource.ID,
 				interfaces.OPERATION_TYPE_QUERY_DATA)
 			if err != nil {
-				invalidErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-					WithErrorDetails(invalidParameterDetail(ctx, "BackingDataSourceNotFound", map[string]any{"resource": mappingRules.BackingDataSource.ID}))
+				localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingDataSourceNotFound", map[string]any{"resource": mappingRules.BackingDataSource.ID})
+				if renderErr != nil {
+					logger.Errorf("localized message rendering failed: %v", renderErr)
+				}
+				invalidErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
+					WithErrorDetails(localizedText)
 				return logics.MapDependencyError(ctx, err, !controlledLookup, invalidErr,
 					berrors.BknBackend_RelationType_InternalError)
 			}
 			if res == nil {
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-					WithErrorDetails(invalidParameterDetail(ctx, "BackingDataSourceNotFound", map[string]any{"resource": mappingRules.BackingDataSource.ID}))
+				localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingDataSourceNotFound", map[string]any{"resource": mappingRules.BackingDataSource.ID})
+				if renderErr != nil {
+					logger.Errorf("localized message rendering failed: %v", renderErr)
+				}
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
+					WithErrorDetails(localizedText)
 			}
 			propertiesMap := logics.VegaResourceSchemaToPropertiesMap(res)
 			for _, mapping := range mappingRules.SourceMappingRules {
 				if sourceObjectType != nil {
 					if _, exists := sourceObjectType.PropertyMap[mapping.SourceProp.Name]; !exists {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-							WithErrorDetails(invalidParameterDetail(ctx, "SourcePropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "objectType": sourceObjectType.OTName}))
+						localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.SourcePropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "objectType": sourceObjectType.OTName})
+						if renderErr != nil {
+							logger.Errorf("localized message rendering failed: %v", renderErr)
+						}
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 					}
 				}
 				if _, exists := propertiesMap[mapping.TargetProp.Name]; !exists {
-					return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-						WithErrorDetails(invalidParameterDetail(ctx, "BackingPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "resource": res.Name}))
+					localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "resource": res.Name})
+					if renderErr != nil {
+						logger.Errorf("localized message rendering failed: %v", renderErr)
+					}
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 				}
 			}
 			for _, mapping := range mappingRules.TargetMappingRules {
 				if _, exists := propertiesMap[mapping.SourceProp.Name]; !exists {
-					return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-						WithErrorDetails(invalidParameterDetail(ctx, "BackingPropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "resource": res.Name}))
+					localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingPropertyNotFound", map[string]any{"property": mapping.SourceProp.Name, "resource": res.Name})
+					if renderErr != nil {
+						logger.Errorf("localized message rendering failed: %v", renderErr)
+					}
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 				}
 				if targetObjectType != nil {
 					if _, exists := targetObjectType.PropertyMap[mapping.TargetProp.Name]; !exists {
-						return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-							WithErrorDetails(invalidParameterDetail(ctx, "TargetPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "objectType": targetObjectType.OTName}))
+						localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.TargetPropertyNotFound", map[string]any{"property": mapping.TargetProp.Name, "objectType": targetObjectType.OTName})
+						if renderErr != nil {
+							logger.Errorf("localized message rendering failed: %v", renderErr)
+						}
+						return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 					}
+				}
+			}
+			// A relation property reads a column of the backing resource, as the mapping rules do;
+			// one kept from before a change of resource may name a column it no longer has.
+			for _, property := range mappingRules.Properties {
+				if property == nil || property.MappedField == nil || property.MappedField.Name == "" {
+					continue
+				}
+				if _, exists := propertiesMap[property.MappedField.Name]; !exists {
+					localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.BackingPropertyNotFound", map[string]any{"property": property.MappedField.Name, "resource": res.Name})
+					if renderErr != nil {
+						logger.Errorf("localized message rendering failed: %v", renderErr)
+					}
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).WithErrorDetails(localizedText)
 				}
 			}
 		case interfaces.RELATION_TYPE_FILTERED_CROSS_JOIN:
 			rules := relationType.MappingRules.(*interfaces.FilteredCrossJoinMapping)
 			if sourceObjectType != nil && rules.SourceCondition != nil {
 				if _, err := cond.NewCondition(ctx, rules.SourceCondition, cond.CUSTOM, objectTypeToCondFieldsMap(sourceObjectType)); err != nil {
-					return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-						WithErrorDetails(invalidParameterDetail(ctx, "SourceConditionInvalid", nil))
+					localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.SourceConditionInvalid", nil)
+					if renderErr != nil {
+						logger.Errorf("localized message rendering failed: %v", renderErr)
+					}
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
+						WithErrorDetails(localizedText)
 				}
 			}
 			if targetObjectType != nil && rules.TargetCondition != nil {
 				if _, err := cond.NewCondition(ctx, rules.TargetCondition, cond.CUSTOM, objectTypeToCondFieldsMap(targetObjectType)); err != nil {
-					return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
-						WithErrorDetails(invalidParameterDetail(ctx, "TargetConditionInvalid", nil))
+					localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.RelationType.InvalidParameter.Detail.TargetConditionInvalid", nil)
+					if renderErr != nil {
+						logger.Errorf("localized message rendering failed: %v", renderErr)
+					}
+					return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_RelationType_InvalidParameter).
+						WithErrorDetails(localizedText)
 				}
 			}
 		}

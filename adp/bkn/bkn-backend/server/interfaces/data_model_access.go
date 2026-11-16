@@ -7,7 +7,7 @@
 package interfaces
 
 import (
-	"bkn-backend/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
 )
 
 const (
@@ -139,13 +139,3 @@ var (
 		condition.OperationKNN,
 	}
 )
-
-// Metric model structure.
-type MetricModel struct {
-	ModelID      string           `json:"id"`
-	ModelName    string           `json:"name"`
-	GroupID      string           `json:"group_id"`
-	GroupName    string           `json:"group_name"`
-	AnalysisDims []Field          `json:"analysis_dimensions,omitempty"`
-	FieldsMap    map[string]Field `json:"fields_map"` // Field set
-}

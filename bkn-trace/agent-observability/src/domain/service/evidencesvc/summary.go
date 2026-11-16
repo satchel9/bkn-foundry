@@ -25,19 +25,21 @@ import (
 
 const (
 	DefaultSummaryQueryLimit = 50
-	MaxSummaryQueryLimit     = 200
+	MaxSummaryQueryLimit     = evidencevo.MaxSummaryQueryLimit
 	MaxSummaryScanEntries    = 2000
 	maxReceiptsPerSummary    = 20
 )
 
 var (
-	ErrSummaryCursorInvalid = errors.New("BKN_TRACE_SUMMARY_CURSOR_INVALID")
-	ErrSummaryProjectionLag = errors.New("BKN_TRACE_SUMMARY_PROJECTION_LAG")
+	ErrSummaryCursorInvalid       = errors.New("BKN_TRACE_SUMMARY_CURSOR_INVALID")
+	ErrSummaryProjectionLag       = errors.New("BKN_TRACE_SUMMARY_PROJECTION_LAG")
+	ErrSummaryFallbackUnavailable = errors.New("BKN_TRACE_SUMMARY_FALLBACK_UNAVAILABLE")
 )
 
 type summaryCursor struct {
-	StartedAt string `json:"started_at"`
-	ID        string `json:"id"`
+	StartedAt   string `json:"started_at"`
+	ID          string `json:"id"`
+	ScanBinding string `json:"scan_binding,omitempty"`
 }
 
 type summaryLoadMetadata struct {
@@ -108,7 +110,7 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 	}
 	loadOptions := options
 	loadOptions.Status = ""
-	requests, metadata, err := s.loadConversationExecutionSummaries(ctx, loadOptions, candidateLimit)
+	requests, metadata, err := s.loadProvenanceRequestSummaries(ctx, loadOptions, candidateLimit)
 	if err != nil {
 		return evidencevo.ConversationSummaryPage{}, err
 	}
@@ -205,7 +207,7 @@ func (s *Service) ListConversations(ctx context.Context, options evidencevo.Summ
 
 // Preserve execution facts used by legacy business-reference and network filters.
 // First-turn previews are loaded independently so operation artifacts cannot hide them.
-func (s *Service) loadConversationExecutionSummaries(ctx context.Context, options evidencevo.SummaryQueryOptions, limit int) ([]evidencevo.RequestSummary, summaryLoadMetadata, error) {
+func (s *Service) loadProvenanceRequestSummaries(ctx context.Context, options evidencevo.SummaryQueryOptions, limit int) ([]evidencevo.RequestSummary, summaryLoadMetadata, error) {
 	if !trustedQueryScope(options.Scope) {
 		return []evidencevo.RequestSummary{}, summaryLoadMetadata{}, nil
 	}
@@ -232,7 +234,7 @@ func (s *Service) loadConversationExecutionSummaries(ctx context.Context, option
 	if err := s.applyCanonicalRequestIdentity(ctx, requests); err != nil {
 		return nil, summaryLoadMetadata{}, err
 	}
-	// Conversation filters consume request facts only; trace identity and span
+	// Provenance lists consume request facts only; trace identity and span
 	// statistics belong to the trace list and must not add discarded reads here.
 	return requests, metadata, nil
 }
@@ -304,7 +306,10 @@ func (s *Service) ListInteractions(ctx context.Context, options evidencevo.Summa
 	candidateLimit := summaryCandidateLimit(options)
 	loadOptions := options
 	loadOptions.Status = ""
-	requests, _, metadata, err := s.loadExecutionSummariesWithCandidateLimit(ctx, loadOptions, candidateLimit)
+	// Preserve the legacy interaction-level authorization and scan window.
+	// Conversation filtering still happens after request aggregation below.
+	loadOptions.ConversationID = ""
+	requests, metadata, err := s.loadProvenanceRequestSummaries(ctx, loadOptions, candidateLimit)
 	if err != nil {
 		return evidencevo.InteractionSummaryPage{}, err
 	}
@@ -434,10 +439,10 @@ func (s *Service) listCanonicalConversationInteractions(
 	metadata := summaryLoadMetadata{}
 	for _, interaction := range selection.Entries {
 		canonical := canonicalInteractionListSummary(conversation, interaction)
-		facts, _, factMetadata, loadErr := s.loadExecutionSummaries(ctx, evidencevo.SummaryQueryOptions{
-			Scope: options.Scope, ConversationID: conversation.ID, InteractionID: interaction.ID,
+		facts, factMetadata, loadErr := s.loadProvenanceRequestSummaries(ctx, evidencevo.SummaryQueryOptions{
+			Scope: options.Scope, InteractionID: interaction.ID,
 			Limit: MaxSummaryQueryLimit,
-		})
+		}, MaxSummaryScanEntries)
 		if loadErr != nil {
 			return evidencevo.InteractionSummaryPage{}, false, loadErr
 		}
@@ -1193,7 +1198,15 @@ func (s *Service) applyCanonicalRequestIdentity(ctx context.Context, requests []
 	})
 }
 
-func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evidencevo.TraceSummary) error {
+func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evidencevo.TraceSummary, scope evidencevo.QueryScope) error {
+	return s.applyCanonicalTraceMetadata(ctx, traces, scope, false)
+}
+
+func (s *Service) applyCanonicalTraceMetadata(ctx context.Context, traces []evidencevo.TraceSummary, scope evidencevo.QueryScope, requireRoots bool) error {
+	return s.applyTraceMetadata(ctx, traces, scope, requireRoots, nil)
+}
+
+func (s *Service) applyTraceMetadata(ctx context.Context, traces []evidencevo.TraceSummary, scope evidencevo.QueryScope, requireRoots bool, visibleScopes map[string][]iprojectionsource.CanonicalTraceScope) error {
 	if s.sessionStore == nil || len(traces) == 0 {
 		return nil
 	}
@@ -1213,12 +1226,113 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 			traceIDs = append(traceIDs, trace.TraceID)
 		}
 		byConversation := tx.ListConversationsByIDs(conversationIDs)
-		sourceModulesByTraceID := tx.ListFirstOperationSourceModulesByTraceIDs(traceIDs)
+		var sourceModulesByTraceID map[string]string
+		var rootTools map[string]string
+		// Only the exact ownership/global scope supported by identity SQL can
+		// replace projection metadata. Shared-network scopes retain their reader.
+		if visibleScopes != nil && !requireRoots {
+			// A scanned trace already has a complete authorized receipt root.
+			// Its module comes from exact scope tuples below; do not run the
+			// old TraceID-only lookup and discard private collision metadata.
+			sourceModulesByTraceID = map[string]string{}
+			rootTools = map[string]string{}
+		} else if canUseSummaryIdentityPage(evidencevo.SummaryQueryOptions{Scope: scope}) {
+			sourceModulesByTraceID = map[string]string{}
+			rootTools = map[string]string{}
+			for id, root := range tx.ListCanonicalTraceRootsByTraceIDs(traceIDs, scope) {
+				sourceModulesByTraceID[id] = root.SourceModule
+				if root.HasTool {
+					rootTools[id] = root.ToolName
+				}
+			}
+		} else {
+			sourceModulesByTraceID = tx.ListFirstOperationSourceModulesByTraceIDs(traceIDs)
+		}
 		type traceFailure struct {
 			traceID, conversationID, summary string
 		}
 		failuresByInteraction := map[string][]traceFailure{}
+		scopedSources := map[string]sessionvo.OperationCallFact{}
+		if visibleScopes != nil {
+			var facts []sessionvo.OperationCallFact
+			if source, ok := tx.(isessionstore.TraceSourceMetadataTransaction); ok {
+				keys := []isessionstore.TraceMetadataScope{}
+				for traceID, tuples := range visibleScopes {
+					for _, tuple := range tuples {
+						keys = append(keys, isessionstore.TraceMetadataScope{TraceID: traceID, ConversationID: tuple.ConversationID, InteractionID: tuple.InteractionID})
+					}
+				}
+				facts = source.ListFirstTraceSourceMetadata(keys)
+			} else {
+				loaded := map[string]bool{}
+				for _, tuples := range visibleScopes {
+					for _, tuple := range tuples {
+						if tuple.InteractionID != "" && !loaded[tuple.InteractionID] {
+							loaded[tuple.InteractionID] = true
+							facts = append(facts, tx.ListOperationCallFacts(tuple.InteractionID)...)
+						}
+					}
+				}
+			}
+			for _, fact := range facts {
+				if fact.SourceModule == "" {
+					continue
+				}
+				allowed := false
+				for _, tuple := range visibleScopes[fact.TraceID] {
+					if tuple.ConversationID == fact.ConversationID && tuple.InteractionID == fact.InteractionID {
+						allowed = true
+						break
+					}
+				}
+				if !allowed {
+					continue
+				}
+				old, found := scopedSources[fact.TraceID]
+				if !found || fact.StartedAt.Before(old.StartedAt) || fact.StartedAt.Equal(old.StartedAt) && (fact.OperationID < old.OperationID || fact.OperationID == old.OperationID && fact.Attempt < old.Attempt) {
+					scopedSources[fact.TraceID] = fact
+				}
+			}
+		}
+		// The scanner can visit many small batches. Read only the first failed
+		// call's error metadata, never all input/output payloads per interaction.
+		failureMetadata, narrowFailures := tx.(isessionstore.TraceFailureMetadataTransaction)
+		type failureKey struct{ trace, conversation, interaction string }
+		canReadFailure := func(trace evidencevo.TraceSummary) bool {
+			if visibleScopes == nil {
+				return true
+			}
+			for _, tuple := range visibleScopes[trace.TraceID] {
+				if tuple.ConversationID == trace.ConversationID && tuple.InteractionID == trace.InteractionID {
+					return true
+				}
+			}
+			return false
+		}
+		firstFailures := map[failureKey]string{}
+		if narrowFailures {
+			needed := []isessionstore.TraceMetadataScope{}
+			for _, trace := range traces {
+				if trace.Status == "error" && trace.ErrorSummary == "" && trace.InteractionID != "" && canReadFailure(trace) {
+					needed = append(needed, isessionstore.TraceMetadataScope{TraceID: trace.TraceID, ConversationID: trace.ConversationID, InteractionID: trace.InteractionID})
+				}
+			}
+			if len(needed) > 0 {
+				for _, fact := range failureMetadata.ListFirstTraceFailureMetadata(needed) {
+					if fact.Status == sessionvo.AttemptFailed {
+						firstFailures[failureKey{fact.TraceID, fact.ConversationID, fact.InteractionID}] = operationFailureSummary(fact)
+					}
+				}
+			}
+		}
 		for index := range traces {
+			projectedRootService := traces[index].RootService
+			// An exact Tool identity page cannot rely on stale projection
+			// metadata if all usable Core receipts disappeared after selection.
+			rootTool, rootFound := rootTools[traces[index].TraceID]
+			if requireRoots && !rootFound {
+				return ErrSummaryProjectionLag
+			}
 			conversationID := traces[index].ConversationID
 			if conversationID != "" {
 				conversation := byConversation[conversationID]
@@ -1228,28 +1342,41 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 					traces[index].EffectiveSubjectID = conversation.Owner.EffectiveSubjectID
 				}
 			}
-			if traces[index].Status == "error" && traces[index].ErrorSummary == "" && traces[index].InteractionID != "" {
+			if traces[index].Status == "error" && traces[index].ErrorSummary == "" && traces[index].InteractionID != "" && canReadFailure(traces[index]) {
 				summary := &traces[index]
-				failures, loaded := failuresByInteraction[summary.InteractionID]
-				if !loaded {
-					for _, fact := range tx.ListOperationCallFacts(summary.InteractionID) {
-						if _, requested := seenTraceIDs[fact.TraceID]; requested && fact.Status == sessionvo.AttemptFailed && fact.InteractionID == summary.InteractionID {
-							failures = append(failures, traceFailure{fact.TraceID, fact.ConversationID, operationFailureSummary(fact)})
+				if narrowFailures {
+					summary.ErrorSummary = firstFailures[failureKey{summary.TraceID, summary.ConversationID, summary.InteractionID}]
+				} else {
+					failures, loaded := failuresByInteraction[summary.InteractionID]
+					if !loaded {
+						for _, fact := range tx.ListOperationCallFacts(summary.InteractionID) {
+							if _, requested := seenTraceIDs[fact.TraceID]; requested && fact.Status == sessionvo.AttemptFailed && fact.InteractionID == summary.InteractionID {
+								failures = append(failures, traceFailure{fact.TraceID, fact.ConversationID, operationFailureSummary(fact)})
+							}
 						}
+						// Retain bounded summaries, not full input/output/error payloads.
+						failuresByInteraction[summary.InteractionID] = failures
 					}
-					// Retain bounded summaries, not full input/output/error payloads.
-					failuresByInteraction[summary.InteractionID] = failures
-				}
-				for _, failure := range failures {
-					if failure.traceID == summary.TraceID && failure.conversationID == summary.ConversationID {
-						summary.ErrorSummary = failure.summary
-						break
+					for _, failure := range failures {
+						if failure.traceID == summary.TraceID && failure.conversationID == summary.ConversationID {
+							summary.ErrorSummary = failure.summary
+							break
+						}
 					}
 				}
 			}
 
+			if rootFound {
+				traces[index].RootOperation = rootTool
+			}
 			if sourceModule := sourceModulesByTraceID[traces[index].TraceID]; sourceModule != "" {
 				traces[index].RootService = sourceModule
+			}
+			if visibleScopes != nil {
+				traces[index].RootService = projectedRootService
+				if source, found := scopedSources[traces[index].TraceID]; found {
+					traces[index].RootService = source.SourceModule
+				}
 			}
 		}
 		return nil
@@ -1444,9 +1571,16 @@ func (s *Service) getInteractionSummary(ctx context.Context, interactionID strin
 	if interactionID == "" || !trustedQueryScope(scope) {
 		return evidencevo.InteractionSummary{}, false, nil
 	}
-	requests, traces, metadata, err := s.loadExecutionSummaries(ctx, evidencevo.SummaryQueryOptions{
+	if s.projectionSource == nil {
+		return evidencevo.InteractionSummary{}, false, errors.New("execution summary projection source is not configured")
+	}
+	// Receipt projection already supplies the call identities. Read only the
+	// authorized artifact metadata and terminal texts needed by this summary;
+	// supporting bodies and discarded legacy traces are not detail dependencies.
+	requests, traces, metadata, err := s.loadProjectedExecutionSummaries(ctx, iprojectionsource.Query{
 		Scope: scope, InteractionID: interactionID,
-	})
+		Limit: summaryCandidateLimit(evidencevo.SummaryQueryOptions{}), SummaryOnly: true,
+	}, summaryLoadMetadata{}, false)
 	if err != nil {
 		return evidencevo.InteractionSummary{}, false, err
 	}
@@ -1688,6 +1822,9 @@ func (s *Service) ListRequestTraces(ctx context.Context, requestID string, optio
 }
 
 func (s *Service) ListTraceExecutions(ctx context.Context, options evidencevo.SummaryQueryOptions) (evidencevo.TraceSummaryPage, error) {
+	if page, handled, err := s.listScannedTraceSummaryPage(ctx, options); handled || err != nil {
+		return page, err
+	}
 	if page, handled, err := s.listTraceIdentityPage(ctx, options); handled || err != nil {
 		return page, err
 	}
@@ -1701,6 +1838,13 @@ func (s *Service) ListTraceExecutions(ctx context.Context, options evidencevo.Su
 	}
 	if err != nil {
 		return evidencevo.TraceSummaryPage{}, err
+	}
+	// A compatibility reader cannot continue beyond its candidate window. Never
+	// report a window-local keyword count as a completed search, even when no
+	// candidate in that window matched. The bounded scanner handles ordinary
+	// keyword queries; narrower selectors and older sources may still land here.
+	if strings.TrimSpace(options.Keyword) != "" && metadata.Truncated {
+		return evidencevo.TraceSummaryPage{}, iprojectionsource.ErrSummaryScanBudgetExceeded
 	}
 	filtered := make([]evidencevo.TraceSummary, 0, len(traces))
 	for _, trace := range traces {
@@ -1719,7 +1863,7 @@ func (s *Service) ListTraceExecutions(ctx context.Context, options evidencevo.Su
 
 func (s *Service) listTraceIdentityPage(ctx context.Context, options evidencevo.SummaryQueryOptions) (evidencevo.TraceSummaryPage, bool, error) {
 	pageStore, ok := s.sessionStore.(isessionstore.SummaryPageStore)
-	if !ok || s.projectionSource == nil || !canUseSummaryIdentityPage(options) {
+	if !ok || s.projectionSource == nil || !canUseTraceSummaryIdentityPage(options) {
 		return evidencevo.TraceSummaryPage{}, false, nil
 	}
 	cursor, hasCursor, err := decodeSummaryCursor(options.Cursor)
@@ -1727,6 +1871,8 @@ func (s *Service) listTraceIdentityPage(ctx context.Context, options evidencevo.
 		return evidencevo.TraceSummaryPage{}, true, err
 	}
 	query := summaryIdentityQuery(options)
+	query.Service = options.Service
+	query.Tool = options.Tool
 	if hasCursor {
 		query.Offset = 0
 		query.AfterStartedAt, query.AfterID = cursor.StartedAt, cursor.ID
@@ -1740,9 +1886,9 @@ func (s *Service) listTraceIdentityPage(ctx context.Context, options evidencevo.
 	}
 	ids := summaryIdentityIDs(identityPage.Entries)
 	_, traces, metadata, err := s.loadProjectedExecutionSummaries(ctx, iprojectionsource.Query{
-		Scope:    options.Scope,
+		Scope: options.Scope, SummaryOnly: true,
 		TraceIDs: ids, Limit: selectedSummaryCandidateLimit(len(ids)),
-	}, summaryLoadMetadata{})
+	}, summaryLoadMetadata{}, options.Tool != "")
 	if err != nil {
 		return evidencevo.TraceSummaryPage{}, true, err
 	}
@@ -1750,10 +1896,18 @@ func (s *Service) listTraceIdentityPage(ctx context.Context, options evidencevo.
 	for _, trace := range traces {
 		byID[trace.TraceID] = trace
 	}
+	if err := s.fillMissingTracePage(ctx, options, ids, byID); err != nil {
+		return evidencevo.TraceSummaryPage{}, true, err
+	}
 	entries := make([]evidencevo.TraceSummary, 0, len(ids))
 	for _, identity := range identityPage.Entries {
 		trace, found := byID[identity.ID]
 		if !found {
+			return evidencevo.TraceSummaryPage{}, true, ErrSummaryProjectionLag
+		}
+		// Identity selection and projection enrichment are separate reads. Do
+		// not return an exact Tool page if a concurrent receipt changed its root.
+		if options.Tool != "" && trace.RootOperation != options.Tool {
 			return evidencevo.TraceSummaryPage{}, true, ErrSummaryProjectionLag
 		}
 		trace.StartedAt = identity.StartedAt
@@ -1968,6 +2122,15 @@ func firstCanonicalInteraction(interactions []sessionvo.Interaction) (sessionvo.
 	return first, found
 }
 
+// Service is authoritative in Core CallFacts. Only the Trace identity query
+// supports this filter; conversation paging and other content filters retain
+// their existing compatibility path.
+func canUseTraceSummaryIdentityPage(options evidencevo.SummaryQueryOptions) bool {
+	options.Service = ""
+	options.Tool = ""
+	return canUseSummaryIdentityPage(options)
+}
+
 func canUseSummaryIdentityPage(options evidencevo.SummaryQueryOptions) bool {
 	return trustedQueryScope(options.Scope) &&
 		(options.Scope.AccessProfile == nil || options.Scope.AccessProfile.AccountActive) &&
@@ -2051,7 +2214,7 @@ func (s *Service) loadTraceExecutionSummaries(ctx context.Context, traceID strin
 	if len(result.Traces) == 0 {
 		return s.loadProjectedExecutionSummaries(ctx, iprojectionsource.Query{
 			Scope: scope, TraceID: traceID, Limit: MaxSummaryScanEntries,
-		}, metadata)
+		}, metadata, false)
 	}
 	traces := mergeTraceBatches(result.Traces)
 	artifacts := []evidencevo.EvidenceArtifact{}
@@ -2078,7 +2241,7 @@ func (s *Service) loadTraceExecutionSummaries(ctx context.Context, traceID strin
 	if err := s.applyCanonicalRequestIdentity(ctx, requestSummaries); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
-	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries); err != nil {
+	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries, scope); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
 	return requestSummaries, traceSummaries, metadata, nil
@@ -2130,7 +2293,7 @@ func (s *Service) loadExecutionSummariesWithCandidateLimit(ctx context.Context, 
 	if err := s.applyCanonicalRequestIdentity(ctx, requests); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
-	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries); err != nil {
+	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries, options.Scope); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
 	s.enrichTraceStats(ctx, traceSummaries)
@@ -2177,7 +2340,7 @@ func (s *Service) loadRequestExecutionSummaries(ctx context.Context, requestID s
 	if len(result.Traces) == 0 {
 		return s.loadProjectedExecutionSummaries(ctx, iprojectionsource.Query{
 			Scope: scope, RequestID: requestID, Limit: MaxSummaryScanEntries,
-		}, metadata)
+		}, metadata, false)
 	}
 	traces := mergeTraceBatches(result.Traces)
 	artifacts := []evidencevo.EvidenceArtifact{}
@@ -2198,7 +2361,7 @@ func (s *Service) loadRequestExecutionSummaries(ctx context.Context, requestID s
 	if err := s.applyCanonicalRequestIdentity(ctx, requests); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
-	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries); err != nil {
+	if err := s.applyCanonicalTraceIdentity(ctx, traceSummaries, scope); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
 	s.enrichTraceStats(ctx, traceSummaries)
@@ -2209,6 +2372,7 @@ func (s *Service) loadProjectedExecutionSummaries(
 	ctx context.Context,
 	query iprojectionsource.Query,
 	metadata summaryLoadMetadata,
+	requireCanonicalRoots bool,
 ) ([]evidencevo.RequestSummary, []evidencevo.TraceSummary, summaryLoadMetadata, error) {
 	if s.projectionSource == nil {
 		return []evidencevo.RequestSummary{}, []evidencevo.TraceSummary{}, metadata, nil
@@ -2224,7 +2388,7 @@ func (s *Service) loadProjectedExecutionSummaries(
 	if err := s.applyCanonicalRequestIdentity(ctx, requests); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
-	if err := s.applyCanonicalTraceIdentity(ctx, traces); err != nil {
+	if err := s.applyCanonicalTraceMetadata(ctx, traces, query.Scope, requireCanonicalRoots); err != nil {
 		return nil, nil, summaryLoadMetadata{}, err
 	}
 	s.enrichTraceStats(ctx, traces)

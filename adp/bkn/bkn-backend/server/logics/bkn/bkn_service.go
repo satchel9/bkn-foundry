@@ -9,22 +9,25 @@ package bkn
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/capability_binding"
-	"bkn-backend/logics/knowledge_network"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/capability_binding"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/knowledge_network"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 var (
@@ -36,6 +39,8 @@ type bknService struct {
 	appSetting *common.AppSetting
 	kns        interfaces.KNService
 	cbs        interfaces.CapabilityBindingService
+	archive    interfaces.ObjectMetricArchiveAccessV1
+	ps         interfaces.PermissionService
 }
 
 // NewBKNService creates the BKN service.
@@ -45,13 +50,20 @@ func NewBKNService(appSetting *common.AppSetting) interfaces.BKNService {
 			appSetting: appSetting,
 			kns:        knowledge_network.NewKNService(appSetting),
 			cbs:        capability_binding.NewCapabilityBindingService(appSetting),
+			ps:         permission.NewPermissionService(appSetting),
 		}
 	})
 	return bService
 }
 
 // ExportToTar exports a knowledge network as a tar archive.
-func (bs *bknService) ExportToTar(ctx context.Context, knID string, branch string) ([]byte, error) {
+//
+// A network without a 3.0 declaration is written as 2.x, byte for byte as before, unless 3.0 is asked
+// for. A network with one is written as 3.0, because a 2.x package cannot hold it, unless 2.0 is
+// asked for, which leaves the declarations out. A 3.0 export first runs the network check: a
+// misplaced parameter would be refused when the package is imported again, so the export is refused
+// with the parameters to fix.
+func (bs *bknService) ExportToTar(ctx context.Context, knID string, branch string, spec string) ([]byte, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "BKN导出为Tar")
 	defer span.End()
 
@@ -75,6 +87,15 @@ func (bs *bknService) ExportToTar(ctx context.Context, knID string, branch strin
 	}
 	bknNetwork.Capabilities = capabilities
 
+	v3 := spec == interfaces.BKN_EXPORT_SPEC_3 || (spec == interfaces.BKN_EXPORT_SPEC_AUTO && bknsdk.HasV3Declarations(bknNetwork))
+	if v3 {
+		if found := checkResult(bknNetwork); found.NeedsFix() {
+			return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_ExportNeedsNetworkCheck).
+				WithErrorDetails(found)
+		}
+		bknNetwork.BknSpec = bknsdk.BknSpecV3
+	}
+
 	var buf bytes.Buffer
 	err = bknsdk.WriteNetworkToTar(bknNetwork, &buf)
 	if err != nil {
@@ -83,9 +104,62 @@ func (bs *bknService) ExportToTar(ctx context.Context, knID string, branch strin
 	}
 	tarData := buf.Bytes()
 
+	// A 3.0 package is read back by the 3.0 rules before it leaves. The check above covers the
+	// parameters; this covers everything else stored data might hold that 3.0 refuses, so the
+	// refusal comes now, with its reason, instead of at the next import.
+	if v3 {
+		if _, err := bknsdk.LoadNetworkFromTar(bytes.NewReader(tarData)); err != nil {
+			return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_KnowledgeNetwork_ExportNotReadableAsV3).
+				WithErrorDetails(err.Error())
+		}
+	}
+
 	logger.Debugf("BKN ExportToTar Completed: size=%d", len(tarData))
 	span.SetStatus(codes.Ok, "")
 	return tarData, nil
+}
+
+// CheckNetwork checks the definitions of a knowledge network branch without changing anything. It
+// works on any network: the parameters it finds are as misplaced in a 2.x network, where execution
+// drops them.
+func (bs *bknService) CheckNetwork(ctx context.Context, knID string, branch string) (*interfaces.NetworkCheckResult, error) {
+	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "BKN network check")
+	defer span.End()
+
+	bknNetwork, err := bs.buildNetwork(ctx, knID, branch)
+	if err != nil {
+		return nil, err
+	}
+	span.SetStatus(codes.Ok, "")
+	return checkResult(bknNetwork), nil
+}
+
+func checkResult(network *bknsdk.BknNetwork) *interfaces.NetworkCheckResult {
+	result := &interfaces.NetworkCheckResult{
+		MisplacedParameters: []interfaces.NetworkCheckParameter{},
+		InvalidParameters:   []interfaces.NetworkCheckInvalidParameter{},
+	}
+	for _, m := range bknsdk.FindMisplacedParameters(network) {
+		result.MisplacedParameters = append(result.MisplacedParameters, interfaces.NetworkCheckParameter{
+			ActionTypeID:  m.ActionTypeID,
+			ObjectTypeID:  m.ObjectTypeID,
+			LogicProperty: m.LogicProperty,
+			Parameter:     m.Parameter,
+			Current:       interfaces.NetworkCheckParameterValue{Source: m.Current.Source, ValueFrom: m.Current.ValueFrom, Value: m.Current.Value},
+			Suggested:     interfaces.NetworkCheckParameterValue{Source: m.Suggested.Source, ValueFrom: m.Suggested.ValueFrom, Value: m.Suggested.Value},
+			Conflict:      m.Conflict,
+		})
+	}
+	for _, p := range bknsdk.FindInvalidParameters(network) {
+		result.InvalidParameters = append(result.InvalidParameters, interfaces.NetworkCheckInvalidParameter{
+			ActionTypeID:  p.ActionTypeID,
+			ObjectTypeID:  p.ObjectTypeID,
+			LogicProperty: p.LogicProperty,
+			Parameter:     p.Parameter,
+			Current:       interfaces.NetworkCheckParameterValue{Source: p.Current.Source, ValueFrom: p.Current.ValueFrom, Value: p.Current.Value},
+		})
+	}
+	return result
 }
 
 // buildNetwork assembles the complete in-memory model of one knowledge network branch.
@@ -115,11 +189,81 @@ func (bs *bknService) buildNetwork(ctx context.Context, knID string, branch stri
 	for _, cg := range kn.ConceptGroups {
 		bknNetwork.ConceptGroups = append(bknNetwork.ConceptGroups, logics.ToBKNConceptGroup(cg))
 	}
-	for _, m := range kn.Metrics {
-		bknNetwork.Metrics = append(bknNetwork.Metrics, logics.ToBKNMetricDefinition(m))
+	for _, vt := range kn.ValueTypes {
+		bknNetwork.ValueTypes = append(bknNetwork.ValueTypes, logics.ToBKNValueType(vt))
+	}
+	archive := bs.archive
+	if archive == nil {
+		archive, _ = logics.OMA.(interfaces.ObjectMetricArchiveAccessV1)
+	}
+	if archive != nil {
+		records, err := archive.ListObjectMetricArchive(ctx, knID, branch)
+		if err != nil {
+			return nil, err
+		}
+		records, err = bs.filterVisibleObjectMetricArchive(ctx, knID, bknNetwork.ObjectTypes, records)
+		if err != nil {
+			return nil, err
+		}
+		for _, record := range records {
+			data, err := json.Marshal(record)
+			if err != nil {
+				return nil, fmt.Errorf("marshal object metric archive: %w", err)
+			}
+			bknNetwork.ObjectMetrics = append(bknNetwork.ObjectMetrics, data)
+		}
 	}
 
 	return bknNetwork, nil
+}
+
+func (bs *bknService) filterVisibleObjectMetricArchive(ctx context.Context, knID string,
+	objectTypes []*bknsdk.BknObjectType, records []*interfaces.ObjectMetricRecordV1) ([]*interfaces.ObjectMetricRecordV1, error) {
+
+	if len(records) == 0 {
+		return records, nil
+	}
+	metricIDs := make([]string, 0, len(records))
+	seenMetricIDs := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		metricID := record.Definition.ID
+		if _, seen := seenMetricIDs[metricID]; !seen {
+			seenMetricIDs[metricID] = struct{}{}
+			metricIDs = append(metricIDs, metricID)
+		}
+	}
+	visibleMetricIDs, err := permission.FilterKNChildIDs(ctx, bs.ps, interfaces.RESOURCE_TYPE_METRIC,
+		knID, metricIDs, interfaces.OPERATION_TYPE_VIEW_DETAIL)
+	if err != nil {
+		return nil, err
+	}
+	visibleMetrics := make(map[string]struct{}, len(visibleMetricIDs))
+	for _, metricID := range visibleMetricIDs {
+		visibleMetrics[metricID] = struct{}{}
+	}
+	visibleOwners := make(map[string]struct{}, len(objectTypes))
+	for _, objectType := range objectTypes {
+		if objectType != nil {
+			visibleOwners[objectType.ID] = struct{}{}
+		}
+	}
+	filtered := make([]*interfaces.ObjectMetricRecordV1, 0, len(records))
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		if _, visible := visibleMetrics[record.Definition.ID]; !visible {
+			continue
+		}
+		if _, ownerVisible := visibleOwners[record.Definition.OwnerObjectTypeID]; !ownerVisible {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+	return filtered, nil
 }
 
 // DiffNetworks compares two knowledge network branches and reports what differs.
@@ -138,6 +282,15 @@ func (bs *bknService) DiffNetworks(ctx context.Context, req interfaces.KNDiffReq
 	target, err := bs.buildNetwork(ctx, req.Target.KNID, req.Target.Branch)
 	if err != nil {
 		return nil, err
+	}
+	// The bindings are compared too: a version restores them along with the definitions.
+	for _, side := range []struct {
+		net *bknsdk.BknNetwork
+		ref interfaces.KNRef
+	}{{base, req.Base}, {target, req.Target}} {
+		if side.net.Capabilities, err = bs.exportCapabilities(ctx, side.ref.KNID, side.ref.Branch); err != nil {
+			return nil, err
+		}
 	}
 
 	diff := bknsdk.DiffNetworkModels(base, target, bknsdk.DiffOptions{
@@ -175,10 +328,10 @@ func (bs *bknService) exportCapabilities(ctx context.Context, knID, branch strin
 		return nil, nil
 	}
 	// Names are half the identity and the only half another environment can resolve. When the
-	// execution factory could not be reached they are all empty, and the section would still look
+	// metadata service is unconfigured or unreachable they can be empty, and the section would look
 	// well-formed while resolving to nothing on import. Failing the export says so instead.
 	if !list.MetadataAvailable {
-		return nil, rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 			berrors.BknBackend_CapabilityBinding_ExportMetadataUnavailable).
 			WithErrorDetails("capability names are unavailable, so the exported dependency section would not resolve elsewhere")
 	}
@@ -219,10 +372,14 @@ func (bs *bknService) exportCapabilities(ctx context.Context, knID, branch strin
 				MCPName:  binding.OwnerName,
 				ToolName: binding.CapabilityID,
 			})
+		case interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE:
+			capabilities.KnowledgeBases = append(capabilities.KnowledgeBases, &bknsdk.BknCapabilityKnowledgeBase{
+				ID:   binding.CapabilityID,
+				Name: binding.Name,
+			})
 		}
 	}
-	if len(capabilities.Skills) == 0 && len(capabilities.Functions) == 0 &&
-		len(capabilities.MCPTools) == 0 {
+	if capabilities.IsEmpty() {
 		return nil, nil
 	}
 	return capabilities, nil

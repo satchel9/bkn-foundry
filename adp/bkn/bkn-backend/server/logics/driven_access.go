@@ -9,7 +9,7 @@ package logics
 import (
 	"database/sql"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 var (
@@ -21,10 +21,15 @@ var (
 	ATA            interfaces.ActionTypeAccess
 	CBA            interfaces.CapabilityBindingAccess
 	CGA            interfaces.ConceptGroupAccess
+	KBA            interfaces.KnowledgeBaseAccess
 	KNA            interfaces.KNAccess
+	KNVA           interfaces.KNVersionAccess
+	BC             interfaces.BranchCopier
+	KECA           interfaces.KnEventCleanupAccess
 	KPA            interfaces.KNProxyAccess
 	KPOA           interfaces.KNProxyOutboxAccess
-	MA             interfaces.MetricAccess
+	OMA            interfaces.ObjectMetricAccessV1
+	OMVP           interfaces.ObjectMetricVersionPublisher
 	MPA            interfaces.ManagedProxyAccess
 	MFA            interfaces.ModelFactoryAccess
 	OSA            interfaces.OpenSearchAccess
@@ -34,6 +39,7 @@ var (
 	RiskTypeAccess interfaces.RiskTypeAccess
 	UMA            interfaces.UserMgmtAccess
 	VBA            interfaces.VegaBackendAccess
+	VTA            interfaces.ValueTypeAccess
 )
 
 func SetDB(db *sql.DB) {
@@ -68,6 +74,11 @@ func SetKNAccess(kna interfaces.KNAccess) {
 	KNA = kna
 }
 
+func SetKNVersionAccess(knva interfaces.KNVersionAccess, bc interfaces.BranchCopier) {
+	KNVA = knva
+	BC = bc
+}
+
 func SetKNProxyAccess(kpa interfaces.KNProxyAccess) {
 	KPA = kpa
 }
@@ -80,8 +91,20 @@ func SetManagedProxyAccess(mpa interfaces.ManagedProxyAccess) {
 	MPA = mpa
 }
 
-func SetMetricAccess(ma interfaces.MetricAccess) {
-	MA = ma
+func SetObjectMetricAccess(oma interfaces.ObjectMetricAccessV1) {
+	OMA = oma
+}
+
+// SetObjectMetricVersionPublisher installs the paid image's publication of metrics with the
+// network. Without it a network publish leaves metrics alone.
+func SetObjectMetricVersionPublisher(p interfaces.ObjectMetricVersionPublisher) {
+	OMVP = p
+}
+
+// SetKnEventCleanupAccess installs the event module's cleanup of a network's
+// events, run in the transaction that deletes the network.
+func SetKnEventCleanupAccess(keca interfaces.KnEventCleanupAccess) {
+	KECA = keca
 }
 
 func SetModelFactoryAccess(mfa interfaces.ModelFactoryAccess) {
@@ -112,10 +135,20 @@ func SetAgentOperatorAccess(aoa interfaces.AgentOperatorAccess) {
 	AOA = aoa
 }
 
+// SetKnowledgeBaseAccess sets the kb-api identity reader that knowledge_base capability
+// bindings use; it answers ErrKnowledgeBaseUnavailable where kb-api is not deployed.
+func SetKnowledgeBaseAccess(kba interfaces.KnowledgeBaseAccess) {
+	KBA = kba
+}
+
 func SetUserMgmtAccess(uma interfaces.UserMgmtAccess) {
 	UMA = uma
 }
 
 func SetVegaBackendAccess(vba interfaces.VegaBackendAccess) {
 	VBA = vba
+}
+
+func SetValueTypeAccess(vta interfaces.ValueTypeAccess) {
+	VTA = vta
 }

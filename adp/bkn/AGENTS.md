@@ -8,12 +8,13 @@ You are an experienced programming master, focused on efficient, scalable, compa
 
 ## Subsystem Overview
 
-BKN Engine is a subsystem of ADP (AISHU Data Platform), consisting of two Go microservices:
+BKN Engine is a subsystem of ADP, consisting of three Go microservices:
 
 | Service | Port | Purpose |
 |---------|------|---------|
 | `bkn-backend` | 13014 | BKN modeling, knowledge network management, CRUD operations |
 | `ontology-query` | 13018 | Graph queries, semantic search, data retrieval |
+| `bkn-project` | 13016 | Projects that build and publish knowledge networks; release lineage |
 
 ## Code Standards
 
@@ -141,6 +142,7 @@ adp/
 - Use `$PROJECT_ROOT` or relative paths, avoid hardcoded personal paths
 - Include runnable code examples
 - Keep API docs in sync with code changes
+- Any change to what `run_cypher` / the Cypher endpoint accepts, refuses or returns must update, in the same PR, `docs/api/bkn/cypher-queries.yaml`, `help/zh/manual/cypher.md` and `help/en/manual/cypher.md`, the Context Loader tool text when it describes the change, and the built-in agent prompts that list what the subset supports (the `studio_smart_qa` prompt in `migrations/bkn-agent/mariadb/*/01-seed-studio-smart-qa.sql` and `init.sql`, with its digest in `infra/bkn-agent/app/test/test_shared_agent_seeds.py`), plus the sandbox stubs regenerated with `make -C infra/sandbox bkn-tools`. In a separate PR to openbkn-ai/bkn-studio, update the Studio Cypher reference (`src/modules/knowledge-network/locales/{zh-CN,en-US}/cypher-reference.ts` and its examples) to match, including its "Not supported" section. Run the manual's examples against a test environment before submitting. `tools/check_cypher_docs.py` (CI job `ci-cypher-docs`) checks that each rule listed in `tools/cypher_doc_facts.json` is stated in every one of these texts; when a change adds or alters a rule, add it there as a fact.
 
 ## Configuration
 

@@ -10,6 +10,15 @@ JSON Schema from the conversation messages:
    validated with jsonschema, and an invalid one is fed back for a single retry.
 The fallback is not guaranteed to succeed, but it works with any model that can
 hold a conversation.
+
+The native path asks for a json_schema response_format, which not every
+OpenAI-compatible provider has: DeepSeek, for one, answers 400 "This
+response_format type is unavailable now". The fallback then asks for the
+json_object response_format those providers do have, so the reply is at least
+syntactically JSON, and drops it when the provider has neither. A reply cut off
+at the output cap (finish_reason length) is never valid JSON: the retry asks for
+a shorter answer, and the final error says the output was truncated, so the
+caller can ask for less at a time.
 """
 import json
 import logging
@@ -19,22 +28,66 @@ from typing import Any
 from jsonschema import validate as _jsonschema_validate
 from jsonschema.exceptions import SchemaError, ValidationError
 from langchain_core.messages import AIMessage, SystemMessage
+from openai import LengthFinishReasonError
 
 from app.core.llm import normalize_response_format
 
 logger = logging.getLogger(__name__)
 
+
+class StructuredOutputError(RuntimeError):
+    """The model exhausted the bounded JSON/schema correction path."""
+
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+
+
+# TRUNCATED marks a StructuredOutputError whose last reply was cut off at the
+# output cap; callers match it to ask for less per call.
+TRUNCATED = "output truncated"
 
 
 def _extract_json(text: str) -> Any:
     """Dig the JSON out of model text: strip the markdown fence, then take
-    everything between the first { and the last }."""
+    everything between the first { and the last }. Raw control characters such
+    as a newline inside a string, which models often write, are accepted."""
     t = _FENCE.sub("", text.strip())
     start, end = t.find("{"), t.rfind("}")
     if start != -1 and end != -1 and end > start:
         t = t[start : end + 1]
-    return json.loads(t)
+    return json.loads(t, strict=False)
+
+
+def _truncated(resp: Any) -> bool:
+    """Whether the provider stopped the reply at the output cap."""
+    metadata = getattr(resp, "response_metadata", None) or {}
+    return metadata.get("finish_reason") == "length"
+
+
+async def _invoke(model, msgs) -> Any:
+    """One model call. With a response_format, langchain-openai parses the
+    reply through the OpenAI SDK, which raises instead of returning a reply cut
+    off at the output cap: that is turned back into a truncated reply, so the
+    retry asks for a shorter one. The reasoning tokens are logged, to tell
+    reasoning from answer when the cap is reached."""
+    try:
+        return await model.ainvoke(msgs)
+    except LengthFinishReasonError as e:
+        usage = getattr(e.completion, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        logger.warning(
+            "[Structured] reply cut off at the output cap: completion_tokens=%s reasoning_tokens=%s",
+            getattr(usage, "completion_tokens", None), getattr(details, "reasoning_tokens", None),
+        )
+        return AIMessage(content="", response_metadata={"finish_reason": "length"})
+
+
+def _request_refused(error: Exception) -> bool:
+    """Whether the provider refused the request itself (a 4xx), as one without
+    json_object does in its own words; a network failure or a timeout is not."""
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return 400 <= status < 500
+    return "response_format" in str(error)
 
 
 def _with_system_prompt(messages: list, system_prompt: str | None) -> list:
@@ -150,10 +203,27 @@ async def structured_extract_with_path(
     )
     msgs = list(messages) + [("user", instr)]
     last_err: Any = None
+    truncated = False
+    # json_object keeps the reply syntactically JSON on providers that lack
+    # json_schema; the instruction names JSON, as such providers require.
+    json_mode = hasattr(model, "bind")
     for attempt in range(1, 3):
-        resp = await model.ainvoke(msgs)
+        resp = None
+        if json_mode:
+            try:
+                resp = await _invoke(model.bind(response_format={"type": "json_object"}), msgs)
+            except Exception as e:  # The provider has no json_object either
+                if not _request_refused(e):
+                    raise
+                logger.warning("[Structured] json_object unavailable; plain prompt: %s", e)
+                json_mode = False
+        if resp is None:
+            resp = await _invoke(model, msgs)
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
+        truncated = _truncated(resp)
         try:
+            if truncated:
+                raise ValueError(f"{TRUNCATED} at the output limit")
             obj = _extract_json(text)
             _jsonschema_validate(obj, schema)
             logger.warning(
@@ -164,11 +234,21 @@ async def structured_extract_with_path(
             return obj, "fallback"
         except (json.JSONDecodeError, ValidationError, ValueError) as e:
             last_err = e
-            msgs = msgs + [
-                ("assistant", text),
-                ("user", f"上面的输出不合法（{e}）。请重新只输出严格符合 schema 的 JSON。"),
-            ]
-    raise RuntimeError(
+            if truncated:
+                # The cut-off text is not repeated: the model writes it whole
+                # again, shorter.
+                msgs = msgs + [(
+                    "user",
+                    "Your previous answer was cut off at the output length limit. "
+                    "Answer again with valid JSON only, matching the schema, and keep "
+                    "it shorter: fewer items, and shorter texts and quotes.",
+                )]
+            else:
+                msgs = msgs + [
+                    ("assistant", text),
+                    ("user", f"上面的输出不合法（{e}）。请重新只输出严格符合 schema 的 JSON。"),
+                ]
+    raise StructuredOutputError(
         "structured output failed: not supported natively and the prompt "
         f"fallback was still invalid ({last_err})"
     )

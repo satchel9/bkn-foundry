@@ -8,12 +8,12 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 // Keep authorization-derived predicates below a conservative database
@@ -104,12 +104,12 @@ func (ats *actionTypeService) listActionSummaryPage(ctx context.Context,
 	query interfaces.ActionTypesQueryParams, hydrate bool) ([]*interfaces.ActionType, int, error) {
 	total, err := ats.ata.GetActionTypesTotal(ctx, query)
 	if err != nil {
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
 	}
 	items, err := ats.ata.ListActionTypeSummaries(ctx, query)
 	if err != nil {
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
 	}
 	if !hydrate || len(items) == 0 {
@@ -132,7 +132,7 @@ func (ats *actionTypeService) listActionSummaryFallback(ctx context.Context,
 	candidateQuery.Limit = -1
 	candidates, err := ats.ata.ListActionTypeSummaries(ctx, candidateQuery)
 	if err != nil {
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
 	}
 	candidates, err = ats.filterActionSummaryOperations(ctx, query.KNID, candidates)
@@ -208,7 +208,7 @@ func (ats *actionTypeService) hydrateActionSummaries(ctx context.Context, knID, 
 		accounts = append(accounts, &item.Creator, &item.Updater)
 	}
 	if err := ats.ums.GetAccountNames(ctx, accounts); err != nil {
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_ActionType_InternalError).WithErrorDetails(err.Error())
 	}
 	return nil

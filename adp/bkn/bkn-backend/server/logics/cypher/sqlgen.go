@@ -11,6 +11,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
 )
 
 // Generation is the last stage and the only one that writes SQL text. Every
@@ -45,10 +47,14 @@ type GenerateOptions struct {
 	// that has no LIMIT. Removing the default would therefore cost sorted
 	// results, not just a row cap.
 	DefaultLimit int64
+
+	// conclusions, when set, keeps only the rows of the conclusions a
+	// derived table chose; see planGraphRead.
+	conclusions *conclusionJoin
 }
 
 // Generate writes the plan as one SQL statement. Resources appear as
-// {{.resource_id}} placeholders, which vega-backend replaces with the quoted
+// {{resource_id}} placeholders, which vega-backend replaces with the quoted
 // physical table name, so no table name is ever composed here.
 func Generate(plan *Plan, options GenerateOptions) (string, error) {
 	dialect := options.Dialect
@@ -58,19 +64,70 @@ func Generate(plan *Plan, options GenerateOptions) (string, error) {
 	if dialect != DialectMySQL && dialect != DialectPostgres {
 		return "", fmt.Errorf("unsupported SQL dialect %q", dialect)
 	}
+	if plan.Intersection != nil {
+		return generateIntersection(plan.Intersection, dialect)
+	}
+	if plan.Union != nil {
+		return "", fmt.Errorf("a UNION runs part by part, each as its own statement")
+	}
 	if len(plan.Tables) == 0 || len(plan.Select) == 0 {
 		return "", fmt.Errorf("cannot generate SQL for an empty plan")
 	}
+	if len(plan.Totals) > 0 {
+		return generateTotals(plan, dialect, options.DefaultLimit)
+	}
 
-	g := &generator{dialect: dialect, plan: plan}
+	g := &generator{dialect: dialect, plan: plan, conclusions: options.conclusions}
+	g.where, g.semiJoins = splitSemiJoins(plan.Where)
 	g.writeSelect()
 	g.writeFrom()
 	if err := g.writeWhere(); err != nil {
 		return "", err
 	}
 	g.writeGroupBy()
+	if err := g.writeHaving(); err != nil {
+		return "", err
+	}
 	g.writeOrderBy()
 	g.writeLimit(options.DefaultLimit)
+	if g.err != nil {
+		return "", g.err
+	}
+	return g.out.String(), nil
+}
+
+// groupsAlias names the derived table whose rows are a WITH's groups.
+const groupsAlias = "g"
+
+// generateTotals writes a query whose RETURN aggregates the groups a WITH
+// made. The grouped query becomes a derived table with one row per group, and
+// the totals aggregate its rows -- MySQL 5.7 has no CTE, and a derived table
+// is how it nests one aggregation in another. The derived table takes no
+// LIMIT: capping it would count only some of the groups.
+func generateTotals(plan *Plan, dialect Dialect, defaultLimit int64) (string, error) {
+	groups := *plan
+	groups.Totals, groups.Skip, groups.Limit = nil, nil, nil
+	inner, err := Generate(&groups, GenerateOptions{Dialect: dialect})
+	if err != nil {
+		return "", err
+	}
+	g := &generator{dialect: dialect, plan: plan}
+	g.out.WriteString("SELECT ")
+	for i, total := range plan.Totals {
+		if i > 0 {
+			g.out.WriteString(", ")
+		}
+		argument := "*"
+		if total.Of != "" {
+			argument = groupsAlias + "." + g.identifier(total.Of)
+		}
+		if total.Distinct {
+			argument = "DISTINCT " + argument
+		}
+		g.out.WriteString(total.Function + "(" + argument + ") AS " + g.identifier(total.Alias))
+	}
+	g.out.WriteString(" FROM (" + inner + ") " + groupsAlias)
+	g.writeLimit(defaultLimit)
 	if g.err != nil {
 		return "", g.err
 	}
@@ -87,6 +144,44 @@ type generator struct {
 	// table, so they belong in WHERE rather than in the FROM list -- appending
 	// them there produced SQL that does not parse.
 	deferred []PlanJoin
+	// semiJoins are the conditions on an earlier stage's values, written as
+	// joins to that stage; where is the rest of the plan's condition.
+	semiJoins []PlanSemiJoin
+	where     PlanPredicate
+	// conclusions is joined after the semi-joins, when set.
+	conclusions *conclusionJoin
+}
+
+// splitSemiJoins takes the semi-joins out of a condition. The analyzer only
+// lets one stand on its own at the top of WHERE, so each is a conjunct here.
+func splitSemiJoins(predicate PlanPredicate) (PlanPredicate, []PlanSemiJoin) {
+	switch node := predicate.(type) {
+	case PlanSemiJoin:
+		return nil, []PlanSemiJoin{node}
+	case PlanLogical:
+		if node.Operator != "AND" {
+			return predicate, nil
+		}
+		var rest []PlanPredicate
+		var semiJoins []PlanSemiJoin
+		for _, operand := range node.Operands {
+			remaining, found := splitSemiJoins(operand)
+			semiJoins = append(semiJoins, found...)
+			if remaining != nil {
+				rest = append(rest, remaining)
+			}
+		}
+		switch len(rest) {
+		case 0:
+			return nil, semiJoins
+		case 1:
+			return rest[0], semiJoins
+		default:
+			return PlanLogical{Operator: "AND", Operands: rest}, semiJoins
+		}
+	default:
+		return predicate, nil
+	}
 }
 
 func (g *generator) writeSelect() {
@@ -128,9 +223,46 @@ func (g *generator) expression(value PlanExpression) string {
 	case PlanValueColumn:
 		return g.column(node.Table, node.Column)
 	case PlanValueLiteral:
-		return g.number(node.Value)
+		if node.Value.Kind == LiteralInteger || node.Value.Kind == LiteralFloat {
+			return g.number(node.Value)
+		}
+		// Only a branch of CASE or an argument of coalesce carries a string
+		// or a null; arithmetic was given numbers alone.
+		if node.Value.Kind == LiteralNull {
+			return "NULL"
+		}
+		written, err := g.literal(node.Value)
+		if err != nil {
+			g.fail(err)
+		}
+		return written
 	case PlanAggregate:
 		return g.aggregate(node)
+	case PlanCarriedValue:
+		return carriedAlias + "." + g.identifier(node.Alias)
+	case PlanCase:
+		var out strings.Builder
+		out.WriteString("CASE")
+		for _, when := range node.Whens {
+			out.WriteString(" WHEN " + g.condition(when.Condition) + " THEN " + g.expression(when.Result))
+		}
+		if node.Else != nil {
+			out.WriteString(" ELSE " + g.expression(node.Else))
+		}
+		out.WriteString(" END")
+		return out.String()
+	case PlanCoalesce:
+		arguments := make([]string, len(node.Arguments))
+		for i, argument := range node.Arguments {
+			arguments[i] = g.expression(argument)
+		}
+		return "COALESCE(" + strings.Join(arguments, ", ") + ")"
+	case PlanScalarFunction:
+		arguments := make([]string, len(node.Arguments))
+		for i, argument := range node.Arguments {
+			arguments[i] = g.expression(argument)
+		}
+		return scalarFunctionSQL(node.Name, arguments)
 	case PlanNegative:
 		if column, ok := node.Operand.(PlanValueColumn); ok {
 			return "-" + g.column(column.Table, column.Column)
@@ -144,6 +276,15 @@ func (g *generator) expression(value PlanExpression) string {
 		}
 		return g.operand(node.Left, precedence, false) + " " + node.Operator + " " +
 			g.operand(node.Right, precedence, true)
+	case PlanConditionValue:
+		// A condition is written as CASE rather than as a bare predicate: some
+		// dialects vega-backend translates into, such as SQL Server and Oracle,
+		// do not allow a predicate as a value. It gives 1, 0, or NULL when the
+		// condition cannot be decided, which the caller turns back into a
+		// boolean. The condition is written by the same code that writes WHERE,
+		// so it reads the same in both places.
+		written := g.condition(node.Predicate)
+		return "CASE WHEN " + written + " THEN 1 WHEN NOT (" + written + ") THEN 0 END"
 	default:
 		g.fail(fmt.Errorf("cannot generate a %T value", value))
 		return ""
@@ -153,6 +294,21 @@ func (g *generator) expression(value PlanExpression) string {
 // operand writes one side of an operation, in parentheses when the tree binds
 // it tighter than the text would: a looser operator on either side, or an
 // equal one on the right, since a - (b - c) is not a - b - c.
+// condition writes a condition where a value is being written, as CASE needs
+// one, with the same code that writes WHERE so it reads the same in both.
+func (g *generator) condition(predicate PlanPredicate) string {
+	condition := &generator{dialect: g.dialect, plan: g.plan}
+	if err := condition.writePredicate(predicate, true); err != nil {
+		g.fail(err)
+		return ""
+	}
+	if condition.err != nil {
+		g.fail(condition.err)
+		return ""
+	}
+	return condition.out.String()
+}
+
 func (g *generator) operand(value PlanExpression, parent int, right bool) string {
 	written := g.expression(value)
 	if inner, ok := value.(PlanArithmetic); ok {
@@ -198,10 +354,38 @@ func (g *generator) aggregate(aggregate PlanAggregate) string {
 	if aggregate.Argument != nil {
 		inner = g.expression(aggregate.Argument)
 	}
+	if len(aggregate.Keys) > 0 {
+		columns := []string{inner}
+		for _, key := range aggregate.Keys {
+			columns = append(columns, g.column(key.Table, key.Column))
+		}
+		inner = strings.Join(columns, ", ")
+		// MySQL counts distinct column lists, skipping any with a NULL in it.
+		// Postgres counts distinct rows, and a row with NULL fields is not
+		// itself NULL, so the row is written only when every field is there:
+		// a missing optional end then counts nothing, as it does on MySQL.
+		if g.dialect == DialectPostgres {
+			present := make([]string, len(columns))
+			for i, column := range columns {
+				present[i] = column + " IS NOT NULL"
+			}
+			inner = "CASE WHEN " + strings.Join(present, " AND ") + " THEN (" + inner + ") END"
+		}
+	}
 	if aggregate.Distinct {
 		inner = "DISTINCT " + inner
 	}
 	return aggregate.Function + "(" + inner + ")"
+}
+
+// writeHaving writes the condition each group must meet, which reads
+// aggregates and so cannot go in WHERE.
+func (g *generator) writeHaving() error {
+	if g.plan.Having == nil {
+		return nil
+	}
+	g.out.WriteString(" HAVING ")
+	return g.writePredicate(g.plan.Having, false)
 }
 
 // writeGroupBy writes the grouping the planner derived from what is returned.
@@ -234,9 +418,12 @@ func (g *generator) writeFrom() {
 	// Only the required tables take part in this. An outer join has a side that
 	// may go null, so it cannot be reordered in among the inner ones: everything
 	// it hangs off has to be in the statement before it is written.
+	//
+	// A backing table is not counted: it is written with the join it belongs
+	// to, never on its own.
 	required := 0
 	for _, table := range g.plan.Tables {
-		if !table.Optional {
+		if !table.Optional && !table.Backing {
 			required++
 		}
 	}
@@ -250,10 +437,17 @@ func (g *generator) writeFrom() {
 			continue
 		}
 		g.writeJoin(g.plan.Joins[join], next)
+		g.markBacking(g.plan.Joins[join], joined)
 		joined[next] = true
 		used[join] = true
 	}
+	g.writeSemiJoins()
+	g.writeCarried()
 	g.writeOptionalJoins(joined, used)
+	g.writeClosingBackings(joined, used)
+	// The chosen conclusions may name a node an OPTIONAL MATCH attached, or a
+	// backing table a relationship value reads, so they join after both.
+	g.writeConclusions()
 
 	// A join that attached no table still carries a condition: a cycle closing
 	// on tables already read, or a relationship from a node to itself. It is
@@ -270,6 +464,67 @@ func (g *generator) writeFrom() {
 			}
 			g.deferred = append(g.deferred, join)
 		}
+	}
+}
+
+// writeClosingBackings joins the backing table of each indirect relationship
+// whose ends are both read already, as a cycle has: it is the one table such a
+// relationship has left to attach, joined on both of its rule sets at once.
+func (g *generator) writeClosingBackings(joined, used []bool) {
+	for i, join := range g.plan.Joins {
+		if used[i] || join.Backing == nil || join.Optional {
+			continue
+		}
+		g.writeClosingBacking(join)
+		joined[join.Backing.Table] = true
+		used[i] = true
+	}
+}
+
+// writeSemiJoins joins each earlier stage as a derived table of its distinct
+// values, so a row matches at most once and is kept exactly when its value is
+// among them. It is written as a join rather than as IN (SELECT ...): both
+// mean the same, and a derived table is the form every SQL target vega-backend
+// compiles to accepts. The stage is unlimited, since a LIMIT would cut the set.
+func (g *generator) writeSemiJoins() {
+	for i, semiJoin := range g.semiJoins {
+		sub, err := Generate(semiJoin.Sub, GenerateOptions{Dialect: g.dialect})
+		if err != nil {
+			g.fail(err)
+			return
+		}
+		alias := "s" + strconv.Itoa(i)
+		g.out.WriteString(" JOIN (")
+		g.out.WriteString(sub)
+		g.out.WriteString(") ")
+		g.out.WriteString(alias)
+		g.out.WriteString(" ON ")
+		g.out.WriteString(g.column(semiJoin.Table, semiJoin.Column))
+		g.out.WriteString(" = ")
+		g.out.WriteString(alias + "." + g.identifier(semiJoin.Sub.Select[0].Alias))
+	}
+}
+
+// writeCarried joins a carried stage on the primary keys of the nodes it
+// passed on. The stage has one row per row its WITH passed on, so each of
+// those rows meets the outer rows of its nodes, as in Cypher; it is unlimited,
+// since a LIMIT would drop some of them.
+func (g *generator) writeCarried() {
+	carried := g.plan.Carried
+	if carried == nil {
+		return
+	}
+	sub, err := Generate(carried.Stage, GenerateOptions{Dialect: g.dialect})
+	if err != nil {
+		g.fail(err)
+		return
+	}
+	g.out.WriteString(" JOIN (" + sub + ") " + carriedAlias + " ON ")
+	for i, key := range carried.Keys {
+		if i > 0 {
+			g.out.WriteString(" AND ")
+		}
+		g.out.WriteString(g.column(key.Table, key.Column) + " = " + carriedAlias + "." + g.identifier(key.Alias))
 	}
 }
 
@@ -293,8 +548,17 @@ func (g *generator) writeOptionalJoins(joined, used []bool) {
 			return
 		}
 		g.writeJoin(join, table)
+		g.markBacking(join, joined)
 		joined[table] = true
 		used[i] = true
+	}
+}
+
+// markBacking records that a join over an indirect relation wrote its
+// backing table along with the table it attached.
+func (g *generator) markBacking(join PlanJoin, joined []bool) {
+	if join.Backing != nil {
+		joined[join.Backing.Table] = true
 	}
 }
 
@@ -317,7 +581,7 @@ func (g *generator) nextJoinable(joined, used []bool) (table int, join int) {
 
 func (g *generator) firstUnjoined(joined []bool) int {
 	for i, in := range joined {
-		if !in && !g.plan.Tables[i].Optional {
+		if !in && !g.plan.Tables[i].Optional && !g.plan.Tables[i].Backing {
 			return i
 		}
 	}
@@ -325,6 +589,10 @@ func (g *generator) firstUnjoined(joined []bool) int {
 }
 
 func (g *generator) writeJoin(join PlanJoin, table int) {
+	if join.Backing != nil {
+		g.writeBackingJoin(join, table)
+		return
+	}
 	if join.Optional {
 		g.out.WriteString(" LEFT JOIN ")
 	} else {
@@ -351,6 +619,90 @@ func (g *generator) writeJoin(join PlanJoin, table int) {
 	}
 }
 
+// writeBackingJoin attaches table through an indirect relation's backing
+// table: the backing row has to match the side already read on one rule set
+// and table on the other.
+//
+// An inner join is two joins in a row. An outer join nests them, as in
+// LEFT JOIN (backing JOIN table ON ...) ON ..., so that only a backing row
+// that reaches a matching table row counts as a match: written as two outer
+// joins, a link row whose other end is missing or filtered out would come
+// back as a row of its own with nothing attached, beside the real matches.
+func (g *generator) writeBackingJoin(join PlanJoin, table int) {
+	link := join.Backing
+	// nearKeys join the backing table to the side already read, farKeys to
+	// the table being attached, each written backing column first.
+	anchor, nearKeys, farKeys := join.Left, link.LeftKeys, link.RightKeys
+	nearFlipped, farFlipped := true, false
+	if table == join.Left {
+		anchor, nearKeys, farKeys = join.Right, link.RightKeys, link.LeftKeys
+		nearFlipped, farFlipped = false, true
+	}
+	if join.Optional {
+		g.out.WriteString(" LEFT JOIN (")
+		g.out.WriteString(g.table(link.Table))
+		g.out.WriteString(" JOIN ")
+		g.out.WriteString(g.table(table))
+		g.out.WriteString(" ON ")
+		g.writeBackingKeys(link.Table, table, farKeys, farFlipped)
+		g.out.WriteString(") ON ")
+		g.writeBackingKeys(link.Table, anchor, nearKeys, nearFlipped)
+	} else {
+		g.out.WriteString(" JOIN ")
+		g.out.WriteString(g.table(link.Table))
+		g.out.WriteString(" ON ")
+		g.writeBackingKeys(link.Table, anchor, nearKeys, nearFlipped)
+		g.out.WriteString(" JOIN ")
+		g.out.WriteString(g.table(table))
+		g.out.WriteString(" ON ")
+		g.writeBackingKeys(link.Table, table, farKeys, farFlipped)
+	}
+	for _, condition := range join.Conditions {
+		g.out.WriteString(" AND ")
+		if err := g.writePredicate(condition, true); err != nil {
+			g.fail(err)
+			return
+		}
+	}
+}
+
+// writeClosingBacking joins the backing table of a relationship both of whose
+// ends are already read, as a cycle or a node linked to itself has.
+func (g *generator) writeClosingBacking(join PlanJoin) {
+	link := join.Backing
+	g.out.WriteString(" JOIN ")
+	g.out.WriteString(g.table(link.Table))
+	g.out.WriteString(" ON ")
+	g.writeBackingKeys(link.Table, join.Left, link.LeftKeys, true)
+	g.out.WriteString(" AND ")
+	g.writeBackingKeys(link.Table, join.Right, link.RightKeys, false)
+	for _, condition := range join.Conditions {
+		g.out.WriteString(" AND ")
+		if err := g.writePredicate(condition, true); err != nil {
+			g.fail(err)
+			return
+		}
+	}
+}
+
+// writeBackingKeys writes the equalities between the backing table and one
+// end. Keys keep pattern order, so the backing column is the right column of
+// the left end's keys (flipped) and the left column of the right end's.
+func (g *generator) writeBackingKeys(backing, end int, keys []PlanJoinKey, flipped bool) {
+	for i, key := range keys {
+		if i > 0 {
+			g.out.WriteString(" AND ")
+		}
+		backingColumn, endColumn := key.LeftColumn, key.RightColumn
+		if flipped {
+			backingColumn, endColumn = key.RightColumn, key.LeftColumn
+		}
+		g.out.WriteString(g.column(backing, backingColumn))
+		g.out.WriteString(" = ")
+		g.out.WriteString(g.column(end, endColumn))
+	}
+}
+
 // fail records the first generation failure. Generate checks it once, after
 // every part of the statement has been written.
 func (g *generator) fail(err error) {
@@ -360,6 +712,17 @@ func (g *generator) fail(err error) {
 }
 
 func (g *generator) writeJoinCondition(join PlanJoin) {
+	if join.Filtered {
+		// The two ends' conditions are the whole link.
+		if join.Filter == nil {
+			g.out.WriteString("1 = 1")
+			return
+		}
+		if err := g.writePredicate(join.Filter, true); err != nil {
+			g.fail(err)
+		}
+		return
+	}
 	for r, reading := range join.Readings {
 		if r > 0 {
 			g.out.WriteString(" OR ")
@@ -384,7 +747,7 @@ func (g *generator) writeJoinCondition(join PlanJoin) {
 }
 
 func (g *generator) writeWhere() error {
-	if g.plan.Where == nil && len(g.deferred) == 0 {
+	if g.where == nil && len(g.deferred) == 0 {
 		return nil
 	}
 	g.out.WriteString(" WHERE ")
@@ -403,13 +766,13 @@ func (g *generator) writeWhere() error {
 			g.out.WriteString(")")
 		}
 	}
-	if g.plan.Where == nil {
+	if g.where == nil {
 		return nil
 	}
 	if len(g.deferred) > 0 {
 		g.out.WriteString(" AND ")
 	}
-	return g.writePredicate(g.plan.Where, len(g.deferred) > 0)
+	return g.writePredicate(g.where, len(g.deferred) > 0)
 }
 
 // writePredicate writes one node of the condition tree. Parentheses are added
@@ -448,6 +811,11 @@ func (g *generator) writePredicate(predicate PlanPredicate, nested bool) error {
 	case PlanNever:
 		g.out.WriteString("1 = 0")
 		return nil
+
+	case PlanSemiJoin:
+		// writeSemiJoins writes every semi-join the analyzer allows; one
+		// left in a condition sits under OR or NOT, which a join cannot say.
+		return fmt.Errorf("a semi-join must be a condition of its own")
 
 	case PlanNullCheck:
 		g.out.WriteString(g.column(node.Table, node.Column))
@@ -558,17 +926,21 @@ func likePattern(operator StringMatchOperator, value string) string {
 	}
 }
 
-// writeStringMatch writes STARTS WITH, ENDS WITH or CONTAINS as a LIKE. The
-// pattern is escaped for LIKE first and then written as any other string, so
+// writeStringMatch writes Cypher string matches and stored LIKE patterns. The
+// pattern is escaped for SQL first and then written as any other string, so
 // the quoting rules of the dialect apply to it unchanged. Whether the match
 // ignores case is up to the column's collation, as it is for =.
 func (g *generator) writeStringMatch(node PlanStringMatch) error {
 	switch node.Operator {
-	case StartsWith, EndsWith, Contains:
+	case StartsWith, EndsWith, Contains, LikePattern:
 	default:
 		return fmt.Errorf("cannot generate a %q string predicate", node.Operator)
 	}
-	pattern, err := g.stringLiteral(likePattern(node.Operator, node.Value))
+	value := likePattern(node.Operator, node.Value)
+	if node.Operator == LikePattern {
+		value = cond.SQLLikeToBangPattern(node.Value)
+	}
+	pattern, err := g.stringLiteral(value)
 	if err != nil {
 		return err
 	}
@@ -634,7 +1006,7 @@ func (g *generator) writeLimit(defaultLimit int64) {
 // wrote or carry anything the author controls.
 func (g *generator) table(index int) string {
 	t := g.plan.Tables[index]
-	return "{{." + t.ResourceID + "}} " + t.Alias
+	return "{{" + t.ResourceID + "}} " + t.Alias
 }
 
 func (g *generator) column(table int, column string) string {

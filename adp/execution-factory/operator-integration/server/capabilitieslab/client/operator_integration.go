@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 )
 
 type contextKey string
@@ -41,7 +41,7 @@ func WithForwardedAuth(ctx context.Context, authorization string, cookie string)
 }
 
 func applyLanguageHeader(ctx context.Context, header http.Header) {
-	header.Set(sharedrest.AcceptLanguageHeader, sharedrest.GetLanguageByCtx(ctx))
+	header.Set(i18n.AcceptLanguageHeader, string(i18n.GetLanguageByCtx(ctx)))
 }
 
 func NewOperatorIntegrationClient(baseURL string) *OperatorIntegrationClient {
@@ -204,7 +204,7 @@ func (f createToolFailure) Message() string {
 
 	var detail struct {
 		Description string `json:"description"`
-		Details     string `json:"details"`
+		Details     string `json:"error_details"`
 		Message     string `json:"message"`
 		Error       string `json:"error"`
 	}
@@ -224,29 +224,6 @@ func (f createToolFailure) Message() string {
 	}
 
 	return ""
-}
-
-type bundleRequest struct {
-	BoxID         string                 `json:"box_id,omitempty"`
-	BoxName       string                 `json:"box_name,omitempty"`
-	BoxDesc       string                 `json:"box_desc,omitempty"`
-	BoxSvcURL     string                 `json:"box_svc_url"`
-	BoxCategory   string                 `json:"box_category"`
-	Data          string                 `json:"data"`
-	DirectPublish bool                   `json:"direct_publish"`
-	OperatorInfo  map[string]interface{} `json:"operator_info"`
-}
-
-type bundleResponse struct {
-	BoxID       string   `json:"box_id"`
-	ToolIDs     []string `json:"tool_ids"`
-	OperatorIDs []string `json:"operator_ids"`
-	Links       []struct {
-		OperatorID string `json:"operator_id"`
-		ToolID     string `json:"tool_id"`
-	} `json:"links"`
-	FailureCount int64    `json:"failure_count"`
-	Failures     []string `json:"failures"`
 }
 
 func (c *OperatorIntegrationClient) ListToolboxes(
@@ -351,37 +328,6 @@ func CreateToolPayload(openapiSpec string) (createToolRequest, error) {
 	}, nil
 }
 
-func BundleRequestFromModel(
-	boxID, boxName string,
-	req struct {
-		OpenAPISpec string
-		ServiceURL  string
-		Description string
-		Category    string
-	},
-	category string,
-) bundleRequest {
-	payload := bundleRequest{
-		BoxSvcURL:     req.ServiceURL,
-		BoxCategory:   category,
-		Data:          req.OpenAPISpec,
-		DirectPublish: false,
-		OperatorInfo: map[string]interface{}{
-			"category":       category,
-			"execution_mode": "sync",
-			"operator_type":  "basic",
-			"source":         "custom",
-		},
-	}
-	if boxID != "" {
-		payload.BoxID = boxID
-	} else {
-		payload.BoxName = boxName
-		payload.BoxDesc = req.Description
-	}
-	return payload
-}
-
 func (c *OperatorIntegrationClient) GetTool(
 	ctx context.Context,
 	boxID, toolID string,
@@ -430,24 +376,6 @@ func (c *OperatorIntegrationClient) CreateTool(
 
 	var resp createToolResponse
 	if err := c.doJSON(ctx, http.MethodPost, path, req, &resp); err != nil {
-		return nil, err
-	}
-
-	return &resp, nil
-}
-
-func (c *OperatorIntegrationClient) RegisterOpenAPIBundle(
-	ctx context.Context,
-	req bundleRequest,
-) (*bundleResponse, error) {
-	var resp bundleResponse
-	if err := c.doJSON(
-		ctx,
-		http.MethodPost,
-		"/api/agent-operator-integration/v1/capabilities/openapi-bundle",
-		req,
-		&resp,
-	); err != nil {
 		return nil, err
 	}
 

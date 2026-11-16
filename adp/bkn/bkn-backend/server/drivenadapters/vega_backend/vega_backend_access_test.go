@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bytedance/sonic"
 	rmock "github.com/openbkn-ai/bkn-foundry/comm-go/rest/mock"
@@ -21,7 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func TestResourceDataQueryRequestUsesPagingContract(t *testing.T) {
@@ -98,7 +99,7 @@ func TestGetResourcesByIDsReadsBatchToleratingMissing(t *testing.T) {
 		DoAndReturn(func(_ context.Context, _ string, params url.Values, headers map[string]string) (int, []byte, error) {
 			gotHeaders = headers
 			assert.Equal(t, "true", params.Get("ignore_missing"))
-			return http.StatusOK, []byte(`{"entries":[{"id":"r/1","name":"orders"},{"id":"r3","name":"items"}]}`), nil
+			return http.StatusOK, []byte(`{"entries":[{"id":"r/1","name":"orders","row_count":9007199254740993,"row_count_time":1790000000000},{"id":"r3","name":"items"}]}`), nil
 		})
 
 	access := &vegaBackendAccess{httpClient: mockHTTPClient, baseUrl: "http://vega"}
@@ -110,6 +111,10 @@ func TestGetResourcesByIDsReadsBatchToleratingMissing(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, resources, 2)
 	assert.Equal(t, "orders", resources[0].Name)
+	require.NotNil(t, resources[0].RowCount)
+	require.NotNil(t, resources[0].RowCountTime)
+	assert.Equal(t, int64(9007199254740993), *resources[0].RowCount)
+	assert.Equal(t, int64(1790000000000), *resources[0].RowCountTime)
 	assert.Equal(t, "items", resources[1].Name)
 	assert.Equal(t, "user-1", gotHeaders[interfaces.HTTP_HEADER_ACCOUNT_ID])
 }
@@ -411,6 +416,18 @@ func TestWriteDatasetDocumentUsesExplicitDocumentID(t *testing.T) {
 	require.NoError(t, access.WriteDatasetDocument(context.Background(), "dataset-1", "document-1", document))
 }
 
+func TestDeleteDatasetDocumentByIDIsIdempotentWhenDocumentIsMissing(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	mockHTTPClient := rmock.NewMockHTTPClient(mockCtrl)
+	access := &vegaBackendAccess{baseUrl: "http://vega", httpClient: mockHTTPClient}
+
+	mockHTTPClient.EXPECT().
+		DeleteNoUnmarshal(gomock.Any(), "http://vega/resources/dataset-1/data/document-1", gomock.Any()).
+		Return(http.StatusNotFound, []byte(`{"message":"not found"}`), nil)
+
+	require.NoError(t, access.DeleteDatasetDocumentByID(context.Background(), "dataset-1", "document-1"))
+}
+
 // The admin fallback in buildHeaders would authorize a read as the platform
 // instead of as the caller, turning vega's per-resource check off without any
 // signal. Raw query must refuse before reaching the network.
@@ -431,8 +448,7 @@ func TestRawQueryRefusesWithoutCallerIdentity(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := access.RawQuery(tc.ctx, &interfaces.RawQueryRequest{
-				Query:        "SELECT 1 FROM {{.r1}}",
-				InputDialect: interfaces.VEGA_DIALECT_MYSQL,
+				Query: "SELECT 1 FROM {{.r1}}",
 			})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "identity")
@@ -440,7 +456,7 @@ func TestRawQueryRefusesWithoutCallerIdentity(t *testing.T) {
 	}
 }
 
-func TestRawQueryForwardsCallerIdentityAndDialect(t *testing.T) {
+func TestRawQueryForwardsCallerIdentityAndSQLContract(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	mockHTTPClient := rmock.NewMockHTTPClient(mockCtrl)
 
@@ -462,8 +478,7 @@ func TestRawQueryForwardsCallerIdentityAndDialect(t *testing.T) {
 		interfaces.AccountInfo{ID: "user-42", Type: "user"})
 
 	resp, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{
-		Query:        "SELECT o.order_id FROM {{.r1}} o",
-		InputDialect: interfaces.VEGA_DIALECT_POSTGRES,
+		Query: "SELECT o.order_id FROM {{.r1}} o",
 	})
 	require.NoError(t, err)
 
@@ -475,7 +490,7 @@ func TestRawQueryForwardsCallerIdentityAndDialect(t *testing.T) {
 	sent, ok := gotBody.(*interfaces.RawQueryRequest)
 	require.True(t, ok)
 	assert.Equal(t, interfaces.VEGA_QUERY_FORMAT_SQL, sent.QueryFormat, "query_format defaults to sql")
-	assert.Equal(t, interfaces.VEGA_DIALECT_POSTGRES, sent.InputDialect, "dialect must reach vega unchanged")
+	assert.Equal(t, "SELECT o.order_id FROM {{.r1}} o", sent.Query)
 
 	require.Len(t, resp.Columns, 1)
 	assert.Equal(t, "order_id", resp.Columns[0].Name)
@@ -507,8 +522,7 @@ func TestRawQueryClassifiesRefusalWithoutDetail(t *testing.T) {
 				interfaces.AccountInfo{ID: "user-42", Type: "user"})
 
 			_, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{
-				Query:        "SELECT o.email FROM {{.r1}} o",
-				InputDialect: interfaces.VEGA_DIALECT_MYSQL,
+				Query: "SELECT o.email FROM {{.r1}} o",
 			})
 			var dependencyErr *interfaces.DependencyError
 			require.ErrorAs(t, err, &dependencyErr)
@@ -516,6 +530,52 @@ func TestRawQueryClassifiesRefusalWithoutDetail(t *testing.T) {
 			assert.Equal(t, tc.kind, dependencyErr.Kind)
 			assert.NotContains(t, err.Error(), "email")
 			assert.NotContains(t, err.Error(), "r1")
+		})
+	}
+}
+
+// #2090: vega-backend stops a statement at its query_timeout_sec and answers
+// with the same 500 as any other failure. A failure that took the whole
+// timeout is that stop, and is classified as a timeout so the caller can say
+// so; one that came back sooner, or a query that set no timeout, is not.
+func TestRawQueryClassifiesStatementTimeoutByElapsedTime(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     int
+		timeoutSec int
+		elapsed    time.Duration
+		kind       interfaces.DependencyErrorKind
+	}{
+		{"failed at the timeout", http.StatusInternalServerError, 30, 30*time.Second + 15*time.Millisecond, interfaces.DependencyTimeout},
+		{"failed before the timeout", http.StatusInternalServerError, 30, 2 * time.Second, interfaces.DependencyDownstreamError},
+		{"no timeout set", http.StatusInternalServerError, 0, 90 * time.Second, interfaces.DependencyDownstreamError},
+		{"refused after the timeout stays a refusal", http.StatusForbidden, 30, 31 * time.Second, interfaces.DependencyForbidden},
+		{"answered 504", http.StatusGatewayTimeout, 30, time.Second, interfaces.DependencyTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			mockHTTPClient := rmock.NewMockHTTPClient(mockCtrl)
+			mockHTTPClient.EXPECT().
+				PostNoUnmarshal(gomock.Any(), "http://vega/resources/query", gomock.Any(), gomock.Any()).
+				Return(tc.status, []byte(`{"error_code":"VegaBackend.Query.ExecuteFailed","error_details":"query execution failed"}`), nil)
+
+			start := time.Unix(1_700_000_000, 0)
+			readings := []time.Time{start, start.Add(tc.elapsed)}
+			access := &vegaBackendAccess{httpClient: mockHTTPClient, baseUrl: "http://vega", now: func() time.Time {
+				reading := readings[0]
+				readings = readings[1:]
+				return reading
+			}}
+			ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
+				interfaces.AccountInfo{ID: "user-42", Type: "user"})
+
+			_, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{
+				Query: "SELECT count(*) FROM {{.r1}} t", QueryTimeoutSec: tc.timeoutSec,
+			})
+			var dependencyErr *interfaces.DependencyError
+			require.ErrorAs(t, err, &dependencyErr)
+			assert.Equal(t, tc.kind, dependencyErr.Kind)
+			assert.Equal(t, tc.status, dependencyErr.HTTPStatus)
 		})
 	}
 }
@@ -540,7 +600,7 @@ func TestRawQueryAsRunsUnderTheNamedAccount(t *testing.T) {
 	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
 		interfaces.AccountInfo{ID: "user-42", Type: "user"})
 	resp, err := access.RawQueryAs(ctx, interfaces.AccountInfo{ID: "proxy-7", Type: interfaces.KNProxyAccountTypeApp},
-		&interfaces.RawQueryRequest{Query: "SELECT t0.id FROM {{.r1}} t0", InputDialect: interfaces.VEGA_DIALECT_MYSQL})
+		&interfaces.RawQueryRequest{Query: "SELECT t0.id FROM {{.r1}} t0"})
 	require.NoError(t, err)
 	require.Len(t, resp.Entries, 1)
 
@@ -571,7 +631,7 @@ func TestRawQueryAsRefusesWithoutAnAccount(t *testing.T) {
 				interfaces.AccountInfo{ID: "user-42", Type: "user"})
 
 			_, err := access.RawQueryAs(ctx, account,
-				&interfaces.RawQueryRequest{Query: "SELECT 1 FROM {{.r1}}", InputDialect: interfaces.VEGA_DIALECT_MYSQL})
+				&interfaces.RawQueryRequest{Query: "SELECT 1 FROM {{.r1}}"})
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "account")
 		})
@@ -590,11 +650,8 @@ func TestRawQueryRejectsIncompleteRequest(t *testing.T) {
 	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
 		interfaces.AccountInfo{ID: "user-42", Type: "user"})
 
-	_, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{InputDialect: interfaces.VEGA_DIALECT_MYSQL})
+	_, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{})
 	require.Error(t, err)
-
-	_, err = access.RawQuery(ctx, &interfaces.RawQueryRequest{Query: "SELECT 1 FROM {{.r1}}"})
-	require.Error(t, err, "an unset dialect would silently take vega's postgres default")
 }
 
 // Three ways the dependency can fail. In each of them the statement, which
@@ -641,13 +698,33 @@ func TestRawQueryDoesNotReturnDependencyDetail(t *testing.T) {
 				interfaces.AccountInfo{ID: "user-42", Type: "user"})
 
 			_, err := access.RawQuery(ctx, &interfaces.RawQueryRequest{
-				Query:        statement,
-				InputDialect: interfaces.VEGA_DIALECT_MYSQL,
+				Query: statement,
 			})
 			require.Error(t, err)
 			for _, forbidden := range tc.leakFree {
 				assert.NotContains(t, err.Error(), forbidden)
 			}
 		})
+	}
+}
+
+// A raw query refused for where its resources live is told apart from one
+// refused for what it says, by error code alone.
+func TestRawQuerySourceUnsupported(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+		want   bool
+	}{
+		{http.StatusBadRequest, `{"error_code":"VegaBackend.Query.InvalidParameter","error_details":"unsupported connector type: "}`, true},
+		{http.StatusBadRequest, `{"error_code":"VegaBackend.Query.InvalidParameter","error_details":"unsupported connector type: opensearch"}`, true},
+		{http.StatusNotImplemented, `{"error_code":"VegaBackend.Query.MultiCatalogNotSupported","error_details":"x"}`, true},
+		{http.StatusBadRequest, `{"error_code":"VegaBackend.Query.InvalidParameter","error_details":"syntax error near t0"}`, false},
+		{http.StatusBadRequest, `not json`, false},
+		{http.StatusInternalServerError, `{"error_code":"VegaBackend.Query.MultiCatalogNotSupported"}`, false},
+	} {
+		if got := rawQuerySourceUnsupported(tc.status, []byte(tc.body)); got != tc.want {
+			t.Errorf("%d %s: got %v, want %v", tc.status, tc.body, got, tc.want)
+		}
 	}
 }

@@ -43,14 +43,6 @@ type resourceAccess struct {
 	db         *sql.DB
 }
 
-func marshalResourceLogicDefinition(resource *interfaces.Resource) []byte {
-	if resource.LogicDefinition != nil {
-		encoded, _ := sonic.Marshal(resource.LogicDefinition)
-		return encoded
-	}
-	return []byte("[]")
-}
-
 var resourceColumns = []string{
 	"f_id",
 	"f_catalog_id",
@@ -160,14 +152,14 @@ func scanResource(scanner resourceRowScanner) (*interfaces.Resource, error) {
 		_ = common.UnmarshalPreciseJSON([]byte(sourceMetadata.String), &resource.SourceMetadata)
 	}
 	if schemaDefinition.Valid && schemaDefinition.String != "" {
-		_ = sonic.Unmarshal([]byte(schemaDefinition.String), &resource.SchemaDefinition)
+		if err := common.UnmarshalPreciseJSON([]byte(schemaDefinition.String), &resource.SchemaDefinition); err != nil {
+			return nil, err
+		}
 	}
 	if indexConfig.Valid && indexConfig.String != "" {
 		_ = sonic.Unmarshal([]byte(indexConfig.String), &resource.IndexConfig)
 	}
-	if resource.Category == interfaces.ResourceCategoryLogicalView && logicDefinition.Valid && logicDefinition.String != "" {
-		_ = common.UnmarshalPreciseJSON([]byte(logicDefinition.String), &resource.LogicDefinition)
-	}
+	resource.LogicDefinitionStr = logicDefinition.String
 	return resource, nil
 }
 
@@ -229,7 +221,7 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 	// Convert tags to string format
 	tagsStr := libCommon.TagSlice2TagString(resource.Tags)
 
-	// Serialize Source Data, Scheme Definition, and LogicDefinition
+	// Serialize source metadata, schema definition, and index configuration.
 	sourceMetadataBytes, _ := sonic.Marshal(resource.SourceMetadata)
 	if resource.SourceMetadata == nil {
 		sourceMetadataBytes = []byte("{}")
@@ -242,7 +234,6 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 	if resource.IndexConfig == nil {
 		indexConfigBytes = []byte("{}")
 	}
-	logicDefinitionBytes := marshalResourceLogicDefinition(resource)
 	if resource.LocalIndexStatus == "" {
 		resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusUnavailable
 	}
@@ -307,7 +298,7 @@ func (ra *resourceAccess) Create(ctx context.Context, tx *sql.Tx, resource *inte
 			string(indexConfigBytes),
 
 			resource.LogicType,
-			string(logicDefinitionBytes),
+			resource.LogicDefinitionStr,
 
 			resource.LocalIndexStatus,
 			resource.LocalIndexName,
@@ -627,7 +618,7 @@ func (ra *resourceAccess) Update(ctx context.Context, tx *sql.Tx,
 	// Convert tags to string format
 	tagsStr := libCommon.TagSlice2TagString(resource.Tags)
 
-	// Serialize schema definition, index config, and logic definition.
+	// Serialize schema definition and index configuration.
 	schemaDefinitionBytes, _ := sonic.Marshal(resource.SchemaDefinition)
 	if resource.SchemaDefinition == nil {
 		schemaDefinitionBytes = []byte("[]")
@@ -636,7 +627,6 @@ func (ra *resourceAccess) Update(ctx context.Context, tx *sql.Tx,
 	if resource.IndexConfig == nil {
 		indexConfigBytes = []byte("{}")
 	}
-	logicDefinitionBytes := marshalResourceLogicDefinition(resource)
 	sourceMetadataBytes, _ := sonic.Marshal(resource.SourceMetadata)
 	if resource.SourceMetadata == nil {
 		sourceMetadataBytes = []byte("{}")
@@ -649,7 +639,7 @@ func (ra *resourceAccess) Update(ctx context.Context, tx *sql.Tx,
 		Set("f_schema_definition", string(schemaDefinitionBytes)).
 		Set("f_index_config", string(indexConfigBytes)).
 		Set("f_logic_type", resource.LogicType).
-		Set("f_logic_definition", string(logicDefinitionBytes)).
+		Set("f_logic_definition", resource.LogicDefinitionStr).
 		Set("f_updater", resource.Updater.ID).
 		Set("f_updater_type", resource.Updater.Type).
 		Set("f_update_time", resource.UpdateTime).
@@ -798,19 +788,11 @@ func (ra *resourceAccess) UpdateSemanticMetadata(ctx context.Context,
 	if resource.SchemaDefinition == nil {
 		schemaDefinitionBytes = []byte("[]")
 	}
-	logicDefinitionBytes, err := sonic.Marshal(resource.LogicDefinition)
-	if err != nil {
-		span.SetStatus(codes.Error, "Marshal logic definition failed")
-		return 0, err
-	}
-	if resource.LogicDefinition == nil {
-		logicDefinitionBytes = []byte("[]")
-	}
 	builder := sq.Update(RESOURCE_TABLE_NAME).
 		Set("f_name", resource.Name).
 		Set("f_description", resource.Description).
 		Set("f_schema_definition", string(schemaDefinitionBytes)).
-		Set("f_logic_definition", string(logicDefinitionBytes)).
+		Set("f_logic_definition", resource.LogicDefinitionStr).
 		Set("f_updater", resource.Updater.ID).
 		Set("f_updater_type", resource.Updater.Type).
 		Set("f_update_time", resource.UpdateTime).
@@ -1014,7 +996,7 @@ func (ra *resourceAccess) UpdateDiscoverStatus(ctx context.Context, id string, s
 	return nil
 }
 
-func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string, onlyIfStale bool) error {
+func (ra *resourceAccess) DeleteByIDs(ctx context.Context, tx *sql.Tx, ids []string, onlyIfStale bool) error {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Delete resources")
 	defer span.End()
 
@@ -1037,14 +1019,12 @@ func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string, onlyIfS
 		span.SetStatus(codes.Error, "Build delete query failed")
 		return err
 	}
-	tx, err := ra.db.BeginTx(ctx, nil)
-	if err != nil {
-		span.SetStatus(codes.Error, "Begin delete transaction failed")
-		return err
+	var result sql.Result
+	if tx != nil {
+		result, err = tx.ExecContext(ctx, sqlStr, vals...)
+	} else {
+		result, err = ra.db.ExecContext(ctx, sqlStr, vals...)
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	result, err := tx.ExecContext(ctx, sqlStr, vals...)
 	if err != nil {
 		span.SetStatus(codes.Error, "Delete failed")
 		return err
@@ -1056,16 +1036,8 @@ func (ra *resourceAccess) DeleteByIDs(ctx context.Context, ids []string, onlyIfS
 			return err
 		}
 		if rows != int64(len(ids)) {
-			if err := tx.Rollback(); err != nil {
-				span.SetStatus(codes.Error, "Rollback conditional deletion failed")
-				return err
-			}
 			return interfaces.ErrResourceDeleteConditionNotMet
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		span.SetStatus(codes.Error, "Commit resource deletion failed")
-		return err
 	}
 	span.SetStatus(codes.Ok, "")
 	return nil

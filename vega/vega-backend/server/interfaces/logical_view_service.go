@@ -15,22 +15,23 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 )
 
 const (
-	LogicType_Derived   = "derived"
-	LogicType_Composite = "composite"
+	LogicalType_Derived   = "derived"
+	LogicalType_Composite = "composite"
 
 	//Configuration items of features
 	PropertyFeatureType_Keyword  = "keyword"
 	PropertyFeatureType_Fulltext = "fulltext"
 	PropertyFeatureType_Vector   = "vector"
 
-	LogicDefinitionNodeType_Resource = "resource"
-	LogicDefinitionNodeType_Join     = "join"
-	LogicDefinitionNodeType_Union    = "union"
-	LogicDefinitionNodeType_Sql      = "sql"
-	LogicDefinitionNodeType_Output   = "output"
+	LogicalViewDefinitionNodeType_Resource = "resource"
+	LogicalViewDefinitionNodeType_Join     = "join"
+	LogicalViewDefinitionNodeType_Union    = "union"
+	LogicalViewDefinitionNodeType_Sql      = "sql"
+	LogicalViewDefinitionNodeType_Output   = "output"
 
 	// The type of join
 	JoinType_Inner = "inner"
@@ -47,12 +48,12 @@ const (
 )
 
 var (
-	LogicDefinitionNodeTypeMap = map[string]struct{}{
-		LogicDefinitionNodeType_Resource: {},
-		LogicDefinitionNodeType_Join:     {},
-		LogicDefinitionNodeType_Union:    {},
-		LogicDefinitionNodeType_Sql:      {},
-		LogicDefinitionNodeType_Output:   {},
+	LogicalViewDefinitionNodeTypeMap = map[string]struct{}{
+		LogicalViewDefinitionNodeType_Resource: {},
+		LogicalViewDefinitionNodeType_Join:     {},
+		LogicalViewDefinitionNodeType_Union:    {},
+		LogicalViewDefinitionNodeType_Sql:      {},
+		LogicalViewDefinitionNodeType_Output:   {},
 	}
 
 	JoinTypeMap = map[string]struct{}{
@@ -79,14 +80,14 @@ type LogicalView struct {
 	RefResources   map[string]*Resource `json:"ref_resources,omitempty" mapstructure:"-"`
 }
 
-// DerivedLogicDefinition binds a view to one source and an optional fixed filter.
-type DerivedLogicDefinition struct {
+// DerivedLogicalViewDefinition binds a view to one source and an optional fixed filter.
+type DerivedLogicalViewDefinition struct {
 	SourceResourceID string `json:"source_resource_id"`
 	FilterCondition  any    `json:"filter_condition,omitempty"`
 }
 
-func (d *DerivedLogicDefinition) UnmarshalJSON(data []byte) error {
-	type definition DerivedLogicDefinition
+func (d *DerivedLogicalViewDefinition) UnmarshalJSON(data []byte) error {
+	type definition DerivedLogicalViewDefinition
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	decoder.UseNumber()
@@ -94,20 +95,20 @@ func (d *DerivedLogicDefinition) UnmarshalJSON(data []byte) error {
 	if err := decoder.Decode(&parsed); err != nil {
 		return err
 	}
-	*d = DerivedLogicDefinition(parsed)
+	*d = DerivedLogicalViewDefinition(parsed)
 	return nil
 }
 
-// DecodeDerivedLogicDefinition validates and decodes the derived shape carried by Resource.
-func DecodeDerivedLogicDefinition(raw any) (*DerivedLogicDefinition, error) {
+// DecodeDerivedLogicalViewDefinition validates and decodes the derived shape carried by Resource.
+func DecodeDerivedLogicalViewDefinition(raw any) (*DerivedLogicalViewDefinition, error) {
 	if raw == nil {
-		return nil, fmt.Errorf("logic_definition is required")
+		return nil, fmt.Errorf("logical_view_definition is required")
 	}
 	encoded, err := sonic.Marshal(raw)
 	if err != nil {
 		return nil, err
 	}
-	var definition DerivedLogicDefinition
+	var definition DerivedLogicalViewDefinition
 	if err := common.UnmarshalPreciseJSON(encoded, &definition); err != nil {
 		return nil, err
 	}
@@ -117,16 +118,16 @@ func DecodeDerivedLogicDefinition(raw any) (*DerivedLogicDefinition, error) {
 	return &definition, nil
 }
 
-// LegacyLogicDefinitionNodes isolates the inactive node model from the Resource JSON field.
-func LegacyLogicDefinitionNodes(raw any) []*LogicDefinitionNode {
-	if nodes, ok := raw.([]*LogicDefinitionNode); ok {
+// LegacyLogicalViewDefinitionNodes isolates the inactive node model from the Resource JSON field.
+func LegacyLogicalViewDefinitionNodes(raw any) []*LogicalViewDefinitionNode {
+	if nodes, ok := raw.([]*LogicalViewDefinitionNode); ok {
 		return nodes
 	}
 	return nil
 }
 
-// LogicDefinitionNode represents the nodes in the graph
-type LogicDefinitionNode struct {
+// LogicalViewDefinitionNode represents the nodes in the graph
+type LogicalViewDefinitionNode struct {
 	ID           string          `json:"id"`
 	Name         string          `json:"name"`
 	Type         string          `json:"type"`
@@ -293,6 +294,21 @@ type SearchAfterParams struct {
 	PitKeepAlive string `json:"pit_keep_alive"`
 }
 
+// SQLViewQuery is the result of the registered logical-view service's SQL preparation.
+// Sources contains additional physical Tables with unique IDs; direct Tables
+// are supplied by the query engine. CursorValidator must be non-nil.
+type SQLViewQuery struct {
+	Sources         []*Resource
+	CursorValidator SQLQueryCursorValidator
+}
+
+// SQLQueryCursorValidator retains one query's extension-owned dependency state.
+// ValidateSQLCursor rechecks capability and dependencies using freshly authorized
+// direct resources. The query engine owns cursor invalidation and row cleanup.
+type SQLQueryCursorValidator interface {
+	ValidateSQLCursor(context.Context, []*Resource) error
+}
+
 //go:generate mockgen -source ../interfaces/logical_view_service.go -destination ../interfaces/mock/mock_logical_view_service.go
 type LogicalViewService interface {
 	// ValidateRequest checks the logic-view definition before persistence.
@@ -302,8 +318,14 @@ type LogicalViewService interface {
 	// view, it must replace req.SourceMetadata with a map containing a non-empty
 	// "source_resource" map[string]any snapshot; the shared service rejects a
 	// successful preparation that omits this server-generated metadata.
-	Prepare(ctx context.Context, req *ResourceRequest) (logicType string, schema []*Property, err error)
+	Prepare(ctx context.Context, req *ResourceRequest) (logicalType string, schema []*Property, err error)
 
 	// QueryWithPaging queries logic-view data and returns cursor paging state when supported.
 	QueryWithPaging(ctx context.Context, resource *Resource, params *ResourceDataQueryParams) (*ResourceDataQueryResult, error)
+
+	// PrepareSQLQuery expands views in place and enforces view policy and field
+	// visibility. Direct resources are authorized and direct Table metadata is
+	// bound by the query engine. Each view occurrence gets its own subquery.
+	// The result declares additional physical sources and cursor validation state.
+	PrepareSQLQuery(ctx context.Context, query *sqlbuilder.SelectBuilder, resources []*Resource) (*SQLViewQuery, error)
 }

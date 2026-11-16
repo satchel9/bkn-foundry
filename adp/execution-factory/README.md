@@ -17,15 +17,16 @@ The BKN Foundry platform includes key subsystems such as ADP, Decision Agent, an
 
 ## Execution Factory Definition
 
-Execution Factory is an open-source platform for managing and executing AI operators and tools, designed to bridge Large Language Models (LLMs) with real-world capabilities. By supporting the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), it provides a standardized mechanism to register, manage, and execute various operators and tools, empowering developers to build powerful AI Agent applications rapidly.
+Execution Factory is an open-source platform for managing and executing AI tools, MCP servers and skills, designed to bridge Large Language Models (LLMs) with real-world capabilities. By supporting the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), it provides a standardized mechanism to register, manage, and execute tools, empowering developers to build powerful AI Agent applications rapidly.
 
 ## Core Components
 
 Execution Factory ships as a single service, `operator-integration`, which exposes two API faces.
 
 ### Operator Integration (`operator-integration`)
-The core integration service platform responsible for the full lifecycle management of operators and tools.
-- **Operator Management**: Supports registration, versioning, publishing, and deprecation of operators.
+
+The core integration service platform responsible for the full lifecycle management of tools, MCP servers and skills.
+
 - **Toolbox**: Enables grouping multiple tools into toolboxes for unified management and invocation.
 - **MCP Support**: Acts as an MCP Server, providing standardized tool invocation interfaces for LLMs.
 - **Multi-Protocol Adaptation**: Supports various communication protocols like HTTP and SSE.
@@ -35,27 +36,29 @@ The core integration service platform responsible for the full lifecycle managem
 
 | Prefix | Purpose |
 | --- | --- |
-| `/api/agent-operator-integration/v1` | Public API for operators, toolboxes, MCP servers and skills. |
+| `/api/agent-operator-integration/v1` | Public API for toolboxes, MCP servers and skills. |
 | `/api/agent-operator-integration/internal-v1` | Service-to-service API. Cluster-internal; not for browser clients. |
 | `/api/capabilities-lab/v1` | Capability face: flattens tools, MCP servers and skills into a single `capability` model. Previously a separate `capabilities-lab` service, merged in as a route group — the paths are unchanged. |
 
 ## Features
 
 - **Standardized Interface**: Based on the MCP protocol, decoupling models from tools.
-- **Flexible Extensibility**: Supports operators written in multiple programming languages (e.g., Go, Python).
+- **Flexible Extensibility**: Supports OpenAPI tools and Python function tools.
 - **Observability**: Integrated with OpenTelemetry for end-to-end tracing.
 - **High Performance**: Built with Go, offering high concurrency processing capabilities.
 
 ## Quick Start
 
 ### Prerequisites
-- Go 1.25+
+
+- Go 1.26.0+
 - MySQL / MariaDB / Dameng DB
 - Redis
 
 ### Build and Run
 
 #### Run Operator Integration
+
 ```bash
 cd operator-integration
 # Install dependencies

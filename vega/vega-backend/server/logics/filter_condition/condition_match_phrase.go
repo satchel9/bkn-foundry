@@ -37,10 +37,8 @@ func (c *MatchPhraseCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg
 
 	// First, obtain the fields array from the RemainCfg
 	if cfgFields, ok := cfg.RemainCfg["fields"].([]any); ok {
-		if len(cfgFields) == 1 && cfgFields[0].(string) == interfaces.AllField {
-			for _, field := range fieldsMap {
-				fields = append(fields, field)
-			}
+		if len(cfgFields) == 1 && cfgFields[0] == interfaces.AllField {
+			fields = append(fields, wildcardFields(fieldsMap)...)
 		} else {
 			// The field array needs to be a string array
 			for _, cfgField := range cfgFields {
@@ -57,17 +55,15 @@ func (c *MatchPhraseCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg
 		}
 	} else {
 		// Compatible with the old single field method
-		if cfg.Name == "" {
+		if cfg.Field == "" {
 			return nil, fmt.Errorf("condition [match_phrase] left field is empty")
 		}
-		if cfg.Name == interfaces.AllField {
-			for fieldName := range fieldsMap {
-				fields = append(fields, fieldsMap[fieldName])
-			}
+		if cfg.Field == interfaces.AllField {
+			fields = append(fields, wildcardFields(fieldsMap)...)
 		} else {
-			field, ok := fieldsMap[cfg.Name]
+			field, ok := fieldsMap[cfg.Field]
 			if !ok {
-				return nil, fmt.Errorf("condition [match_phrase] left field '%s' not found", cfg.Name)
+				return nil, fmt.Errorf("condition [match_phrase] left field '%s' not found", cfg.Field)
 			}
 			fields = append(fields, field)
 		}

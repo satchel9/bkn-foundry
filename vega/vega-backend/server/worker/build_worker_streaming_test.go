@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,12 +73,12 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 		cs := vmock.NewMockCatalogService(ctrl)
 		cf := vmock.NewMockConnectorFactory(ctrl)
 		connector := vmock.NewMockTableConnector(ctrl)
-		cf.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeMySQL, gomock.Any()).Return(connector, nil)
+		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().DecodeTableMeta(gomock.Any()).Return(nil, errors.New("incomplete table metadata"))
 		worker := &streamingBuildWorker{cf: cf, bts: bts, rs: rs, cs: cs, lim: vmock.NewMockLocalIndexManager(ctrl)}
 		task := &interfaces.BuildTask{ID: "t1", ResourceID: "r1", Status: interfaces.BuildTaskStatusPending}
 		rs.EXPECT().InternalGetByID(gomock.Any(), nil, "r1").Return(&interfaces.Resource{ID: "r1", CatalogID: "c1", Category: interfaces.ResourceCategoryTable, SourceIdentifier: "`app`.`orders`"}, nil)
-		cs.EXPECT().InternalGetByID(gomock.Any(), "c1", true).Return(&interfaces.Catalog{ID: "c1", Enabled: true, ConnectorType: interfaces.ConnectorTypeMySQL, ConnectorCfg: interfaces.ConnectorConfig{"databases": []string{"app"}}}, nil)
+		cs.EXPECT().InternalGetByID(gomock.Any(), "c1", true).Return(&interfaces.Catalog{ID: "c1", Enabled: true, ConnectorType: "mysql", ConnectorCfg: interfaces.ConnectorConfig{"databases": []string{"app"}}}, nil)
 		bts.EXPECT().InternalMarkFailed(gomock.Any(), nil, "t1", "incomplete table metadata").Return(true, nil)
 		require.NoError(t, worker.Run(context.Background(), task))
 	})
@@ -96,7 +97,7 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 		cs.EXPECT().InternalGetByID(gomock.Any(), "c1", true).Return(&interfaces.Catalog{
 			ID:            "c1",
 			Enabled:       true,
-			ConnectorType: interfaces.ConnectorTypePostgreSQL,
+			ConnectorType: "postgresql",
 			ConnectorCfg:  interfaces.ConnectorConfig{},
 		}, nil)
 		bts.EXPECT().InternalMarkFailed(gomock.Any(), nil, "t1", "PostgreSQL streaming build requires connector_config.database").
@@ -109,7 +110,7 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 func TestStreamingDatabase(t *testing.T) {
 	t.Run("returns PostgreSQL connection database", func(t *testing.T) {
 		database, err := streamingDatabase(&interfaces.Catalog{
-			ConnectorType: interfaces.ConnectorTypePostgreSQL,
+			ConnectorType: "postgresql",
 			ConnectorCfg:  interfaces.ConnectorConfig{"database": "app"},
 		})
 
@@ -119,7 +120,7 @@ func TestStreamingDatabase(t *testing.T) {
 
 	t.Run("rejects PostgreSQL without connection database", func(t *testing.T) {
 		_, err := streamingDatabase(&interfaces.Catalog{
-			ConnectorType: interfaces.ConnectorTypePostgreSQL,
+			ConnectorType: "postgresql",
 			ConnectorCfg:  interfaces.ConnectorConfig{},
 		})
 
@@ -128,7 +129,7 @@ func TestStreamingDatabase(t *testing.T) {
 
 	t.Run("returns MySQL database include list from databases", func(t *testing.T) {
 		database, err := streamingDatabase(&interfaces.Catalog{
-			ConnectorType: interfaces.ConnectorTypeMySQL,
+			ConnectorType: "mysql",
 			ConnectorCfg:  interfaces.ConnectorConfig{"databases": []any{"app", "analytics"}},
 		})
 
@@ -138,7 +139,7 @@ func TestStreamingDatabase(t *testing.T) {
 
 	t.Run("rejects MySQL instance-level catalog", func(t *testing.T) {
 		_, err := streamingDatabase(&interfaces.Catalog{
-			ConnectorType: interfaces.ConnectorTypeMySQL,
+			ConnectorType: "mysql",
 			ConnectorCfg:  interfaces.ConnectorConfig{"databases": []any{}},
 		})
 
@@ -184,9 +185,7 @@ func TestHandleCreateOperationExcludesUnsupportedFields(t *testing.T) {
 	}
 	docID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
 	require.NoError(t, err)
-	lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", map[string]map[string]any{
-		docID: {"id": 2, "title": "created"},
-	}).Return(nil, nil)
+	lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", []interfaces.DocumentWrite{{ID: docID, Document: map[string]any{"id": 2, "title": "created"}}}).DoAndReturn(successfulIndexDocuments)
 
 	require.NoError(t, worker.handleCreateOperation(
 		context.Background(),
@@ -197,7 +196,7 @@ func TestHandleCreateOperationExcludesUnsupportedFields(t *testing.T) {
 		&embeddingPipeline{},
 		[]string{"id", "title"},
 		nil,
-	))
+		nil))
 }
 
 func TestHandleUpdateOperationWritesReplacementBeforeDeletingOldDocument(t *testing.T) {
@@ -218,7 +217,7 @@ func TestHandleUpdateOperationWritesReplacementBeforeDeletingOldDocument(t *test
 	require.NoError(t, err)
 
 	gomock.InOrder(
-		lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", map[string]map[string]any{newID: {"id": 2, "title": "updated"}}).Return([]string{newID}, nil),
+		lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", []interfaces.DocumentWrite{{ID: newID, Document: map[string]any{"id": 2, "title": "updated"}}}).Return([]interfaces.DocumentWriteResult{{ID: newID, Status: 201}}, nil),
 		lim.EXPECT().DeleteDocument(gomock.Any(), "index-1", oldID).Return(nil),
 	)
 
@@ -231,7 +230,7 @@ func TestHandleUpdateOperationWritesReplacementBeforeDeletingOldDocument(t *test
 		&embeddingPipeline{},
 		[]string{"id", "title"},
 		nil,
-	))
+		nil))
 }
 
 func TestHandleUpdateOperationExcludesUnsupportedFields(t *testing.T) {
@@ -249,7 +248,7 @@ func TestHandleUpdateOperationExcludesUnsupportedFields(t *testing.T) {
 	require.NoError(t, err)
 
 	gomock.InOrder(
-		lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", map[string]map[string]any{newID: {"id": 2}}).Return(nil, nil),
+		lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", []interfaces.DocumentWrite{{ID: newID, Document: map[string]any{"id": 2}}}).DoAndReturn(successfulIndexDocuments),
 		lim.EXPECT().DeleteDocument(gomock.Any(), "index-1", oldID).Return(nil),
 	)
 
@@ -262,37 +261,49 @@ func TestHandleUpdateOperationExcludesUnsupportedFields(t *testing.T) {
 		&embeddingPipeline{},
 		[]string{"id"},
 		nil,
-	))
+		nil))
 }
 
 func TestHandleUpdateOperationKeepsOldDocumentWhenReplacementWriteFails(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	lim := vmock.NewMockLocalIndexManager(ctrl)
-	worker := &streamingBuildWorker{lim: lim}
-	buildTask := &interfaces.BuildTask{
-		IndexConfig: &interfaces.BuildTaskIndexConfig{
-			IndexConfigContract: interfaces.IndexConfigContract{
-				PrimaryKeyFields:  []string{"id"},
-				IncrementalFields: []string{"id"},
-			},
-		},
+	for _, requestFailure := range []bool{true, false} {
+		t.Run(fmt.Sprint(requestFailure), func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			lim := vmock.NewMockLocalIndexManager(ctrl)
+			worker := &streamingBuildWorker{lim: lim}
+			buildTask := &interfaces.BuildTask{
+				IndexConfig: &interfaces.BuildTaskIndexConfig{
+					IndexConfigContract: interfaces.IndexConfigContract{
+						PrimaryKeyFields:  []string{"id"},
+						IncrementalFields: []string{"id"},
+					},
+				},
+			}
+			newID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
+			require.NoError(t, err)
+
+			if requestFailure {
+				lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", []interfaces.DocumentWrite{{ID: newID, Document: map[string]any{"id": 2}}}).Return(nil, errors.New("write failed"))
+			} else {
+				lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", []interfaces.DocumentWrite{{ID: newID, Document: map[string]any{"id": 2}}}).Return([]interfaces.DocumentWriteResult{{ID: newID, Status: 503}}, nil)
+			}
+
+			err = worker.handleUpdateOperation(
+				context.Background(),
+				map[string]any{"id": 1},
+				map[string]any{"id": 2},
+				"index-1",
+				buildTask,
+				&embeddingPipeline{},
+				[]string{"id"},
+				nil,
+				nil)
+			if requestFailure {
+				require.ErrorContains(t, err, "write failed")
+			} else {
+				require.ErrorContains(t, err, "failed with status 503")
+			}
+		})
 	}
-	newID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
-	require.NoError(t, err)
-
-	lim.EXPECT().IndexDocuments(gomock.Any(), "index-1", map[string]map[string]any{newID: {"id": 2}}).Return(nil, errors.New("write failed"))
-
-	err = worker.handleUpdateOperation(
-		context.Background(),
-		map[string]any{"id": 1},
-		map[string]any{"id": 2},
-		"index-1",
-		buildTask,
-		&embeddingPipeline{},
-		[]string{"id"},
-		nil,
-	)
-	require.ErrorContains(t, err, "write failed")
 }
 
 func TestBuildConnectorConfigUsesCaptureDatabase(t *testing.T) {
@@ -301,7 +312,7 @@ func TestBuildConnectorConfigUsesCaptureDatabase(t *testing.T) {
 	t.Run("uses database include list for MySQL", func(t *testing.T) {
 		config := worker.buildConnectorConfig("build-c1", &interfaces.Catalog{
 			ID:            "c1",
-			ConnectorType: interfaces.ConnectorTypeMySQL,
+			ConnectorType: "mysql",
 			ConnectorCfg:  interfaces.ConnectorConfig{},
 		}, "app,analytics", "")
 
@@ -311,7 +322,7 @@ func TestBuildConnectorConfigUsesCaptureDatabase(t *testing.T) {
 	t.Run("uses connection database for PostgreSQL", func(t *testing.T) {
 		config := worker.buildConnectorConfig("build-c1", &interfaces.Catalog{
 			ID:            "c1",
-			ConnectorType: interfaces.ConnectorTypePostgreSQL,
+			ConnectorType: "postgresql",
 			ConnectorCfg:  interfaces.ConnectorConfig{},
 		}, "app", "")
 
@@ -319,30 +330,70 @@ func TestBuildConnectorConfigUsesCaptureDatabase(t *testing.T) {
 	})
 }
 
-func TestStreamingHandlersNormalizeJSON(t *testing.T) {
+func TestStreamingHandlersNormalizeDocuments(t *testing.T) {
+	t.Run("CDC schema decodes calendar days and clock units on create and update", func(t *testing.T) {
+		for _, operation := range []string{"create", "update"} {
+			for _, tc := range []struct{ logicalType, raw, want string }{
+				{"io.debezium.time.MicroTime", "43200123456", "12:00:00.123456"},
+				{"io.debezium.time.Time", "43200123", "12:00:00.123"},
+				{"io.debezium.time.NanoTime", "43200123456789", "12:00:00.123456789"},
+			} {
+				t.Run(operation+"/"+tc.logicalType, func(t *testing.T) {
+					var event map[string]any
+					require.NoError(t, common.UnmarshalPreciseJSON([]byte(`{"schema":{"fields":[{"field":"before","fields":[{"field":"clock","name":"unknown"}]},{"field":"after","fields":[{"field":"clock","name":"`+tc.logicalType+`"},{"field":"day","name":"io.debezium.time.Date"}]}]},"payload":{"after":{"id":2,"clock":`+tc.raw+`,"day":20745}}}`), &event))
+					after := event["payload"].(map[string]any)["after"].(map[string]any)
+					lim := vmock.NewMockLocalIndexManager(gomock.NewController(t))
+					worker := &streamingBuildWorker{lim: lim}
+					task := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{PrimaryKeyFields: []string{"id"}}}}
+					id, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: json.Number("2")}})
+					require.NoError(t, err)
+					lim.EXPECT().IndexDocuments(gomock.Any(), "index", []interfaces.DocumentWrite{{ID: id, Document: map[string]any{"id": json.Number("2"), "clock": tc.want, "day": "2026-10-19"}}}).DoAndReturn(successfulIndexDocuments)
+					fields := []*interfaces.Property{{Name: "clock", Type: interfaces.DataType_Time}, {Name: "day", Type: interfaces.DataType_Date}}
+					if operation == "create" {
+						err = worker.handleCreateOperation(context.Background(), map[string]any{"id": json.Number("2")}, after, "index", task, &embeddingPipeline{}, []string{"id", "clock", "day"}, fields, event["schema"])
+					} else {
+						err = worker.handleUpdateOperation(context.Background(), map[string]any{"id": json.Number("2")}, after, "index", task, &embeddingPipeline{}, []string{"id", "clock", "day"}, fields, event["schema"])
+					}
+					require.NoError(t, err)
+					assert.Equal(t, json.Number(tc.raw), after["clock"])
+					assert.Equal(t, json.Number("20745"), after["day"])
+				})
+			}
+		}
+	})
 	for _, operation := range []string{"create", "update"} {
 		for _, tc := range []struct {
-			name    string
-			value   any
-			want    any
-			invalid bool
+			name      string
+			value     any
+			want      any
+			invalid   bool
+			fieldType string
 		}{
-			{"object array", `{"items":[{"id":9007199254740993}]}`, map[string]any{"items": []any{map[string]any{"id": json.Number("9007199254740993")}}}, false},
-			{"scalar array", []byte(`{"items":["a","b"]}`), map[string]any{"items": []any{"a", "b"}}, false},
-			{"scalar root", `"value"`, "value", false},
-			{"null", `null`, nil, false},
-			{"invalid", `{`, nil, true},
+			{"object array", `{"items":[{"id":9007199254740993}]}`, map[string]any{"items": []any{map[string]any{"id": json.Number("9007199254740993")}}}, false, interfaces.DataType_Json},
+			{"scalar array", []byte(`{"items":["a","b"]}`), map[string]any{"items": []any{"a", "b"}}, false, interfaces.DataType_Json},
+			{"scalar root", `"value"`, "value", false, interfaces.DataType_Json},
+			{"JSON null", `null`, nil, false, interfaces.DataType_Json},
+			{"SQL NULL", nil, nil, false, interfaces.DataType_Json},
+			{"string null", `"null"`, "null", false, interfaces.DataType_Json},
+			{"empty JSON string", `""`, "", false, interfaces.DataType_Json},
+			{"empty source text", "", "", false, interfaces.DataType_Json},
+			{"invalid", `{`, nil, true, interfaces.DataType_Json},
+			{"time string", "12:00:00.100000", "12:00:00.1", false, interfaces.DataType_Time},
+			{"time bytes", []byte("12:00:00.100000"), "12:00:00.1", false, interfaces.DataType_Time},
+			{"time duration", "24:00:00", "24:00:00", false, interfaces.DataType_Time},
+			{"time negative duration", "-01:00:00", "-01:00:00", false, interfaces.DataType_Time},
+			{"time numeric without schema", json.Number("43200123456"), json.Number("43200123456"), false, interfaces.DataType_Time},
 		} {
 			t.Run(operation+"/"+tc.name, func(t *testing.T) {
 				lim := vmock.NewMockLocalIndexManager(gomock.NewController(t))
 				worker := &streamingBuildWorker{lim: lim}
 				task := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{PrimaryKeyFields: []string{"id"}}}}
-				schema := []*interfaces.Property{{Name: "payload", Type: interfaces.DataType_Json}}
+				schema := []*interfaces.Property{{Name: "payload", Type: tc.fieldType}}
 				after := map[string]any{"id": 2, "payload": tc.value}
 				if !tc.invalid {
 					docID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
 					require.NoError(t, err)
-					lim.EXPECT().IndexDocuments(gomock.Any(), "index", map[string]map[string]any{docID: {"id": 2, "payload": tc.want}}).Return(nil, nil)
+					lim.EXPECT().IndexDocuments(gomock.Any(), "index", []interfaces.DocumentWrite{{ID: docID, Document: map[string]any{"id": 2, "payload": tc.want}}}).DoAndReturn(successfulIndexDocuments)
 					if operation == "update" {
 						oldID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 1}})
 						require.NoError(t, err)
@@ -351,12 +402,12 @@ func TestStreamingHandlersNormalizeJSON(t *testing.T) {
 				}
 				var err error
 				if operation == "create" {
-					err = worker.handleCreateOperation(context.Background(), map[string]any{"id": 2}, after, "index", task, &embeddingPipeline{}, []string{"id", "payload"}, schema)
+					err = worker.handleCreateOperation(context.Background(), map[string]any{"id": 2}, after, "index", task, &embeddingPipeline{}, []string{"id", "payload"}, schema, nil)
 				} else {
-					err = worker.handleUpdateOperation(context.Background(), map[string]any{"id": 1}, after, "index", task, &embeddingPipeline{}, []string{"id", "payload"}, schema)
+					err = worker.handleUpdateOperation(context.Background(), map[string]any{"id": 1}, after, "index", task, &embeddingPipeline{}, []string{"id", "payload"}, schema, nil)
 				}
 				if tc.invalid {
-					require.ErrorContains(t, err, `JSON field "payload"`)
+					require.ErrorContains(t, err, `field "payload"`)
 				} else {
 					require.NoError(t, err)
 				}
@@ -364,6 +415,17 @@ func TestStreamingHandlersNormalizeJSON(t *testing.T) {
 			})
 		}
 	}
+	t.Run("time primary key keeps its source document identity", func(t *testing.T) {
+		lim := vmock.NewMockLocalIndexManager(gomock.NewController(t))
+		worker := &streamingBuildWorker{lim: lim}
+		task := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{PrimaryKeyFields: []string{"clock"}}}}
+		id, err := generateDocumentID([]interfaces.KeyValue{{Key: "clock", Value: "12:00:00.100"}})
+		require.NoError(t, err)
+		lim.EXPECT().IndexDocuments(gomock.Any(), "index", []interfaces.DocumentWrite{{ID: id, Document: map[string]any{"clock": "12:00:00.1"}}}).DoAndReturn(successfulIndexDocuments)
+		after := map[string]any{"clock": "12:00:00.100"}
+		require.NoError(t, worker.handleUpdateOperation(context.Background(), map[string]any{"clock": "12:00:00.100"}, after, "index", task, &embeddingPipeline{}, []string{"clock"}, []*interfaces.Property{{Name: "clock", Type: interfaces.DataType_Time}}, nil))
+		assert.Equal(t, "12:00:00.100", after["clock"])
+	})
 }
 
 func TestStreamingBuildWorkerExecuteBuild(t *testing.T) {
@@ -397,8 +459,8 @@ func TestStreamingBuildWorkerBuildTableName(t *testing.T) {
 	for _, tc := range []struct {
 		name, connectorType, database, schema, want string
 	}{
-		{"MySQL", interfaces.ConnectorTypeMySQL, "app", "app", "app.orders"},
-		{"PostgreSQL", interfaces.ConnectorTypePostgreSQL, "app", "sales", "sales.orders"},
+		{"MySQL", "mysql", "app", "app", "app.orders"},
+		{"PostgreSQL", "postgresql", "app", "sales", "sales.orders"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctrl := gomock.NewController(t)
@@ -435,4 +497,12 @@ func TestStreamingBuildWorkerBuildTableName(t *testing.T) {
 		require.ErrorContains(t, err, "decode table metadata")
 		assert.Empty(t, got)
 	})
+}
+
+func TestDebeziumAfterLogicalTypes(t *testing.T) {
+	for _, schema := range []any{nil, "unknown", map[string]any{}, map[string]any{"fields": []any{nil, "unknown", map[string]any{"field": "before", "fields": []any{map[string]any{"field": "clock", "name": "io.debezium.time.MicroTime"}}}}}} {
+		assert.Empty(t, debeziumAfterLogicalTypes(schema))
+	}
+	schema := map[string]any{"fields": []any{map[string]any{"field": "after", "fields": []any{nil, map[string]any{"field": "clock", "name": "io.debezium.time.MicroTime"}, map[string]any{"field": "untyped"}, map[string]any{"name": "io.debezium.time.Date"}}}}}
+	assert.Equal(t, map[string]string{"clock": "io.debezium.time.MicroTime"}, debeziumAfterLogicalTypes(schema))
 }

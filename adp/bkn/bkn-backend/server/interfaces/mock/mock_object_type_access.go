@@ -10,11 +10,11 @@
 package mock_interfaces
 
 import (
-	interfaces "bkn-backend/interfaces"
 	context "context"
 	sql "database/sql"
 	reflect "reflect"
 
+	interfaces "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 	gomock "go.uber.org/mock/gomock"
 )
 
@@ -278,6 +278,36 @@ func (m *MockObjectTypeAccess) GetObjectTypesTotal(ctx context.Context, query in
 func (mr *MockObjectTypeAccessMockRecorder) GetObjectTypesTotal(ctx, query any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetObjectTypesTotal", reflect.TypeOf((*MockObjectTypeAccess)(nil).GetObjectTypesTotal), ctx, query)
+}
+
+// ListAliasedObjectTypes mocks base method.
+func (m *MockObjectTypeAccess) ListAliasedObjectTypes(ctx context.Context, knID, branch string) ([]*interfaces.ObjectType, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListAliasedObjectTypes", ctx, knID, branch)
+	ret0, _ := ret[0].([]*interfaces.ObjectType)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListAliasedObjectTypes indicates an expected call of ListAliasedObjectTypes.
+func (mr *MockObjectTypeAccessMockRecorder) ListAliasedObjectTypes(ctx, knID, branch any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListAliasedObjectTypes", reflect.TypeOf((*MockObjectTypeAccess)(nil).ListAliasedObjectTypes), ctx, knID, branch)
+}
+
+// ListDeprecatedObjectTypes mocks base method.
+func (m *MockObjectTypeAccess) ListDeprecatedObjectTypes(ctx context.Context, knID, branch string) ([]*interfaces.ObjectType, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "ListDeprecatedObjectTypes", ctx, knID, branch)
+	ret0, _ := ret[0].([]*interfaces.ObjectType)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListDeprecatedObjectTypes indicates an expected call of ListDeprecatedObjectTypes.
+func (mr *MockObjectTypeAccessMockRecorder) ListDeprecatedObjectTypes(ctx, knID, branch any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListDeprecatedObjectTypes", reflect.TypeOf((*MockObjectTypeAccess)(nil).ListDeprecatedObjectTypes), ctx, knID, branch)
 }
 
 // ListObjectTypeLogicProperties mocks base method.

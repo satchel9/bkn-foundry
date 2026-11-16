@@ -4,12 +4,11 @@
 # See the LICENSE file in the project root for details.
 
 ########################### Stage 0 ########################
-ARG BUILD_IMAGE=golang:1.25.14
+ARG BUILD_IMAGE=golang:1.26.9
 ARG BASE_IMAGE=ubuntu:24.04
 
 FROM ${BUILD_IMAGE} AS builder
 
-COPY comm-go /workspace/comm-go
 COPY adp/bkn/ontology-query/server /workspace/adp/bkn/ontology-query/server
 
 ARG SERVER_VERSION=0.1.0
@@ -20,7 +19,7 @@ ENV GOPROXY=${GOPROXY_URL}
 RUN set -ex; \
     cd /workspace/adp/bkn/ontology-query/server; \
     go mod download -x; \
-    export flags="-X 'ontology-query/version.ServerVersion=${SERVER_VERSION}'"; \
+    export flags="-X 'github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/version.ServerVersion=${SERVER_VERSION}'"; \
     CGO_ENABLED=1 go build -ldflags "-s -w $flags" -o ./bin/ontology-query-server;
 
 ########################### Stage 1 ########################
@@ -36,7 +35,6 @@ RUN groupadd -r -g $GID openbkn \
 COPY --from=builder --chown=$UID:$GID /workspace/adp/bkn/ontology-query/server/bin /opt/ontology-query
 
 ADD adp/bkn/ontology-query/server/config/ontology-query-config.yaml /opt/ontology-query/config/
-ADD adp/bkn/ontology-query/server/locale /opt/ontology-query/locale
 
 # Set the working directory
 WORKDIR /opt/ontology-query/

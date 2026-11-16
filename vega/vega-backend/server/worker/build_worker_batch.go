@@ -23,6 +23,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/build_task"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/factory"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/dataset"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/local_index"
@@ -252,15 +253,17 @@ func buildBatchCursorFilter(keys []string, keyValues []interfaces.KeyValue) (*in
 		subConditions := make([]*interfaces.FilterCondCfg, 0, i+1)
 		for j := 0; j < i; j++ {
 			subConditions = append(subConditions, &interfaces.FilterCondCfg{
-				Name:        keys[j], //nolint:gosec // keyValues length is checked to equal keys above.
-				Operation:   "==",
-				ValueOptCfg: interfaces.ValueOptCfg{Value: keyValues[j].Value, ValueFrom: interfaces.ValueFrom_Const}, //nolint:gosec // keyValues length is checked to equal keys above.
+				Field:     keys[j], //nolint:gosec // keyValues length is checked to equal keys above.
+				Operation: "==",
+				Value:     keyValues[j].Value, //nolint:gosec // keyValues length is checked to equal keys above.
+				ValueFrom: interfaces.ValueFrom_Const,
 			})
 		}
 		subConditions = append(subConditions, &interfaces.FilterCondCfg{
-			Name:        key,
-			Operation:   "gt",
-			ValueOptCfg: interfaces.ValueOptCfg{Value: keyValues[i].Value, ValueFrom: interfaces.ValueFrom_Const}, //nolint:gosec // keyValues length is checked to equal keys above.
+			Field:     key,
+			Operation: "gt",
+			Value:     keyValues[i].Value, //nolint:gosec // keyValues length is checked to equal keys above.
+			ValueFrom: interfaces.ValueFrom_Const,
 		})
 		branches = append(branches, &interfaces.FilterCondCfg{Operation: "and", SubConds: subConditions})
 	}
@@ -278,9 +281,12 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 	if isIncremental && indexName != resource.LocalIndexName {
 		return errors.New("resource local index changed before incremental build")
 	}
+	columns, err := table.ColumnMetadata(resource)
+	if err != nil {
+		return err
+	}
 	restartFromBeginning := buildTaskInfo.ExecuteType == interfaces.BuildTaskExecuteTypeFull &&
 		buildTaskInfo.SyncedMark == ""
-	var err error
 	switch {
 	case restartFromBeginning:
 		err = recreateManagedLocalIndex(ctx, bbw.lim, indexName, buildTaskInfo, resource)
@@ -292,6 +298,11 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 	if err != nil {
 		return fmt.Errorf("prepare local index failed: %w", err)
 	}
+	decimalSchema, err := local_index.DecimalIndexSchema(resource.SchemaDefinition, columns)
+	if err != nil {
+		return err
+	}
+	validationResource := &interfaces.Resource{SchemaDefinition: decimalSchema}
 
 	lastSyncedMark := buildTaskInfo.SyncedMark
 	if restartFromBeginning {
@@ -409,9 +420,16 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 
 			// Convert FilterCondCfg to ActualFilterCond
 			fieldMap := map[string]*interfaces.Property{}
-			if resource.SchemaDefinition != nil {
-				for _, prop := range resource.SchemaDefinition {
-					fieldMap[prop.Name] = prop
+			for _, prop := range resource.SchemaDefinition {
+				fieldMap[prop.Name] = prop
+			}
+			// Internal keyset pagination is not a caller-supplied filter.
+			// Permit cursor comparisons on copies without changing public metadata.
+			for _, name := range effectiveCursorFields {
+				if property, exists := fieldMap[name]; exists {
+					copied := *property
+					copied.Filterable = new(true)
+					fieldMap[name] = &copied
 				}
 			}
 			actualFilterCond, err := filter_condition.NewFilterCondition(ctx, params.FilterCondCfg, fieldMap)
@@ -426,7 +444,7 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 			return fmt.Errorf("execute query failed: %w", err)
 		}
 
-		totalRows := result.Total
+		totalRows := result.TotalCount
 		readRows := len(result.Entries)
 		if firstQuery {
 			firstQuery = false
@@ -465,7 +483,11 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 				if _, exists := indexDocuments[docID]; exists {
 					return fmt.Errorf("build document ID: duplicate primary key values %q", docID)
 				}
-				if err := normalizeJSONDocumentFields(doc, resource.SchemaDefinition); err != nil {
+				doc, err = local_index.EncodeDecimalDocument(validationResource, doc)
+				if err != nil {
+					return fmt.Errorf("build document %q: %w", docID, err)
+				}
+				if err := normalizeBuildDocumentFields(doc, resource.SchemaDefinition, nil); err != nil {
 					return fmt.Errorf("normalize document for local index: %w", err)
 				}
 				indexDocuments[docID] = doc
@@ -478,7 +500,7 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 			}
 			logger.Infof("Indexing batch task %s: source rows=%d, vector fields=%s", buildTaskInfo.ID,
 				readRows, formatEmbeddingFields(embeddingConfig))
-			_, err = bbw.lim.IndexDocuments(ctx, indexName, indexDocuments)
+			err = indexBuildDocuments(ctx, bbw.lim, indexName, indexDocuments)
 			if err != nil {
 				return fmt.Errorf("index documents failed: %w", err)
 			}

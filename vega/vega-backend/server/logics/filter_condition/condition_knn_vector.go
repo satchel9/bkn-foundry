@@ -9,7 +9,9 @@ package filter_condition
 import (
 	"context"
 	"fmt"
+	"reflect"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
@@ -33,18 +35,23 @@ func (c *KnnVectorCond) RequiredValueLen() int      { return -1 }
 func (c *KnnVectorCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	fieldsMap map[string]*interfaces.Property) (interfaces.FilterCondition, error) {
 
-	if cfg.Name == "" {
+	if cfg.Field == "" {
 		return nil, fmt.Errorf("condition [knn_vector] left field is empty")
 	}
-	field, ok := fieldsMap[cfg.Name]
+	_, ok := fieldsMap[cfg.Field]
 	if !ok {
-		return nil, fmt.Errorf("condition [knn_vector] left field '%s' not found", cfg.Name)
+		return nil, fmt.Errorf("condition [knn_vector] left field '%s' not found", cfg.Field)
 	}
+	field := FilterFieldForOperation(cfg.Field, OperationKnnVector, fieldsMap)
 	if field.Type != interfaces.DataType_Vector {
-		return nil, fmt.Errorf("condition [knn_vector] left field '%s' type must be vector", cfg.Name)
+		return nil, fmt.Errorf("condition [knn_vector] left field '%s' type must be vector", cfg.Field)
 	}
 	if cfg.ValueFrom != interfaces.ValueFrom_Const {
 		return nil, fmt.Errorf("condition [knn_vector] does not support value_from type '%s'", cfg.ValueFrom)
+	}
+
+	if err := ValidateKnnValue(field, cfg.Value); err != nil {
+		return nil, err
 	}
 
 	subConds := []interfaces.FilterCondition{}
@@ -61,7 +68,37 @@ func (c *KnnVectorCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 
 	return &KnnVectorCond{
 		Cfg:             cfg,
-		FilterFieldName: cfg.Name,
+		FilterFieldName: field.Name,
 		SubConds:        subConds,
 	}, nil
+}
+
+// ValidateKnnValue 校验查询文本或非空有限数值向量；向量长度按可用的索引维度元数据检查。
+func ValidateKnnValue(field *interfaces.Property, value any) error {
+	if _, text := value.(string); text {
+		return nil
+	}
+	vector := reflect.ValueOf(value)
+	if !vector.IsValid() || vector.Kind() != reflect.Slice || vector.Len() == 0 || vector.Type().Elem().Kind() == reflect.Uint8 {
+		return interfaces.NewConditionBuildError("condition [knn_vector] value must be query text or a non-empty numeric vector")
+	}
+	for i := 0; i < vector.Len(); i++ {
+		if _, numeric := common.NumberAsFloat64(vector.Index(i).Interface()); !numeric {
+			return interfaces.NewConditionBuildError("condition [knn_vector] vector element at index %d must be a finite number", i)
+		}
+	}
+	if field == nil {
+		return nil
+	}
+	actual := vector.Len()
+	for _, feature := range field.Features {
+		if feature.FeatureType != interfaces.PropertyFeatureType_Vector {
+			continue
+		}
+		expected, known := common.NumberAsInt64(feature.Config["dimension"])
+		if known && expected > 0 && int64(actual) != expected {
+			return interfaces.NewConditionBuildError("condition [knn_vector] field '%s': query vector has dimension %d; index requires dimension %d", field.Name, actual, expected)
+		}
+	}
+	return nil
 }

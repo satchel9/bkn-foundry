@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
 	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
@@ -34,8 +37,10 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 	actionsReq := &interfaces.QueryActionsRequest{
 		KnID:               req.KnID,
 		AtID:               req.AtID,
+		RelationTarget:     req.RelationTarget,
+		ObjectInput:        req.ObjectInput,
 		InstanceIdentities: instanceIdentities,
-		IncludeTypeInfo:    false, // No type information required.
+		IncludeTypeInfo:    true,
 	}
 
 	actionsResp, err := s.ontologyQuery.QueryActions(ctx, actionsReq)
@@ -43,11 +48,13 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 		s.logger.WithContext(ctx).Errorf("[KnActionRecall#GetActionInfo] QueryActions failed, err: %v", err)
 		return nil, err
 	}
+	actionInfo := businessActionInfo(actionsResp.ActionType)
 
 	// 3. Validate the response.
 	if actionsResp.ActionSource == nil {
 		s.logger.WithContext(ctx).Warnf("[KnActionRecall#GetActionInfo] ActionSource is nil")
 		return &interfaces.KnActionRecallResponse{
+			ActionType:   actionInfo,
 			DynamicTools: []interfaces.KnDynamicTool{},
 		}, nil
 	}
@@ -55,6 +62,7 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 	if len(actionsResp.Actions) == 0 {
 		s.logger.WithContext(ctx).Warnf("[KnActionRecall#GetActionInfo] Actions is empty")
 		return &interfaces.KnActionRecallResponse{
+			ActionType:   actionInfo,
 			DynamicTools: []interfaces.KnDynamicTool{},
 		}, nil
 	}
@@ -62,8 +70,11 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 	// 4. Validate action_source.type.
 	if actionsResp.ActionSource.Type != interfaces.ActionSourceTypeTool && actionsResp.ActionSource.Type != interfaces.ActionSourceTypeMCP {
 		s.logger.WithContext(ctx).Warnf("[KnActionRecall#GetActionInfo] Unsupported action_source type: %s", actionsResp.ActionSource.Type)
-		return nil, infraErr.DefaultHTTPError(ctx, http.StatusBadRequest,
-			infraErr.LocalizedDetail(ctx, "ActionSourceTypeUnsupported"))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ActionSourceTypeUnsupported", map[string]any{})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusBadRequest, localizedText)
 	}
 
 	// 5. Process actions[0] only.
@@ -76,6 +87,8 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 	fixedParams := interfaces.ActionDriverFixedParams{
 		DynamicParams:      firstAction.Parameters,
 		InstanceIdentities: instanceIdentities,
+		RelationTarget:     req.RelationTarget,
+		ObjectInput:        req.ObjectInput,
 	}
 
 	var dynamicTool interfaces.KnDynamicTool
@@ -101,8 +114,11 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 		parameters, err := s.convertToolSchemaToActionDriver(ctx, toolDetail.Metadata.APISpec)
 		if err != nil {
 			s.logger.WithContext(ctx).Errorf("[KnActionRecall#GetActionInfo] ConvertToolSchemaToActionDriver failed, err: %v", err)
-			return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-				infraErr.LocalizedDetail(ctx, "ToolSchemaConversionFailed"))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ToolSchemaConversionFailed", map[string]any{})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 		}
 
 		// 10a. Build KnDynamicTool. The output schema is best-effort: a tool that
@@ -137,8 +153,11 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 		parameters, err := s.convertMCPSchemaToActionDriver(ctx, toolDetail.InputSchema)
 		if err != nil {
 			s.logger.WithContext(ctx).Errorf("[KnActionRecall#GetActionInfo] ConvertMCPSchemaToActionDriver failed, err: %v", err)
-			return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError,
-				infraErr.LocalizedDetail(ctx, "MCPSchemaConversionFailed"))
+			localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.MCPSchemaConversionFailed", map[string]any{})
+			if renderErr != nil {
+				logger.Errorf("localized message rendering failed: %v", renderErr)
+			}
+			return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, localizedText)
 		}
 
 		// 10b. Build KnDynamicTool. No output schema for MCP sources: an MCP tool's
@@ -155,13 +174,38 @@ func (s *knActionRecallServiceImpl) GetActionInfo(ctx context.Context, req *inte
 		}
 	}
 
+	parameters, err := actionExecutionSchema(actionsResp.ExecutionSchema, dynamicTool.Parameters)
+	if err != nil {
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusBadGateway, err.Error())
+	}
+	dynamicTool.Parameters = parameters
+
 	// 11. Build request headers.
 	headers := common.GetHeaderForChildOperation(ctx, "ontology.action.execute", 1)
 
 	return &interfaces.KnActionRecallResponse{
 		Headers:      headers,
+		ActionType:   actionInfo,
 		DynamicTools: []interfaces.KnDynamicTool{dynamicTool},
 	}, nil
+}
+
+func businessActionInfo(action *interfaces.ActionTypeInfo) *interfaces.KnActionTypeInfo {
+	if action == nil {
+		return nil
+	}
+	intent := action.ActionIntent
+	if intent == "" {
+		intent = action.ActionType
+	}
+	return &interfaces.KnActionTypeInfo{
+		ID:              action.ID,
+		Name:            action.Name,
+		Description:     action.Comment,
+		ActionIntent:    intent,
+		ObjectTypeID:    action.ObjectTypeID,
+		OperationConfig: action.OperationConfig,
+	}
 }
 
 // buildActionDriverAPIURL builds the internal action driver execution endpoint.

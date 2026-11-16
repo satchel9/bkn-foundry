@@ -60,6 +60,9 @@ func newToolBuilder(locale *mcpLocaleBundle) *toolBuilder {
 // bundle.
 func (b *toolBuilder) add(key string, h mcptool.Handler) {
 	in, out := b.locale.ToolSchemas(key)
+	if hasKnVersionProperty(in) {
+		h = withKnVersion(h)
+	}
 	b.addWith(key, b.locale.ToolMeta(key), in, out, h)
 }
 
@@ -87,14 +90,11 @@ func (b *toolBuilder) addExtras() {
 	for _, t := range mcptool.Extras() {
 		b.claimName(t.Name, t.Key)
 		b.gated[t.Name] = t
-		// An enterprise tool is a business tool by this service's own
-		// definition (isBusinessTool is "not a lifecycle tool"), so the
-		// lifecycle middleware will demand bkn_context from it exactly as it
-		// does from core's tools. Its advertised schema has to say so, or the
-		// tool is unusable by anyone following it — the schema comes from ee,
-		// which has no reason to know this service has a lifecycle guard.
+		// Business extensions use the same lifecycle context as core tools.
+		// Control-plane extensions bootstrap or manage work and authorize
+		// their own resources, so they keep the provider's input schema.
 		b.pending = append(b.pending, pendingTool{
-			newToolWithSchemas(extraToolMeta(t), offerBKNContext(t.Input), t.Output),
+			newToolWithSchemas(extraToolMeta(t), extraInputSchema(t), t.Output),
 			mcptool.Gated(t),
 		})
 	}
@@ -175,10 +175,8 @@ func extraToolMeta(t mcptool.ExtraTool) ToolMeta {
 // filter is mcp-go's ToolFilterFunc: it decides what tools/list shows, per
 // request, against the licence in force at that moment.
 //
-// Three jobs. Retired tools are dropped for everyone, on every profile and on
-// the gateway that resolves through this filter (see retiredTools). Enterprise
-// tools the licence does not cover are dropped, so the catalogue matches what
-// a community binary would show. Decorated core tools
+// Two jobs. Enterprise tools the licence does not cover are dropped, so the
+// catalogue matches what a community binary would show. Decorated core tools
 // are swapped for their patched variant only while the decorator is covered,
 // so the paid parameter appears and disappears with the licence instead of
 // being baked in at boot.
@@ -188,9 +186,6 @@ func extraToolMeta(t mcptool.ExtraTool) ToolMeta {
 func (b *toolBuilder) filter(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 	out := make([]mcp.Tool, 0, len(tools))
 	for _, t := range tools {
-		if _, gone := retiredTools[b.names[t.Name]]; gone {
-			continue
-		}
 		if extra, isExtra := b.gated[t.Name]; isExtra {
 			if extra.Allowed() {
 				out = append(out, t)

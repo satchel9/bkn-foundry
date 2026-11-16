@@ -12,7 +12,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 )
 
-// TypeMapping maps PostgreSQL udt_name/common data_type to VEGA types.
+// TypeMapping maps normalized PostgreSQL source type names to VEGA types.
 var TypeMapping = map[string]string{
 	// Integer
 	"int2":        interfaces.DataType_Integer,
@@ -33,9 +33,9 @@ var TypeMapping = map[string]string{
 	"float8":           interfaces.DataType_Float,
 	"double precision": interfaces.DataType_Float,
 	"real":             interfaces.DataType_Float,
-	"money":            interfaces.DataType_Float,
 
 	// decimal
+	"money":   interfaces.DataType_Decimal,
 	"numeric": interfaces.DataType_Decimal,
 	"decimal": interfaces.DataType_Decimal,
 
@@ -49,8 +49,10 @@ var TypeMapping = map[string]string{
 	"interval":          interfaces.DataType_String,
 	"character varying": interfaces.DataType_String,
 	"enum":              interfaces.DataType_String,
-	"inet":              interfaces.DataType_Ip,
-	"cidr":              interfaces.DataType_Ip,
+
+	// 暂不启用 IP 类型，inet/cidr 统一归为 other。
+	// "inet": interfaces.DataType_Ip,
+	// "cidr": interfaces.DataType_Ip,
 
 	// Text
 	"text": interfaces.DataType_Text,
@@ -67,7 +69,7 @@ var TypeMapping = map[string]string{
 	"timestamp without time zone": interfaces.DataType_Timestamp,
 	"timestamp with time zone":    interfaces.DataType_Timestamp,
 
-	// Bull
+	// Boolean
 	"bool":    interfaces.DataType_Boolean,
 	"boolean": interfaces.DataType_Boolean,
 
@@ -79,11 +81,30 @@ var TypeMapping = map[string]string{
 	"jsonb": interfaces.DataType_Json,
 }
 
-// MapType maps to VEGA type based on data_type of information_schema.
+// MapType maps a source type name to a VEGA type, falling back to other.
 func (c *PostgresqlConnector) MapType(dataType string) string {
-	d := strings.ToLower(strings.TrimSpace(dataType))
-	if vegaType, ok := TypeMapping[d]; ok {
+	normalizedType := strings.ToLower(dataType)
+	if vegaType, ok := TypeMapping[normalizedType]; ok {
 		return vegaType
 	}
 	return interfaces.DataType_Other
+}
+
+// normalizeColumnType normalizes source type syntax before storing column metadata.
+func (c *PostgresqlConnector) normalizeColumnType(nativeType string) string {
+	return strings.ToLower(strings.TrimSpace(nativeType))
+}
+
+// IsFilterable 根据列元数据判断过滤能力，忽略已有 Filterable，不修改入参。
+func (c *PostgresqlConnector) IsFilterable(column *interfaces.TableColumnMeta) bool {
+	switch c.MapType(column.Type) {
+	case interfaces.DataType_Integer,
+		interfaces.DataType_Float, interfaces.DataType_Decimal,
+		interfaces.DataType_String, interfaces.DataType_Text,
+		interfaces.DataType_Date, interfaces.DataType_Time,
+		interfaces.DataType_Timestamp, interfaces.DataType_Boolean:
+		return true
+	default:
+		return false
+	}
 }

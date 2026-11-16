@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.2
 info:
-  title: RelationType
+  title: BKN 知识网络 · 关系类 API
   version: 0.1.0
   description: |
     Relation types use `relation_type:{kn_id}/{relation_type_id}`. Reads and
@@ -9,12 +9,74 @@ info:
     deletes use `modify` and `delete`. Lists and searches are filtered before
     total and pagination. See `../knowledge-network-authorization.md`.
 
+    Resource IDs use lowercase letters, digits, underscores, and hyphens, start
+    with a letter or digit, and contain at most 128 characters. Resource names
+    contain at most 128 Unicode characters.
+
     With `strict_mode=true`, indirect relation mappings read the backing Vega schema under the
     source contract's `query_data` operation; they do not introduce an implicit `view_detail`
     requirement. Main-branch publication reuses the effective delegator selected by Proxy
     preflight. Missing bindings return 400; a current-user denial returns 403; controlled lookup
     failures return 502, and timeout/unavailable dependencies return 503 without exposing the
     downstream response body.
+
+    ### Refused declarations and references
+
+    A save the declaration rules refuse answers 400 `BknBackend.RelationType.InvalidParameter.Declarations`. As before,
+    `error_details` holds the English text (several issues are joined with `; `). `metadata.issues` holds the same
+    refusal as records, so that a caller words it in its own language and finds the definition and the property:
+
+    ```json
+    {
+      "error_code": "BknBackend.RelationType.InvalidParameter.Declarations",
+      "error_details": "relation type aliases: alias \"order\" is the same as its own name",
+      "metadata": {"issues": [{
+        "rule": "alias_equals_own_name",
+        "relation_type_id": "order",
+        "params": {"alias": "order"},
+        "message": "relation type aliases: alias \"order\" is the same as its own name"
+      }]}
+    }
+    ```
+
+    Each issue has `rule` (the stable code below), the ID of the definition it concerns (`object_type_id`,
+    `relation_type_id` or `action_type_id`), `property` for a rule of one data property, `params` (the values the
+    message is built from), `involved` (every definition a rule that spans definitions concerns, as `{kind, id}`;
+    the first is the definition that refers first and the one named by the ID field) and `message` (the English
+    text). A rule within one definition lists the first problem it finds. A rule that spans definitions
+    (`replaced_by`, `fallback_for`, deprecated endpoints) lists every problem that involves a definition of the
+    save. An alias that names another definition (`alias_conflict`) reports only the first conflict.
+
+    A delete refused because definitions still refer to it answers 409 `BknBackend.RelationType.StillReferenced`.
+    `error_details.references` lists the English sentences, as before. `metadata.references` holds one record per
+    reference: `kind` and `id` name what is referred to, `referrer_kind` and `referrer_id` who refers to it, `via`
+    the declaration (`replaced_by` or `fallback_for`), and `message` the English sentence.
+
+    Rules of this definition kind:
+
+    - Relation declarations: `reverse_name_invalid` (`reverse_name`, `reason`), `importance_invalid` (`importance`,
+      `allowed`), `verification_invalid` (`verification`, `allowed`), `cardinality_invalid` (`cardinality`,
+      `allowed`), `cardinality_cross_join` (`cardinality`), `characteristics_ends_differ` (`source`, `target`),
+      `symmetric_cardinality` (`cardinality`), `symmetric_reverse_name`, `symmetric_required`,
+      `list_value_invalid` (`field`, `value`, `allowed`), `list_value_duplicated` (`field`, `value`); `field` is the
+      declaration field, `required` or `characteristics`.
+    - Fallback paths on the relation itself: `fallback_for_invalid` (`fallback_for`), `fallback_for_not_secondary`
+      (`fallback_for`), `fallback_for_self` (`fallback_for`), `fallback_cross_join` (`relation_type`),
+      `fallback_characteristics` (`relation_type`).
+    - Fallback paths across relation types: `fallback_target_missing`, `fallback_target_not_primary`,
+      `fallback_target_deprecated` (each with `fallback_for`), `fallback_ends_differ` (`fallback_for`, `source`,
+      `target`, `primary_source`, `primary_target`), `fallback_primary_cardinality` (`fallback_for`,
+      `cardinality`), `fallback_already_taken` (`fallback_for`, `other_fallback`).
+    - Relation properties: `relation_properties_not_indirect` (`endpoint_type`), `relation_properties_too_many`
+      (`count`, `max`), `relation_property_invalid` (`reason`, the English text of the property check, not a stable code), `relation_property_joins_ends` (`mapped_field`),
+      `relation_property_unique`; and the property rules of an object type (semantics, constraints, aliases),
+      which name the property.
+    - Lifecycle: `lifecycle_fields_without_deprecation`, `lifecycle_reason_missing`, `lifecycle_replaced_by_invalid`,
+      `lifecycle_replaced_by_self`, `lifecycle_status_invalid`, `replaced_by_missing`, `replaced_by_deprecated`
+      (see the object type API for their params), and `endpoint_deprecated` (`object_type`): an endpoint object type
+      is deprecated while the relation is not.
+    - Aliases: the alias rules of the object type API.
+
 security:
   - OAuth2: []
 paths:
@@ -93,13 +155,26 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListRelationTypes"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: List relation types
     post:
       requestBody:
@@ -211,6 +286,16 @@ paths:
             enum: [normal, overwrite, ignore]
             default: normal
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing relation type,
+            such as a 2.x package or an old JSON export, would clear them. Without this parameter the request is
+            refused with 409 BknBackend.RelationType.DeclarationsWouldBeCleared, whose details list the cleared
+            declarations (`relation_type_id`, `fields`); pass true to clear them.
+          schema:
+            type: boolean
+            default: false
         - name: strict_mode
           description: Whether to validate dependency existence. Defaults to true. When unset, falls back to the deprecated validate_dependency.
           schema:
@@ -235,7 +320,7 @@ paths:
                 list relation types - first request:
                   value:
                     entries:
-                      - id: pod_2_node_TEST
+                      - id: pod_2_node_test
                         name: belongs to 2
                         tags:
                           - topology
@@ -311,6 +396,9 @@ paths:
                     next_cursor: cursor-relation-types-2
           description: Override GET to search relation types
         "201":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
@@ -358,17 +446,31 @@ paths:
             type: boolean
             default: true
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
         "400":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadRequest"
         "403":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyForbidden"
+        "404":
+          description: Relation type not found on the requested branch (BknBackend.RelationType.RelationTypeNotFound)
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
         "502":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyBadGateway"
         "503":
           $ref: "../_shared/errors.yaml#/components/responses/StrictDependencyUnavailable"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Update a relation type
     parameters:
       - name: kn_id
@@ -406,13 +508,28 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
+            ETag:
+              $ref: "../_shared/kn-version.yaml#/components/headers/ETag"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/RelationTypeDetails"
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: Get relation type details
     delete:
       parameters:
@@ -436,9 +553,29 @@ paths:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/IfMatch"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: ok
+        "409":
+          description: |
+            BknBackend.RelationType.StillReferenced: a relation type to delete is still the lifecycle replaced_by of a deprecated relation type, or the fallback_for of a relation type
+            that this request does not delete. `error_details.references` lists each reference; change or remove them
+            first, or delete the referring definitions in the same request.
+
+            On a versioned network the request also answers 409 `BknBackend.KNVersion.DefinitionModified` when `If-Match`
+            is stale, `BknBackend.KNVersion.DraftRevisionMismatch` when `expected_draft_revision` is stale, and
+            `BknBackend.KNVersion.VersioningDisabling` while versioning is being turned off.
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
       summary: Delete relation types
     parameters:
       - name: kn_id
@@ -475,14 +612,31 @@ paths:
         - name: kn_id
           in: path
           required: true
+        - name: x-http-method-override
+          description: Must be GET. The request is sent as POST so the query can be carried in the body.
+          schema:
+            enum:
+              - GET
+            type: string
+          in: header
+          required: true
         - name: branch
           description: Branch. Defaults to main.
           schema:
             type: string
             default: main
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
@@ -837,6 +991,10 @@ paths:
                           direction: backward
                       length: 1
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: Explore concept paths from a source
       description: Explore concept paths from a source
     parameters:
@@ -877,6 +1035,16 @@ paths:
             enum: [normal, ignore, overwrite]
             default: normal
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing relation type,
+            such as a 2.x package or an old JSON export, would clear them. Without this parameter the request is
+            refused with 409 BknBackend.RelationType.DeclarationsWouldBeCleared, whose details list the cleared
+            declarations (`relation_type_id`, `fields`); pass true to clear them.
+          schema:
+            type: boolean
+            default: false
       requestBody:
         required: true
         content:
@@ -1010,6 +1178,36 @@ components:
         name:
           description: Data view name. Returned when retrieving details.
           type: string
+    Lifecycle:
+      description: |
+        BKN spec 3.0. Whether the definition is still in use. Without it the definition is active. status
+        deprecated needs a reason; replaced_by names an active definition of the same kind.
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [active, deprecated]
+        reason:
+          type: string
+        replaced_by:
+          type: string
+    RelationConstraints:
+      description: BKN spec 3.0. The Relation Constraints section of the relation type.
+      type: object
+      properties:
+        required:
+          description: The ends whose every instance has at least one counterpart.
+          type: array
+          items:
+            type: string
+            enum: [source, target]
+        characteristics:
+          description: For a relation from an object type to itself.
+          type: array
+          items:
+            type: string
+            enum: [symmetric, transitive]
     IndirectMappingRule:
       description: Mapping rules for an indirect relation type backed by a Vega resource.
       required:
@@ -1028,6 +1226,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/Mapping"
+        properties:
+          description: |
+            BKN spec 3.0. The relation properties: columns of the backing resource read on each edge, written like
+            the data properties of an object type, with mapped_field naming a column that does not join the ends.
+            No unique constraint applies.
+          type: array
+          items:
+            $ref: "#/components/schemas/DataProperty"
     FilteredCrossJoinMappingRule:
       description: |
         Matching rules for the filtered_cross_join relation type (FCJ).
@@ -1240,9 +1446,6 @@ components:
         - type
         - comment
         - mapped_field
-        - index
-        - fulltext_config
-        - vector_config
       type: object
       properties:
         name:
@@ -1252,7 +1455,7 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, metric, objective, event, trace, log, and operator are supported.
+          description: Property data type, matching the type of the mapped view field.
           type: string
         comment:
           description: Property description
@@ -1260,28 +1463,6 @@ components:
         mapped_field:
           $ref: "#/components/schemas/ViewField"
           description: Field name mapped to the data source
-        index:
-          description: Whether to enable indexing. Defaults to true.
-          type: boolean
-        fulltext_config:
-          $ref: "#/components/schemas/FulltextConfig"
-          description: Full-text index configuration
-        vector_config:
-          $ref: "#/components/schemas/VectorConfig"
-          description: Vector index configuration
-    FulltextConfig:
-      description: Full-text index configuration
-      required:
-        - analyzer
-        - field_keyword
-      type: object
-      properties:
-        analyzer:
-          description: Analyzer ID. Available values come from fulltext_analyzers returned by GET /api/vega-backend/v1/index-capabilities and depend on the cluster capabilities.
-          type: string
-        field_keyword:
-          description: Whether to retain the original string for exact matching. Defaults to false.
-          type: boolean
     ViewField:
       description: View field information
       required:
@@ -1297,15 +1478,6 @@ components:
         type:
           description: View field type. Returned when retrieving details.
           type: string
-    VectorConfig:
-      description: Vector index configuration
-      required:
-        - dimension
-      type: object
-      properties:
-        dimension:
-          description: Vector dimension
-          type: integer
     LogicProperty:
       description: Logical properties
       required:
@@ -1321,14 +1493,11 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, metric, objective, event, trace, log, and operator are supported.
+          description: Logic property type. Only tool is supported.
           type: string
         comment:
           description: Property description
           type: string
-        index:
-          description: Whether to enable indexing. Defaults to true.
-          type: boolean
         data_source:
           $ref: "#/components/schemas/LogicSource"
           description: Logical source
@@ -1341,17 +1510,25 @@ components:
       description: Data source
       required:
         - type
-        - id
+        - box_id
+        - tool_id
       type: object
       properties:
         type:
           description: Data source type
-          enum:
-            - metric
-            - operator
+          enum: [tool]
           type: string
         id:
-          description: Data sourceID
+          description: Optional external source ID.
+          type: string
+        box_id:
+          description: Toolbox ID. Required when type is tool.
+          type: string
+        tool_id:
+          description: Tool ID. Required when type is tool.
+          type: string
+        result_path:
+          description: Optional JSONPath for the tool response. Configurable when type is tool; the full response is returned when omitted.
           type: string
         name:
           description: Name. Returned when retrieving details.
@@ -1419,15 +1596,17 @@ components:
       required:
         - name
         - branch
-        - base_version
       type: object
       properties:
         id:
           description: ID. It cannot be changed after creation and may contain only lowercase English letters, digits, underscores, and hyphens. It cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1448,9 +1627,13 @@ components:
         source_object_type_id:
           description: Source object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         target_object_type_id:
           description: Target object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         type:
           description: Relation type
           enum:
@@ -1464,12 +1647,42 @@ components:
             - $ref: "#/components/schemas/IndirectMappingRule"
             - $ref: "#/components/schemas/FilteredCrossJoinMappingRule"
           description: Mapping rule. For direct, this is a Mapping array; for filtered_cross_join (FCJ), this is a FilteredCrossJoinMappingRule with per-side conditions and no key mapping.
+        reverse_name:
+          description: BKN spec 3.0. The name of the relation read from the target to the source, with the rules of name. Empty is none.
+          type: string
+        aliases:
+          description: BKN spec 3.0. Other names of the relation type. Empty is none.
+          type: array
+          items:
+            type: string
+        cardinality:
+          description: BKN spec 3.0. How many counterparts an instance of each end has, from source to target. Empty is not declared; a filtered_cross_join relation can only be many_to_many.
+          type: string
+          enum: [one_to_one, one_to_many, many_to_one, many_to_many]
+        constraints:
+          $ref: "#/components/schemas/RelationConstraints"
+        lifecycle:
+          $ref: "#/components/schemas/Lifecycle"
+        importance:
+          description: BKN spec 3.0. primary (the default, returned as empty) or secondary.
+          type: string
+          enum: [primary, secondary]
+        fallback_for:
+          description: BKN spec 3.0. On a secondary relation, the ID of the primary relation it stands in for when a source instance has no primary counterpart. Empty is none.
+          type: string
+        verification:
+          description: BKN spec 3.0. confirmed when the relation joins on real identifiers, unconfirmed when it joins by inferred rules. Empty is not declared.
+          type: string
+          enum: [confirmed, unconfirmed]
     UpdateRelationType:
-      description: Relation type update information
+      description: |
+        Relation type update information. The BKN spec 3.0 declarations (reverse_name, aliases, cardinality,
+        constraints, lifecycle, importance, fallback_for, verification and mapping_rules.properties) are each one
+        field: a request that leaves one out keeps the stored value, null, "", [] or {} clears it, and a value
+        replaces it whole.
       required:
         - name
         - branch
-        - base_version
         - source_object_type
         - target_object_type
       type: object
@@ -1477,6 +1690,7 @@ components:
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1497,9 +1711,13 @@ components:
         source_object_type_id:
           description: Source object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         target_object_type_id:
           description: Target object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         type:
           description: Relation type
           enum:
@@ -1513,6 +1731,33 @@ components:
             - $ref: "#/components/schemas/IndirectMappingRule"
             - $ref: "#/components/schemas/FilteredCrossJoinMappingRule"
           description: Associated matching rule. For direct, this is a Mapping array; for filtered_cross_join, this is a FilteredCrossJoinMappingRule.
+        reverse_name:
+          description: BKN spec 3.0. The name of the relation read from the target to the source, with the rules of name. Empty is none.
+          type: string
+        aliases:
+          description: BKN spec 3.0. Other names of the relation type. Empty is none.
+          type: array
+          items:
+            type: string
+        cardinality:
+          description: BKN spec 3.0. How many counterparts an instance of each end has, from source to target. Empty is not declared; a filtered_cross_join relation can only be many_to_many.
+          type: string
+          enum: [one_to_one, one_to_many, many_to_one, many_to_many]
+        constraints:
+          $ref: "#/components/schemas/RelationConstraints"
+        lifecycle:
+          $ref: "#/components/schemas/Lifecycle"
+        importance:
+          description: BKN spec 3.0. primary (the default, returned as empty) or secondary.
+          type: string
+          enum: [primary, secondary]
+        fallback_for:
+          description: BKN spec 3.0. On a secondary relation, the ID of the primary relation it stands in for when a source instance has no primary counterpart. Empty is none.
+          type: string
+        verification:
+          description: BKN spec 3.0. confirmed when the relation joins on real identifiers, unconfirmed when it joins by inferred rules. Empty is not declared.
+          type: string
+          enum: [confirmed, unconfirmed]
     RelationTypeDetail:
       description: Relation type
       required:
@@ -1537,9 +1782,12 @@ components:
         id:
           description: Relation type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Relation type name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -1585,6 +1833,33 @@ components:
             - $ref: "#/components/schemas/IndirectMappingRule"
             - $ref: "#/components/schemas/FilteredCrossJoinMappingRule"
           description: Associated matching rule. For direct, this is a Mapping array; for filtered_cross_join, this is a FilteredCrossJoinMappingRule.
+        reverse_name:
+          description: BKN spec 3.0. The name of the relation read from the target to the source, with the rules of name. Empty is none.
+          type: string
+        aliases:
+          description: BKN spec 3.0. Other names of the relation type. Empty is none.
+          type: array
+          items:
+            type: string
+        cardinality:
+          description: BKN spec 3.0. How many counterparts an instance of each end has, from source to target. Empty is not declared; a filtered_cross_join relation can only be many_to_many.
+          type: string
+          enum: [one_to_one, one_to_many, many_to_one, many_to_many]
+        constraints:
+          $ref: "#/components/schemas/RelationConstraints"
+        lifecycle:
+          $ref: "#/components/schemas/Lifecycle"
+        importance:
+          description: BKN spec 3.0. primary (the default, returned as empty) or secondary.
+          type: string
+          enum: [primary, secondary]
+        fallback_for:
+          description: BKN spec 3.0. On a secondary relation, the ID of the primary relation it stands in for when a source instance has no primary counterpart. Empty is none.
+          type: string
+        verification:
+          description: BKN spec 3.0. confirmed when the relation joins on real identifiers, unconfirmed when it joins by inferred rules. Empty is not declared.
+          type: string
+          enum: [confirmed, unconfirmed]
         creator:
           $ref: '../_shared/common.yaml#/components/schemas/AccountInfo'
         create_time:
@@ -1629,9 +1904,12 @@ components:
         id:
           description: Relation type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Relation type name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -1671,6 +1949,33 @@ components:
             - $ref: "#/components/schemas/IndirectMappingRule"
             - $ref: "#/components/schemas/FilteredCrossJoinMappingRule"
           description: Associated matching rule. For direct, this is a Mapping array; for filtered_cross_join, this is a FilteredCrossJoinMappingRule.
+        reverse_name:
+          description: BKN spec 3.0. The name of the relation read from the target to the source, with the rules of name. Empty is none.
+          type: string
+        aliases:
+          description: BKN spec 3.0. Other names of the relation type. Empty is none.
+          type: array
+          items:
+            type: string
+        cardinality:
+          description: BKN spec 3.0. How many counterparts an instance of each end has, from source to target. Empty is not declared; a filtered_cross_join relation can only be many_to_many.
+          type: string
+          enum: [one_to_one, one_to_many, many_to_one, many_to_many]
+        constraints:
+          $ref: "#/components/schemas/RelationConstraints"
+        lifecycle:
+          $ref: "#/components/schemas/Lifecycle"
+        importance:
+          description: BKN spec 3.0. primary (the default, returned as empty) or secondary.
+          type: string
+          enum: [primary, secondary]
+        fallback_for:
+          description: BKN spec 3.0. On a secondary relation, the ID of the primary relation it stands in for when a source instance has no primary counterpart. Empty is none.
+          type: string
+        verification:
+          description: BKN spec 3.0. confirmed when the relation joins on real identifiers, unconfirmed when it joins by inferred rules. Empty is not declared.
+          type: string
+          enum: [confirmed, unconfirmed]
         creator:
           $ref: '../_shared/common.yaml#/components/schemas/AccountInfo'
         create_time:
@@ -1856,7 +2161,7 @@ components:
           description: "Direction of the current edge relative to the relation type: forward, backward, or bidirectional."
           enum:
             - forward
-            - reverse
+            - backward
             - bidirectional
           type: string
     RelationTypeDetails:
@@ -1918,6 +2223,11 @@ components:
         need_total:
           description: Whether a total count is needed. Defaults to false.
           type: boolean
+        exclude_deprecated:
+          description: |-
+            Whether to leave out definitions whose lifecycle status is deprecated, as concept
+            recall does. Defaults to false. Querying by ID still returns them.
+          type: boolean
     PageTurnQueryWithCursor:
       description: Subsequent request for a paginated query
       required:
@@ -1945,6 +2255,11 @@ components:
         need_total:
           description: Whether a total count is needed. Defaults to false.
           type: boolean
+        exclude_deprecated:
+          description: |-
+            Whether to leave out definitions whose lifecycle status is deprecated, as concept
+            recall does. Defaults to false. Querying by ID still returns them.
+          type: boolean
         cursor:
           description: next_cursor returned by the previous response.
           type: string
@@ -1971,7 +2286,7 @@ components:
           description: "Direction: forward, backward, or bidirectional."
           enum:
             - forward
-            - reverse
+            - backward
             - bidirectional
           type: string
     condition_or:
@@ -2080,7 +2395,7 @@ components:
             - like
           type: string
         value:
-          description: Filter value
+          description: Complete SQL LIKE pattern; % matches zero or more characters, _ matches one, backslash escapes the next character, and a trailing escape is invalid. No wildcards are added automatically.
           type: string
     condition_not_like:
       description: Not-like filter
@@ -2103,7 +2418,7 @@ components:
             - not_like
           type: string
         value:
-          description: Filter value
+          description: Complete SQL LIKE pattern; % matches zero or more characters, _ matches one, backslash escapes the next character, and a trailing escape is invalid. No wildcards are added automatically.
           type: string
     condition_regex:
       description: Regular-expression filter

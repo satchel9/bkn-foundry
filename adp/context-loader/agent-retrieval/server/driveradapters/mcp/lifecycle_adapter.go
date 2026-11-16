@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,7 +40,7 @@ func lifecycleToolMiddleware(client *bkntrace.LifecycleClient) server.ToolHandle
 	return func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
 		return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 			ctx = withMCPClientApplication(ctx)
-			if _, lifecycle := lifecycleToolNames[req.Params.Name]; lifecycle {
+			if !isBusinessTool(req.Params.Name) {
 				return next(ctx, req)
 			}
 			// Guarding the executor as well would record two Operations for one
@@ -255,6 +256,11 @@ func handleLifecycleTool(
 			}), nil
 		}
 		args := req.GetArguments()
+		if name == toolKeyFinishInteraction {
+			// Enrichment must not mutate the caller's arguments or alter the key
+			// computed for a retry of the same original request.
+			args = maps.Clone(args)
+		}
 		if validationErr := validateLifecycleArguments(name, args); validationErr != nil {
 			return lifecycleToolError(*validationErr), nil
 		}
@@ -327,6 +333,16 @@ func handleLifecycleTool(
 			if current.ExecutionStatus == "completed" && current.ClosureManifest != nil &&
 				current.ClosureManifest.AnswerArtifactRef != "" {
 				args["answer_artifact_ref"] = current.ClosureManifest.AnswerArtifactRef
+			} else if bkntrace.DurableAnswerEnabled() && !bkntrace.CaptureDisabled() {
+				// Core's verified policy may be newer than this process's local copy.
+				if current.CaptureEnabled == nil || *current.CaptureEnabled {
+					ctx = common.SetAuthoritativeObservedAtIfMissing(ctx, current.UpdatedAt)
+					artifact, err := bkntrace.BuildInteractionArtifact(ctx, current.ConversationID, current.InteractionID, bkntrace.InteractionArtifactResult, args["answer"])
+					if err != nil {
+						return lifecycleUnavailable(ctx, name, "answer_artifact", err), nil
+					}
+					args["answer_artifact"] = artifact
+				}
 			} else if !bkntrace.CaptureDisabled() {
 				ctx = common.SetAuthoritativeObservedAtIfMissing(ctx, current.UpdatedAt)
 				artifactRef, err := bkntrace.RecordInteractionArtifact(
@@ -361,7 +377,18 @@ func handleLifecycleTool(
 		}
 		method, path, body := lifecycleRequest(name, args)
 		target := &bkntrace.Interaction{}
-		apiErr, err := client.Call(ctx, method, path, body, target)
+		var apiErr *bkntrace.APIError
+		switch name {
+		case toolKeyFinishInteraction:
+			// Finish preparation keeps the observation budget; the authoritative
+			// terminal POST has its own finite submission/replay budget.
+			release()
+			apiErr, err = callInteractionFinish(ctx, client, path, stringValue(args["interaction_id"]), body, target)
+		case toolKeyStartInteraction:
+			apiErr, err = callInteractionStart(ctx, client, path, stringValue(args["conversation_id"]), body, target)
+		default:
+			apiErr, err = client.Call(ctx, method, path, body, target)
+		}
 		if err != nil {
 			return lifecycleUnavailable(ctx, name, "core_call", err), nil
 		}
@@ -386,7 +413,7 @@ func handleLifecycleTool(
 				// affect evidence capture, not the committed lifecycle state. Return
 				// Core's ids/status and log every fault, including deployment and
 				// authorization defects, without fabricating an artifact reference.
-				value := lifecycleAvailabilityError(err)
+				value := lifecycleStageAvailabilityError("question_artifact", err)
 				bkntrace.MarkTraceUnavailable(ctx, "question_artifact", "", value.Code)
 				logger.DefaultLogger().WithContext(ctx).Warnf(
 					"[BKN Trace] lifecycle degraded: tool=%s stage=question_artifact code=%s interaction_id=%s: %v",
@@ -552,7 +579,7 @@ func lifecycleRequest(name string, args map[string]any) (string, string, map[str
 	case "bkn_finish_interaction":
 		interactionID := url.PathEscape(stringValue(args["interaction_id"]))
 		return http.MethodPost, "/interactions/" + interactionID + "/finish",
-			copyArgs(args, "outcome", "idempotency_key", "answer_artifact_ref", "reason", "partial_reasons")
+			copyArgs(args, "outcome", "idempotency_key", "answer_artifact_ref", "answer_artifact", "reason", "partial_reasons")
 	default:
 		return "", "", nil
 	}

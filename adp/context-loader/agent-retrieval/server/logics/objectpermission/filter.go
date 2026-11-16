@@ -4,8 +4,7 @@
 // See the LICENSE file in the project root for details.
 
 // Package objectpermission applies ontology-query's effective property plan to
-// Context Loader schema models. Physical resource tools intentionally do not
-// use this package: their authorization boundary is Vega resource permission.
+// Context Loader schema models.
 package objectpermission
 
 import (
@@ -15,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
 	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
@@ -40,7 +41,15 @@ const schemaFanOut = 8
 // same order rather than the first to arrive.
 func FilterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
 	objectTypes []*interfaces.ObjectType) ([]*interfaces.ObjectType, error) {
-	filtered, _, err := filterObjectTypes(ctx, access, knID, objectTypes, 0)
+	filtered, _, err := filterObjectTypes(ctx, access, knID, objectTypes, 0, "main")
+	return filtered, err
+}
+
+// FilterObjectTypesBranch applies the permission plan from the same branch as
+// the discovered object and metric definitions.
+func FilterObjectTypesBranch(ctx context.Context, access interfaces.ObjectSchemaAccess, knID, branch string,
+	objectTypes []*interfaces.ObjectType) ([]*interfaces.ObjectType, error) {
+	filtered, _, err := filterObjectTypes(ctx, access, knID, objectTypes, 0, branch)
 	return filtered, err
 }
 
@@ -57,13 +66,13 @@ func FilterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess
 func FilterObjectTypesDegrading(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
 	objectTypes []*interfaces.ObjectType, readTimeout time.Duration,
 ) (filtered []*interfaces.ObjectType, degraded []string, err error) {
-	return filterObjectTypes(ctx, access, knID, objectTypes, readTimeout)
+	return filterObjectTypes(ctx, access, knID, objectTypes, readTimeout, "main")
 }
 
 // filterObjectTypes degrades transient read failures only when readTimeout is
 // positive; zero keeps every failure fatal.
 func filterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess, knID string,
-	objectTypes []*interfaces.ObjectType, readTimeout time.Duration,
+	objectTypes []*interfaces.ObjectType, readTimeout time.Duration, branch string,
 ) ([]*interfaces.ObjectType, []string, error) {
 	if access == nil {
 		return objectTypes, nil, nil
@@ -98,6 +107,9 @@ func filterObjectTypes(ctx context.Context, access interfaces.ObjectSchemaAccess
 	tokens := make(chan struct{}, schemaFanOut)
 queue:
 	for i, objectType := range objectTypes {
+		if ctx.Err() != nil {
+			break queue
+		}
 		if objectType == nil {
 			continue
 		}
@@ -115,6 +127,12 @@ queue:
 			// is lost, so stop queueing reads someone would still have to serve.
 			break queue
 		}
+		// A free slot and cancellation may both be ready in the select above.
+		// Release the acquired slot instead of scheduling another schema read.
+		if ctx.Err() != nil {
+			<-tokens
+			break queue
+		}
 		wg.Add(1)
 		go func(i int, objectType *interfaces.ObjectType) {
 			defer wg.Done()
@@ -123,7 +141,18 @@ queue:
 			if readTimeout > 0 {
 				readCtx, cancelRead = context.WithTimeout(ctx, readTimeout)
 			}
-			schema, err := access.GetObjectTypeSchema(readCtx, knID, objectType.ID)
+			var schema *interfaces.ObjectTypeSchemaResp
+			var err error
+			if selected := strings.TrimSpace(branch); selected != "" && selected != "main" {
+				branched, ok := access.(interfaces.BranchObjectSchemaAccess)
+				if !ok {
+					err = fmt.Errorf("branch-aware object schema permissions are unavailable for %q", selected)
+				} else {
+					schema, err = branched.GetObjectTypeSchemaBranch(readCtx, knID, selected, objectType.ID)
+				}
+			} else {
+				schema, err = access.GetObjectTypeSchema(readCtx, knID, objectType.ID)
+			}
 			cancelRead()
 			switch {
 			case err != nil && readTimeout > 0 && ctx.Err() == nil && transientReadFailure(err):
@@ -178,11 +207,12 @@ func transientReadFailure(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	var httpErr *infraErr.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
 		return true
 	}
-	return httpErr.HTTPCode >= 500 && httpErr.DownstreamBody != nil
+	var dependency *infraErr.DependencyError
+	return httpErr.HTTPCode >= 500 && errors.As(err, &dependency) && dependency.Body != nil
 }
 
 func filterObjectType(source *interfaces.ObjectType,
@@ -285,6 +315,26 @@ func OmitUnrestrictedPermissions(objectTypes []*interfaces.ObjectType) {
 			objectType.EffectivePermissions = nil
 		}
 	}
+}
+
+// WithUnrestrictedPermissionsOmitted returns detail as OmitUnrestrictedPermissions
+// will leave it, without changing detail: the object types are shallow copies, so
+// the answer can be measured before the evidence snapshot still sees every entry.
+func WithUnrestrictedPermissionsOmitted(detail *interfaces.KnowledgeNetworkDetail) *interfaces.KnowledgeNetworkDetail {
+	if detail == nil || detail.ObjectTypes == nil {
+		return detail
+	}
+	view := *detail
+	view.ObjectTypes = make([]*interfaces.ObjectType, len(detail.ObjectTypes))
+	for i, objectType := range detail.ObjectTypes {
+		if objectType != nil {
+			copied := *objectType
+			objectType = &copied
+		}
+		view.ObjectTypes[i] = objectType
+	}
+	OmitUnrestrictedPermissions(view.ObjectTypes)
+	return &view
 }
 
 // TrimObjectTypesToIndexBackedOps keeps only operators whose availability

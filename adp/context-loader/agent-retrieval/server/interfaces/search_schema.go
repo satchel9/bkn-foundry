@@ -24,13 +24,16 @@ type SearchSchemaReq struct {
 	// agents should not pick reranker model names.
 	RerankModel *string `json:"rerank_model,omitempty"`
 	// IncludeColumns, when true, adds each data property's physical column name
-	// (mapped_field) to the response, for writing run_sql against the resource.
+	// (mapped_field) to the response.
 	// Off by default to keep the response compact.
 	IncludeColumns *bool `json:"include_columns,omitempty" default:"false"`
 	// IndexOpsOnly keeps only index-derived operators in response condition_operations. It is set by the MCP layer,
 	// Not entering the request contract: the comparison operator can be deduced according to the attribute type, and issuing it one by one is pure noise to the Agent; while REST.
 	// The caller (and consumers like Studio who are directly connected to BKN) still get the full amount.
 	IndexOpsOnly bool `json:"-"`
+	// EnumQuery looks up the enum items of the returned properties by display name or code, for an
+	// enum search_schema does not expand: one over the expansion limit, or any enum in brief mode.
+	EnumQuery *string `json:"enum_query,omitempty"`
 }
 
 // SearchSchemaScope search_schema scope controls

@@ -32,6 +32,32 @@ func TestMariaDBConnectorMapType(t *testing.T) {
 			nativeType: "bigint unsigned",
 			want:       interfaces.DataType_UnsignedInteger,
 		},
+		{"unsigned integer with display width", "int(11) unsigned", interfaces.DataType_UnsignedInteger},
+		{"uppercase unsigned suffix", "BIGINT(20) UNSIGNED", interfaces.DataType_UnsignedInteger},
+		{"unsigned tinyint with display width", "tinyint(1) unsigned", interfaces.DataType_UnsignedInteger},
+		{"unsigned integer with display width and zerofill", "int(11) unsigned zerofill", interfaces.DataType_UnsignedInteger},
+		{"unsigned zerofill integer", "bigint unsigned zerofill", interfaces.DataType_UnsignedInteger},
+		{"tinyint flag remains integer", "tinyint(1)", interfaces.DataType_Integer},
+		{"boolean alias remains integer", "boolean", interfaces.DataType_Integer},
+		{"bool alias remains integer", "BOOL", interfaces.DataType_Integer},
+		{"bit without width", "BIT", interfaces.DataType_Binary},
+		{"single bit", "bit(1)", interfaces.DataType_Binary},
+		{"eight bits", "BIT(8)", interfaces.DataType_Binary},
+		{"multiple bytes", "bit(17)", interfaces.DataType_Binary},
+		{"maximum bit width", "bit(64)", interfaces.DataType_Binary},
+		{"signed integer with display width", "int(11)", interfaces.DataType_Integer},
+		{"unsigned float", "float unsigned", interfaces.DataType_Float},
+		{"unsigned double", "double unsigned", interfaces.DataType_Float},
+		{"unsigned real", "real unsigned", interfaces.DataType_Float},
+		{"unsigned double precision", "double precision unsigned", interfaces.DataType_Float},
+		{"unsigned float with precision", "float(10,2) unsigned zerofill", interfaces.DataType_Float},
+		{"unsigned decimal with precision", "decimal(20,4) unsigned", interfaces.DataType_Decimal},
+		{"unsigned decimal without precision", "decimal unsigned", interfaces.DataType_Decimal},
+		{"enum labels are not modifiers", "enum('unsigned','zerofill','A)B')", interfaces.DataType_String},
+		{"compressed varchar", "varchar(1000) /*M!100301 COMPRESSED*/", interfaces.DataType_String},
+		{"compressed text", "longtext /*M!100301 COMPRESSED*/", interfaces.DataType_Text},
+		{"comment after numeric modifiers", "int(11) unsigned zerofill /* comment */", interfaces.DataType_UnsignedInteger},
+		{"enum labels contain comment markers", "enum('/*literal*/','zerofill','A)B')", interfaces.DataType_String},
 		{
 			name:       "strips length suffix",
 			nativeType: "varchar(255)",
@@ -48,8 +74,8 @@ func TestMariaDBConnectorMapType(t *testing.T) {
 			want:       interfaces.DataType_String,
 		},
 		{
-			name:       "normalizes case and whitespace",
-			nativeType: "  DATETIME  ",
+			name:       "normalizes case",
+			nativeType: "DATETIME",
 			want:       interfaces.DataType_Datetime,
 		},
 		{
@@ -72,6 +98,58 @@ func TestMariaDBConnectorMapType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, connector.MapType(tt.nativeType))
+		})
+	}
+}
+
+func TestMariaDBConnectorNormalizeColumnType(t *testing.T) {
+	c := &MariaDBConnector{}
+	for _, tc := range []struct{ native, want string }{
+		{"", ""},
+		{"  INT  ", "int"},
+		{" DECIMAL(10,2) ", "decimal(10,2)"},
+		{" INT(11) UNSIGNED ", "int(11) UNSIGNED"},
+		{` ENUM('Active','Inactive') `, `enum('Active','Inactive')`},
+		{` SET('Read','Write') `, `set('Read','Write')`},
+		{` ENUM('It''S','A\'B','C\\D','尾巴') `, `enum('It''S','A\'B','C\\D','尾巴')`},
+		{` ENUM("Active","A""B") `, `enum("Active","A""B")`},
+	} {
+		t.Run(tc.native, func(t *testing.T) {
+			assert.Equal(t, tc.want, c.normalizeColumnType(tc.native))
+		})
+	}
+}
+
+func TestMariaDBConnectorIsFilterable(t *testing.T) {
+	connector := &MariaDBConnector{}
+	for _, tc := range []struct {
+		nativeType string
+		want       bool
+	}{
+		{"INT(11) UNSIGNED", true},
+		{"enum('Active','Inactive')", true},
+		{"decimal(18,4) unsigned", true},
+		{"varchar(255)", true},
+		{"timestamp(6)", true},
+		{"boolean", true},
+		{"json", false},
+		{"varbinary(255)", false},
+		{"bit(8)", false},
+		{"geometry", false},
+		{"future_type", false},
+		{"", false},
+	} {
+		t.Run(tc.nativeType, func(t *testing.T) {
+			for _, flag := range []*bool{nil, new(false), new(true)} {
+				column := interfaces.TableColumnMeta{Name: "field", Type: tc.nativeType, Filterable: flag}
+				before := column
+				if flag != nil {
+					before.Filterable = new(*flag)
+				}
+				assert.Equal(t, tc.want, connector.IsFilterable(&column))
+				assert.Equal(t, before, column, "capability checks must not change column metadata")
+				assert.True(t, flag == column.Filterable, "capability checks must preserve the original filterable pointer")
+			}
 		})
 	}
 }

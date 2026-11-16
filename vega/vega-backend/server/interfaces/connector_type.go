@@ -29,24 +29,16 @@ var (
 	}
 )
 
-// Connector type constant definition
-const (
-	ConnectorTypeMySQL      string = "mysql"
-	ConnectorTypeMariaDB    string = "mariadb"
-	ConnectorTypePostgreSQL string = "postgresql"
-	ConnectorTypeSQLServer  string = "sqlserver"
-	ConnectorTypeOpenSearch string = "opensearch"
-	ConnectorTypeOracle     string = "oracle"
-	ConnectorTypeHANA       string = "hana"
-	ConnectorTypeAnyShare   string = "anyshare"
-)
-
-// ConnectorFieldConfig defines the metadata of the connector configuration field (compatible with JSON Schema properties)
+// ConnectorFieldConfig is custom connector configuration metadata, not a JSON Schema.
+// Type and Description use the familiar Schema keyword meanings; Name, the field-level
+// Required boolean, and Encrypted are custom metadata. Standard JSON Schema requires
+// conversion, including collecting required field identifiers in the parent object's
+// required array and handling display names and encryption separately.
 type ConnectorFieldConfig struct {
 	Name        string `json:"name"`        // Field display name
 	Type        string `json:"type"`        // Field types: string, integer, number, boolean, object, array
 	Description string `json:"description"` // Field description
-	Required    bool   `json:"required"`    // Whether required
+	Required    bool   `json:"required"`    // Custom field-level required flag
 	Encrypted   bool   `json:"encrypted"`   // Is encrypted storage required (custom extension)
 }
 
@@ -64,7 +56,7 @@ type ConnectorType struct {
 	Available       bool              `json:"available"`                  // Whether the current binary contains the implementation of this connector
 	RequiredEdition licverify.Edition `json:"required_edition,omitempty"` // Minimum edition required by this connector implementation
 
-	FieldConfig map[string]ConnectorFieldConfig `json:"field_config,omitempty"` // Runtime field configuration (compatible with JSON Schema properties)
+	FieldConfig map[string]ConnectorFieldConfig `json:"field_config,omitempty"` // Custom runtime metadata keyed by field identifier
 
 	Operations []string `json:"operations"`
 }

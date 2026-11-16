@@ -8,6 +8,8 @@ moduleName: agent-operator-integration
 # bkn-safe API used for authorization, directory lookups, and AppKey introspection.
 bknSafe:
   url: "http://bkn-safe:3000"
+  # Timeout for resource policy teardown only. Other authorization calls keep their short timeout.
+  resourceCleanupTimeout: "30s"
 
 # Set to dev for development mode.
 runMode: release
@@ -68,20 +70,17 @@ service:
     periodSeconds: 5
     timeoutSeconds: 5
     failureThreshold: 30
-  operator:
-    importFileSizeLimit: 2097152 # Import file size limit is 2M.
-    importOperatorMaxCount: 10 # Maximum number of operators imported in batches.
-    descriptionLengthLimit: 500 # Length limit of operator description, unit character.
   mcp:
     connTimeout: 30 # Unit: seconds.
     maxInstances: 100 # Maximum number of instances.
     instanceTTL: 1800 # Unit second.
     cleanupInterval: 600 # Unit second.
   category:
-    initSwitch: true # Whether to initialize operator classification.
+    initSwitch: true # Whether to initialize built-in categories.
   proxyModule:
     defaultTimeout: 300 # Unit second.
     maxTimeout: 300 # Unit second.
+    platformFunctionGrace: 5 # Unit second. Added to the client timeout of platform Function calls.
     maxClients: 50 # Unit second.
     clientLifetime: 600 # Unit second.
   skillIndexBuild:
@@ -180,6 +179,10 @@ depServices:
     maxSessions: 3
     activeSessions: 1
     maxConcurrentTasks: 100
+    # Tasks one session takes before the next call goes to another session. 0 or unset means the
+    # default 2. To turn spreading off, set it to a value not less than maxConcurrentTasks.
+    spreadThreshold: 2
+    syncPollDeadline: 300 # Unit second. Control plane polling deadline for sync executions.
   oss-gateway-backend:
     privateHost: "oss-gateway-backend"
     privatePort: 8080
@@ -189,6 +192,10 @@ depServices:
     expires: 3600
   vega-backend:
     privateHost: vega-backend-svc
+    privatePort: 13014
+    privateProtocol: http
+  bkn-backend:
+    privateHost: bkn-backend-svc
     privatePort: 13014
     privateProtocol: http
 

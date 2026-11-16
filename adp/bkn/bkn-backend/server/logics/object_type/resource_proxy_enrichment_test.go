@@ -14,13 +14,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 // Issue #1536: a caller who may view and query an object type but holds nothing on the Vega
@@ -177,7 +177,7 @@ func TestEnrichmentReadsOnlyRequestedBindingsThroughProxy(t *testing.T) {
 
 func TestEnrichmentKeepsRefusalWhenProxyCannotHelp(t *testing.T) {
 	proxyError := func(status int, code string) error {
-		return rest.NewHTTPError(context.Background(), status, code)
+		return httperrors.NewHTTPError(context.Background(), status, code)
 	}
 	for _, tc := range []struct {
 		name   string

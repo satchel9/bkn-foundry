@@ -50,11 +50,11 @@ func ptcTestTools() []MCPToolInfo {
 				"cursor":{"type":"string"}}}`),
 		},
 		{
-			Name: "run_sql", Title: "SQL 查询",
+			Name: "run_cypher", Title: "Cypher 查询",
 			Group: "query", GroupTitle: "实例查询", Order: 240,
-			Description:  "执行只读 SQL",
-			InputSchema:  json.RawMessage(`{"type":"object","properties":{"sql":{"type":"string"}},"required":["sql"]}`),
-			OutputSchema: json.RawMessage(`{"type":"object","properties":{"columns":{},"entries":{}}}`),
+			Description:  "执行只读 Cypher",
+			InputSchema:  json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+			OutputSchema: json.RawMessage(`{"type":"object","properties":{"columns":{},"rows":{}}}`),
 		},
 		{
 			Name: "bkn_start_interaction", Title: "开始交互",
@@ -180,13 +180,6 @@ func TestPTCDigestGroupsOrderedByOrder(t *testing.T) {
 func TestPTCDigestFencesBalanced(t *testing.T) {
 	if n := strings.Count(ptcTestDigest(), "```"); n%2 != 0 {
 		t.Fatalf("代码围栏未闭合，共 %d 个", n)
-	}
-}
-
-// In actual testing, if the model writes SQL without reading the complete docstring, it will miss the placeholder convention and fail in one round.
-func TestPTCDigestCarriesRunSQLHint(t *testing.T) {
-	if digest := ptcTestDigest(); !strings.Contains(digest, "{{.<resource_id>}}") {
-		t.Fatalf("run_sql 缺少占位符示例:\n%s", digest)
 	}
 }
 
@@ -462,7 +455,7 @@ func TestInlineDigestListsNamesOnly(t *testing.T) {
 	tools := ptcUsableTools(&MCPInfo{Tools: ptcTestTools()})
 	inline := renderPTCDigestForLocale(locale, tools, false)
 
-	for _, name := range []string{"list_knowledge_networks", "query_object_instance", "run_sql"} {
+	for _, name := range []string{"list_knowledge_networks", "query_object_instance", "run_cypher"} {
 		if !strings.Contains(inline, name) {
 			t.Fatalf("缺少函数名 %s:\n%s", name, inline)
 		}
@@ -489,7 +482,7 @@ func TestInlineDigestNameOrderIsStable(t *testing.T) {
 		t.Fatal("并入版渲染不稳定")
 	}
 	if !strings.Contains(renderPTCDigestForLocale(locale, tools, false),
-		"list_knowledge_networks, query_object_instance, run_sql") {
+		"list_knowledge_networks, query_object_instance, run_cypher") {
 		t.Fatal("函数名未按字典序排列")
 	}
 }
@@ -616,7 +609,7 @@ func TestPTCStubToleratesModelSuppliedBKNContext(t *testing.T) {
 		t.Fatalf("stub 应把 bkn_context 作为可忽略的尾参数接受:\n%s", stub)
 	}
 	// A tool whose schema never carried bkn_context does not grow one.
-	if !strings.Contains(stub, "def run_sql(sql: str) -> dict:") {
+	if !strings.Contains(stub, "def run_cypher(query: str) -> dict:") {
 		t.Fatalf("没有 bkn_context 的工具签名不该变:\n%s", stub)
 	}
 	if strings.Contains(stub, `"bkn_context": bkn_context`) {
@@ -651,6 +644,45 @@ print(json.dumps(_calls[-1]["arguments"]["bkn_context"], sort_keys=True))
 	}
 	if got := strings.TrimSpace(string(out)); got != `{"conversation_id": "conv_runtime", "interaction_id": "int_runtime"}` {
 		t.Fatalf("运行时的 bkn_context 必须胜出，实际发出: %s", got)
+	}
+}
+
+func TestPTCBranchKeepsExistingPositionalArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{toolKeyQueryMetric, "def query_metric(kn_id: str, metric_id: str, version: int, query: dict = None, response_format: str = 'json', bkn_context: dict = None, *, branch: str = 'main', kn_version: str = None, draft_revision: int = None) -> dict:"},
+		{toolKeyDrillThroughMetric, "def drill_through_metric(bucket_key: str, kn_id: str, metric_id: str, query: dict, version: int, cursor: str = None, page_size: int = 100, response_format: str = 'json', bkn_context: dict = None, *, branch: str = 'main', kn_version: str = None, draft_revision: int = None) -> dict:"},
+		{toolKeyGetKnDetail, "def get_kn_detail(kn_id: str, detail_level: str = 'summary', response_format: str = 'json', bkn_context: dict = None, *, branch: str = 'main', kn_version: str = None, draft_revision: int = None) -> dict:"},
+		{toolKeyGetObjectTypes, "def get_object_types(kn_id: str, ids: list = None, limit: int = 50, offset: int = 0, response_format: str = 'json', bkn_context: dict = None, *, branch: str = 'main', kn_version: str = None, draft_revision: int = None) -> dict:"},
+	} {
+		input, _ := loadToolSchemas(tc.name)
+		tool := MCPToolInfo{Name: tc.name, InputSchema: input}
+		got := "def " + ptcStubSignature(tool) + " -> dict:"
+		if got != tc.want {
+			t.Fatalf("%s signature = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The digest shown to the model lists arguments in the same slots as the stub it will
+// call: by-name-only arguments sit after the star there too. Only the plumbing parameters
+// the stub tolerates are left out of the digest.
+func TestPTCDigestMatchesStubKeywordOnlyArguments(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{toolKeyGetKnDetail, "get_kn_detail(kn_id: str, detail_level: str = 'summary', response_format: str = 'json', *, branch: str = 'main', kn_version: str = None, draft_revision: int = None)"},
+		{toolKeyGetObjectTypes, "get_object_types(kn_id: str, ids: list = None, limit: int = 50, offset: int = 0, response_format: str = 'json', *, branch: str = 'main', kn_version: str = None, draft_revision: int = None)"},
+		{toolKeyGetRelationTypes, "get_relation_types(kn_id: str, branch: str = 'main', ids: list = None, limit: int = 50, object_type_ids: list = None, offset: int = 0, response_format: str = 'json', *, kn_version: str = None, draft_revision: int = None)"},
+	} {
+		input, _ := loadToolSchemas(tc.name)
+		tool := MCPToolInfo{Name: tc.name, InputSchema: input}
+		if got := ptcDigestSignature(tool); got != tc.want {
+			t.Fatalf("%s digest signature =\n  %s\nwant\n  %s", tc.name, got, tc.want)
+		}
 	}
 }
 

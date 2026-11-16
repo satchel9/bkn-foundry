@@ -9,6 +9,8 @@ package opensearch
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -17,7 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/bytedance/sonic"
 	osclient "github.com/opensearch-project/opensearch-go/v2"
 	"github.com/stretchr/testify/assert"
@@ -93,10 +97,46 @@ func TestOpenSearchQueryScoreAndSearchAfter(t *testing.T) {
 }
 
 func TestValidateStoredFilterConditionPreservesErrorSource(t *testing.T) {
+	clock := gomonkey.ApplyFunc(time.Now, func() time.Time { return time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC) })
+	t.Cleanup(clock.Reset)
+	t.Run("temporal range rejected before search", func(t *testing.T) {
+		for _, stored := range []bool{false, true} {
+			for _, aggregate := range []bool{false, true} {
+				t.Run(fmt.Sprintf("stored=%v/aggregate=%v", stored, aggregate), func(t *testing.T) {
+					requests := 0
+					client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+						Transport: countRowsTransport(func(*http.Request) (*http.Response, error) {
+							requests++
+							return nil, errors.New("unexpected search")
+						})})
+					require.NoError(t, err)
+					field := &interfaces.Property{Name: "created", Type: interfaces.DataType_Datetime, OriginalType: "date_nanos"}
+					actual := &filter_condition.BeforeCond{Lfield: field, Value: []any{int64(2147483647), "day"}}
+					params := &interfaces.ResourceDataQueryParams{ActualFilterCond: actual}
+					if stored {
+						params.FixedActualFilterCond = actual
+					}
+					if aggregate {
+						params.Aggregation = &interfaces.Aggregation{Aggr: "count", Property: "created"}
+					}
+					result, err := (&OpenSearchConnector{client: client}).ExecuteQuery(t.Context(), "index", &interfaces.Resource{SchemaDefinition: []*interfaces.Property{field}}, params)
+					var temporal *interfaces.TemporalRangeError
+					require.ErrorAs(t, err, &temporal)
+					assert.Equal(t, "created", temporal.Field)
+					assert.Nil(t, result)
+					assert.Zero(t, requests)
+					if stored {
+						var saved *interfaces.StoredConditionBuildError
+						require.ErrorAs(t, err, &saved)
+					}
+				})
+			}
+		}
+	})
 	field := &interfaces.Property{Name: "body", OriginalName: "BODY", Type: interfaces.DataType_Text}
 	resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{field}}
-	cfg := &interfaces.FilterCondCfg{Name: "body", Operation: filter_condition.OperationEqual,
-		ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: "example"}}
+	cfg := &interfaces.FilterCondCfg{Field: "body", Operation: filter_condition.OperationEqual,
+		ValueFrom: interfaces.ValueFrom_Const, Value: "example"}
 	actual, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"body": field})
 	require.NoError(t, err)
 	params := &interfaces.ResourceDataQueryParams{FixedFilterCondCfg: cfg, FixedActualFilterCond: actual}
@@ -133,7 +173,7 @@ func TestOpenSearchQueryTracksTotalOnlyWhenRequested(t *testing.T) {
 	port, err := strconv.Atoi(portText)
 	require.NoError(t, err)
 	connector := &OpenSearchConnector{Config: &opensearchConfig{Host: host, Port: port}}
-	resource := &interfaces.Resource{}
+	resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{{Name: "status", Type: interfaces.DataType_String}}}
 
 	_, err = connector.ExecuteQuery(context.Background(), "events", resource, &interfaces.ResourceDataQueryParams{})
 	require.NoError(t, err)
@@ -149,7 +189,7 @@ func TestOpenSearchQueryTracksTotalOnlyWhenRequested(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, true, (<-queries)["track_total_hits"])
-	assert.Equal(t, int64(4), result.Total)
+	assert.Equal(t, int64(4), result.TotalCount)
 }
 
 func TestOpenSearchQueryUsesTextKeywordField(t *testing.T) {
@@ -205,14 +245,6 @@ func TestOpenSearchQueryUsesTextKeywordField(t *testing.T) {
 			aggregation := aggregationQuery["aggs"].(map[string]any)["__value"].(map[string]any)
 			assert.Equal(t, "body.raw", aggregation["cardinality"].(map[string]any)["field"])
 
-			_, err = connector.ExecuteQuery(context.Background(), "events", resource, &interfaces.ResourceDataQueryParams{
-				GroupBy: []*interfaces.GroupByItem{{Property: fieldName}},
-			})
-			require.NoError(t, err)
-			groupQuery := <-queries
-			group := groupQuery["aggs"].(map[string]any)["group_by_"+fieldName].(map[string]any)
-			assert.Equal(t, "body.raw", group["terms"].(map[string]any)["field"])
-
 		})
 	}
 }
@@ -262,7 +294,7 @@ func TestExecuteQueryWithDslPreservesLargeIntegerSourceField(t *testing.T) {
 	require.Len(t, result.Entries, 1)
 	assert.Equal(t, json.Number("110101199001152345"), result.Entries[0]["identifier"])
 	assert.Equal(t, float64(1.5), result.Entries[0]["_score"])
-	assert.Equal(t, int64(1), result.Total)
+	assert.Equal(t, int64(1), result.TotalCount)
 }
 
 func TestValidateAnalyzerCallsOpenSearch(t *testing.T) {
@@ -416,209 +448,504 @@ func TestExecuteRawQueryPreservesLargeIntegerSourceField(t *testing.T) {
 	assert.Equal(t, int64(1), *result.TotalCount)
 }
 
-func TestOpenSearchFlattenNestedGroupByRows(t *testing.T) {
-	conn := &OpenSearchConnector{}
-
-	t.Run("returns empty rows for malformed buckets", func(t *testing.T) {
-		rows := conn.flattenNestedGroupByRows(map[string]any{"buckets": "bad"}, &interfaces.ResourceDataQueryParams{}, "__value")
-
-		assert.Empty(t, rows)
-	})
-
-	t.Run("uses key_as_string and truncates by limit", func(t *testing.T) {
-		params := &interfaces.ResourceDataQueryParams{
-			Paging: interfaces.PagingRequest{Limit: 1},
-			Aggregation: &interfaces.Aggregation{
-				Alias: "__value",
-			},
-			GroupBy: []*interfaces.GroupByItem{
-				{Property: "created_at"},
-			},
-		}
-		rootAgg := map[string]any{
-			"buckets": []any{
-				map[string]any{"key_as_string": "2026-07-09", "__value": map[string]any{"value": float64(3)}},
-				map[string]any{"key_as_string": "2026-07-10", "__value": map[string]any{"value": float64(4)}},
-			},
-		}
-
-		rows := conn.flattenNestedGroupByRows(rootAgg, params, "__value")
-
-		require.Len(t, rows, 1)
-		assert.Equal(t, "2026-07-09", rows[0]["created_at"])
-		assert.Equal(t, float64(3), rows[0]["__value"])
-	})
-
-	t.Run("returns parent row when child aggregation is missing", func(t *testing.T) {
-		params := &interfaces.ResourceDataQueryParams{
-			GroupBy: []*interfaces.GroupByItem{
-				{Property: "country"},
-				{Property: "city"},
-			},
-		}
-		rootAgg := map[string]any{
-			"buckets": []any{
-				map[string]any{"key": "CN"},
-			},
-		}
-
-		rows := conn.flattenNestedGroupByRows(rootAgg, params, "")
-
-		require.Len(t, rows, 1)
-		assert.Equal(t, "CN", rows[0]["country"])
-		assert.NotContains(t, rows[0], "city")
-	})
-	t.Run("flatten nested group by rows two dimensions", func(t *testing.T) {
-		conn := &OpenSearchConnector{}
-		params := &interfaces.ResourceDataQueryParams{
-			Paging: interfaces.PagingRequest{Limit: 10},
-			Aggregation: &interfaces.Aggregation{
-				Property: "id",
-				Aggr:     "count",
-				Alias:    "__value",
-			},
-			GroupBy: []*interfaces.GroupByItem{
-				{Property: "kn_id"},
-				{Property: "module_type"},
-			},
-		}
-
-		rootAgg := map[string]any{
-			"buckets": []any{
-				map[string]any{
-					"key": "yzm_mock_system",
-					"group_by_module_type": map[string]any{
-						"buckets": []any{
-							map[string]any{
-								"key": "a",
-								"__value": map[string]any{
-									"value": float64(3),
-								},
-							},
-							map[string]any{
-								"key": "b",
-								"__value": map[string]any{
-									"value": float64(2),
-								},
-							},
-						},
-					},
-				},
-			},
-		}
-
-		rows := conn.flattenNestedGroupByRows(rootAgg, params, "__value")
-		require.Len(t, rows, 2)
-
-		assert.Equal(t, "yzm_mock_system", rows[0]["kn_id"])
-		assert.Equal(t, "a", rows[0]["module_type"])
-		assert.Equal(t, float64(3), rows[0]["__value"])
-		assert.Equal(t, "yzm_mock_system", rows[1]["kn_id"])
-		assert.Equal(t, "b", rows[1]["module_type"])
-		assert.Equal(t, float64(2), rows[1]["__value"])
-	})
-}
-
-func TestNestedTermsSize(t *testing.T) {
-	tests := []struct {
-		name       string
-		levelIndex int
-		numLevels  int
-		limit      int
-		want       int
-	}{
-		{name: "single level default", levelIndex: 0, numLevels: 1, limit: 0, want: 10},
-		{name: "single level uses limit", levelIndex: 0, numLevels: 1, limit: 7, want: 7},
-		{name: "inner level uses limit", levelIndex: 1, numLevels: 2, limit: 5, want: 5},
-		{name: "outer level minimum", levelIndex: 0, numLevels: 2, limit: 0, want: 1000},
-		{name: "outer level scaled lower bound", levelIndex: 0, numLevels: 2, limit: 1, want: 100},
-		{name: "outer level scaled upper bound", levelIndex: 0, numLevels: 2, limit: 200, want: 10000},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, nestedTermsSize(tt.levelIndex, tt.numLevels, tt.limit))
-		})
-	}
-}
-
-func TestOpenSearchApplyTermsOrderToGroupAggNode(t *testing.T) {
-	conn := &OpenSearchConnector{}
-
-	t.Run("applies key and metric order recursively", func(t *testing.T) {
-		node := map[string]any{
-			"terms": map[string]any{"field": "country"},
-			"aggs": map[string]any{
-				"group_by_city": map[string]any{
-					"terms": map[string]any{"field": "city"},
-					"aggs": map[string]any{
-						"total": map[string]any{"sum": map[string]any{"field": "amount"}},
-					},
-				},
-			},
-		}
-		params := &interfaces.ResourceDataQueryParams{
-			Aggregation: &interfaces.Aggregation{Alias: "total"},
-			Sort: []*interfaces.SortField{
-				{Field: "country", Direction: "DESC"},
-				{Field: "total", Direction: "sideways"},
-				{Field: "city", Direction: "asc"},
-			},
-		}
-
-		conn.applyTermsOrderToGroupAggNode(node, params, "total")
-
-		assert.Equal(t, []map[string]any{{"_key": "desc"}}, node["terms"].(map[string]any)["order"])
-		child := node["aggs"].(map[string]any)["group_by_city"].(map[string]any)
-		assert.Equal(t, []map[string]any{{"total": "asc"}, {"_key": "asc"}}, child["terms"].(map[string]any)["order"])
-	})
-
-	t.Run("skips having filter child", func(t *testing.T) {
-		node := map[string]any{
-			"terms": map[string]any{"field": "country"},
-			"aggs": map[string]any{
-				"having_filter": map[string]any{"bucket_selector": map[string]any{}},
-			},
-		}
-
-		conn.applyTermsOrderToGroupAggNode(node, &interfaces.ResourceDataQueryParams{
-			Sort: []*interfaces.SortField{{Field: "country", Direction: "asc"}},
-		}, "total")
-
-		assert.Equal(t, []map[string]any{{"_key": "asc"}}, node["terms"].(map[string]any)["order"])
-	})
-}
-
 func TestOpenSearchBuildHavingBucketSelector(t *testing.T) {
-	conn := &OpenSearchConnector{}
-	tests := []struct {
-		name       string
-		having     *interfaces.HavingClause
-		wantScript string
-	}{
-		{name: "eq", having: &interfaces.HavingClause{Operation: "==", Value: 10}, wantScript: "params.total == 10"},
-		{name: "gte", having: &interfaces.HavingClause{Operation: ">=", Value: 10}, wantScript: "params.total >= 10"},
-		{name: "in", having: &interfaces.HavingClause{Operation: "in", Value: []any{"a", 2}}, wantScript: "['a', 2].contains(params.total.toString())"},
-		{name: "not in", having: &interfaces.HavingClause{Operation: "not_in", Value: []any{"a", 2}}, wantScript: "!['a', 2].contains(params.total.toString())"},
-		{name: "range", having: &interfaces.HavingClause{Operation: "range", Value: []any{1, 5}}, wantScript: "params.total >= 1 && params.total <= 5"},
-		{name: "out range", having: &interfaces.HavingClause{Operation: "out_range", Value: []any{1, 5}}, wantScript: "params.total < 1 || params.total > 5"},
-		{name: "unsupported", having: &interfaces.HavingClause{Operation: "like", Value: "x"}, wantScript: ""},
+	t.Setenv("TZ", "Asia/Shanghai")
+	connector := &OpenSearchConnector{}
+	field := &interfaces.Property{Name: "created", Type: interfaces.DataType_Datetime, OriginalType: "date_nanos"}
+	for _, operation := range []string{"==", "!=", ">", ">=", "<", "<=", "in", "not_in", "range", "out_range"} {
+		t.Run(operation+" equivalent datetime inputs", func(t *testing.T) {
+			var expected map[string]any
+			for _, input := range []any{"2026-10-19T00:00:00.123+08:00", "2026-10-19 00:00:00.123", json.Number("1792339200123"), "1792339200123"} {
+				value := input
+				switch operation {
+				case "in", "not_in", "range", "out_range":
+					value = []any{input, input}
+				}
+				having := &interfaces.HavingClause{Field: "__value", Operation: operation, Value: value}
+				got, err := connector.buildHavingBucketSelector(having, "created_min", field)
+				require.NoError(t, err)
+				if expected == nil {
+					expected = got
+				} else {
+					assert.Equal(t, expected, got)
+				}
+				selector := got["bucket_selector"].(map[string]any)
+				assert.Equal(t, map[string]any{"metric": "created_min"}, selector["buckets_path"])
+				script := selector["script"].(map[string]any)
+				assert.NotContains(t, script["source"], "2026-10-19")
+				parameters := script["params"].(map[string]any)
+				switch operation {
+				case "in", "not_in":
+					assert.Equal(t, []any{float64(1792339200123), float64(1792339200123)}, parameters["values"])
+				case "range", "out_range":
+					assert.Equal(t, map[string]any{"lower": float64(1792339200123), "upper": float64(1792339200123)}, parameters)
+				default:
+					assert.Equal(t, float64(1792339200123), parameters["value"])
+				}
+				assert.Equal(t, value, having.Value)
+			}
+		})
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := conn.buildHavingBucketSelector(tt.having, "total")
-
+	t.Run("numeric scripts use fixed expressions", func(t *testing.T) {
+		cases := []struct {
+			operation, source string
+			value             any
+			parameters        map[string]any
+		}{
+			{">=", "params.metric >= params.value", 10, map[string]any{"value": float64(10)}},
+			{"in", "for (def value : params.values) { if (params.metric == value) return true; } return false;", []any{1, 2}, map[string]any{"values": []any{float64(1), float64(2)}}},
+			{"not_in", "for (def value : params.values) { if (params.metric == value) return false; } return true;", []any{1, 2}, map[string]any{"values": []any{float64(1), float64(2)}}},
+			{"range", "params.metric >= params.lower && params.metric <= params.upper", []any{1, 5}, map[string]any{"lower": float64(1), "upper": float64(5)}},
+			{"out_range", "params.metric < params.lower || params.metric > params.upper", []any{1, 5}, map[string]any{"lower": float64(1), "upper": float64(5)}},
+		}
+		for _, tc := range cases {
+			got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: tc.operation, Value: tc.value}, "metric.with.dots", nil)
+			require.NoError(t, err)
 			selector := got["bucket_selector"].(map[string]any)
-			assert.Equal(t, map[string]any{"total": "total"}, selector["buckets_path"])
-			assert.Equal(t, tt.wantScript, selector["script"].(map[string]any)["source"])
+			assert.Equal(t, map[string]any{"metric": "metric.with.dots"}, selector["buckets_path"])
+			assert.Equal(t, map[string]any{"source": tc.source, "params": tc.parameters}, selector["script"])
+		}
+	})
+	t.Run("decimal HAVING uses the output scale and exact thresholds", func(t *testing.T) {
+		field := &interfaces.Property{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"scale": 2}}
+		for _, operation := range []string{"==", "!=", ">", ">=", "<", "<=", "in", "not_in", "range", "out_range"} {
+			t.Run(operation, func(t *testing.T) {
+				value := any(json.Number("0.300000000000000001"))
+				if operation == "in" || operation == "not_in" || operation == "range" || operation == "out_range" {
+					value = []any{json.Number("0.30"), json.Number("0.300000000000000001")}
+				}
+				got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Field: "total", Operation: operation, Value: value}, "total", field)
+				require.NoError(t, err)
+				script := got["bucket_selector"].(map[string]any)["script"].(map[string]any)
+				assert.Contains(t, script["source"], "setScale(params.scale, RoundingMode.HALF_UP)")
+				assert.Contains(t, script["source"], "compareTo(")
+				parameters := script["params"].(map[string]any)
+				assert.EqualValues(t, 2, parameters["scale"])
+				switch operation {
+				case "in", "not_in":
+					assert.Equal(t, []any{"0.3", "0.300000000000000001"}, parameters["values"])
+				case "range", "out_range":
+					assert.Equal(t, "0.3", parameters["lower"])
+					assert.Equal(t, "0.300000000000000001", parameters["upper"])
+				default:
+					assert.Equal(t, "0.300000000000000001", parameters["value"])
+				}
+			})
+		}
+	})
+	t.Run("invalid decimal declarations and values retain condition errors", func(t *testing.T) {
+		for _, scale := range []any{nil, -1, 309, "2"} {
+			got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: 0}, "total", &interfaces.Property{Type: interfaces.DataType_Decimal, Attributes: map[string]any{"scale": scale}})
+			var failure *interfaces.ConditionBuildError
+			require.ErrorAs(t, err, &failure)
+			assert.Nil(t, got)
+		}
+		for _, value := range []any{"NaN", true, "1e1000000", "return true", strings.Repeat("1", 1025)} {
+			got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: value}, "total", &interfaces.Property{Type: interfaces.DataType_Decimal, Attributes: map[string]any{"scale": 2}})
+			var failure *interfaces.ConditionBuildError
+			require.ErrorAs(t, err, &failure)
+			assert.Nil(t, got)
+		}
+	})
+	t.Run("decimal script source stays constant across scales and thresholds", func(t *testing.T) {
+		var source any
+		for _, tc := range []struct {
+			scale int
+			value json.Number
+		}{{0, "0.30"}, {2, "0.300000000000000001"}, {18, "-0.30"}, {308, "1e300"}} {
+			got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: "==", Value: tc.value}, "total", &interfaces.Property{Type: interfaces.DataType_Decimal, Attributes: map[string]any{"scale": tc.scale}})
+			require.NoError(t, err)
+			script := got["bucket_selector"].(map[string]any)["script"].(map[string]any)
+			if source == nil {
+				source = script["source"]
+			}
+			assert.Equal(t, source, script["source"])
+			assert.EqualValues(t, tc.scale, script["params"].(map[string]any)["scale"])
+		}
+	})
+	t.Run("count remains numeric", func(t *testing.T) {
+		got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 2}, "min_date", field)
+		require.NoError(t, err)
+		selector := got["bucket_selector"].(map[string]any)
+		assert.Equal(t, map[string]any{"metric": "_count"}, selector["buckets_path"])
+		assert.Equal(t, map[string]any{"value": float64(2)}, selector["script"].(map[string]any)["params"])
+	})
+	t.Run("fractional milliseconds and calendar dates", func(t *testing.T) {
+		got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: "2026-10-19T00:00:00.1235+08:00"}, "min_date", field)
+		require.NoError(t, err)
+		script := got["bucket_selector"].(map[string]any)["script"].(map[string]any)
+		assert.Equal(t, map[string]any{"value": 1792339200123.5}, script["params"])
+		dateField := &interfaces.Property{Type: interfaces.DataType_Date}
+		got, err = connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: "1970-01-02"}, "min_date", dateField)
+		require.NoError(t, err)
+		script = got["bucket_selector"].(map[string]any)["script"].(map[string]any)
+		assert.Equal(t, map[string]any{"value": float64(86400000)}, script["params"])
+	})
+	for _, having := range []*interfaces.HavingClause{
+		{Operation: "like", Value: 1}, {Operation: "range", Value: []any{1}},
+		{Operation: "in", Value: []any{}}, {Operation: ">", Value: "return true"},
+	} {
+		got, err := connector.buildHavingBucketSelector(having, "total", nil)
+		var conditionErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &conditionErr)
+		assert.Nil(t, got)
+	}
+	t.Run("invalid temporal input and server timezone retain error types", func(t *testing.T) {
+		got, err := connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: "2026-10-19"}, "total", field)
+		var conditionErr *interfaces.ConditionBuildError
+		require.ErrorAs(t, err, &conditionErr)
+		assert.Nil(t, got)
+		t.Setenv("TZ", "invalid/zone")
+		got, err = connector.buildHavingBucketSelector(&interfaces.HavingClause{Operation: ">", Value: "2026-10-19 00:00:00"}, "total", field)
+		var zoneErr *interfaces.ServerTimeZoneError
+		require.ErrorAs(t, err, &zoneErr)
+		assert.Nil(t, got)
+	})
+}
+
+func TestOpenSearchJSONQueryResults(t *testing.T) {
+	for _, mode := range []string{"structured", "raw", "dsl"} {
+		t.Run(mode, func(t *testing.T) {
+			client, err := osclient.NewClient(osclient.Config{
+				Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+				Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+					body := `{"hits":{"total":{"value":1},"hits":[{"_id":"1","_source":{"object":{"n":9007199254740993},"array":[1,true],"text":"{incomplete","empty":"","nothing":null,"number":9007199254740993,"boolean":true,"null_text":"null","id":42,"vector":[1,2]}}]}}`
+					if strings.HasSuffix(request.URL.Path, "/_mapping") {
+						body = `{"events":{"mappings":{"properties":{"object":{"properties":{"n":{"type":"long"}}},"array":{"type":"nested"},"text":{"type":"object","enabled":false},"empty":{"type":"object","enabled":false},"nothing":{"type":"object"},"number":{"type":"object","enabled":false},"boolean":{"type":"object","enabled":false},"null_text":{"type":"object","enabled":false},"id":{"type":"long"},"vector":{"type":"knn_vector"}}}}}`
+					}
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				}),
+			})
+			require.NoError(t, err)
+			c := &OpenSearchConnector{client: client, enabled: true}
+			resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{
+				{Name: "object", Type: interfaces.DataType_Json}, {Name: "array", Type: interfaces.DataType_Json},
+				{Name: "text", Type: interfaces.DataType_Json}, {Name: "empty", Type: interfaces.DataType_Json}, {Name: "nothing", Type: interfaces.DataType_Json}, {Name: "number", Type: interfaces.DataType_Json}, {Name: "boolean", Type: interfaces.DataType_Json}, {Name: "null_text", Type: interfaces.DataType_Json},
+				{Name: "id", Type: interfaces.DataType_Integer}, {Name: "vector", Type: interfaces.DataType_Vector},
+			}}
+			var entries []map[string]any
+			switch mode {
+			case "structured":
+				got, err := c.ExecuteQuery(context.Background(), "events", resource, &interfaces.ResourceDataQueryParams{Paging: interfaces.PagingRequest{Limit: 10}})
+				require.NoError(t, err)
+				entries = got.Entries
+			case "raw":
+				got, err := c.ExecuteRawQuery(context.Background(), "events", map[string]any{"query": map[string]any{"match_all": map[string]any{}}})
+				require.NoError(t, err)
+				entries = got.Entries
+			case "dsl":
+				got, err := c.ExecuteQueryWithDsl(context.Background(), "events", `{"query":{"match_all":{}}}`)
+				require.NoError(t, err)
+				entries = got.Entries
+			}
+			require.Len(t, entries, 1)
+			assert.Equal(t, `{"n":9007199254740993}`, entries[0]["object"])
+			assert.Equal(t, `[1,true]`, entries[0]["array"])
+			assert.Equal(t, "{incomplete", entries[0]["text"])
+			assert.Equal(t, "", entries[0]["empty"])
+			assert.Nil(t, entries[0]["nothing"])
+			assert.Equal(t, "9007199254740993", entries[0]["number"])
+			assert.Equal(t, "true", entries[0]["boolean"])
+			assert.Equal(t, "null", entries[0]["null_text"])
+			assert.Equal(t, json.Number("42"), entries[0]["id"])
+			assert.Equal(t, []any{json.Number("1"), json.Number("2")}, entries[0]["vector"])
 		})
 	}
 }
 
-func TestFormatInValuesForScript(t *testing.T) {
-	t.Run("format in values for script", func(t *testing.T) {
-		assert.Equal(t, "[]", formatInValuesForScript(nil))
-		assert.Equal(t, "['a', 2, true]", formatInValuesForScript([]any{"a", 2, true}))
+func TestOpenSearchJSONQueryMappingFailure(t *testing.T) {
+	for _, mode := range []string{"raw", "dsl"} {
+		t.Run(mode, func(t *testing.T) {
+			client, err := osclient.NewClient(osclient.Config{
+				Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+				Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+					status, body := http.StatusOK, `{"hits":{"total":{"value":1},"hits":[{"_source":{"payload":{"n":1}}}]}}`
+					if strings.HasSuffix(request.URL.Path, "/_mapping") {
+						status, body = http.StatusForbidden, `{}`
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				}),
+			})
+			require.NoError(t, err)
+			c := &OpenSearchConnector{client: client, enabled: true}
+			if mode == "raw" {
+				got, err := c.ExecuteRawQuery(context.Background(), "events", map[string]any{"query": map[string]any{"match_all": map[string]any{}}})
+				require.ErrorContains(t, err, "failed to read JSON field types")
+				assert.Nil(t, got)
+			} else {
+				got, err := c.ExecuteQueryWithDsl(context.Background(), "events", `{"query":{"match_all":{}}}`)
+				require.ErrorContains(t, err, "failed to read JSON field types")
+				assert.Nil(t, got)
+			}
+		})
+	}
+}
+
+func TestStringifyJSONQueryFields(t *testing.T) {
+	t.Run("discovered paths traverse objects and arrays", func(t *testing.T) {
+		fields := map[string]interfaces.IndexFieldMeta{}
+		parseProperties("", map[string]Property{"outer": {Type: "object", Properties: map[string]Property{"payload": {Type: "nested"}, "vector": {Type: "knn_vector"}}}}, fields)
+		types := map[string]string{}
+		for name, field := range fields {
+			types[name] = (&OpenSearchConnector{}).MapType(field.Type)
+		}
+		for _, array := range []bool{false, true} {
+			child := map[string]any{"payload": []any{map[string]any{"n": json.Number("9007199254740993")}}, "vector": []any{json.Number("1"), json.Number("2")}}
+			var outer any = child
+			if array {
+				outer = []any{child, nil, map[string]any{"payload": "{incomplete"}}
+			}
+			source := map[string]any{"outer": outer}
+			require.NoError(t, stringifyJSONQueryFields(source, types))
+			assert.Equal(t, `[{"n":9007199254740993}]`, child["payload"])
+			assert.Equal(t, []any{json.Number("1"), json.Number("2")}, child["vector"])
+			if array {
+				assert.Equal(t, "{incomplete", outer.([]any)[2].(map[string]any)["payload"])
+			}
+		}
 	})
+	t.Run("parents are serialized before children", func(t *testing.T) {
+		source := map[string]any{"parent": map[string]any{"child": map[string]any{"n": 1}}}
+		require.NoError(t, stringifyJSONQueryFields(source, map[string]string{"parent": interfaces.DataType_Json, "parent.child": interfaces.DataType_Json}))
+		assert.Equal(t, `{"child":{"n":1}}`, source["parent"])
+	})
+	t.Run("literal dotted keys and missing values", func(t *testing.T) {
+		source := map[string]any{"outer.payload": map[string]any{"n": 1}, "outer": map[string]any{"payload": nil}, "empty": nil}
+		require.NoError(t, stringifyJSONQueryFields(source, map[string]string{"outer.payload": interfaces.DataType_Json, "missing.child": interfaces.DataType_Json, "empty.child": interfaces.DataType_Json}))
+		assert.Equal(t, `{"n":1}`, source["outer.payload"])
+		assert.Nil(t, source["outer"].(map[string]any)["payload"])
+		assert.NotContains(t, source, "missing")
+		assert.Nil(t, source["empty"])
+	})
+}
+
+func TestOpenSearchJSONAliasQueries(t *testing.T) {
+	for _, mode := range []string{"raw", "dsl"} {
+		for caseIndex, mapping := range []string{
+			`{"events-000001":{"mappings":{"properties":{"payload":{"type":"object","enabled":false}}}}}`,
+			`{"events-000001":{"mappings":{"properties":{"payload":{"type":"object","enabled":false}}}},"events-000002":{"mappings":{"properties":{"payload":{"type":"object","enabled":false}}}}}`,
+			`{"events-000001":{"mappings":{"properties":{"payload":{"type":"object","enabled":false}}}},"events-000002":{"mappings":{"properties":{"payload":{"type":"keyword"}}}}}`,
+		} {
+			t.Run(mode+"/"+[]string{"single index alias", "multiple compatible indices", "conflicting types"}[caseIndex], func(t *testing.T) {
+				conflict := strings.Contains(mapping, "keyword")
+				client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true, Transport: countRowsTransport(func(r *http.Request) (*http.Response, error) {
+					body := `{"hits":{"total":{"value":1},"hits":[{"_source":{"payload":{"n":9007199254740993}}}]}}`
+					if strings.HasSuffix(r.URL.Path, "/_mapping") {
+						body = mapping
+					}
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				})})
+				require.NoError(t, err)
+				c := &OpenSearchConnector{client: client, enabled: true}
+				var entries []map[string]any
+				if mode == "raw" {
+					got, err := c.ExecuteRawQuery(context.Background(), "events", map[string]any{"query": map[string]any{"match_all": map[string]any{}}})
+					if conflict {
+						require.ErrorContains(t, err, "conflicting mapping types")
+						assert.Nil(t, got)
+						return
+					}
+					require.NoError(t, err)
+					entries = got.Entries
+					assert.Equal(t, interfaces.DataType_Json, got.Columns[0].Type)
+				} else {
+					got, err := c.ExecuteQueryWithDsl(context.Background(), "events", `{"query":{"match_all":{}}}`)
+					if conflict {
+						require.ErrorContains(t, err, "conflicting mapping types")
+						assert.Nil(t, got)
+						return
+					}
+					require.NoError(t, err)
+					entries = got.Entries
+				}
+				require.Len(t, entries, 1)
+				assert.Equal(t, `{"n":9007199254740993}`, entries[0]["payload"])
+			})
+		}
+	}
+}
+
+func TestOpenSearchConnectorExecuteQueryPreservesBackendErrors(t *testing.T) {
+	for _, status := range []int{http.StatusBadRequest, http.StatusInternalServerError} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			body := `{"error":{"type":"illegal_argument_exception","reason":"Query vector has invalid dimension: 3. Dimension should be: 1024"}}`
+			client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true, Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+				var query map[string]any
+				require.NoError(t, json.NewDecoder(request.Body).Decode(&query))
+				assert.Equal(t, map[string]any{"knn": map[string]any{"embedding": map[string]any{"vector": []any{float64(0), float64(0), float64(0)}, "k": float64(10)}}}, query["query"])
+				return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+			})})
+			require.NoError(t, err)
+			cfg := &interfaces.FilterCondCfg{Field: "embedding", Operation: filter_condition.OperationKnnVector, Value: make([]float32, 3)}
+			actual, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"embedding": {Name: "embedding", Type: interfaces.DataType_Vector}})
+			require.NoError(t, err)
+			require.NotNil(t, actual)
+			result, err := (&OpenSearchConnector{client: client}).ExecuteQuery(context.Background(), "index", &interfaces.Resource{}, &interfaces.ResourceDataQueryParams{FilterCondCfg: cfg, ActualFilterCond: actual})
+			require.Error(t, err)
+			assert.Nil(t, result)
+			_, invalid := interfaces.RequestSideQueryError(err)
+			assert.False(t, invalid, "backend errors without known index dimensions retain their original classification")
+		})
+	}
+}
+
+func TestOpenSearchConnectorExecuteQueryMultiMatchPhysicalFields(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		field        *interfaces.Property
+		fields       []any
+		wantPhysical string
+	}{
+		{name: "native pattern in a non-sole field list", field: &interfaces.Property{Name: "foo*", Type: interfaces.DataType_Text}, fields: []any{"foo*", "body"}},
+		{name: "native boost syntax", field: &interfaces.Property{Name: "foo^2", Type: interfaces.DataType_Text}, fields: []any{"foo^2"}},
+		{name: "safe alias with a physical pattern", field: &interfaces.Property{Name: "published", OriginalName: "foo*", Type: interfaces.DataType_Text}, fields: []any{"published"}},
+		{name: "safe alias with physical boost syntax", field: &interfaces.Property{Name: "published", OriginalName: "foo^2", Type: interfaces.DataType_Text}, fields: []any{"published"}},
+		{name: "managed fulltext feature pattern", field: &interfaces.Property{Name: "published", OriginalName: "published", Type: interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Fulltext, FeatureName: "foo*"}}}, fields: []any{"published"}},
+		{name: "managed fulltext feature boost syntax", field: &interfaces.Property{Name: "published", OriginalName: "published", Type: interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Fulltext, FeatureName: "foo^2"}}}, fields: []any{"published"}},
+		{name: "empty bound fields", field: &interfaces.Property{Name: "published", Type: interfaces.DataType_Text}, fields: []any{}},
+		{name: "ordinary native field", field: &interfaces.Property{Name: "published", Type: interfaces.DataType_Text}, fields: []any{"published"}, wantPhysical: "published"},
+		{name: "ordinary physical alias", field: &interfaces.Property{Name: "published", OriginalName: "body.text", Type: interfaces.DataType_Text}, fields: []any{"published"}, wantPhysical: "body.text"},
+		{name: "ordinary managed fulltext feature", field: &interfaces.Property{Name: "published", OriginalName: "published", Type: interfaces.DataType_String,
+			Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Fulltext}}}, fields: []any{"published"}, wantPhysical: "published.fulltext"},
+		{name: "raw wildcard binds a concrete field", field: &interfaces.Property{Name: "published", Type: interfaces.DataType_Text}, fields: []any{"*"}, wantPhysical: "published"},
+	} {
+		for _, aggregate := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/aggregate=%v", tc.name, aggregate), func(t *testing.T) {
+				requests := 0
+				client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+					Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+						requests++
+						if tc.wantPhysical == "" {
+							return nil, errors.New("invalid multi_match fields reached search")
+						}
+						assert.Equal(t, "/events/_search", request.URL.Path)
+						var body map[string]any
+						require.NoError(t, json.NewDecoder(request.Body).Decode(&body))
+						assert.Equal(t, map[string]any{"multi_match": map[string]any{
+							"query": "example", "fields": []any{tc.wantPhysical}, "type": "phrase",
+						}}, body["query"])
+						return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}},
+							Body: io.NopCloser(strings.NewReader(`{"hits":{"total":{"value":0},"hits":[]},"aggregations":{"__value":{"value":0}}}`))}, nil
+					})})
+				require.NoError(t, err)
+				fields := map[string]*interfaces.Property{tc.field.Name: tc.field}
+				schema := []*interfaces.Property{tc.field}
+				if len(tc.fields) > 1 {
+					fields["body"] = &interfaces.Property{Name: "body", Type: interfaces.DataType_Text}
+					schema = append(schema, fields["body"])
+				}
+				cfg := &interfaces.FilterCondCfg{Operation: filter_condition.OperationMultiMatch, ValueFrom: interfaces.ValueFrom_Const,
+					Value: "example", RemainCfg: map[string]any{"fields": tc.fields, "match_type": "phrase"}}
+				actual, err := filter_condition.NewFilterCondition(t.Context(), cfg, fields)
+				require.NoError(t, err)
+				params := &interfaces.ResourceDataQueryParams{FilterCondCfg: cfg, ActualFilterCond: actual}
+				if aggregate {
+					schema = append(schema, &interfaces.Property{Name: "id", Type: interfaces.DataType_Integer})
+					params.Aggregation = &interfaces.Aggregation{Aggr: "count", Property: "id"}
+				}
+				result, err := (&OpenSearchConnector{client: client}).ExecuteQuery(t.Context(), "events", &interfaces.Resource{SchemaDefinition: schema}, params)
+				assert.Equal(t, tc.fields, cfg.RemainCfg["fields"], "binding must preserve the raw field list")
+				if tc.wantPhysical == "" {
+					var invalid *interfaces.ConditionBuildError
+					require.ErrorAs(t, err, &invalid)
+					assert.Nil(t, result)
+					assert.Zero(t, requests, "invalid bound fields must fail before any search or mapping request")
+					return
+				}
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, 1, requests)
+			})
+		}
+	}
+}
+
+func TestOpenSearchConnectorExecuteQueryHavingPaths(t *testing.T) {
+	t.Run("decimal aggregation selects scaled HAVING without changing count or AVG", func(t *testing.T) {
+		for _, operation := range []string{"sum", "min", "max", "avg", "count", "count_distinct"} {
+			for _, countOnly := range []bool{false, true} {
+				client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+					Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+						var query map[string]any
+						require.NoError(t, json.NewDecoder(request.Body).Decode(&query))
+						parent := query["aggs"].(map[string]any)[singleHavingGroup].(map[string]any)
+						selector := parent["aggs"].(map[string]any)["having_filter"].(map[string]any)["bucket_selector"].(map[string]any)
+						script := selector["script"].(map[string]any)
+						if !countOnly && (operation == "sum" || operation == "min" || operation == "max") {
+							assert.Contains(t, script["source"], "setScale(params.scale, RoundingMode.HALF_UP)")
+							assert.Equal(t, float64(2), script["params"].(map[string]any)["scale"])
+							assert.Equal(t, "0.3", script["params"].(map[string]any)["value"])
+						} else {
+							assert.Equal(t, "params.metric > params.value", script["source"])
+							assert.Equal(t, map[string]any{"value": float64(0.3)}, script["params"])
+						}
+						if !countOnly && operation == "sum" {
+							assert.Equal(t, map[string]any{"sum": map[string]any{"field": "amount"}}, parent["aggs"].(map[string]any)["total"])
+							assert.Equal(t, "insert_zeros", selector["gap_policy"])
+						} else {
+							assert.NotContains(t, selector, "gap_policy")
+						}
+						return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"aggregations":{"__vega_single_group":{"buckets":{}}}}`))}, nil
+					}),
+				})
+				require.NoError(t, err)
+				resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, Attributes: map[string]any{"scale": 2}}}}
+				params := &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "amount", Aggr: operation, Alias: "total"}, Having: &interfaces.HavingClause{Field: "total", Operation: ">", Value: json.Number("0.30")}}
+				if countOnly {
+					params.Having.Field = "count(*)"
+				}
+				result, err := (&OpenSearchConnector{client: client}).ExecuteQuery(context.Background(), "events", resource, params)
+				require.NoError(t, err)
+				assert.Empty(t, result.Entries)
+			}
+		}
+	})
+	for _, countOnly := range []bool{false, true} {
+		for _, retained := range []bool{false, true} {
+			requests := 0
+			client, err := osclient.NewClient(osclient.Config{Addresses: []string{"http://opensearch.test"}, DisableRetry: true,
+				Transport: countRowsTransport(func(request *http.Request) (*http.Response, error) {
+					requests++
+					var query map[string]any
+					require.NoError(t, json.NewDecoder(request.Body).Decode(&query))
+					parent := query["aggs"].(map[string]any)[singleHavingGroup].(map[string]any)
+					assert.Equal(t, map[string]any{"filters": map[string]any{"all": map[string]any{"match_all": map[string]any{}}}}, parent["filters"])
+					selector := parent["aggs"].(map[string]any)["having_filter"].(map[string]any)["bucket_selector"].(map[string]any)
+					metric := "min_created"
+					if countOnly {
+						metric = "_count"
+					}
+					assert.Equal(t, map[string]any{"metric": metric}, selector["buckets_path"])
+					buckets := map[string]any{}
+					if retained {
+						buckets["all"] = map[string]any{"doc_count": 3, "min_created": map[string]any{"value": 1792339200000}}
+					}
+					data, err := json.Marshal(map[string]any{"aggregations": map[string]any{singleHavingGroup: map[string]any{"buckets": buckets}}})
+					require.NoError(t, err)
+					return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(string(data)))}, nil
+				})})
+			require.NoError(t, err)
+			resource := &interfaces.Resource{SchemaDefinition: []*interfaces.Property{{Name: "created", Type: interfaces.DataType_Datetime}}}
+			params := &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "created", Aggr: "min", Alias: "min_created"}, Having: &interfaces.HavingClause{Field: "__value", Operation: ">", Value: "2026-10-19T00:00:00Z"}}
+			if countOnly {
+				params.Aggregation = nil
+				params.Having = &interfaces.HavingClause{Field: "count(*)", Operation: ">", Value: 2}
+			}
+			result, err := (&OpenSearchConnector{client: client}).ExecuteQuery(context.Background(), "events", resource, params)
+			require.NoError(t, err)
+			if retained {
+				require.Len(t, result.Entries, 1)
+				if countOnly {
+					assert.Equal(t, json.Number("3"), result.Entries[0]["__value"])
+				} else {
+					assert.Equal(t, json.Number("1792339200000"), result.Entries[0]["min_created"])
+				}
+			} else {
+				assert.Empty(t, result.Entries)
+			}
+			assert.Equal(t, 1, requests)
+		}
+	}
 }

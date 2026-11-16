@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: 已挂载能力的检索与调用
+  title: 上下文加载 · 能力检索与调用 API
   description: |
     把知识网络已挂载的能力交给调用方使用：`search_capabilities` 在一个排序空间里检索
     全部四类能力——Skill、函数工具、API 工具（`metadata_type=openapi`）与 MCP 工具——
@@ -200,6 +200,12 @@ paths:
       summary: 执行一个已发布函数工具
       operationId: executeTool
       description: |
+        REST lifecycle context is optional, as for search_schema. Missing or empty
+        bkn_context permits ad-hoc execution without depending on Trace Core or
+        capture policy. Explicit nonempty context remains validated. Authentication,
+        network execute permission and mounted-tool authorization still apply.
+        MCP managed execution continues to require conversation/interaction IDs.
+
         以知识网络托管代理执行工具，返回工具的原始响应；真实调用者仍用于网络级鉴权和审计。
 
         `toolbox_id` 与 `tool_id` 必须取自 `search_capabilities`（`owner_id` / `capability_id`）；`arguments` 按其返回的

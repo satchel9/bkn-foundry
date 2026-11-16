@@ -9,32 +9,271 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.uber.org/mock/gomock"
 
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
 )
 
-func TestAuthorizeMetricQueryUsesOnlyPublishedMetricPermission(t *testing.T) {
+func TestAuthorizeObjectMetricQueryDoesNotConsultLegacyMetricCatalog(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	permissions := omock.NewMockPermissionService(ctrl)
+	service := &queryAuthorizationService{permissions: permissions}
+
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "metric", ID: "kn-a/metric-v1"},
+	}).Return(nil)
+
+	if err := service.AuthorizeObjectMetricQuery(context.Background(), "kn-a", "main", "metric-v1"); err != nil {
+		t.Fatalf("AuthorizeObjectMetricQuery() error = %v", err)
+	}
+}
+
+func TestAuthorizeObjectMetricExecutionRejectsMissingObjectQueryData(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	models := omock.NewMockOntologyManagerAccess(ctrl)
 	permissions := omock.NewMockPermissionService(ctrl)
 	service := &queryAuthorizationService{models: models, permissions: permissions}
 
-	models.EXPECT().GetMetricDefinition(gomock.Any(), "kn-a", "main", "metric-1").Return(
-		&interfaces.MetricDefinition{
-			ID: "metric-1", KnID: "kn-a", Branch: "main",
-			ScopeType: interfaces.ScopeTypeObjectType, ScopeRef: "orders",
-		}, true, nil)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(
+		publishedObjectType("kn-a", "orders", "orders-resource"), true, nil)
 	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
-		{Type: "metric", ID: "kn-a/metric-1"},
+		{Type: "metric", ID: "kn-a/sales"},
+		{Type: "object_type", ID: "kn-a/orders"},
+	}).Return(httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden))
+
+	err := service.AuthorizeObjectMetricExecution(context.Background(), "kn-a", "main", objectMetricExecutionContext(
+		"sales", "orders", nil), nil)
+	assertQueryAuthHTTPStatus(t, err, http.StatusForbidden)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || strings.Contains(fmt.Sprint(httpErr.ErrorDetails), "orders") {
+		t.Fatalf("permission error leaked protected resource details: %v", err)
+	}
+}
+
+func TestAuthorizeObjectMetricExecutionRequiresFullPropertyAccess(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		level     interfaces.PropertyAccessLevel
+		wantError bool
+	}{
+		{name: "none is forbidden", level: interfaces.PropertyAccessNone, wantError: true},
+		{name: "full is allowed", level: interfaces.PropertyAccessFull},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			models := omock.NewMockOntologyManagerAccess(ctrl)
+			permissions := omock.NewMockPermissionService(ctrl)
+			properties := omock.NewMockPropertyAccessService(ctrl)
+			service := &queryAuthorizationService{models: models, permissions: permissions, properties: properties}
+
+			orders := publishedObjectType("kn-a", "orders", "orders-resource")
+			orders.DataProperties = []cond.DataProperty{{Name: "amount"}}
+			models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(orders, true, nil)
+			permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+				{Type: "metric", ID: "kn-a/sales"},
+				{Type: "object_type", ID: "kn-a/orders"},
+			}).Return(nil)
+			properties.EXPECT().ResolvePropertyLevels(gomock.Any(), []interfaces.PropertyLevelsRequestItem{{
+				ObjectTypeRef: "kn-a/orders", Properties: []string{"amount"},
+			}}).Return([]interfaces.PropertyLevelsDecisionEntry{{
+				ObjectTypeRef: "kn-a/orders",
+				Properties:    []interfaces.PropertyAccessDecision{{Name: "amount", Level: test.level}},
+			}}, nil)
+
+			err := service.AuthorizeObjectMetricExecution(context.Background(), "kn-a", "main", objectMetricExecutionContext(
+				"sales", "orders", &interfaces.ObjectMetricPropertyRefV1{
+					ObjectTypeID: "orders", PropertyName: "amount",
+				}), nil)
+			if !test.wantError {
+				if err != nil {
+					t.Fatalf("AuthorizeObjectMetricExecution() error = %v", err)
+				}
+				return
+			}
+			assertQueryAuthHTTPStatus(t, err, http.StatusForbidden)
+		})
+	}
+}
+
+func TestAuthorizeObjectMetricExecutionRequiresDependencyClosure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	service := &queryAuthorizationService{models: models, permissions: permissions}
+
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(
+		publishedObjectType("kn-a", "orders", "orders-resource"), true, nil)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "customers").Return(
+		publishedObjectType("kn-a", "customers", "customers-resource"), true, nil)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "metric", ID: "kn-a/composite-sales"},
+		{Type: "metric", ID: "kn-a/customer-sales"},
+		{Type: "object_type", ID: "kn-a/orders"},
+		{Type: "object_type", ID: "kn-a/customers"},
 	}).Return(nil)
 
-	if err := service.AuthorizeMetricQuery(context.Background(), "kn-a", "main", "metric-1"); err != nil {
-		t.Fatalf("AuthorizeMetricQuery() error = %v", err)
+	executionContext := objectMetricExecutionContext("composite-sales", "orders", nil)
+	executionContext.Root.Definition.Specification.Dependencies = []interfaces.ObjectMetricDependencyV1{{
+		MetricRef: interfaces.ObjectMetricRefV1{MetricID: "customer-sales", Version: 1},
+	}}
+	executionContext.Dependencies = []*interfaces.ObjectMetricRecordV1{{
+		KNID: "kn-a", Branch: "main",
+		Definition: interfaces.ObjectMetricDefinitionV1{
+			ID: "customer-sales", Version: 1, OwnerObjectTypeID: "customers",
+		},
+	}}
+	if err := service.AuthorizeObjectMetricExecution(context.Background(), "kn-a", "main", executionContext, nil); err != nil {
+		t.Fatalf("AuthorizeObjectMetricExecution() error = %v", err)
+	}
+}
+
+func objectMetricExecutionContext(metricID, ownerObjectTypeID string,
+	measure *interfaces.ObjectMetricPropertyRefV1) *interfaces.ObjectMetricExecutionContextV1 {
+	definition := interfaces.ObjectMetricDefinitionV1{
+		ID: metricID, Version: 1, OwnerObjectTypeID: ownerObjectTypeID,
+	}
+	if measure != nil {
+		definition.Specification.Measure = &interfaces.ObjectMetricMeasureV1{
+			Expression: &interfaces.ObjectMetricExpressionV1{PropertyRef: measure},
+		}
+	}
+	return &interfaces.ObjectMetricExecutionContextV1{Root: &interfaces.ObjectMetricRecordV1{
+		Definition: definition, KNID: "kn-a", Branch: "main",
+	}}
+}
+
+type fixedMetricRowFilters struct {
+	digest string
+}
+
+type fixedMetricProxy struct {
+	version int64
+}
+
+func (proxy fixedMetricProxy) Resolve(_ context.Context, binding interfaces.TrustedProxyBinding) (*interfaces.TrustedProxyContext, error) {
+	return &interfaces.TrustedProxyContext{Proxy: interfaces.AccountInfo{ID: "proxy", Type: "app"},
+		ProxyVersion: proxy.version, PublishedModelVersion: "model-v1", Binding: binding}, nil
+}
+
+func (filters fixedMetricRowFilters) ResolveRowFilters(_ context.Context,
+	refs []string) ([]interfaces.RowFilterDecisionEntry, error) {
+	entries := make([]interfaces.RowFilterDecisionEntry, 0, len(refs))
+	for _, ref := range refs {
+		entries = append(entries, interfaces.RowFilterDecisionEntry{
+			ObjectTypeRef:            ref,
+			Predicate:                interfaces.RowFilterPredicate{Kind: "true"},
+			EffectiveRowFilterDigest: filters.digest,
+		})
+	}
+	return entries, nil
+}
+
+func TestObjectMetricAuthorizationFingerprintChangesWithRowFilter(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").AnyTimes().Return(
+		publishedObjectType("kn-a", "orders", "orders-resource"), true, nil)
+	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY,
+		interfaces.AccountInfo{ID: "user-1", Type: "user"})
+	definition := &interfaces.ObjectMetricDefinitionV1{OwnerObjectTypeID: "orders"}
+	definition.Specification.Measure = &interfaces.ObjectMetricMeasureV1{Expression: &interfaces.ObjectMetricExpressionV1{
+		PropertyRef: &interfaces.ObjectMetricPropertyRefV1{ObjectTypeID: "orders", PropertyName: "amount"},
+	}}
+	input := []objectMetricAuthorizationInput{{definition: definition}}
+	first, err := (&queryAuthorizationService{models: models, snapshotProxies: allowMetricSnapshotProxies{}, proxy: fixedMetricProxy{version: 1}, rowFilters: fixedMetricRowFilters{digest: "sha256:a"}}).
+		objectMetricAuthorizationFingerprint(ctx, "kn-a", input)
+	if err != nil || first.Digest == "" {
+		t.Fatalf("first fingerprint = %#v, %v", first, err)
+	}
+	second, err := (&queryAuthorizationService{models: models, snapshotProxies: allowMetricSnapshotProxies{}, proxy: fixedMetricProxy{version: 1}, rowFilters: fixedMetricRowFilters{digest: "sha256:b"}}).
+		objectMetricAuthorizationFingerprint(ctx, "kn-a", input)
+	if err != nil || first.Digest == second.Digest {
+		t.Fatalf("row-filter change did not change fingerprint: first=%q second=%q error=%v",
+			first.Digest, second.Digest, err)
+	}
+	third, err := (&queryAuthorizationService{models: models, snapshotProxies: allowMetricSnapshotProxies{}, proxy: fixedMetricProxy{version: 2}, rowFilters: fixedMetricRowFilters{digest: "sha256:a"}}).
+		objectMetricAuthorizationFingerprint(ctx, "kn-a", input)
+	if err != nil || third.Digest == first.Digest {
+		t.Fatalf("proxy version was not bound: %#v %v", third, err)
+	}
+}
+
+type fixedMetricProperties struct {
+	level interfaces.PropertyAccessLevel
+}
+
+func (properties fixedMetricProperties) ResolvePropertyLevels(_ context.Context,
+	items []interfaces.PropertyLevelsRequestItem) ([]interfaces.PropertyLevelsDecisionEntry, error) {
+	entries := make([]interfaces.PropertyLevelsDecisionEntry, 0, len(items))
+	for _, item := range items {
+		entry := interfaces.PropertyLevelsDecisionEntry{ObjectTypeRef: item.ObjectTypeRef}
+		for _, name := range item.Properties {
+			entry.Properties = append(entry.Properties, interfaces.PropertyAccessDecision{Name: name, Level: properties.level})
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+func TestMetricFingerprintBindsImplicitPropertiesModelAndCaller(t *testing.T) {
+	models := omock.NewMockOntologyManagerAccess(gomock.NewController(t))
+	model := publishedObjectType("kn-a", "orders", "resource")
+	model.DataProperties = []cond.DataProperty{{Name: "join_key", Type: "string", MappedField: cond.Field{Name: "join_key"}}}
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").AnyTimes().DoAndReturn(
+		func(context.Context, string, string, string) (interfaces.ObjectType, bool, error) {
+			return model, true, nil
+		})
+	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "user-1", Type: "user"})
+	service := &queryAuthorizationService{models: models, snapshotProxies: allowMetricSnapshotProxies{}, proxy: fixedMetricProxy{version: 1},
+		properties: fixedMetricProperties{level: interfaces.PropertyAccessFull}, rowFilters: fixedMetricRowFilters{digest: "rows"}}
+	inputs := []objectMetricAuthorizationInput{{definition: &interfaces.ObjectMetricDefinitionV1{OwnerObjectTypeID: "orders"}}}
+	first, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model.Status = &interfaces.ObjectTypeStatus{DocCount: 1000, IndexAvailable: true}
+	physicalChange, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", inputs)
+	if err != nil || physicalChange.Digest != first.Digest {
+		t.Fatalf("physical index state changed authorization binding: %v", err)
+	}
+	service.properties = fixedMetricProperties{level: interfaces.PropertyAccessSchema}
+	changedProperty, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", inputs)
+	if err != nil || changedProperty.Digest == first.Digest {
+		t.Fatalf("implicit property was not bound: %v", err)
+	}
+	service.properties = fixedMetricProperties{level: interfaces.PropertyAccessFull}
+	model.DataProperties[0].MappedField.Name = "other_column"
+	changedModel, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", inputs)
+	if err != nil || changedModel.Digest == first.Digest {
+		t.Fatalf("model mapping was not bound: %v", err)
+	}
+	model.DataProperties[0].MappedField.Name = "join_key"
+	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "user-2", Type: "user"})
+	changedCaller, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", inputs)
+	if err != nil || changedCaller.Digest == first.Digest {
+		t.Fatalf("caller was not bound: %v", err)
+	}
+}
+
+func TestMetricFingerprintRequiresAuthorizationBeforeReturningDigest(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(publishedObjectType("kn-a", "orders", "resource"), true, nil)
+	denied := httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), gomock.Any()).Return(denied)
+	service := &queryAuthorizationService{models: models, permissions: permissions}
+	fingerprint, err := service.AuthorizeObjectMetricExecutionWithFingerprint(context.Background(), "kn-a", "main",
+		objectMetricExecutionContext("metric", "orders", nil), nil)
+	assertQueryAuthHTTPStatus(t, err, http.StatusForbidden)
+	if fingerprint.Digest != "" {
+		t.Fatal("denied execution received a fingerprint")
 	}
 }
 
@@ -57,7 +296,7 @@ func TestAuthorizeObjectTypeSchemaRequiresViewDetail(t *testing.T) {
 	}
 }
 
-func TestAuthorizeMetricDryRunDoesNotInventMetricResource(t *testing.T) {
+func TestAuthorizeObjectMetricTrialUsesKnowledgeNetworkAndObjectResources(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	models := omock.NewMockOntologyManagerAccess(ctrl)
 	permissions := omock.NewMockPermissionService(ctrl)
@@ -70,11 +309,369 @@ func TestAuthorizeMetricDryRunDoesNotInventMetricResource(t *testing.T) {
 		{Type: "object_type", ID: "kn-a/orders"},
 	}).Return(nil)
 
-	err := service.AuthorizeMetricDryRun(context.Background(), "kn-a", "main", &interfaces.MetricDefinition{
-		KnID: "kn-a", ScopeType: interfaces.ScopeTypeObjectType, ScopeRef: "orders",
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+	}, nil)
+	if err != nil {
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v", err)
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRequiresEveryReferencedResource(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	service := &queryAuthorizationService{models: models, permissions: permissions}
+
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(
+		publishedObjectType("kn-a", "orders", "orders-resource"), true, nil)
+	models.EXPECT().GetRelationType(gomock.Any(), "kn-a", "main", "order-customer").Return(
+		interfaces.RelationType{
+			RTID: "order-customer", Type: interfaces.RELATION_TYPE_DIRECT,
+			SourceObjectTypeID: "orders", TargetObjectTypeID: "customers",
+		}, true, nil)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "customers").Return(
+		publishedObjectType("kn-a", "customers", "customers-resource"), true, nil)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "knowledge_network", ID: "kn-a"},
+		{Type: "object_type", ID: "kn-a/orders"},
+		{Type: "relation_type", ID: "kn-a/order-customer"},
+		{Type: "object_type", ID: "kn-a/customers"},
+		{Type: "metric", ID: "kn-a/base-metric"},
+		{Type: "metric", ID: "kn-a/dependency-metric"},
+	}).Return(nil)
+
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+		Specification: interfaces.ObjectMetricSpecificationV1{
+			BaseMetric: &interfaces.ObjectMetricRefV1{MetricID: "base-metric", Version: 2},
+			BusinessQualifiers: &interfaces.ObjectMetricBusinessQualifiersV1{
+				RelationPath: &interfaces.ObjectMetricRelationPathV1{Steps: []interfaces.ObjectMetricRelationStepV1{{
+					RelationTypeID: "order-customer", Direction: interfaces.DIRECTION_FORWARD,
+					TargetObjectTypeID: "customers",
+				}}},
+			},
+			Dependencies: []interfaces.ObjectMetricDependencyV1{{
+				MetricRef: interfaces.ObjectMetricRefV1{MetricID: "dependency-metric", Version: 3},
+			}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v", err)
+	}
+}
+
+func TestAuthorizeObjectMetricTrialAcceptsBackwardAndLegacyIncomingDirections(t *testing.T) {
+	for _, direction := range []string{interfaces.DIRECTION_BACKWARD, "incoming"} {
+		t.Run(direction, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			models := omock.NewMockOntologyManagerAccess(ctrl)
+			permissions := omock.NewMockPermissionService(ctrl)
+			service := &queryAuthorizationService{models: models, permissions: permissions}
+
+			models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "product").Return(
+				publishedObjectType("kn-a", "product", "product-resource"), true, nil)
+			models.EXPECT().GetRelationType(gomock.Any(), "kn-a", "main", "sales-order-product").Return(
+				interfaces.RelationType{
+					RTID: "sales-order-product", Type: interfaces.RELATION_TYPE_DIRECT,
+					SourceObjectTypeID: "sales-order", TargetObjectTypeID: "product",
+				}, true, nil)
+			models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "sales-order").Return(
+				publishedObjectType("kn-a", "sales-order", "sales-order-resource"), true, nil)
+			permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+				{Type: "knowledge_network", ID: "kn-a"},
+				{Type: "object_type", ID: "kn-a/product"},
+				{Type: "relation_type", ID: "kn-a/sales-order-product"},
+				{Type: "object_type", ID: "kn-a/sales-order"},
+			}).Return(nil)
+
+			err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+				OwnerObjectTypeID: "product",
+				Specification: interfaces.ObjectMetricSpecificationV1{
+					BusinessQualifiers: &interfaces.ObjectMetricBusinessQualifiersV1{
+						RelationPath: &interfaces.ObjectMetricRelationPathV1{Steps: []interfaces.ObjectMetricRelationStepV1{{
+							RelationTypeID: "sales-order-product", Direction: direction,
+							TargetObjectTypeID: "sales-order",
+						}}},
+					},
+				},
+			}, nil)
+			if err != nil {
+				t.Fatalf("AuthorizeObjectMetricTrial() direction=%q error = %v", direction, err)
+			}
+		})
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRequiresFullPropertyAccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	properties := omock.NewMockPropertyAccessService(ctrl)
+	service := &queryAuthorizationService{models: models, permissions: permissions, properties: properties}
+
+	orders := publishedObjectType("kn-a", "orders", "orders-resource")
+	orders.DataProperties = []cond.DataProperty{{Name: "amount"}, {Name: "status"}}
+	customers := publishedObjectType("kn-a", "customers", "customers-resource")
+	customers.DataProperties = []cond.DataProperty{{Name: "region"}}
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(orders, true, nil)
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "customers").Return(customers, true, nil)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "knowledge_network", ID: "kn-a"},
+		{Type: "object_type", ID: "kn-a/orders"},
+		{Type: "object_type", ID: "kn-a/customers"},
+	}).Return(nil)
+	properties.EXPECT().ResolvePropertyLevels(gomock.Any(), []interfaces.PropertyLevelsRequestItem{
+		{ObjectTypeRef: "kn-a/customers", Properties: []string{"region"}},
+		{ObjectTypeRef: "kn-a/orders", Properties: []string{"amount", "status"}},
+	}).Return([]interfaces.PropertyLevelsDecisionEntry{
+		{ObjectTypeRef: "kn-a/customers", Properties: []interfaces.PropertyAccessDecision{{Name: "region", Level: interfaces.PropertyAccessFull}}},
+		{ObjectTypeRef: "kn-a/orders", Properties: []interfaces.PropertyAccessDecision{
+			{Name: "amount", Level: interfaces.PropertyAccessFull},
+			{Name: "status", Level: interfaces.PropertyAccessFull},
+		}},
+	}, nil)
+
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+		Specification: interfaces.ObjectMetricSpecificationV1{
+			Measure: &interfaces.ObjectMetricMeasureV1{Expression: &interfaces.ObjectMetricExpressionV1{
+				PropertyRef: &interfaces.ObjectMetricPropertyRefV1{ObjectTypeID: "orders", PropertyName: "amount"},
+			}},
+			Alignment: &interfaces.ObjectMetricAlignmentV1{
+				ResultOwnerObjectTypeID: "customers",
+			},
+		},
+	}, &interfaces.ObjectMetricQueryRequestV1{
+		Filter: &interfaces.ObjectMetricConditionV1{Left: &interfaces.ObjectMetricOperandV1{
+			PropertyRef: &interfaces.ObjectMetricPropertyRefV1{ObjectTypeID: "orders", PropertyName: "status"},
+		}},
+		GroupBy: []interfaces.ObjectMetricPropertyRefV1{{ObjectTypeID: "customers", PropertyName: "region"}},
 	})
 	if err != nil {
-		t.Fatalf("AuthorizeMetricDryRun() error = %v", err)
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v", err)
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRejectsNonFullPropertyAccess(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	properties := omock.NewMockPropertyAccessService(ctrl)
+	service := &queryAuthorizationService{models: models, permissions: permissions, properties: properties}
+
+	orders := publishedObjectType("kn-a", "orders", "orders-resource")
+	orders.DataProperties = []cond.DataProperty{{Name: "amount"}}
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(orders, true, nil)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "knowledge_network", ID: "kn-a"},
+		{Type: "object_type", ID: "kn-a/orders"},
+	}).Return(nil)
+	properties.EXPECT().ResolvePropertyLevels(gomock.Any(), []interfaces.PropertyLevelsRequestItem{
+		{ObjectTypeRef: "kn-a/orders", Properties: []string{"amount"}},
+	}).Return([]interfaces.PropertyLevelsDecisionEntry{{
+		ObjectTypeRef: "kn-a/orders",
+		Properties:    []interfaces.PropertyAccessDecision{{Name: "amount", Level: interfaces.PropertyAccessSchema}},
+	}}, nil)
+
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+		Specification: interfaces.ObjectMetricSpecificationV1{Measure: &interfaces.ObjectMetricMeasureV1{
+			Expression: &interfaces.ObjectMetricExpressionV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+				ObjectTypeID: "orders", PropertyName: "amount",
+			}},
+		}},
+	}, nil)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusForbidden {
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v, want 403", err)
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRejectsNonFullQueryFilterProperty(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	permissions := omock.NewMockPermissionService(ctrl)
+	properties := omock.NewMockPropertyAccessService(ctrl)
+	service := &queryAuthorizationService{models: models, permissions: permissions, properties: properties}
+
+	orders := publishedObjectType("kn-a", "orders", "orders-resource")
+	orders.DataProperties = []cond.DataProperty{{Name: "amount"}, {Name: "status"}}
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(orders, true, nil)
+	permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+		{Type: "knowledge_network", ID: "kn-a"},
+		{Type: "object_type", ID: "kn-a/orders"},
+	}).Return(nil)
+	properties.EXPECT().ResolvePropertyLevels(gomock.Any(), []interfaces.PropertyLevelsRequestItem{
+		{ObjectTypeRef: "kn-a/orders", Properties: []string{"amount", "status"}},
+	}).Return([]interfaces.PropertyLevelsDecisionEntry{{
+		ObjectTypeRef: "kn-a/orders",
+		Properties: []interfaces.PropertyAccessDecision{
+			{Name: "amount", Level: interfaces.PropertyAccessFull},
+			{Name: "status", Level: interfaces.PropertyAccessSchema},
+		},
+	}}, nil)
+
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+		Specification: interfaces.ObjectMetricSpecificationV1{Measure: &interfaces.ObjectMetricMeasureV1{
+			Expression: &interfaces.ObjectMetricExpressionV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+				ObjectTypeID: "orders", PropertyName: "amount",
+			}},
+		}},
+	}, &interfaces.ObjectMetricQueryRequestV1{Filter: &interfaces.ObjectMetricConditionV1{
+		Left: &interfaces.ObjectMetricOperandV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+			ObjectTypeID: "orders", PropertyName: "status",
+		}},
+	}})
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusForbidden {
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v, want 403", err)
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRejectsNonFullParentQueryProperties(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		parentQuery   interfaces.ObjectMetricQueryRequestV1
+		topLevelQuery *interfaces.ObjectMetricQueryRequestV1
+		allow         bool
+	}{
+		{
+			name: "parent filter",
+			parentQuery: interfaces.ObjectMetricQueryRequestV1{Filter: &interfaces.ObjectMetricConditionV1{
+				Left: &interfaces.ObjectMetricOperandV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+					ObjectTypeID: "orders", PropertyName: "status",
+				}},
+			}},
+		},
+		{
+			name: "parent analysis dimension",
+			parentQuery: interfaces.ObjectMetricQueryRequestV1{GroupBy: []interfaces.ObjectMetricPropertyRefV1{{
+				ObjectTypeID: "orders", PropertyName: "status",
+			}}},
+		},
+		{
+			name: "top-level order dimension",
+			topLevelQuery: &interfaces.ObjectMetricQueryRequestV1{OrderBy: []interfaces.ObjectMetricOrderByV1{{
+				Field: "dimension", Direction: "asc", Dimension: &interfaces.ObjectMetricPropertyRefV1{ObjectTypeID: "orders", PropertyName: "status"},
+			}}},
+		},
+		{
+			name: "parent order dimension",
+			parentQuery: interfaces.ObjectMetricQueryRequestV1{OrderBy: []interfaces.ObjectMetricOrderByV1{{
+				Field: "dimension", Direction: "asc", Dimension: &interfaces.ObjectMetricPropertyRefV1{ObjectTypeID: "orders", PropertyName: "status"},
+			}}},
+		},
+		{
+			name:          "value order needs no additional property",
+			topLevelQuery: &interfaces.ObjectMetricQueryRequestV1{OrderBy: []interfaces.ObjectMetricOrderByV1{{Field: "value", Direction: "asc"}}},
+			allow:         true,
+		},
+		{
+			name: "ancestor filter",
+			parentQuery: interfaces.ObjectMetricQueryRequestV1{BucketSelection: &interfaces.ObjectMetricBucketSelectionV1{
+				ParentQuery: interfaces.ObjectMetricQueryRequestV1{Filter: &interfaces.ObjectMetricConditionV1{
+					Left: &interfaces.ObjectMetricOperandV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+						ObjectTypeID: "orders", PropertyName: "status",
+					}},
+				}},
+			}},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			models := omock.NewMockOntologyManagerAccess(ctrl)
+			permissions := omock.NewMockPermissionService(ctrl)
+			properties := omock.NewMockPropertyAccessService(ctrl)
+			service := &queryAuthorizationService{models: models, permissions: permissions, properties: properties}
+
+			orders := publishedObjectType("kn-a", "orders", "orders-resource")
+			orders.DataProperties = []cond.DataProperty{{Name: "amount"}, {Name: "status"}}
+			models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(orders, true, nil)
+			permissions.EXPECT().RequireQueryData(gomock.Any(), []interfaces.PermissionResource{
+				{Type: "knowledge_network", ID: "kn-a"},
+				{Type: "object_type", ID: "kn-a/orders"},
+			}).Return(nil)
+			decisions := []interfaces.PropertyAccessDecision{
+				{Name: "amount", Level: interfaces.PropertyAccessFull},
+				{Name: "status", Level: interfaces.PropertyAccessSchema},
+			}
+			properties.EXPECT().ResolvePropertyLevels(gomock.Any(), []interfaces.PropertyLevelsRequestItem{
+				{ObjectTypeRef: "kn-a/orders", Properties: []string{"amount", "status"}},
+			}).Return([]interfaces.PropertyLevelsDecisionEntry{{
+				ObjectTypeRef: "kn-a/orders",
+				Properties:    decisions,
+			}}, nil)
+
+			definition := &interfaces.ObjectMetricDefinitionV1{
+				OwnerObjectTypeID: "orders",
+				Specification: interfaces.ObjectMetricSpecificationV1{Measure: &interfaces.ObjectMetricMeasureV1{
+					Expression: &interfaces.ObjectMetricExpressionV1{PropertyRef: &interfaces.ObjectMetricPropertyRefV1{
+						ObjectTypeID: "orders", PropertyName: "amount",
+					}},
+				}},
+			}
+			query := &interfaces.ObjectMetricQueryRequestV1{BucketSelection: &interfaces.ObjectMetricBucketSelectionV1{
+				ParentQuery: test.parentQuery,
+				BucketKey:   "server-issued-key",
+			}}
+			if test.topLevelQuery != nil {
+				query = test.topLevelQuery
+			}
+			err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", definition, query)
+			if test.allow {
+				if err != nil {
+					t.Fatalf("ordering by value should not require property access: %v", err)
+				}
+				return
+			}
+			var httpErr *httperrors.HTTPError
+			if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusForbidden {
+				t.Fatalf("parent query must require full property access: %v", err)
+			}
+		})
+	}
+}
+
+func TestObjectMetricPropertyRequirementsRejectsExcessiveBucketSelectionDepth(t *testing.T) {
+	query := interfaces.ObjectMetricQueryRequestV1{}
+	for range 9 {
+		query = interfaces.ObjectMetricQueryRequestV1{BucketSelection: &interfaces.ObjectMetricBucketSelectionV1{ParentQuery: query}}
+	}
+	_, err := objectMetricPropertyRequirements(&interfaces.ObjectMetricDefinitionV1{}, &query)
+	if err == nil {
+		t.Fatal("excessive parent query depth must be rejected before authorization")
+	}
+}
+
+func TestAuthorizeObjectMetricTrialRejectsRelationPathOutsidePublishedModel(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	models := omock.NewMockOntologyManagerAccess(ctrl)
+	service := &queryAuthorizationService{models: models}
+
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(
+		publishedObjectType("kn-a", "orders", "orders-resource"), true, nil)
+	models.EXPECT().GetRelationType(gomock.Any(), "kn-a", "main", "order-customer").Return(
+		interfaces.RelationType{
+			RTID: "order-customer", Type: interfaces.RELATION_TYPE_DIRECT,
+			SourceObjectTypeID: "orders", TargetObjectTypeID: "customers",
+		}, true, nil)
+
+	err := service.AuthorizeObjectMetricTrial(context.Background(), "kn-a", "main", &interfaces.ObjectMetricDefinitionV1{
+		OwnerObjectTypeID: "orders",
+		Specification: interfaces.ObjectMetricSpecificationV1{
+			BusinessQualifiers: &interfaces.ObjectMetricBusinessQualifiersV1{
+				RelationPath: &interfaces.ObjectMetricRelationPathV1{Steps: []interfaces.ObjectMetricRelationStepV1{{
+					RelationTypeID: "order-customer", Direction: interfaces.DIRECTION_FORWARD,
+					TargetObjectTypeID: "restricted-object-type",
+				}}},
+			},
+		},
+	}, nil)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest {
+		t.Fatalf("AuthorizeObjectMetricTrial() error = %v, want 400", err)
 	}
 }
 
@@ -227,7 +824,7 @@ func TestAuthorizeSubgraphByTypePathRejectsEdgeThatCannotWalkRelation(t *testing
 			models.EXPECT().GetRelationType(gomock.Any(), "kn-a", "main", tt.relation.RTID).Return(tt.relation, true, nil)
 
 			err := service.AuthorizeSubgraphByTypePath(context.Background(), userOrderPathQuery(tt.edge))
-			var httpErr *rest.HTTPError
+			var httpErr *httperrors.HTTPError
 			if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest {
 				t.Fatalf("AuthorizeSubgraphByTypePath() error = %v, want 400", err)
 			}
@@ -324,7 +921,7 @@ func TestAuthorizeObjectTypePreservesModelPermissionDenial(t *testing.T) {
 	}
 	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").Return(
 		interfaces.ObjectType{}, false,
-		rest.NewHTTPError(context.Background(), http.StatusForbidden, rest.PublicError_Forbidden))
+		httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden))
 
 	err := service.AuthorizeObjectTypeQuery(context.Background(), "kn-a", "main", "orders")
 	assertQueryAuthHTTPStatus(t, err, http.StatusForbidden)
@@ -338,7 +935,7 @@ func TestAuthorizeActionTypePreservesWrappedModelPermissionDenial(t *testing.T) 
 	models.EXPECT().GetActionType(gomock.Any(), "kn-a", "main", "action-1").Return(
 		interfaces.ActionType{}, nil, false,
 		fmt.Errorf("get action type failed: %w",
-			rest.NewHTTPError(context.Background(), http.StatusForbidden, rest.PublicError_Forbidden)))
+			httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden)))
 
 	err := service.AuthorizeActionTypeQuery(context.Background(), "kn-a", "main", "action-1")
 	assertQueryAuthHTTPStatus(t, err, http.StatusForbidden)
@@ -408,11 +1005,29 @@ func TestAuthorizeSubgraphByObjectsFailsClosedWithoutModelAccess(t *testing.T) {
 
 func assertQueryAuthHTTPStatus(t *testing.T, err error, expected int) {
 	t.Helper()
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
 		t.Fatalf("error = %T %v", err, err)
 	}
 	if httpErr.HTTPCode != expected {
 		t.Fatalf("HTTP status = %d, want %d", httpErr.HTTPCode, expected)
+	}
+}
+
+type allowMetricSnapshotProxies struct{ err error }
+
+func (service allowMetricSnapshotProxies) AuthorizeMetricSnapshotProxies(context.Context, []*interfaces.TrustedProxyContext) error {
+	return service.err
+}
+
+func TestMetricFingerprintRejectsLiveProxyRevocation(t *testing.T) {
+	models := omock.NewMockOntologyManagerAccess(gomock.NewController(t))
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-a", "main", "orders").AnyTimes().Return(publishedObjectType("kn-a", "orders", "resource"), true, nil)
+	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "user", Type: "user"})
+	service := &queryAuthorizationService{models: models, proxy: fixedMetricProxy{version: 1}, rowFilters: fixedMetricRowFilters{digest: "rows"}, snapshotProxies: allowMetricSnapshotProxies{err: httperrors.NewHTTPError(ctx, 403, httperrors.PublicError_Forbidden)}}
+	fingerprint, err := service.objectMetricAuthorizationFingerprint(ctx, "kn-a", []objectMetricAuthorizationInput{{definition: &interfaces.ObjectMetricDefinitionV1{OwnerObjectTypeID: "orders"}}})
+	assertQueryAuthHTTPStatus(t, err, 403)
+	if fingerprint.Digest != "" {
+		t.Fatal("revoked proxy received an authorization fingerprint")
 	}
 }

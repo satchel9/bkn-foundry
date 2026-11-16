@@ -14,10 +14,6 @@ data:
       pod_id: {{ .Values.service.podID | quote }}
       machine_id: {{ .Values.service.machineID | quote }}
       debug: {{ .Values.service.debug }}
-    operator:
-      import_file_size_limit: {{ .Values.service.operator.importFileSizeLimit }}
-      import_operator_max_count: {{ .Values.service.operator.importOperatorMaxCount }}
-      operator_description_length_limit: {{ .Values.service.operator.descriptionLengthLimit }}
     mcp:
       conn_timeout: {{ .Values.service.mcp.connTimeout }}
       max_instances: {{ .Values.service.mcp.maxInstances }}
@@ -28,6 +24,7 @@ data:
     proxy_module:
       default_timeout: {{ .Values.service.proxyModule.defaultTimeout }}
       max_timeout: {{ .Values.service.proxyModule.maxTimeout }}
+      platform_function_grace: {{ .Values.service.proxyModule.platformFunctionGrace }}
       max_clients: {{ .Values.service.proxyModule.maxClients }}
       client_lifetime: {{ .Values.service.proxyModule.clientLifetime }}
     skill_index_build:
@@ -80,6 +77,8 @@ data:
       max_sessions: {{ index .Values "depServices" "sandbox-control-plane" "maxSessions" }}
       active_sessions: {{ index .Values "depServices" "sandbox-control-plane" "activeSessions" }}
       max_concurrent_tasks: {{ index .Values "depServices" "sandbox-control-plane" "maxConcurrentTasks" }}
+      spread_threshold: {{ index .Values "depServices" "sandbox-control-plane" "spreadThreshold" }}
+      sync_poll_deadline: {{ index .Values "depServices" "sandbox-control-plane" "syncPollDeadline" }}
     mf-model-api:
       private_protocol: {{ index .Values "depServices" "mf-model-api" "privateProtocol" | quote }}
       private_host: {{ index .Values "depServices" "mf-model-api" "privateHost" | quote }}
@@ -110,6 +109,10 @@ data:
       private_protocol: {{ index .Values "depServices" "vega-backend" "privateProtocol" | quote }}
       private_host: {{ index .Values "depServices" "vega-backend" "privateHost" | quote }}
       private_port: {{ index .Values "depServices" "vega-backend" "privatePort" }}
+    bkn-backend:
+      private_protocol: {{ index .Values "depServices" "bkn-backend" "privateProtocol" | quote }}
+      private_host: {{ index .Values "depServices" "bkn-backend" "privateHost" | quote }}
+      private_port: {{ index .Values "depServices" "bkn-backend" "privatePort" }}
 
   mq_config.yaml: |
     {{- toYaml .Values.depServices.mq | nindent 4 }}

@@ -4,24 +4,35 @@
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in the project root for details.
 
-// Package mariadb provides MariaDB database connector implementation.
 package mariadb
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	sq "github.com/Masterminds/squirrel"
 	"github.com/go-sql-driver/mysql"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sb "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
+	fc "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
-// convertValue converts []byte to string for MariaDB driver compatibility
+// sqlBuffer 只按写入顺序拼接节点及参数，并保留第一个错误。
+type sqlBuffer struct {
+	text strings.Builder
+	args []any
+	err  error
+}
+
+// convertValue converts driver byte slices to strings unless binary content must be preserved.
 func convertValue(v any, preserveBinary bool) any {
 	if b, ok := v.([]byte); ok {
 		if preserveBinary {
@@ -32,481 +43,827 @@ func convertValue(v any, preserveBinary bool) any {
 	return v
 }
 
-// BuildPagedSQL applies MariaDB paging syntax to a validated query.
-func (c *MariaDBConnector) BuildPagedSQL(sqlStr string, offset, limit int) string {
-	if offset < 0 {
-		offset = 0
-	}
-	if limit <= 0 {
-		limit = interfaces.DefaultPageLimit
-	}
-	return fmt.Sprintf("SELECT * FROM (%s\n) AS _raw_query_page LIMIT %d OFFSET %d", strings.TrimSpace(sqlStr), limit, offset)
-}
-
-// BuildCountSQL applies MariaDB total-count syntax to a validated query.
-func (c *MariaDBConnector) BuildCountSQL(sqlStr string) string {
-	return fmt.Sprintf("SELECT COUNT(*) AS _raw_query_total_count FROM (%s\n) AS _raw_query_total", strings.TrimSpace(sqlStr))
-}
-
-// ExecuteRawSQL executes the original SQL query
-func (c *MariaDBConnector) ExecuteRawSQL(ctx context.Context, sqlStr string) (*interfaces.RawQueryResponse, error) {
-	if err := c.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("connect failed: %w", err)
-	}
-
-	rows, err := c.db.QueryContext(ctx, sqlStr)
-	if err != nil {
-		return nil, fmt.Errorf("execute query failed: %w", classifyQueryError(err))
-	}
-	defer func() { _ = rows.Close() }()
-
+// scanQueryRows 保留所选 Binary 内容，其他字节值转为字符串；总数由调用方按接口契约设置。
+func (c *MariaDBConnector) scanQueryRows(rows *sql.Rows, binaryContentColumns map[string]bool) (*interfaces.ResourceDataQueryResult, error) {
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, fmt.Errorf("get columns failed: %w", err)
+		return nil, fmt.Errorf("failed to read result columns: %w", err)
 	}
-
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, fmt.Errorf("get column types failed: %w", err)
-	}
-
-	response := &interfaces.RawQueryResponse{
-		Columns: make([]interfaces.ColumnInfo, len(columns)),
+	result := &interfaces.ResourceDataQueryResult{
+		Columns: columns,
 		Entries: make([]map[string]any, 0),
-	}
-
-	// Fill column information
-	for i, col := range columns {
-		response.Columns[i] = interfaces.ColumnInfo{
-			Name: col,
-			Type: c.MapType(columnTypes[i].DatabaseTypeName()),
-		}
-	}
-
-	// Read the result row
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, fmt.Errorf("scan row failed: %w", err)
-		}
-
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertValue(values[i], false)
-		}
-		response.Entries = append(response.Entries, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate rows failed: %w", classifyQueryError(err))
-	}
-
-	totalCount := int64(len(response.Entries))
-	response.TotalCount = &totalCount
-
-	return response, nil
-}
-
-// buildSelectBuilder assembles the SELECT statement for detail and aggregate queries.
-//
-// Every identifier — table, column, alias — must go through quoteColumnName.
-// A source column named after a SQL reserved word (say `key`) survives DDL, catalog
-// discover and bkn push untouched, because none of them build a query; concatenating it
-// raw only fails at execution time with a 1064 that names nothing useful.
-func (c *MariaDBConnector) buildSelectBuilder(resource *interfaces.Resource,
-	params *interfaces.ResourceDataQueryParams, fieldMap map[string]*interfaces.Property,
-	condition sq.Sqlizer) (sq.SelectBuilder, error) {
-	if params.Paging.Offset < 0 || params.Paging.Limit < 0 {
-		return sq.SelectBuilder{}, fmt.Errorf("paging offset and limit must not be negative")
-	}
-
-	// Source column name. Fall back to the property name when the schema has no mapping,
-	// and also when the property carries no original_name: build tasks add vector fields
-	// with a Name and no OriginalName (appendTaskEmbeddingVectorFields), and without the
-	// fallback those render as an empty quoted identifier.
-	originalName := func(property string) string {
-		if field, ok := fieldMap[property]; ok && field.OriginalName != "" {
-			return field.OriginalName
-		}
-		return property
-	}
-
-	// Construct the SELECT clause
-	selectFields := []string{}
-
-	// Add the GROUP BY field (when aggregating queries)
-	for _, groupByItem := range params.GroupBy {
-		column := originalName(groupByItem.Property)
-		// Check whether calendar_interval is needed
-		if groupByItem.CalendarInterval != "" {
-			dateFmt := c.buildDateFormat(groupByItem.Property, mariadbQuoteColumnName(column), groupByItem.CalendarInterval)
-			selectFields = append(selectFields, dateFmt+" AS "+mariadbQuoteColumnName(groupByItem.Property))
-		} else {
-			selectFields = append(selectFields,
-				mariadbQuoteColumnName(column)+" AS "+mariadbQuoteColumnName(groupByItem.Property))
-		}
-	}
-
-	// Add the aggregate field (when aggregating queries)
-	var aggAlias string
-	if params.Aggregation != nil {
-		aggField := mariadbQuoteColumnName(originalName(params.Aggregation.Property))
-
-		// Determine the aggregate function
-		aggFunc := params.Aggregation.Aggr
-		switch aggFunc {
-		case "count_distinct":
-			aggFunc = "COUNT(DISTINCT " + aggField + ")"
-		default:
-			aggFunc = strings.ToUpper(aggFunc) + "(" + aggField + ")"
-		}
-
-		// Determine the alias
-		if params.Aggregation.Alias != "" {
-			aggAlias = params.Aggregation.Alias
-		} else {
-			aggAlias = "__value"
-		}
-
-		selectFields = append(selectFields, aggFunc+" AS "+mariadbQuoteColumnName(aggAlias))
-	} else if params.Having != nil && params.Having.Field == "count(*)" {
-		// When HAVING uses count(*), add the COUNT(*) aggregate automatically
-		aggAlias = "__value"
-		selectFields = append(selectFields, "COUNT(*) AS "+mariadbQuoteColumnName(aggAlias))
-	}
-
-	// Select every field when the query is neither aggregated nor grouped
-	selectField := func(name string) string {
-		column := mariadbQuoteColumnName(originalName(name))
-		if prop := fieldMap[name]; prop != nil && prop.Type == interfaces.DataType_Binary {
-			if params.BinaryMode == nil {
-				return "NULL AS " + mariadbQuoteColumnName(name)
-			}
-			switch *params.BinaryMode {
-			case interfaces.BinaryModeMetadata:
-				return "OCTET_LENGTH(" + column + ") AS " + mariadbQuoteColumnName(name)
-			case interfaces.BinaryModeContent:
-				return column + " AS " + mariadbQuoteColumnName(name)
-			default:
-				return "NULL AS " + mariadbQuoteColumnName(name)
-			}
-		}
-		return column + " AS " + mariadbQuoteColumnName(name)
-	}
-	// output_fields controls detail-query projection only. Aggregate projection is
-	// defined by group_by, aggregation, or count(*) having; appending any other
-	// plain field would violate aggregate semantics and differs from PostgreSQL.
-	if len(params.GroupBy) == 0 && params.Aggregation == nil && params.Having == nil {
-		if len(params.OutputFields) > 0 {
-			for _, outName := range params.OutputFields {
-				selectFields = append(selectFields, selectField(outName))
-			}
-		} else if len(selectFields) == 0 {
-			// No output fields specified, so query them all. This branch needs the
-			// originalName fallback too, or a property with an empty original_name
-			// renders as an empty identifier and breaks the statement.
-			for _, prop := range resource.SchemaDefinition {
-				selectFields = append(selectFields, selectField(prop.Name))
-			}
-		}
-	}
-
-	// Build the query
-	builder := sq.Select(selectFields...).
-		From(resource.SourceIdentifier)
-
-	// Add the WHERE condition
-	if condition != nil {
-		builder = builder.Where(condition)
-	}
-
-	// Add GROUP BY (when aggregating queries)
-	if len(params.GroupBy) > 0 {
-		groupByFields := []string{}
-		for _, groupByItem := range params.GroupBy {
-			column := mariadbQuoteColumnName(originalName(groupByItem.Property))
-			// Check whether calendar_interval is needed
-			if groupByItem.CalendarInterval != "" {
-				groupByFields = append(groupByFields,
-					c.buildDateFormat(groupByItem.Property, column, groupByItem.CalendarInterval))
-			} else {
-				groupByFields = append(groupByFields, column)
-			}
-		}
-		builder = builder.GroupBy(groupByFields...)
-	}
-
-	// Add the HAVING condition (when aggregating queries)
-	if params.Having != nil && (params.Aggregation != nil || (params.Having.Field == "count(*)")) {
-		havingCond, err := c.buildHavingCondition(params.Having, aggAlias)
-		if err != nil {
-			return builder, fmt.Errorf("failed to build HAVING condition: %w", err)
-		}
-		if havingCond != "" {
-			builder = builder.Having(havingCond)
-		}
-	}
-
-	// Add ORDER BY
-	for _, sortItem := range params.Sort {
-		dir := "ASC"
-		if sortItem.Direction == interfaces.DESC_DIRECTION {
-			dir = "DESC"
-		}
-
-		// Resolve the sort field against the SELECT aliases first: when an alias matches a
-		// property name the caller means the aggregate, but schema resolution would pick
-		// that property's source column instead. The default sql_mode has no
-		// ONLY_FULL_GROUP_BY, so that does not error — it orders by an arbitrary row.
-		sortField := mariadbQuoteColumnName(originalName(sortItem.Field))
-		if aggAlias != "" && sortItem.Field == aggAlias {
-			sortField = mariadbQuoteColumnName(aggAlias)
-		}
-
-		// Check whether this is a GROUP BY field using calendar_interval
-		for _, groupByItem := range params.GroupBy {
-			if groupByItem.Property == sortItem.Field && groupByItem.CalendarInterval != "" {
-				// Use the full date_format expression
-				sortField = c.buildDateFormat(groupByItem.Property,
-					mariadbQuoteColumnName(originalName(groupByItem.Property)), groupByItem.CalendarInterval)
-				break
-			}
-		}
-
-		builder = builder.OrderBy(sortField + " " + dir)
-	}
-
-	// Add LIMIT and OFFSET
-	if params.CursorEncoded == "" {
-		builder = builder.Offset(uint64(params.Paging.Offset))
-	}
-	return builder.Limit(uint64(params.Paging.Limit)), nil
-}
-
-// ExecuteQuery runs a structured single-table query and returns rows and optional totals.
-func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interfaces.Resource,
-	params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
-
-	if err := c.Connect(ctx); err != nil {
-		return nil, err
-	}
-
-	fieldMap := map[string]*interfaces.Property{}
-	for _, prop := range resource.SchemaDefinition {
-		fieldMap[prop.Name] = prop
-	}
-
-	var condition sq.Sqlizer
-	var err error
-	if params.ActualFilterCond != nil {
-		condition, err = c.ConvertFilterCondition(params.ActualFilterCond)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	result := &interfaces.QueryResult{
-		Entries: make([]map[string]any, 0),
-	}
-
-	builder, err := c.buildSelectBuilder(resource, params, fieldMap, condition)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build SQL and execute it
-	query, args, err := builder.ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build query: %w", err)
-	}
-
-	isAggregate := params.Aggregation != nil || len(params.GroupBy) > 0 || params.Having != nil
-	if isAggregate {
-		logger.Debugf("aggregate query: %s", table.SQLSummary(query, args))
-	} else {
-		logger.Debugf("query: %s", table.SQLSummary(query, args))
-	}
-
-	rows, err := c.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", classifyQueryError(err))
-	}
-	defer func() { _ = rows.Close() }()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-	result.Columns = columns
-
-	binaryContentColumns := map[string]bool{}
-	if params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeContent {
-		for _, prop := range resource.SchemaDefinition {
-			if prop != nil && prop.Type == interfaces.DataType_Binary {
-				binaryContentColumns[prop.Name] = true
-			}
-		}
 	}
 	for rows.Next() {
 		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
+		destinations := make([]any, len(columns))
 		for i := range values {
-			valuePtrs[i] = &values[i]
+			destinations[i] = &values[i]
 		}
 
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
+		if err := rows.Scan(destinations...); err != nil {
+			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
 
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertValue(values[i], binaryContentColumns[col])
+		entry := make(map[string]any)
+		for i, column := range columns {
+			entry[column] = convertValue(values[i], binaryContentColumns[column])
 		}
-		result.Entries = append(result.Entries, row)
+		result.Entries = append(result.Entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, classifyQueryError(err)
-	}
-
-	// Total processing (detail query only) : Independent COUNT query, aligned with the postgresql connector.
-	// Previously, directly take len(result.Entries) - that is, the number of rows on this page. For tables with more than one page, total is always equal to
-	// LIMIT (The progress bar of the build task shows "20802/1000", which indicates this bug)
-	if params.NeedTotal && !isAggregate {
-		countBuilder := sq.Select("COUNT(1)").
-			From(resource.SourceIdentifier)
-		if condition != nil {
-			countBuilder = countBuilder.Where(condition)
-		}
-		countQuery, countArgs, countErr := countBuilder.ToSql()
-		if countErr != nil {
-			return nil, fmt.Errorf("failed to build count query: %w", countErr)
-		}
-		logger.Debugf("count query: %s", table.SQLSummary(countQuery, countArgs))
-		var total int64
-		row := c.db.QueryRowContext(ctx, countQuery, countArgs...)
-		if err := row.Scan(&total); err != nil {
-			return nil, fmt.Errorf("failed to scan total: %w", classifyQueryError(err))
-		}
-		result.Total = total
+		return nil, fmt.Errorf("failed to iterate result rows: %w", mariadbQueryError(err))
 	}
 
 	return result, nil
 }
 
-func classifyQueryError(err error) error {
+// mariadbQueryError 按源端错误码区分查询输入错误，保留驱动原因供诊断，不透传原文到 API。
+func mariadbQueryError(err error) error {
 	var driverErr *mysql.MySQLError
-	if errors.As(err, &driverErr) && driverErr.Number == 1054 {
-		return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterUnknownColumn, err)
+	if errors.As(err, &driverErr) {
+		switch driverErr.Number {
+		case 1054: // ER_BAD_FIELD_ERROR
+			return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterUnknownColumn, err)
+		case 1052, 1055, 1056, 1060, 1064, 1111, 1140, 1210, 1221,
+			1222, 1241, 1271, 1473, 1582, 1583, 1584, 3028, 3029, 3065:
+			// 歧义/重复列、语法、分组、集合列数/嵌套/字符排序规则、函数参数和排序错误；不将连接或资源失效归为输入错误。
+			return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterInvalidQuery, err)
+		}
 	}
 	return err
 }
 
-// buildHavingCondition builds the HAVING condition
-func (c *MariaDBConnector) buildHavingCondition(having *interfaces.HavingClause, aggAlias string) (string, error) {
-	// Support the __value and count(*) fields
+// ExecuteQuery 为 MariaDB/MySQL 使用公共 Builder，复用既有结果扫描和归一化。
+func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
+	query, err := c.buildSelectBuilder(resource, params)
+	if err != nil {
+		return nil, err
+	}
+	rows, _, err := c.OpenSQLBuilder(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	result, err := c.scanQueryRows(rows, table.QueryBinaryContentColumns(resource, params))
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan query rows: %w", err)
+	}
+	// COUNT 独立执行，先释放数据 Rows，兼容单连接池。
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close query rows: %w", mariadbQueryError(err))
+	}
+	if params.NeedTotal {
+		unpaged := *query
+		unpaged.LimitPart = nil
+		unpaged.OffsetPart = 0
+		unpaged.OrderByPart = nil
+		count := sb.Select(&sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}).FromSelect(&unpaged, "_resource_total")
+		text, args, err := ToSql(count)
+		if err != nil {
+			return nil, err
+		}
+		args, err = sqlBuilderArguments(args)
+		if err != nil {
+			return nil, err
+		}
+		if err := c.db.QueryRowContext(ctx, text, args...).Scan(&result.TotalCount); err != nil {
+			return nil, fmt.Errorf("failed to scan total: %w", mariadbQueryError(err))
+		}
+	}
+	table.NormalizeQueryResult(result, resource, params)
+	return result, nil
+}
+
+// buildSelectBuilder 将 DTO 的查询子句组装为公共 Builder，不创建连接或拼接 SQL 片段。
+func (c *MariaDBConnector) buildSelectBuilder(resource *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*sb.SelectBuilder, error) {
+	if params.Paging.Offset < 0 || params.Paging.Limit < 0 {
+		return nil, interfaces.NewConditionBuildError("paging offset and limit must not be negative")
+	}
+	fields := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
+	for _, field := range resource.SchemaDefinition {
+		fields[field.Name] = field
+	}
+	sourceColumn := func(name string) sb.SqlNode {
+		if field := fields[name]; field != nil {
+			return sqlResourceColumn(field)
+		}
+		return sqlColumnName(name)
+	}
+	query := sb.Select().From(&sb.Table{ResourceID: resource.ID, SourceIdentifier: resource.SourceIdentifier})
+	groupExpressions := make(map[string]sb.SqlNode, len(params.GroupBy))
+	for _, group := range params.GroupBy {
+		expr := sourceColumn(group.Property)
+		if group.CalendarInterval != "" {
+			var err error
+			expr, err = sqlCalendarGroup(expr, group.CalendarInterval)
+			if err != nil {
+				return nil, err
+			}
+		}
+		query.Columns(&sb.Alias{Expr: expr, Name: group.Property}).GroupBy(expr)
+		groupExpressions[group.Property] = expr
+	}
+	var metric sb.SqlNode
+	metricAlias := ""
+	metricField := &interfaces.Property{Type: interfaces.DataType_Integer}
+	if aggregation := params.Aggregation; aggregation != nil {
+		name := strings.ToUpper(aggregation.Aggr)
+		distinct := name == "COUNT_DISTINCT"
+		if distinct {
+			name = "COUNT"
+		}
+		switch name {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		default:
+			return nil, interfaces.NewConditionBuildError("unsupported aggregate function")
+		}
+		var arg sb.SqlNode = &sb.Star{}
+		if aggregation.Property != "*" {
+			arg = sourceColumn(aggregation.Property)
+		} else if name != "COUNT" || distinct {
+			return nil, interfaces.NewConditionBuildError("aggregate wildcard requires count")
+		}
+		metric = &sb.Function{Name: name, Args: []sb.SqlNode{arg}, Distinct: distinct}
+		metricAlias = aggregation.Alias
+		if metricAlias == "" {
+			metricAlias = "__value"
+		}
+		if name == "MIN" || name == "MAX" {
+			metricField = fields[aggregation.Property]
+		}
+	} else if params.Having != nil && params.Having.Field == "count(*)" {
+		metric = &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}
+		metricAlias = "__value"
+	}
+	if err := table.ValidateAggregateAlias(metricAlias, params.GroupBy); err != nil {
+		return nil, err
+	}
+	if metric != nil {
+		query.Columns(&sb.Alias{Expr: metric, Name: metricAlias})
+	}
+	if len(params.GroupBy) == 0 && params.Aggregation == nil && params.Having == nil {
+		names := params.OutputFields
+		if len(names) == 0 {
+			for _, field := range resource.SchemaDefinition {
+				names = append(names, field.Name)
+			}
+		}
+		for _, name := range names {
+			field := fields[name]
+			if field == nil {
+				return nil, interfaces.NewOutputFieldError(interfaces.OutputFieldUnknown, name)
+			}
+			expr := sourceColumn(name)
+			if field.Type == interfaces.DataType_Binary {
+				switch {
+				case params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeContent:
+				case params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeMetadata:
+					expr = &sb.Function{Name: "OCTET_LENGTH", Args: []sb.SqlNode{expr}}
+				default:
+					expr = &sb.Literal{Value: nil}
+				}
+			}
+			query.Columns(&sb.Alias{Expr: expr, Name: name})
+		}
+	}
+	if len(query.ColumnsPart) == 0 {
+		return nil, interfaces.NewOutputFieldError(interfaces.OutputFieldNoneQueryable, "")
+	}
+	if params.ActualFilterCond != nil {
+		columns, err := table.ColumnMetadata(resource)
+		if err != nil {
+			return nil, err
+		}
+		predicate, err := c.ConvertFilterCondition(params.ActualFilterCond, resource.SchemaDefinition, columns)
+		if err != nil {
+			return nil, err
+		}
+		query.Where(predicate)
+	}
+	if having := params.Having; having != nil && metric != nil {
+		expr := sqlColumnName(metricAlias)
+		field := metricField
+		if having.Field == "count(*)" {
+			expr = &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}
+			field = &interfaces.Property{Type: interfaces.DataType_Integer}
+		}
+		predicate, err := sqlHavingCondition(having, expr, field)
+		if err != nil {
+			return nil, err
+		}
+		query.Having(predicate)
+	}
+	for _, sort := range table.QuerySortFields(params, metricAlias) {
+		expr := sourceColumn(sort.Field)
+		if sort.Field == metricAlias && metricAlias != "" {
+			expr = sqlColumnName(metricAlias)
+		}
+		if grouped := groupExpressions[sort.Field]; grouped != nil && sort.Field != metricAlias {
+			expr = grouped
+		}
+		query.OrderBy(sb.Order{Expr: expr, Descending: sort.Direction == interfaces.DESC_DIRECTION})
+	}
+	if params.CursorEncoded == "" {
+		query.Offset(uint64(params.Paging.Offset))
+	}
+	query.Limit(uint64(params.Paging.Limit))
+	return query, nil
+}
+
+func sqlHavingCondition(having *interfaces.HavingClause, expr sb.SqlNode, field *interfaces.Property) (sb.SqlNode, error) {
 	if having.Field != "__value" && having.Field != "count(*)" {
-		return "", fmt.Errorf("HAVING field must be '__value' or 'count(*)'")
+		return nil, interfaces.NewConditionBuildError("HAVING field must be '__value' or 'count(*)'")
 	}
-
-	// Determine the field expression used in the HAVING clause. The alias comes straight
-	// from the request body and is not validated, so a reserved word passes SELECT — which
-	// quotes it — and then fails HAVING with a 1064 unless it is quoted here too.
-	var fieldExpr string
-	if having.Field == "count(*)" {
-		fieldExpr = "COUNT(*)"
-	} else {
-		fieldExpr = mariadbQuoteColumnName(aggAlias)
+	if field != nil {
+		if err := fc.ValidateTemporalPrecision(field.Type, having.Value); err != nil {
+			return nil, err
+		}
 	}
-
-	var op string
 	switch having.Operation {
-	case "==":
-		op = "="
-	case "!=":
-		op = "<>"
-	case ">":
-		op = ">"
-	case ">=":
-		op = ">="
-	case "<":
-		op = "<"
-	case "<=":
-		op = "<="
-	case "in":
-		return fmt.Sprintf("%s IN (%s)", fieldExpr, formatInValues(having.Value)), nil
-	case "not_in":
-		return fmt.Sprintf("%s NOT IN (%s)", fieldExpr, formatInValues(having.Value)), nil
-	case "range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			return fmt.Sprintf("%s BETWEEN ? AND ?", fieldExpr), nil
+	case "=", "==", "!=", "<>", ">", ">=", "<", "<=":
+		if having.Value == nil {
+			return nil, interfaces.NewConditionBuildError("HAVING comparison requires a value")
 		}
-		return "", fmt.Errorf("range operation requires an array with 2 values")
-	case "out_range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			return fmt.Sprintf("%s NOT BETWEEN ? AND ?", fieldExpr), nil
+		value, err := sqlConditionValue(field, having.Value)
+		if err != nil {
+			return nil, err
 		}
-		return "", fmt.Errorf("out_range operation requires an array with 2 values")
+		return sqlComparisonNode(expr, value, having.Operation)
+	case "in", "not_in", "range", "out_range":
+		var values []any
+		switch value := having.Value.(type) {
+		case []any:
+			values = value
+		case []string:
+			for _, v := range value {
+				values = append(values, v)
+			}
+		default:
+			return nil, interfaces.NewConditionBuildError("HAVING operation requires an array")
+		}
+		if having.Operation == "in" || having.Operation == "not_in" {
+			return sqlSetCondition(expr, field, values, having.Operation == "not_in")
+		}
+		return sqlRangeCondition(expr, field, values, having.Operation == "out_range")
 	default:
-		return "", fmt.Errorf("unsupported HAVING operation: %s", having.Operation)
-	}
-
-	// Format the value of the HAVING condition
-	var valueStr string
-	switch v := having.Value.(type) {
-	case string:
-		valueStr = fmt.Sprintf("'%s'", v)
-	case int, int64, float64:
-		valueStr = fmt.Sprintf("%v", v)
-	default:
-		valueStr = fmt.Sprintf("%v", v)
-	}
-	return fmt.Sprintf("%s %s %s", fieldExpr, op, valueStr), nil
-}
-
-// Format IN Values: Format the list of values for the in operation
-func formatInValues(value any) string {
-	switch v := value.(type) {
-	case []any:
-		var values []string
-		for _, item := range v {
-			values = append(values, fmt.Sprintf("%v", item))
-		}
-		return strings.Join(values, ", ")
-	case []string:
-		var values []string
-		for _, item := range v {
-			values = append(values, fmt.Sprintf("'%s'", item))
-		}
-		return strings.Join(values, ", ")
-	default:
-		return fmt.Sprintf("%v", value)
+		return nil, interfaces.NewConditionBuildError("unsupported HAVING operation")
 	}
 }
 
-// buildDateFormat builds the date_format expression based on calendar_interval
-// Support the calendar_interval enumeration values of OpenSearch: minute, hour, day, week, month, quarter, year
-// Note: The validity of calendar_interval has been verified in the validateCalendarInterval method in validate_resource_data.go
-func (c *MariaDBConnector) buildDateFormat(alias, dateField, calendarInterval string) string {
-	var dateFmt string
-	switch calendarInterval {
+func sqlCalendarGroup(expr sb.SqlNode, unit string) (sb.SqlNode, error) {
+	format := ""
+	switch unit {
 	case interfaces.CALENDAR_UNIT_MINUTE:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%Y-%m-%d %H:%i`)
+		format = "%Y-%m-%d %H:%i"
 	case interfaces.CALENDAR_UNIT_HOUR:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%Y-%m-%d %H`)
+		format = "%Y-%m-%d %H"
 	case interfaces.CALENDAR_UNIT_DAY:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%Y-%m-%d`)
+		format = "%Y-%m-%d"
 	case interfaces.CALENDAR_UNIT_WEEK:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%x-%v`)
+		format = "%x-%v"
 	case interfaces.CALENDAR_UNIT_MONTH:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%Y-%m`)
-	case interfaces.CALENDAR_UNIT_QUARTER:
-		dateFmt = fmt.Sprintf(`concat(year(%s),'-Q',quarter(%s))`, dateField, dateField)
+		format = "%Y-%m"
 	case interfaces.CALENDAR_UNIT_YEAR:
-		dateFmt = fmt.Sprintf(`date_format(%s,'%s')`, dateField, `%Y`)
+		format = "%Y"
+	case interfaces.CALENDAR_UNIT_QUARTER:
+		return &sb.Function{Name: "CONCAT", Args: []sb.SqlNode{&sb.Function{Name: "YEAR", Args: []sb.SqlNode{expr}}, &sb.Literal{Value: "-Q"}, &sb.Function{Name: "QUARTER", Args: []sb.SqlNode{expr}}}}, nil
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported calendar interval")
 	}
-	return dateFmt
+	return sqlDateFormat(expr, format), nil
+}
+
+// ExecuteSQLBuilder 执行已完成资源授权和来源解析的查询，在执行时生成 SQL 和参数。
+// 结果沿用 RawQueryResponse；TotalCount 是本次返回行数，API 分页和会话由调用层负责。
+// SQL 服务统一消费 Builder 入口，由连接器生成源端 SQL 和参数。
+func (c *MariaDBConnector) ExecuteSQLBuilder(ctx context.Context, query *sb.SelectBuilder) (*interfaces.RawQueryResponse, error) {
+	rows, columns, err := c.OpenSQLBuilder(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	binaryColumns := make(map[string]bool)
+	for _, column := range columns {
+		if column.Type == interfaces.DataType_Binary {
+			binaryColumns[column.Name] = true
+		}
+	}
+	result, err := c.scanQueryRows(rows, binaryColumns)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan SQL builder query rows: %w", mariadbQueryError(err))
+	}
+	total := int64(len(result.Entries))
+	return &interfaces.RawQueryResponse{Columns: columns, Entries: result.Entries, TotalCount: &total}, nil
+}
+
+// OpenSQLBuilder 只执行一次 SQL，不提前扫描结果；成功后 Rows 的所有权交给调用方。
+func (c *MariaDBConnector) OpenSQLBuilder(ctx context.Context, query *sb.SelectBuilder) (*sql.Rows, []interfaces.ColumnInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	text, args, err := ToSql(query)
+	if err != nil {
+		failure := interfaces.NewConditionBuildError("SQL expression is not supported by MySQL")
+		failure.Cause = err
+		return nil, nil, failure
+	}
+	args, err = sqlBuilderArguments(args)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.Connect(ctx); err != nil {
+		return nil, nil, fmt.Errorf("failed to connect for SQL builder query: %w", mariadbQueryError(err))
+	}
+	rows, err := c.db.QueryContext(ctx, text, args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to execute SQL builder query: %w", mariadbQueryError(err))
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			_ = rows.Close()
+		}
+	}()
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read result column types: %w", err)
+	}
+	columns := make([]interfaces.ColumnInfo, len(types))
+	names := make(map[string]bool, len(types))
+	for i, column := range types {
+		if names[column.Name()] {
+			return nil, nil, interfaces.NewConditionBuildError("query result contains duplicate column names; use explicit aliases")
+		}
+		names[column.Name()] = true
+		columns[i] = interfaces.ColumnInfo{Name: column.Name(), Type: c.MapType(column.DatabaseTypeName())}
+	}
+	transferred = true
+	return rows, columns, nil
+}
+
+// render 直接分派具体节点；空指针与未知节点均返回错误。
+func render(node sb.SqlNode) (string, []any, error) {
+	switch n := node.(type) {
+	case *sb.SelectBuilder:
+		if n != nil {
+			return ToSql(n)
+		}
+	case *sb.Table:
+		if n != nil {
+			return tableSql(*n)
+		}
+	case *sb.Subquery:
+		if n != nil {
+			return subquerySql(*n)
+		}
+	case *sb.Union:
+		if n != nil {
+			return unionSql(*n)
+		}
+	case *sb.Join:
+		if n != nil {
+			return joinSql(*n)
+		}
+	case *sb.JoinedTable:
+		if n != nil {
+			return joinedTableSql(*n)
+		}
+	case *sb.Order:
+		if n != nil {
+			return orderSql(*n)
+		}
+	case *sb.Column:
+		if n != nil {
+			return columnSql(*n)
+		}
+	case *sb.Literal:
+		if n != nil {
+			return literalSQL(n.Value)
+		}
+	case *sb.Param:
+		if n != nil {
+			if number, ok := n.Value.(json.Number); ok {
+				return numericLiteralSQL(number)
+			}
+			return "?", []any{n.Value}, nil
+		}
+	case *sb.Star:
+		if n != nil {
+			return starSql(*n)
+		}
+	case *sb.Alias:
+		if n != nil {
+			return aliasSql(*n)
+		}
+	case *sb.Eq:
+		if n != nil {
+			return binarySql(n.Left, "=", n.Right)
+		}
+	case *sb.NotEq:
+		if n != nil {
+			return binarySql(n.Left, "<>", n.Right)
+		}
+	case *sb.Gt:
+		if n != nil {
+			return binarySql(n.Left, ">", n.Right)
+		}
+	case *sb.GtOrEq:
+		if n != nil {
+			return binarySql(n.Left, ">=", n.Right)
+		}
+	case *sb.Lt:
+		if n != nil {
+			return binarySql(n.Left, "<", n.Right)
+		}
+	case *sb.LtOrEq:
+		if n != nil {
+			return binarySql(n.Left, "<=", n.Right)
+		}
+	case *sb.And:
+		if n != nil {
+			return conditionsSql(*n, " AND ", "(1=1)")
+		}
+	case *sb.Or:
+		if n != nil {
+			return conditionsSql(*n, " OR ", "(1=0)")
+		}
+	case *sb.Not:
+		if n != nil {
+			return notSql(*n)
+		}
+	case *sb.IsNull:
+		if n != nil {
+			return isNullSql(*n)
+		}
+	case *sb.In:
+		if n != nil {
+			return inSql(*n)
+		}
+	case *sb.Between:
+		if n != nil {
+			return betweenSql(*n)
+		}
+	case *sb.Like:
+		if n != nil {
+			return likeSql(*n)
+		}
+	case *sb.Regex:
+		if n != nil {
+			return binarySql(n.Expr, "REGEXP", n.Pattern)
+		}
+	case *sb.Interval:
+		if n != nil {
+			if !calendarUnit(string(n.Unit)) {
+				return "", nil, fmt.Errorf("invalid calendar interval unit")
+			}
+			b := sqlBuffer{}
+			b.writeString("INTERVAL ")
+			b.writePart(n.Value)
+			b.writeString(" " + strings.ToUpper(string(n.Unit)))
+			return b.result()
+		}
+	case *sb.Contains:
+		if n != nil {
+			return containsSql(*n)
+		}
+	case *sb.Arithmetic:
+		if n != nil {
+			return arithmeticSql(*n)
+		}
+	case *sb.Unary:
+		if n != nil {
+			return unarySql(*n)
+		}
+	case *sb.Function:
+		if n != nil {
+			return functionSql(*n)
+		}
+	case *sb.Case:
+		if n != nil {
+			return caseSql(*n)
+		}
+	case *sb.Cast:
+		if n != nil {
+			return castSql(*n)
+		}
+	}
+	return "", nil, fmt.Errorf("query node is nil or unsupported")
+}
+
+// ToSql 根据结构化查询生成 MySQL SQL 和按出现顺序排列的参数，不执行请求。
+func ToSql(q *sb.SelectBuilder) (string, []any, error) {
+	if q == nil || len(q.ColumnsPart) == 0 {
+		return "", nil, fmt.Errorf("SELECT requires a projection")
+	}
+	if q.FromPart == nil && len(q.JoinsPart) != 0 {
+		return "", nil, fmt.Errorf("JOIN requires a FROM source")
+	}
+	b := sqlBuffer{}
+	b.writeString("SELECT ")
+	if q.DistinctPart {
+		b.writeString("DISTINCT ")
+	}
+	b.writeParts(q.ColumnsPart, ", ")
+	if q.FromPart != nil {
+		b.writeString(" FROM ")
+		b.writePart(q.FromPart)
+	}
+	for _, join := range q.JoinsPart {
+		b.writeByte(' ')
+		b.writePart(&join)
+	}
+	if len(q.WherePart) != 0 {
+		b.writeString(" WHERE ")
+		b.writeParts(q.WherePart, " AND ")
+	}
+	if len(q.GroupByPart) != 0 {
+		b.writeString(" GROUP BY ")
+		for i, group := range q.GroupByPart {
+			if i > 0 {
+				b.writeString(", ")
+			}
+			// 整数字面量保留位置语义，范围及聚合合法性由源端判断。
+			if param, ok := group.(*sb.Literal); ok && param != nil {
+				if number, ok := param.Value.(json.Number); ok && len(number) > 0 && strings.IndexFunc(string(number), func(r rune) bool { return r < '0' || r > '9' }) == -1 {
+					b.writeString(string(number))
+					continue
+				}
+			}
+			b.writeSortGroupExpression(group)
+		}
+	}
+	if len(q.HavingPart) != 0 {
+		b.writeString(" HAVING ")
+		b.writeParts(q.HavingPart, " AND ")
+	}
+	if len(q.OrderByPart) != 0 {
+		b.writeString(" ORDER BY ")
+		for i, order := range q.OrderByPart {
+			if i != 0 {
+				b.writeString(", ")
+			}
+			b.writePart(&order)
+		}
+	}
+	if q.LimitPart != nil {
+		b.writeString(" LIMIT " + strconv.FormatUint(*q.LimitPart, 10))
+	} else if q.OffsetPart != 0 {
+		// MySQL 的 OFFSET 必须与 LIMIT 同时出现。
+		b.writeString(" LIMIT 18446744073709551615")
+	}
+	if q.OffsetPart != 0 {
+		b.writeString(" OFFSET " + strconv.FormatUint(q.OffsetPart, 10))
+	}
+	return b.result()
+}
+
+func tableSql(t sb.Table) (string, []any, error) {
+	text := t.SourceIdentifier
+	if t.Alias != "" {
+		alias, err := quoteIdentifier(t.Alias)
+		if err != nil {
+			return "", nil, err
+		}
+		text += " AS " + alias
+	}
+	return text, nil, nil
+}
+
+func subquerySql(s sb.Subquery) (string, []any, error) {
+	if s.Query == nil {
+		return "", nil, fmt.Errorf("subquery is nil")
+	}
+	alias, err := quoteIdentifier(s.Alias)
+	if err != nil {
+		return "", nil, err
+	}
+	b := sqlBuffer{}
+	b.writeByte('(')
+	b.writePart(s.Query)
+	b.writeString(") AS " + alias)
+	return b.result()
+}
+
+// unionSql 保留集合运算的分支边界；整体排序与分页由外层 SELECT 表达。
+func unionSql(union sb.Union) (string, []any, error) {
+	if union.Left == nil || union.Right == nil {
+		return "", nil, fmt.Errorf("UNION requires two queries")
+	}
+	alias, err := quoteIdentifier(union.Alias)
+	if err != nil {
+		return "", nil, err
+	}
+	b := sqlBuffer{}
+	b.writeByte('(')
+	b.writeUnionBody(&union)
+	b.writeString(") AS " + alias)
+	return b.result()
+}
+
+// writeUnionBody 展开无额外子句的左结合包装，不改变右分支或局部查询边界。
+func (b *sqlBuffer) writeUnionBody(union *sb.Union) {
+	if b.err != nil {
+		return
+	}
+	if union == nil || union.Left == nil || union.Right == nil {
+		b.err = fmt.Errorf("UNION requires two queries")
+		return
+	}
+	if _, err := quoteIdentifier(union.Alias); err != nil {
+		b.err = err
+		return
+	}
+	if left := sb.UnionSource(union.Left); left != nil {
+		b.writeUnionBody(left)
+	} else {
+		b.writePart(unionBranch(union.Left, "_union_left"))
+	}
+	b.writeString(" UNION ")
+	if union.All {
+		b.writeString("ALL ")
+	}
+	b.writePart(unionBranch(union.Right, "_union_right"))
+}
+
+// unionBranch 通过派生表限定分支自己的 ORDER BY、LIMIT 和 OFFSET。
+func unionBranch(query *sb.SelectBuilder, alias string) *sb.SelectBuilder {
+	if len(query.OrderByPart) > 0 || query.LimitPart != nil || query.OffsetPart != 0 {
+		return sb.Select(&sb.Star{}).FromSelect(query, alias)
+	}
+	return query
+}
+
+func joinSql(j sb.Join) (string, []any, error) {
+	var keyword string
+	switch j.Kind {
+	case sb.InnerJoin:
+		keyword = "INNER JOIN"
+	case sb.LeftJoin:
+		keyword = "LEFT JOIN"
+	case sb.RightJoin:
+		keyword = "RIGHT JOIN"
+	case sb.CrossJoin:
+		keyword = "CROSS JOIN"
+	default:
+		return "", nil, fmt.Errorf("invalid JOIN kind")
+	}
+	if j.Kind == sb.CrossJoin && j.On != nil {
+		return "", nil, fmt.Errorf("CROSS JOIN does not accept ON")
+	}
+	b := sqlBuffer{}
+	b.writeString(keyword + " ")
+	b.writePart(j.Source)
+	if j.Kind != sb.CrossJoin {
+		b.writeString(" ON ")
+		b.writePart(j.On)
+	}
+	return b.result()
+}
+
+func joinedTableSql(j sb.JoinedTable) (string, []any, error) {
+	b := sqlBuffer{}
+	b.writeByte('(')
+	b.writePart(j.From)
+	for _, join := range j.Joins {
+		b.writeByte(' ')
+		b.writePart(&join)
+	}
+	b.writeByte(')')
+	return b.result()
+}
+
+func orderSql(o sb.Order) (string, []any, error) {
+	if o.Position != 0 {
+		if o.Expr != nil || o.Nulls != sb.NullsDefault {
+			return "", nil, fmt.Errorf("ORDER BY position conflicts with an expression or NULL ordering")
+		}
+		direction := " ASC"
+		if o.Descending {
+			direction = " DESC"
+		}
+		return strconv.FormatUint(o.Position, 10) + direction, nil, nil
+	}
+	if o.Nulls != sb.NullsDefault && o.Nulls != sb.NullsFirst && o.Nulls != sb.NullsLast {
+		return "", nil, fmt.Errorf("invalid NULL ordering")
+	}
+	direction := " ASC"
+	if o.Descending {
+		direction = " DESC"
+	}
+	b := sqlBuffer{}
+	// MySQL 自带 ASC NULLS FIRST、DESC NULLS LAST；仅相反规则需要额外排序键。
+	if (o.Descending && o.Nulls == sb.NullsFirst) || (!o.Descending && o.Nulls == sb.NullsLast) {
+		b.writeByte('(')
+		b.writePart(o.Expr)
+		b.writeString(" IS NULL)")
+		if o.Nulls == sb.NullsFirst {
+			b.writeString(" DESC, ")
+		} else {
+			b.writeString(" ASC, ")
+		}
+	}
+	b.writeSortGroupExpression(o.Expr)
+	b.writeString(direction)
+	return b.result()
+}
+
+// writeSortGroupExpression 防止 MariaDB 将独立布尔字面量按整数位置序号解析。
+func (b *sqlBuffer) writeSortGroupExpression(expr sb.SqlNode) {
+	if literal, ok := expr.(*sb.Literal); ok && literal != nil {
+		if _, boolean := literal.Value.(bool); boolean {
+			b.writePart(&sb.Cast{Expr: literal, Type: sb.CastInteger})
+			return
+		}
+	}
+	b.writePart(expr)
+}
+
+func quoteIdentifier(name string) (string, error) {
+	if name == "" || !utf8.ValidString(name) || strings.ContainsRune(name, '\x00') {
+		return "", fmt.Errorf("identifier is empty or contains invalid characters")
+	}
+	return "`" + strings.ReplaceAll(name, "`", "``") + "`", nil
+}
+
+func (b *sqlBuffer) writePart(part sb.SqlNode) {
+	if b.err != nil {
+		return
+	}
+	text, args, err := render(part)
+	if err != nil {
+		b.err = err
+		return
+	}
+	if text == "" {
+		b.err = fmt.Errorf("query node generated empty SQL")
+		return
+	}
+	b.writeString(text)
+	b.args = append(b.args, args...)
+}
+
+func (b *sqlBuffer) writeParts(parts []sb.SqlNode, separator string) {
+	for i, part := range parts {
+		if i != 0 {
+			b.writeString(separator)
+		}
+		b.writePart(part)
+		if b.err != nil {
+			return
+		}
+	}
+}
+
+func (b *sqlBuffer) result() (string, []any, error) {
+	if b.err != nil {
+		return "", nil, b.err
+	}
+	return b.text.String(), b.args, nil
+}
+
+// strings.Builder 的写入始终返回 nil 错误。
+func (b *sqlBuffer) writeString(text string) {
+	_, _ = b.text.WriteString(text)
+}
+
+func (b *sqlBuffer) writeByte(value byte) {
+	_ = b.text.WriteByte(value)
+}
+
+// sqlBuilderArguments 保持 SQL 数字字面量的整数/浮点参数类型，小数由生成的 DECIMAL CAST 定型。
+func sqlBuilderArguments(args []any) ([]any, error) {
+	values := append([]any(nil), args...)
+	for i, value := range values {
+		number, ok := value.(json.Number)
+		if !ok {
+			continue
+		}
+		text := string(number)
+		switch {
+		case strings.ContainsAny(text, "eE"):
+			n, err := strconv.ParseFloat(text, 64)
+			if err != nil || math.IsInf(n, 0) || math.IsNaN(n) {
+				return nil, interfaces.NewConditionBuildError("numeric literal is outside the supported source range")
+			}
+			values[i] = n
+		case strings.Contains(text, "."):
+			values[i] = text
+		default:
+			if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+				values[i] = n
+			} else if n, err := strconv.ParseUint(text, 10, 64); err == nil {
+				values[i] = n
+			} else {
+				values[i] = text
+			}
+		}
+	}
+	return values, nil
+}
+
+// ScanSQLBuilderRow reads one retained SQL row and classifies source errors.
+func (c *MariaDBConnector) ScanSQLBuilderRow(rows *sql.Rows, columns []interfaces.ColumnInfo) (map[string]any, error) {
+	row, err := table.ScanSQLRow(rows, columns)
+	return row, mariadbQueryError(err)
 }

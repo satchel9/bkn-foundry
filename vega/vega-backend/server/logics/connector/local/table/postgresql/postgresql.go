@@ -4,23 +4,66 @@
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in the project root for details.
 
-// Package postgresql provides a PostgreSQL table connector: the connection target is a single database; The configuration item "schemas" represents the schema whitelist.
+// Package postgresql provides a table connector for one database with optional schema discovery scope.
 package postgresql
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
-	_ "github.com/lib/pq"
-	"github.com/mitchellh/mapstructure"
+	"github.com/lib/pq"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
-	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
+)
+
+const (
+	// PORT_MIN is the lowest valid TCP port.
+	PORT_MIN = 1
+	// PORT_MAX is the highest valid TCP port.
+	PORT_MAX = 65535
+	// DATABASE_NAME_MAX_LENGTH is the maximum byte length accepted for a configured database name.
+	DATABASE_NAME_MAX_LENGTH = 63
+	// SCHEMA_NAME_MAX_LENGTH is the maximum byte length accepted for a configured schema name.
+	SCHEMA_NAME_MAX_LENGTH = 63
+	// MAX_TIMEOUT_SECONDS keeps the driver timeout within a time.Duration.
+	MAX_TIMEOUT_SECONDS = int64(math.MaxInt64 / int64(time.Second))
+)
+
+var (
+	_ interfaces.TableConnector = (*PostgresqlConnector)(nil)
+
+	sessionTimeoutPattern = regexp.MustCompile(`^\+?([0-9]+(?:\.[0-9]*)?|\.[0-9]+)\s*(us|ms|s|min|h|d)?$`)
+
+	SYSTEM_SCHEMAS = []string{
+		"information_schema",
+		"pg_catalog",
+		"pg_toast",
+	}
+	SYSTEM_SCHEMAS_MAP = map[string]bool{
+		"information_schema": true,
+		"pg_catalog":         true,
+		"pg_toast":           true,
+	}
+	allowedOptions = map[string]struct{}{
+		"timezone":                            {},
+		"sslmode":                             {},
+		"connect_timeout":                     {},
+		"application_name":                    {},
+		"fallback_application_name":           {},
+		"statement_timeout":                   {},
+		"lock_timeout":                        {},
+		"idle_in_transaction_session_timeout": {},
+	}
 )
 
 type postgresqlConfig struct {
@@ -33,124 +76,201 @@ type postgresqlConfig struct {
 	Options  map[string]any `mapstructure:"options"`
 }
 
-var (
-	SYSTEM_SCHEMAS = []string{
-		"information_schema",
-		"pg_catalog",
-		"pg_toast",
-	}
-	SYSTEM_SCHEMAS_MAP = map[string]bool{
-		"information_schema": true,
-		"pg_catalog":         true,
-		"pg_toast":           true,
-	}
-)
-
-const (
-	databaseNameMaxLength = 63 // The default upper limit of PostgreSQL identifiers
-	portMin               = 1
-	portMax               = 65535
-)
-
-// The PostgresqlConnector implements TableConnector (PostgreSQL).
+// PostgresqlConnector implements the PostgreSQL table connector.
 type PostgresqlConnector struct {
-	enabled bool
-
-	config *postgresqlConfig
-
-	connected bool
-	db        *sql.DB
-
+	enabled       bool
+	config        *postgresqlConfig
+	connected     bool
+	db            *sql.DB
 	compatibility postgresqlCompatibility
 }
 
-// NewPostgresqlConnector creates the PostgreSQL connector builder
+// NewPostgresqlConnector creates the PostgreSQL connector builder.
 func NewPostgresqlConnector() interfaces.TableConnector {
 	return &PostgresqlConnector{}
 }
 
-// GetType returns the data source type key (consistent with t_connector_type.f_type, factory registration key).
+// ValidateBuildSchema adds no source-specific restrictions; the service validates common build-key rules.
+func (c *PostgresqlConnector) ValidateBuildSchema(_ *interfaces.Resource) error {
+	return nil
+}
+
+// GetType returns the PostgreSQL connector type.
 func (c *PostgresqlConnector) GetType() string {
-	return interfaces.ConnectorTypePostgreSQL
+	return "postgresql"
 }
 
 // GetName returns the connector name.
 func (c *PostgresqlConnector) GetName() string {
-	return interfaces.ConnectorTypePostgreSQL
+	return "postgresql"
 }
 
-// GetMode returns the connector mode.
+// GetMode returns the local connector mode.
 func (c *PostgresqlConnector) GetMode() string {
 	return interfaces.ConnectorModeLocal
 }
 
-// GetCategory returns the connector category.
+// GetCategory returns the table connector category.
 func (c *PostgresqlConnector) GetCategory() string {
 	return interfaces.ConnectorCategoryTable
 }
 
-// Whether GetEnabled is enabled.
+// SupportDiscover reports the connector's existing discovery capability.
+func (c *PostgresqlConnector) SupportDiscover() bool {
+	return true
+}
+
+// GetEnabled reports whether the connector is enabled.
 func (c *PostgresqlConnector) GetEnabled() bool {
 	return c.enabled
 }
 
-// Set the enabled status of SetEnabled.
+// SetEnabled updates the connector enabled state.
 func (c *PostgresqlConnector) SetEnabled(enabled bool) {
 	c.enabled = enabled
 }
 
-// GetSensitiveFields: Sensitive fields.
-func (c *PostgresqlConnector) GetSensitiveFields() []string {
-	return []string{"password"}
+// GetSensitiveFields lists configuration fields that require encryption.
+func (c *PostgresqlConnector) GetSensitiveFields(_ interfaces.ConnectorConfig) ([]string, error) {
+	return []string{"password"}, nil
 }
 
-// The GetFieldConfig connection form field (must be exactly the same as the JSON of t_connector_type in the migration).
+// GetFieldConfig returns connection form fields matching the connector-type migration.
 func (c *PostgresqlConnector) GetFieldConfig() map[string]interfaces.ConnectorFieldConfig {
 	return map[string]interfaces.ConnectorFieldConfig{
-		"host":     {Name: "主机地址", Type: "string", Description: "数据库服务器主机地址", Required: true, Encrypted: false},
-		"port":     {Name: "端口号", Type: "integer", Description: "数据库服务器端口", Required: true, Encrypted: false},
-		"username": {Name: "用户名", Type: "string", Description: "数据库用户名", Required: true, Encrypted: false},
-		"password": {Name: "密码", Type: "string", Description: "数据库密码", Required: true, Encrypted: true},
-		"database": {Name: "数据库名", Type: "string", Description: "PostgreSQL 连接目标 database", Required: true, Encrypted: false},
-		"schemas":  {Name: "Schema 列表", Type: "array", Description: "可选；为空则扫描当前库下除系统 schema 外的用户 schema；非空则仅扫描列出的 schema", Required: false, Encrypted: false},
-		"options":  {Name: "连接参数", Type: "object", Description: "连接参数（如 sslmode、connect_timeout 等）", Required: false, Encrypted: false},
+		"host":     {Name: "Host", Type: "string", Description: "Database server host", Required: true, Encrypted: false},
+		"port":     {Name: "Port", Type: "integer", Description: "Database server port", Required: true, Encrypted: false},
+		"username": {Name: "Username", Type: "string", Description: "Database username", Required: true, Encrypted: false},
+		"password": {Name: "Password", Type: "string", Description: "Database password", Required: true, Encrypted: true},
+		"database": {Name: "Database", Type: "string", Description: "Target PostgreSQL database", Required: true, Encrypted: false},
+		"schemas":  {Name: "Schemas", Type: "array", Description: "Optional schema names; leave empty to discover non-system schemas in the current database, or list schemas to restrict discovery", Required: false, Encrypted: false},
+		"options":  {Name: "Connection options", Type: "object", Description: "Optional; only timezone, sslmode, connect_timeout, application_name, fallback_application_name, statement_timeout, lock_timeout and idle_in_transaction_session_timeout are supported. connect_timeout is a non-negative integer in seconds; session timeouts accept milliseconds or strings with PostgreSQL time units, and 0 disables them. sslmode defaults to disable; SSL files are unsupported. Client encoding uses the driver default UTF8 and cannot be configured. timezone: if omitted, use the Vega service TZ (default UTC); an empty or whitespace-only string omits the startup parameter and uses the database session default. Non-empty values are trimmed and validated by PostgreSQL during the connection test, without offset sign conversion.", Required: false, Encrypted: false},
 	}
 }
 
 // New creates a connector instance from the configuration.
 func (c *PostgresqlConnector) New(cfg interfaces.ConnectorConfig) (interfaces.Connector, error) {
 	var pCfg postgresqlConfig
-	if err := mapstructure.Decode(cfg, &pCfg); err != nil {
-		return nil, fmt.Errorf("failed to decode postgresql config: %w", err)
+	if err := common.DecodeMapToStruct(cfg, &pCfg); err != nil {
+		return nil, errors.New("failed to decode postgresql config")
 	}
 
 	if pCfg.Host == "" || pCfg.Port == 0 || pCfg.Username == "" || pCfg.Password == "" || pCfg.Database == "" {
 		return nil, fmt.Errorf("postgresql connector config is incomplete")
 	}
 
-	if pCfg.Port < portMin || pCfg.Port > portMax {
-		return nil, fmt.Errorf("port %d is out of valid range (%d-%d)", pCfg.Port, portMin, portMax)
+	if pCfg.Port < PORT_MIN || pCfg.Port > PORT_MAX {
+		return nil, fmt.Errorf("port %d is out of valid range (%d-%d)", pCfg.Port, PORT_MIN, PORT_MAX)
 	}
 
-	if len(pCfg.Database) > databaseNameMaxLength {
-		return nil, fmt.Errorf("database name exceeds maximum length of %d characters", databaseNameMaxLength)
+	if len(pCfg.Database) > DATABASE_NAME_MAX_LENGTH {
+		return nil, fmt.Errorf("database name exceeds maximum length of %d characters", DATABASE_NAME_MAX_LENGTH)
 	}
 
 	seen := make(map[string]bool)
 	for _, s := range pCfg.Schemas {
-		if len(s) > databaseNameMaxLength {
-			return nil, fmt.Errorf("schema name '%s' exceeds maximum length of %d characters", s, databaseNameMaxLength)
+		if len(s) > SCHEMA_NAME_MAX_LENGTH {
+			return nil, fmt.Errorf("schema name '%s' exceeds maximum length of %d characters", s, SCHEMA_NAME_MAX_LENGTH)
 		}
-		// Check whether there are duplicate elements in the array
+		// Reject duplicate schema names using exact source spelling.
 		if seen[s] {
 			return nil, fmt.Errorf("duplicate element found in 'schemas': %s", s)
 		}
 		seen[s] = true
 	}
 
+	options, err := c.normalizeOptions(pCfg.Options)
+	if err != nil {
+		return nil, err
+	}
+	pCfg.Options = options
+
 	return &PostgresqlConnector{
 		config: &pCfg,
 	}, nil
+}
+
+// normalizeOptions validates allowed options and trims text values without changing timeout units.
+func (c *PostgresqlConnector) normalizeOptions(options map[string]any) (map[string]any, error) {
+	normalized := make(map[string]any, len(options)+1)
+	for key, value := range options {
+		name := strings.TrimSpace(key)
+		if _, allowed := allowedOptions[name]; !allowed {
+			return nil, fmt.Errorf("unsupported postgresql option %q", key)
+		}
+		if _, duplicate := normalized[name]; duplicate {
+			return nil, fmt.Errorf("duplicate postgresql option %q", name)
+		}
+		switch name {
+		case "timezone":
+			zone, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("postgresql option timezone must be a string")
+			}
+			value = strings.TrimSpace(zone)
+		case "sslmode":
+			mode, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("postgresql option sslmode must be a string")
+			}
+			mode = strings.TrimSpace(mode)
+			switch mode {
+			case "", "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+				value = mode
+			default:
+				return nil, fmt.Errorf("postgresql option sslmode must be disable, allow, prefer, require, verify-ca or verify-full")
+			}
+		case "connect_timeout":
+			var seconds int64
+			var ok bool
+			if text, isString := value.(string); isString {
+				var err error
+				text = strings.TrimSpace(text)
+				seconds, err = strconv.ParseInt(text, 10, 64)
+				value = text
+				ok = err == nil
+			} else {
+				seconds, ok = common.NumberAsInt64(value)
+			}
+			// lib/pq converts seconds to time.Duration; reject overflow before opening a connection.
+			if !ok || seconds < 0 || seconds > MAX_TIMEOUT_SECONDS {
+				return nil, fmt.Errorf("postgresql option connect_timeout must be a non-negative integer not greater than %d seconds", MAX_TIMEOUT_SECONDS)
+			}
+		case "statement_timeout", "lock_timeout", "idle_in_transaction_session_timeout":
+			var amount float64
+			var ok bool
+			milliseconds := true
+			if text, isString := value.(string); isString {
+				text = strings.TrimSpace(text)
+				match := sessionTimeoutPattern.FindStringSubmatch(text)
+				if match == nil {
+					return nil, fmt.Errorf("postgresql option %s must be a non-negative timeout in milliseconds or with a PostgreSQL time unit", name)
+				}
+				var err error
+				amount, err = strconv.ParseFloat(match[1], 64)
+				ok = err == nil
+				milliseconds = match[2] == "" || match[2] == "ms"
+				value = text
+			} else {
+				amount, ok = common.NumberAsFloat64(value)
+			}
+			// Validate millisecond values locally; PostgreSQL checks ranges for other units.
+			if !ok || math.IsNaN(amount) || math.IsInf(amount, 0) || amount < 0 || (milliseconds && amount > math.MaxInt32) {
+				return nil, fmt.Errorf("postgresql option %s must be a non-negative finite timeout; millisecond values must not exceed %d", name, math.MaxInt32)
+			}
+		case "application_name", "fallback_application_name":
+			applicationName, ok := value.(string)
+			if !ok {
+				return nil, fmt.Errorf("postgresql option %s must be a string", name)
+			}
+			value = strings.TrimSpace(applicationName)
+		}
+		normalized[name] = value
+	}
+	if mode, exists := normalized["sslmode"]; !exists || mode == "" {
+		normalized["sslmode"] = "disable"
+	}
+	return normalized, nil
 }
 
 // connectionString builds the PostgreSQL connection URL from connector settings.
@@ -162,20 +282,31 @@ func (c *PostgresqlConnector) connectionString() string {
 		Path:   "/" + strings.TrimPrefix(c.config.Database, "/"),
 	}
 	q := u.Query()
+	// 未配置时沿用服务时区；显式空串不发送启动参数，非空原生值由 PG 验证。
+	q.Set("timezone", common.ServerTimeZone())
 	if c.config.Options != nil {
 		for k, v := range c.config.Options {
-			q.Set(k, fmt.Sprintf("%v", v))
+			if k == "timezone" && v == "" {
+				q.Del(k)
+				continue
+			}
+			if integer, ok := common.NumberAsInt64(v); ok {
+				// Encode integer options without scientific notation when serializing JSON numbers.
+				q.Set(k, strconv.FormatInt(integer, 10))
+			} else {
+				q.Set(k, fmt.Sprintf("%v", v))
+			}
 		}
 	}
 	if q.Get("sslmode") == "" {
 		q.Set("sslmode", "disable")
 	}
-	q.Set("timezone", table.ServerTimeZone())
 	u.RawQuery = q.Encode()
 	return u.String()
 }
 
-// Connect establishes a connection.
+// Connect opens and verifies a pool, then detects metadata-query compatibility.
+// Failed initialization closes the candidate pool before returning the error.
 func (c *PostgresqlConnector) Connect(ctx context.Context) error {
 	if c.connected {
 		return nil
@@ -183,68 +314,95 @@ func (c *PostgresqlConnector) Connect(ctx context.Context) error {
 
 	db, err := sql.Open("postgres", c.connectionString())
 	if err != nil {
-		return err
+		return connectionError(ctx, "failed to open PostgreSQL connection", err)
 	}
 
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return err
+		return connectionError(ctx, "failed to ping PostgreSQL connection", err)
 	}
 
-	compatibility := detectPostgresqlCompatibility(ctx, db)
-	if ctxErr := ctx.Err(); ctxErr != nil {
+	compatibility, err := detectPostgresqlCompatibility(ctx, db)
+	if err != nil {
 		_ = db.Close()
-		return ctxErr
+		return connectionError(ctx, "failed to detect PostgreSQL compatibility", err)
 	}
 
 	c.db, c.compatibility, c.connected = db, compatibility, true
 	return nil
 }
 
-// Close to close the connection.
+// Close releases the connection pool and clears connection state.
 func (c *PostgresqlConnector) Close(ctx context.Context) error {
+	c.compatibility = postgresqlCompatibility{}
 	if c.db != nil {
 		err := c.db.Close()
 		c.connected = false
 		c.db = nil
-		return err
+		if err != nil {
+			return connectionError(ctx, "failed to close PostgreSQL connection", err)
+		}
+		return nil
 	}
 	return nil
 }
 
-// Ping detects the connection.
+// Ping connects if necessary and checks source availability.
 func (c *PostgresqlConnector) Ping(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
-		return err
+		return fmt.Errorf("failed to connect for ping: %w", err)
 	}
-	return c.db.PingContext(ctx)
+	if err := c.db.PingContext(ctx); err != nil {
+		return connectionError(ctx, "failed to ping PostgreSQL connection", err)
+	}
+	return nil
 }
 
-// TestConnection test connection; If a schema whitelist is configured, verify the existence.
+// TestConnection verifies the connection and checks configured schemas.
 func (c *PostgresqlConnector) TestConnection(ctx context.Context) error {
 	if err := c.Connect(ctx); err != nil {
-		return err
+		return fmt.Errorf("failed to connect for connection test: %w", err)
 	}
 	if len(c.config.Schemas) > 0 {
 		if err := c.validateSchemas(ctx); err != nil {
-			return err
+			return fmt.Errorf("failed to validate configured schemas: %w", err)
 		}
 	}
 	return nil
 }
 
-// validateSchemas checks that every configured schema exists and is accessible.
+// validateSchemas checks that every configured schema exists in the database.
 func (c *PostgresqlConnector) validateSchemas(ctx context.Context) error {
 	for _, s := range c.config.Schemas {
 		var exists bool
 		err := c.db.QueryRowContext(ctx,
 			`SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)`, s).Scan(&exists)
 		if err != nil {
-			return fmt.Errorf("failed to validate schema %q: %w", s, err)
+			return connectionError(ctx, "failed to validate schema", err)
 		}
 		if !exists {
 			return fmt.Errorf("schema not found: %s", s)
 		}
 	}
 	return nil
+}
+
+// connectionError preserves safe failure classifications without exposing driver messages or connection strings.
+func connectionError(ctx context.Context, operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s: %w", operation, ctx.Err())
+	}
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cause) {
+			return fmt.Errorf("%s: %w", operation, cause)
+		}
+	}
+	var sourceError *pq.Error
+	if errors.As(err, &sourceError) && len(sourceError.Code) == 5 && strings.IndexFunc(string(sourceError.Code), func(char rune) bool { return (char < 'A' || char > 'Z') && (char < '0' || char > '9') }) == -1 {
+		return fmt.Errorf("%s: %w", operation, &pq.Error{Code: sourceError.Code, Message: "source rejected the connection request"})
+	}
+	return errors.New(operation)
 }

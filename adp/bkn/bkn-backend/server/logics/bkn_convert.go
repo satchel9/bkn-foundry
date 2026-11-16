@@ -7,11 +7,13 @@
 package logics
 
 import (
+	"encoding/json"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
+	"math"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	cond "bkn-backend/common/condition"
-	"bkn-backend/interfaces"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func ToADPNetWork(bknNetwork *bknsdk.BknNetwork) *interfaces.KN {
@@ -47,211 +49,6 @@ func ToBKNNetWork(kn *interfaces.KN) *bknsdk.BknNetwork {
 	}
 }
 
-// ── Metric (BKN ↔ MetricDefinition) ───────────────────────────────────────────
-
-// ToADPMetricDefinition converts a parsed BKN metric file into the persisted/API MetricDefinition shape.
-func ToADPMetricDefinition(knID, branch string, m *bknsdk.BknMetric) *interfaces.MetricDefinition {
-	if m == nil {
-		return nil
-	}
-	comment := m.Description
-	if comment == "" {
-		comment = m.Summary
-	}
-	metricType := m.MetricAttributes.MetricType
-	if metricType == "" && m.Formula != nil {
-		metricType = m.Formula.Kind
-	}
-
-	out := &interfaces.MetricDefinition{
-		ID:     m.ID,
-		KnID:   knID,
-		Branch: branch,
-		Name:   m.Name,
-		CommonInfo: interfaces.CommonInfo{
-			Comment:       comment,
-			Tags:          append([]string(nil), m.Tags...),
-			BKNRawContent: m.RawContent,
-		},
-		UnitType:   m.MetricAttributes.UnitType,
-		Unit:       m.MetricAttributes.Unit,
-		MetricType: metricType,
-		ScopeType:  m.ScopeType,
-		ScopeRef:   m.ScopeRef,
-	}
-
-	if len(m.TimeDimensions) > 0 {
-		out.TimeDimension = &interfaces.MetricTimeDimension{
-			Property:           m.TimeDimensions[0].Property,
-			DefaultRangePolicy: m.TimeDimensions[0].Policy,
-		}
-	}
-
-	if len(m.AnalysisDimensions) > 0 {
-		out.AnalysisDimensions = make([]interfaces.MetricAnalysisDimension, 0, len(m.AnalysisDimensions))
-		for _, row := range m.AnalysisDimensions {
-			out.AnalysisDimensions = append(out.AnalysisDimensions, interfaces.MetricAnalysisDimension{
-				Name:        row.Name,
-				DisplayName: row.DisplayName,
-			})
-		}
-	}
-
-	if m.Formula != nil && m.Formula.Atomic != nil {
-		atomic := m.Formula.Atomic
-		out.CalculationFormula = &interfaces.MetricCalculationFormula{
-			Condition: metricConditionToCondCfg(atomic.Condition),
-			Having:    metricHavingToADP(atomic.Having),
-		}
-		if atomic.Aggregation != nil {
-			out.CalculationFormula.Aggregation = interfaces.MetricAggregation{
-				Property: atomic.Aggregation.Property,
-				Aggr:     atomic.Aggregation.Aggr,
-			}
-		}
-		for _, g := range atomic.GroupBy {
-			out.CalculationFormula.GroupBy = append(out.CalculationFormula.GroupBy, interfaces.MetricGroupBy{
-				Property:    g.Property,
-				Description: g.Description,
-			})
-		}
-		for _, o := range atomic.OrderBy {
-			out.CalculationFormula.OrderBy = append(out.CalculationFormula.OrderBy, interfaces.MetricOrderBy{
-				Property:  o.Property,
-				Direction: o.Direction,
-			})
-		}
-	}
-
-	return out
-}
-
-// ToBKNMetricDefinition converts MetricDefinition (export path) into SDK BknMetric for tar serialization.
-func ToBKNMetricDefinition(m *interfaces.MetricDefinition) *bknsdk.BknMetric {
-	if m == nil {
-		return nil
-	}
-	out := &bknsdk.BknMetric{
-		BknMetricFrontmatter: bknsdk.BknMetricFrontmatter{
-			ID:   m.ID,
-			Name: m.Name,
-			Tags: append([]string(nil), m.Tags...),
-		},
-		MetricAttributes: bknsdk.MetricAttributes{
-			MetricType: m.MetricType,
-			UnitType:   m.UnitType,
-			Unit:       m.Unit,
-		},
-		Description: m.Comment,
-		RawContent:  m.BKNRawContent,
-		ScopeType:   m.ScopeType,
-		ScopeRef:    m.ScopeRef,
-	}
-
-	if m.Comment != "" {
-		out.Summary = bknsdk.ExtractSummary(m.Comment)
-	}
-
-	if m.TimeDimension != nil {
-		out.TimeDimensions = []bknsdk.MetricTimeDimRow{
-			{Property: m.TimeDimension.Property, Policy: m.TimeDimension.DefaultRangePolicy},
-		}
-	}
-
-	for _, ad := range m.AnalysisDimensions {
-		out.AnalysisDimensions = append(out.AnalysisDimensions, bknsdk.MetricAnalysisDimRow{
-			Name:        ad.Name,
-			DisplayName: ad.DisplayName,
-		})
-	}
-
-	if m.CalculationFormula != nil {
-		cf := m.CalculationFormula
-		atomic := &bknsdk.MetricAtomic{
-			Condition: condCfgToMetricCondition(cf.Condition),
-			Having:    adpHavingToBKN(cf.Having),
-		}
-		if cf.Aggregation.Property != "" || cf.Aggregation.Aggr != "" {
-			atomic.Aggregation = &bknsdk.MetricAggregation{
-				Property: cf.Aggregation.Property,
-				Aggr:     cf.Aggregation.Aggr,
-			}
-		}
-		for _, g := range cf.GroupBy {
-			atomic.GroupBy = append(atomic.GroupBy, bknsdk.MetricGroupBy{
-				Property:    g.Property,
-				Description: g.Description,
-			})
-		}
-		for _, o := range cf.OrderBy {
-			atomic.OrderBy = append(atomic.OrderBy, bknsdk.MetricOrderBy{
-				Property:  o.Property,
-				Direction: o.Direction,
-			})
-		}
-		out.Formula = &bknsdk.MetricFormula{
-			Kind:   m.MetricType,
-			Atomic: atomic,
-		}
-	}
-
-	return out
-}
-
-func metricConditionToCondCfg(c *bknsdk.MetricCondition) *cond.CondCfg {
-	if c == nil {
-		return nil
-	}
-	out := &cond.CondCfg{
-		Field:     c.Field,
-		Operation: c.Operation,
-		ValueOptCfg: cond.ValueOptCfg{
-			Value: c.Value,
-		},
-	}
-	for _, subCond := range c.SubConds {
-		out.SubConds = append(out.SubConds, metricConditionToCondCfg(subCond))
-	}
-	return out
-}
-
-func condCfgToMetricCondition(c *cond.CondCfg) *bknsdk.MetricCondition {
-	if c == nil {
-		return nil
-	}
-	out := &bknsdk.MetricCondition{
-		Field:     c.Field,
-		Operation: c.Operation,
-		Value:     c.Value,
-	}
-	for _, subCond := range c.SubConds {
-		out.SubConds = append(out.SubConds, condCfgToMetricCondition(subCond))
-	}
-	return out
-}
-
-func metricHavingToADP(h *bknsdk.MetricHaving) *interfaces.MetricHaving {
-	if h == nil {
-		return nil
-	}
-	return &interfaces.MetricHaving{
-		Field:     h.Field,
-		Operation: h.Operation,
-		Value:     h.Value,
-	}
-}
-
-func adpHavingToBKN(h *interfaces.MetricHaving) *bknsdk.MetricHaving {
-	if h == nil {
-		return nil
-	}
-	return &bknsdk.MetricHaving{
-		Field:     h.Field,
-		Operation: h.Operation,
-		Value:     h.Value,
-	}
-}
-
 // ToADPObjectType converts a BKN ObjectType to an ADP ObjectType.
 func ToADPObjectType(knID string, branch string, bknObj *bknsdk.BknObjectType) *interfaces.ObjectType {
 	adpObj := &interfaces.ObjectType{
@@ -266,8 +63,10 @@ func ToADPObjectType(knID string, branch string, bknObj *bknsdk.BknObjectType) *
 			Tags:    bknObj.Tags,
 			Comment: bknObj.Description,
 		},
-		KNID:   knID,
-		Branch: branch,
+		Aliases:   interfaces.NormalizeAliases(bknObj.Aliases),
+		Lifecycle: toADPLifecycle(bknObj.Lifecycle),
+		KNID:      knID,
+		Branch:    branch,
 	}
 
 	// Convert DataSource.
@@ -280,23 +79,7 @@ func ToADPObjectType(knID string, branch string, bknObj *bknsdk.BknObjectType) *
 	}
 
 	// Convert DataProperties.
-	for _, dp := range bknObj.DataProperties {
-		adpDP := &interfaces.DataProperty{
-			Name:        dp.Name,
-			DisplayName: dp.DisplayName,
-			Type:        dp.Type,
-			Comment:     dp.Description,
-			MaskRule:    dp.MaskRule,
-		}
-
-		if dp.MappedField != "" {
-			adpDP.MappedField = &interfaces.Field{
-				Name: dp.MappedField,
-			}
-		}
-
-		adpObj.DataProperties = append(adpObj.DataProperties, adpDP)
-	}
+	adpObj.DataProperties = toADPDataProperties(bknObj.DataProperties)
 
 	// Convert LogicProperties.
 	for _, lp := range bknObj.LogicProperties {
@@ -349,10 +132,12 @@ func ToADPObjectType(knID string, branch string, bknObj *bknsdk.BknObjectType) *
 func ToBKNObjectType(adpObj *interfaces.ObjectType) *bknsdk.BknObjectType {
 	bknObj := &bknsdk.BknObjectType{
 		BknObjectTypeFrontmatter: bknsdk.BknObjectTypeFrontmatter{
-			Type: interfaces.MODULE_TYPE_OBJECT_TYPE,
-			ID:   adpObj.OTID,
-			Name: adpObj.OTName,
-			Tags: adpObj.Tags,
+			Type:      interfaces.MODULE_TYPE_OBJECT_TYPE,
+			ID:        adpObj.OTID,
+			Name:      adpObj.OTName,
+			Tags:      adpObj.Tags,
+			Aliases:   adpObj.Aliases,
+			Lifecycle: toBKNLifecycle(adpObj.Lifecycle),
 		},
 		Summary:        bknsdk.ExtractSummary(adpObj.Comment),
 		Description:    adpObj.Comment,
@@ -371,21 +156,7 @@ func ToBKNObjectType(adpObj *interfaces.ObjectType) *bknsdk.BknObjectType {
 	}
 
 	// Convert DataProperties.
-	for _, adpDP := range adpObj.DataProperties {
-		dp := &bknsdk.DataProperty{
-			Name:        adpDP.Name,
-			DisplayName: adpDP.DisplayName,
-			Type:        adpDP.Type,
-			Description: adpDP.Comment,
-			MaskRule:    adpDP.MaskRule,
-		}
-
-		if adpDP.MappedField != nil {
-			dp.MappedField = adpDP.MappedField.Name
-		}
-
-		bknObj.DataProperties = append(bknObj.DataProperties, dp)
-	}
+	bknObj.DataProperties = toBKNDataProperties(adpObj.DataProperties)
 
 	// Convert LogicProperties.
 	for _, adpLP := range adpObj.LogicProperties {
@@ -453,6 +224,21 @@ func ToADPRelationType(knID string, branch string, bknRel *bknsdk.BknRelationTyp
 		},
 		KNID:   knID,
 		Branch: branch,
+		RelationDeclarations: interfaces.RelationDeclarations{
+			ReverseName:  bknRel.ReverseName,
+			Aliases:      interfaces.NormalizeAliases(bknRel.Aliases),
+			Cardinality:  bknRel.Endpoint.Cardinality,
+			Lifecycle:    toADPLifecycle(bknRel.Lifecycle),
+			Importance:   bknRel.Importance,
+			FallbackFor:  bknRel.FallbackFor,
+			Verification: bknRel.Verification,
+		},
+	}
+	if len(bknRel.RequiredEnds) > 0 || len(bknRel.Characteristics) > 0 {
+		relType.Constraints = &interfaces.RelationConstraints{
+			Required:        append([]string(nil), bknRel.RequiredEnds...),
+			Characteristics: append([]string(nil), bknRel.Characteristics...),
+		}
 	}
 
 	// Convert Endpoint.
@@ -498,6 +284,7 @@ func ToADPRelationType(knID string, branch string, bknRel *bknsdk.BknRelationTyp
 					TargetProp: interfaces.SimpleProperty{Name: rule.TargetProperty},
 				})
 			}
+			indirect.Properties = toADPDataProperties(bknRel.DataProperties)
 			relType.MappingRules = indirect
 
 		case *bknsdk.FilteredCrossJoinMapping:
@@ -523,14 +310,29 @@ func ToBKNRelationType(adpRel *interfaces.RelationType) *bknsdk.BknRelationType 
 			ID:   adpRel.RTID,
 			Name: adpRel.RTName,
 			Tags: adpRel.Tags,
+
+			ReverseName:  adpRel.ReverseName,
+			Aliases:      adpRel.Aliases,
+			Importance:   adpRel.Importance,
+			FallbackFor:  adpRel.FallbackFor,
+			Verification: adpRel.Verification,
+			Lifecycle:    toBKNLifecycle(adpRel.Lifecycle),
 		},
 		Summary:     bknsdk.ExtractSummary(adpRel.Comment),
 		Description: adpRel.Comment,
 		Endpoint: bknsdk.Endpoint{
-			Source: adpRel.SourceObjectTypeID,
-			Target: adpRel.TargetObjectTypeID,
-			Type:   adpRel.Type,
+			Source:      adpRel.SourceObjectTypeID,
+			Target:      adpRel.TargetObjectTypeID,
+			Type:        adpRel.Type,
+			Cardinality: adpRel.Cardinality,
 		},
+	}
+	if adpRel.Constraints != nil {
+		bknRel.RequiredEnds = append([]string(nil), adpRel.Constraints.Required...)
+		bknRel.Characteristics = append([]string(nil), adpRel.Constraints.Characteristics...)
+	}
+	if bknRel.Importance == interfaces.IMPORTANCE_PRIMARY {
+		bknRel.Importance = ""
 	}
 
 	// Convert MappingRules.
@@ -568,6 +370,7 @@ func ToBKNRelationType(adpRel *interfaces.RelationType) *bknsdk.BknRelationType 
 				})
 			}
 			bknRel.MappingRules = indirectRules
+			bknRel.DataProperties = toBKNDataProperties(rules.Properties)
 		case *interfaces.FilteredCrossJoinMapping:
 			filteredRules := &bknsdk.FilteredCrossJoinMapping{
 				SourceCondition: toBKNCondCfg(rules.SourceCondition),
@@ -596,13 +399,21 @@ func ToADPActionType(knID string, branch string, bknAction *bknsdk.BknActionType
 			Tags:    bknAction.Tags,
 			Comment: bknAction.Description,
 		},
-		KNID:   knID,
-		Branch: branch,
+		Aliases:   interfaces.NormalizeAliases(bknAction.Aliases),
+		Lifecycle: toADPLifecycle(bknAction.Lifecycle),
+		KNID:      knID,
+		Branch:    branch,
 	}
 	if adpAction.ActionIntent == "" && bknAction.ActionType != "" {
 		adpAction.ActionIntent = bknAction.ActionType
 	}
 
+	if cfg := bknAction.OperationConfig; cfg != nil {
+		adpAction.OperationConfig = &interfaces.ActionOperationConfig{
+			Type: cfg.Type, RelationTypeID: cfg.RelationTypeID, RelationOperation: cfg.RelationOperation,
+			AnchorRole: cfg.AnchorRole, OtherObjectCondition: toADPActionCondCfg(cfg.OtherObjectCondition),
+		}
+	}
 	for _, ic := range bknAction.ImpactContracts {
 		if ic == nil {
 			continue
@@ -674,6 +485,8 @@ func ToBKNActionType(adpAction *interfaces.ActionType) *bknsdk.BknActionType {
 			Tags:         adpAction.Tags,
 			ActionType:   adpAction.ActionType,
 			ActionIntent: adpAction.ActionIntent,
+			Aliases:      adpAction.Aliases,
+			Lifecycle:    toBKNLifecycle(adpAction.Lifecycle),
 		},
 		Summary:     bknsdk.ExtractSummary(adpAction.Comment),
 		Description: adpAction.Comment,
@@ -686,6 +499,12 @@ func ToBKNActionType(adpAction *interfaces.ActionType) *bknsdk.BknActionType {
 		bknAction.ActionType = bknAction.ActionIntent
 	}
 
+	if cfg := adpAction.OperationConfig; cfg != nil {
+		bknAction.OperationConfig = &bknsdk.ActionOperationConfig{
+			Type: cfg.Type, RelationTypeID: cfg.RelationTypeID, RelationOperation: cfg.RelationOperation,
+			AnchorRole: cfg.AnchorRole, OtherObjectCondition: toBKNActionCondCfg(cfg.OtherObjectCondition),
+		}
+	}
 	for _, ic := range adpAction.ImpactContracts {
 		bknAction.ImpactContracts = append(bknAction.ImpactContracts,
 			&bknsdk.ImpactContractItem{
@@ -825,10 +644,8 @@ func toADPCondCfg(bknCond *bknsdk.CondCfg) *cond.CondCfg {
 	adpCond := &cond.CondCfg{
 		Field:     bknCond.Field,
 		Operation: bknCond.Operation,
-		ValueOptCfg: cond.ValueOptCfg{
-			ValueFrom: bknCond.ValueFrom,
-			Value:     bknCond.Value,
-		},
+		ValueFrom: bknCond.ValueFrom,
+		Value:     bknCond.Value,
 	}
 
 	for _, subCond := range bknCond.SubConds {
@@ -848,10 +665,8 @@ func toADPActionCondCfg(bknCond *bknsdk.ActionCondCfg) *interfaces.ActionCondCfg
 		ObjectTypeID: bknCond.ObjectTypeID,
 		Field:        bknCond.Field,
 		Operation:    bknCond.Operation,
-		ValueOptCfg: cond.ValueOptCfg{
-			ValueFrom: bknCond.ValueFrom,
-			Value:     bknCond.Value,
-		},
+		ValueFrom:    bknCond.ValueFrom,
+		Value:        bknCond.Value,
 	}
 
 	for _, subCond := range bknCond.SubConds {
@@ -900,4 +715,215 @@ func toBKNActionCondCfg(adpCond *interfaces.ActionCondCfg) *bknsdk.ActionCondCfg
 	}
 
 	return bknCond
+}
+
+// toADPDataProperties converts the data properties of an object type or a relation type.
+func toADPDataProperties(props []*bknsdk.DataProperty) []*interfaces.DataProperty {
+	var out []*interfaces.DataProperty
+	for _, dp := range props {
+		adpDP := &interfaces.DataProperty{
+			Name:        dp.Name,
+			DisplayName: dp.DisplayName,
+			Type:        dp.Type,
+			Comment:     dp.Description,
+			MaskRule:    dp.MaskRule,
+			Aliases:     interfaces.NormalizeAliases(dp.Aliases),
+			Semantic:    dp.Semantic,
+			Required:    dp.Required,
+			Constraints: toADPConstraints(dp.Constraints),
+		}
+		if dp.MappedField != "" {
+			adpDP.MappedField = &interfaces.Field{
+				Name: dp.MappedField,
+			}
+		}
+		out = append(out, adpDP)
+	}
+	return out
+}
+
+// toBKNDataProperties converts the data properties of an object type or a relation type.
+func toBKNDataProperties(props []*interfaces.DataProperty) []*bknsdk.DataProperty {
+	var out []*bknsdk.DataProperty
+	for _, adpDP := range props {
+		if adpDP == nil {
+			continue
+		}
+		dp := &bknsdk.DataProperty{
+			Name:        adpDP.Name,
+			DisplayName: adpDP.DisplayName,
+			Type:        adpDP.Type,
+			Description: adpDP.Comment,
+			MaskRule:    adpDP.MaskRule,
+			Aliases:     adpDP.Aliases,
+			Semantic:    adpDP.Semantic,
+			Required:    adpDP.Required,
+			Constraints: toBKNConstraints(adpDP.Constraints),
+		}
+		if adpDP.MappedField != nil {
+			dp.MappedField = adpDP.MappedField.Name
+		}
+		out = append(out, dp)
+	}
+	return out
+}
+
+// toADPLifecycle converts a lifecycle; nil, active, stays nil.
+func toADPLifecycle(lc *bknsdk.Lifecycle) *interfaces.Lifecycle {
+	if lc == nil {
+		return nil
+	}
+	return interfaces.NormalizeLifecycle(&interfaces.Lifecycle{Status: lc.Status, Reason: lc.Reason, ReplacedBy: lc.ReplacedBy})
+}
+
+// toBKNLifecycle converts a lifecycle; nil, active, stays nil.
+func toBKNLifecycle(lc *interfaces.Lifecycle) *bknsdk.Lifecycle {
+	if lc == nil {
+		return nil
+	}
+	return &bknsdk.Lifecycle{Status: lc.Status, Reason: lc.Reason, ReplacedBy: lc.ReplacedBy}
+}
+
+// toADPConstraints carries a property's ### Property Constraints into the stored model.
+func toADPConstraints(c *bknsdk.PropertyConstraints) *interfaces.PropertyConstraints {
+	if c == nil {
+		return nil
+	}
+	out := &interfaces.PropertyConstraints{
+		ValueType: c.ValueType, Pattern: c.Pattern, Unit: c.Unit, Unique: c.Unique, CRS: c.CRS, Timezone: c.Timezone,
+	}
+	if c.Range != nil {
+		out.Range = &interfaces.ValueRange{Min: c.Range.Min, Max: c.Range.Max}
+	}
+	if c.Length != nil {
+		out.Length = &interfaces.LengthRange{Min: c.Length.Min, Max: c.Length.Max}
+	}
+	return out
+}
+
+// toBKNConstraints carries stored constraints into the specification model. A bound read from JSON
+// is a float64; a whole number goes back as an integer, so a 3.0 export writes 0, not 0.0.
+func toBKNConstraints(c *interfaces.PropertyConstraints) *bknsdk.PropertyConstraints {
+	if c.IsEmpty() {
+		return nil
+	}
+	out := &bknsdk.PropertyConstraints{
+		ValueType: c.ValueType, Pattern: c.Pattern, Unit: c.Unit, Unique: c.Unique, CRS: c.CRS, Timezone: c.Timezone,
+	}
+	if c.Range != nil {
+		out.Range = &bknsdk.ValueRange{Min: rangeBound(c.Range.Min), Max: rangeBound(c.Range.Max)}
+	}
+	if c.Length != nil {
+		out.Length = &bknsdk.LengthRange{Min: c.Length.Min, Max: c.Length.Max}
+	}
+	return out
+}
+
+func rangeBound(v any) any {
+	switch n := v.(type) {
+	case float64:
+		if n == math.Trunc(n) && math.Abs(n) < 1<<53 {
+			return int64(n)
+		}
+	case int:
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+		if f, err := n.Float64(); err == nil {
+			return f
+		}
+	}
+	return v
+}
+
+// ToADPValueType converts a BKN value type to the stored model.
+func ToADPValueType(knID string, branch string, vt *bknsdk.BknValueType) *interfaces.ValueType {
+	out := &interfaces.ValueType{
+		VTID:   vt.ID,
+		VTName: vt.Name,
+		CommonInfo: interfaces.CommonInfo{
+			Tags:          vt.Tags,
+			Comment:       vt.Description,
+			BKNRawContent: vt.RawContent,
+		},
+		KNID:     knID,
+		Branch:   branch,
+		BaseType: vt.BaseType,
+		ValueTypeDefinition: interfaces.ValueTypeDefinition{
+			Pattern: vt.Pattern,
+			Unit:    vt.Unit,
+		},
+		ModuleType: interfaces.MODULE_TYPE_VALUE_TYPE,
+	}
+	if vt.Enum != nil {
+		out.Enum = make([]*interfaces.ValueTypeEnumItem, 0, len(vt.Enum))
+		for _, item := range vt.Enum {
+			out.Enum = append(out.Enum, &interfaces.ValueTypeEnumItem{
+				Value: item.Value, Display: item.Display, Deprecated: item.Deprecated, Description: item.Description,
+			})
+		}
+	}
+	if vt.Range != nil {
+		out.Range = &interfaces.ValueRange{Min: vt.Range.Min, Max: vt.Range.Max}
+	}
+	if vt.Length != nil {
+		out.Length = &interfaces.LengthRange{Min: vt.Length.Min, Max: vt.Length.Max}
+	}
+	return out
+}
+
+// ToBKNValueType converts a stored value type to the specification model.
+func ToBKNValueType(vt *interfaces.ValueType) *bknsdk.BknValueType {
+	out := &bknsdk.BknValueType{
+		BknValueTypeFrontmatter: bknsdk.BknValueTypeFrontmatter{
+			Type: interfaces.MODULE_TYPE_VALUE_TYPE,
+			ID:   vt.VTID,
+			Name: vt.VTName,
+			Tags: vt.Tags,
+		},
+		Summary:     bknsdk.ExtractSummary(vt.Comment),
+		Description: vt.Comment,
+		BaseType:    vt.BaseType,
+		Pattern:     vt.Pattern,
+		Unit:        vt.Unit,
+	}
+	if vt.Enum != nil {
+		out.Enum = make([]*bknsdk.ValueTypeEnumItem, 0, len(vt.Enum))
+		for _, item := range vt.Enum {
+			if item == nil {
+				continue
+			}
+			out.Enum = append(out.Enum, &bknsdk.ValueTypeEnumItem{
+				Value: item.Value, Display: item.Display, Deprecated: item.Deprecated, Description: item.Description,
+			})
+		}
+	}
+	if vt.Range != nil {
+		out.Range = &bknsdk.ValueRange{Min: rangeBound(vt.Range.Min), Max: rangeBound(vt.Range.Max)}
+	}
+	if vt.Length != nil {
+		out.Length = &bknsdk.LengthRange{Min: vt.Length.Min, Max: vt.Length.Max}
+	}
+	return out
+}
+
+// ValueTypeReferences lists the data properties of objectTypes whose constraints name vtID, in
+// object type and property order.
+func ValueTypeReferences(objectTypes []*interfaces.ObjectType, vtID string) []interfaces.ValueTypeReference {
+	var refs []interfaces.ValueTypeReference
+	for _, ot := range objectTypes {
+		if ot == nil {
+			continue
+		}
+		for _, p := range ot.DataProperties {
+			if p != nil && p.Constraints != nil && p.Constraints.ValueType == vtID {
+				refs = append(refs, interfaces.ValueTypeReference{
+					ObjectTypeID: ot.OTID, ObjectTypeName: ot.OTName, Property: p.Name, PropertyType: p.Type,
+				})
+			}
+		}
+	}
+	return refs
 }

@@ -13,15 +13,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/opensearch-project/opensearch-go/v2/opensearchapi"
+	"github.com/shopspring/decimal"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
+
+const singleHavingGroup = "__vega_single_group"
 
 func openSearchInt64(value any) (int64, bool) {
 	switch value := value.(type) {
@@ -53,7 +61,7 @@ func openSearchFloat64(value any) (float64, bool) {
 	}
 }
 
-func (c *OpenSearchConnector) ExecuteQueryWithDsl(ctx context.Context, resourceName string, dsl string) (*interfaces.QueryResult, error) {
+func (c *OpenSearchConnector) ExecuteQueryWithDsl(ctx context.Context, resourceName string, dsl string) (*interfaces.ResourceDataQueryResult, error) {
 	// Ensure the connector is enabled
 	if !c.enabled {
 		return nil, fmt.Errorf("OpenSearch connector is not enabled")
@@ -114,10 +122,15 @@ func (c *OpenSearchConnector) ExecuteQueryWithDsl(ctx context.Context, resourceN
 
 	hitsArray, ok := hits["hits"].([]any)
 	if !ok {
-		return &interfaces.QueryResult{
-			Entries: []map[string]any{},
-			Total:   total,
+		return &interfaces.ResourceDataQueryResult{
+			Entries:    []map[string]any{},
+			TotalCount: total,
 		}, nil
+	}
+
+	fieldTypes := make(map[string]string)
+	if err := c.fetchMappingsForQuery(ctx, resourceName, fieldTypes); err != nil {
+		return nil, fmt.Errorf("failed to read JSON field types: %w", err)
 	}
 
 	// Extract documents from hits
@@ -142,12 +155,15 @@ func (c *OpenSearchConnector) ExecuteQueryWithDsl(ctx context.Context, resourceN
 			source["_score"] = score
 		}
 
+		if err := stringifyJSONQueryFields(source, fieldTypes); err != nil {
+			return nil, err
+		}
 		documents = append(documents, source)
 	}
 
-	return &interfaces.QueryResult{
-		Entries: documents,
-		Total:   total,
+	return &interfaces.ResourceDataQueryResult{
+		Entries:    documents,
+		TotalCount: total,
 	}, nil
 }
 
@@ -232,8 +248,7 @@ func (c *OpenSearchConnector) ExecuteRawQuery(ctx context.Context, indexName str
 	// Obtain the mapping information of the index to determine the field type
 	fieldTypeMap := make(map[string]string)
 	if err := c.fetchMappingsForQuery(ctx, indexName, fieldTypeMap); err != nil {
-		// Fall back to the default string type if mapping retrieval fails.
-		logger.Warnf("failed to fetch index mappings, using default string type: %v", err)
+		return nil, fmt.Errorf("failed to read JSON field types: %w", err)
 	}
 
 	// Collect all field names from the first hit
@@ -253,6 +268,9 @@ func (c *OpenSearchConnector) ExecuteRawQuery(ctx context.Context, indexName str
 	// Convert hits to entries
 	entries := make([]map[string]any, 0, len(searchResp.Hits.Hits))
 	for _, hit := range searchResp.Hits.Hits {
+		if err := stringifyJSONQueryFields(hit.Source, fieldTypeMap); err != nil {
+			return nil, err
+		}
 		entries = append(entries, hit.Source)
 	}
 
@@ -306,18 +324,44 @@ func (c *OpenSearchConnector) fetchMappingsForQuery(ctx context.Context, indexNa
 		return fmt.Errorf("failed to unmarshal mappings: %w", err)
 	}
 
-	// Parse the fields and construct field type mappings
-	fields := make(map[string]interfaces.IndexFieldMeta)
-	if idxData, ok := dataMapping[indexName]; ok {
-		parseProperties("", idxData.Mappings.Properties, fields)
+	// 别名和通配符响应使用实际索引名，逐索引解析后再合并类型。
+	indexNames := make([]string, 0, len(dataMapping))
+	for name := range dataMapping {
+		indexNames = append(indexNames, name)
 	}
-	resolveIndexAliasTypes(fields)
-	for fieldName, meta := range fields {
-		nativeType := meta.Type
-		if meta.ResolvedType != "" {
-			nativeType = meta.ResolvedType
+	sort.Strings(indexNames)
+	mergedTypes := make(map[string]string)
+	for _, name := range indexNames {
+		properties := dataMapping[name].Mappings.Properties
+		fields := make(map[string]interfaces.IndexFieldMeta)
+		parseProperties("", properties, fields)
+		// 发现流程展开 object 子字段；查询还需保留顶层 object 的 JSON 类型。
+		for fieldName, property := range properties {
+			if property.Type == "object" || (property.Type == "" && property.Properties != nil) {
+				fields[fieldName] = interfaces.IndexFieldMeta{Type: "object"}
+			}
 		}
-		fieldTypeMap[fieldName] = c.MapType(nativeType)
+		resolveIndexAliasTypes(fields)
+		fieldNames := make([]string, 0, len(fields))
+		for fieldName := range fields {
+			fieldNames = append(fieldNames, fieldName)
+		}
+		sort.Strings(fieldNames)
+		for _, fieldName := range fieldNames {
+			meta := fields[fieldName]
+			nativeType := meta.Type
+			if meta.ResolvedType != "" {
+				nativeType = meta.ResolvedType
+			}
+			fieldType := c.MapType(nativeType)
+			if previous, exists := mergedTypes[fieldName]; exists && previous != fieldType {
+				return fmt.Errorf("conflicting mapping types for field %q", fieldName)
+			}
+			mergedTypes[fieldName] = fieldType
+		}
+	}
+	for fieldName, fieldType := range mergedTypes {
+		fieldTypeMap[fieldName] = fieldType
 	}
 
 	return nil
@@ -332,10 +376,10 @@ func (c *OpenSearchConnector) fetchMappingsForQuery(ctx context.Context, indexNa
 //	-params: Query parameters, including output fields, sorting, pagination, etc
 //
 // Return value:
-//   - *interfaces.QueryResult: Query result, including row data and total number
+//   - *interfaces.ResourceDataQueryResult: Query result, including row data and total number
 //     -error: Error message
 func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string, resource *interfaces.Resource,
-	params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+	params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 
 	// Ensure we have a connection
 	if err := c.Connect(ctx); err != nil {
@@ -347,6 +391,10 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 	}
 	if err := c.validateStoredFilterCondition(resource, params); err != nil {
 		return nil, err
+	}
+	if params.Aggregation != nil && params.Aggregation.Aggr == "count_distinct" &&
+		params.Aggregation.AllowApproximate != nil && !*params.Aggregation.AllowApproximate {
+		return c.executeExactDistinct(ctx, indexName, resource, params)
 	}
 
 	// Aggregation query: Executed when any of the parameters Aggregation, GroupBy, or Having exists
@@ -405,7 +453,8 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 			case "count_distinct":
 				metricBody = map[string]any{
 					"cardinality": map[string]any{
-						"field": aggField,
+						"field":               aggField,
+						"precision_threshold": 40000,
 					},
 				}
 			case "sum":
@@ -435,56 +484,51 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 			}
 		}
 
-		// Grouping: Nested terms/date_histogram from the inside out; The metric and HAVING are placed under the innermost bucket.
 		if len(params.GroupBy) > 0 {
-			leafAggs := make(map[string]any)
-			if metricBody != nil {
-				leafAggs[aggAlias] = metricBody
-			}
-			if params.Having != nil && params.Aggregation != nil {
-				leafAggs["having_filter"] = c.buildHavingBucketSelector(params.Having, aggAlias)
-			}
+			return c.executeGroupedQuery(ctx, indexName, resource, params, query, metricBody)
+		}
 
-			innerNode := leafAggs
-			n := len(params.GroupBy)
-			for i := n - 1; i >= 0; i-- {
-				gb := params.GroupBy[i]
-				name := "group_by_" + gb.Property
-				var bucket map[string]any
-				if gb.CalendarInterval != "" {
-					bucket = map[string]any{
-						"date_histogram": map[string]any{
-							"field":             gb.Property,
-							"calendar_interval": gb.CalendarInterval,
-						},
-					}
-				} else {
-					groupField := gb.Property
-					resolvedField, err := c.exactMatchFieldName(groupField, resource.SchemaDefinition)
-					if err != nil {
-						return nil, fmt.Errorf("resolve group_by field %q: %w", groupField, err)
-					}
-					groupField = resolvedField
-					bucket = map[string]any{
-						"terms": map[string]any{
-							"field": groupField,
-							"size":  nestedTermsSize(i, n, params.Paging.Limit),
-						},
-					}
-				}
-				if len(innerNode) > 0 {
-					bucket["aggs"] = innerNode
-				}
-				innerNode = map[string]any{name: bucket}
+		var havingSelector map[string]any
+		if params.Having != nil {
+			if aggAlias == "" {
+				aggAlias = "__value"
 			}
-			for k, v := range innerNode {
-				aggs[k] = v
+			fields := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
+			for _, field := range resource.SchemaDefinition {
+				fields[field.Name] = field
 			}
-			// Apply the order mapped to sort to each layer of terms (the second-dimensional sort is written on the inner layer terms)
-			for _, v := range aggs {
-				if node, ok := v.(map[string]any); ok {
-					c.applyTermsOrderToGroupAggNode(node, params, aggAlias)
+			havingField := filter_condition.HavingTemporalField(params, fields)
+			if agg := params.Aggregation; agg != nil && (agg.Aggr == "sum" || agg.Aggr == "min" || agg.Aggr == "max") {
+				if field := fields[agg.Property]; field != nil && field.Type == interfaces.DataType_Decimal {
+					havingField = field
 				}
+			}
+			selector, err := c.buildHavingBucketSelector(params.Having, aggAlias, havingField)
+			if err != nil {
+				return nil, fmt.Errorf("failed to build HAVING condition: %w", err)
+			}
+			if params.Aggregation != nil && params.Aggregation.Aggr == "sum" &&
+				params.Having.Field != "count(*)" && havingField != nil && havingField.Type == interfaces.DataType_Decimal {
+				// 空集合的原生 SUM 为 0；pipeline 的空桶不能将它转换为 NaN。
+				selector["bucket_selector"].(map[string]any)["gap_policy"] = "insert_zeros"
+			}
+			havingSelector = selector
+		}
+
+		if havingSelector != nil {
+			children := map[string]any{"having_filter": havingSelector}
+			if metricBody != nil {
+				children[aggAlias] = metricBody
+			}
+			aggs[singleHavingGroup] = map[string]any{
+				"filters": map[string]any{
+					"filters": map[string]any{
+						"all": map[string]any{
+							"match_all": map[string]any{},
+						},
+					},
+				},
+				"aggs": children,
 			}
 		} else if metricBody != nil {
 			aggs[aggAlias] = metricBody
@@ -529,6 +573,9 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 		if err := common.UnmarshalPreciseJSON(bodyBytes, &result); err != nil {
 			return nil, fmt.Errorf("failed to decode aggregate search result: %w", err)
 		}
+		if err := validateCompleteAggregationResponse(result); err != nil {
+			return nil, err
+		}
 
 		// Extract the total number of documents
 		var totalCount int64
@@ -543,18 +590,29 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 		// Extract the aggregation results
 		aggregations, ok := result["aggregations"].(map[string]any)
 		if !ok {
-			return &interfaces.QueryResult{
-				Entries: []map[string]any{},
-				Total:   totalCount,
+			if params.Aggregation != nil && params.Aggregation.Aggr == "count_distinct" {
+				return nil, fmt.Errorf("distinct count response is missing aggregations")
+			}
+			return &interfaces.ResourceDataQueryResult{
+				Entries:    []map[string]any{},
+				TotalCount: totalCount,
 			}, nil
 		}
 
-		// Handle group aggregation results (support multi-level group_by nested bucket flattening)
 		var rows []map[string]any
-		if len(params.GroupBy) > 0 {
-			groupByAggName := "group_by_" + params.GroupBy[0].Property
-			if groupByAgg, ok := aggregations[groupByAggName].(map[string]any); ok {
-				rows = c.flattenNestedGroupByRows(groupByAgg, params, aggAlias)
+		if params.Having != nil {
+			if group, ok := aggregations[singleHavingGroup].(map[string]any); ok {
+				if buckets, ok := group["buckets"].(map[string]any); ok {
+					if bucket, retained := buckets["all"].(map[string]any); retained {
+						row := make(map[string]any)
+						if params.Aggregation != nil {
+							c.mergeMetricIntoRowFromBucket(bucket, row, aggAlias)
+						} else {
+							row["__value"] = bucket["doc_count"]
+						}
+						rows = append(rows, row)
+					}
+				}
 			}
 		} else {
 			// There is no grouping, only aggregation
@@ -569,9 +627,10 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 			}
 		}
 
-		return &interfaces.QueryResult{
-			Entries: rows,
-			Total:   totalCount,
+		return &interfaces.ResourceDataQueryResult{
+			Entries:       rows,
+			TotalCount:    totalCount,
+			IsApproximate: params.Aggregation != nil && params.Aggregation.Aggr == "count_distinct",
 		}, nil
 	}
 
@@ -610,9 +669,14 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 	if params != nil && len(params.Sort) > 0 {
 		sort := make([]map[string]any, 0, len(params.Sort))
 		for _, s := range params.Sort {
-			resolvedField, err := c.exactMatchFieldName(s.Field, resource.SchemaDefinition)
-			if err != nil {
-				return nil, fmt.Errorf("resolve sort field %q: %w", s.Field, err)
+			resolvedField := s.Field
+			// 文档元字段仅用于排序，不作为普通 schema 字段放行过滤或聚合。
+			if s.Field != "_score" && s.Field != "_id" {
+				var err error
+				resolvedField, err = c.exactMatchFieldName(s.Field, resource.SchemaDefinition)
+				if err != nil {
+					return nil, fmt.Errorf("resolve sort field %q: %w", s.Field, err)
+				}
 			}
 			sort = append(sort, map[string]any{
 				resolvedField: map[string]any{
@@ -696,10 +760,17 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 
 	hitsArray, ok := hits["hits"].([]any)
 	if !ok {
-		return &interfaces.QueryResult{
-			Entries: []map[string]any{},
-			Total:   int64(total),
+		return &interfaces.ResourceDataQueryResult{
+			Entries:    []map[string]any{},
+			TotalCount: int64(total),
 		}, nil
+	}
+
+	fieldTypes := make(map[string]string, len(resource.SchemaDefinition))
+	for _, property := range resource.SchemaDefinition {
+		if property != nil {
+			fieldTypes[property.Name] = property.Type
+		}
 	}
 
 	// Extract documents from hits
@@ -721,15 +792,18 @@ func (c *OpenSearchConnector) ExecuteQuery(ctx context.Context, indexName string
 		if score, ok := openSearchFloat64(hitMap["_score"]); ok {
 			source["_score"] = score
 		}
+		if err := stringifyJSONQueryFields(source, fieldTypes); err != nil {
+			return nil, err
+		}
 		documents = append(documents, source)
 		if sort, ok := hitMap["sort"].([]any); ok {
 			searchAfter = sort
 		}
 	}
 
-	return &interfaces.QueryResult{
+	return &interfaces.ResourceDataQueryResult{
 		Entries:     documents,
-		Total:       int64(total),
+		TotalCount:  int64(total),
 		SearchAfter: searchAfter,
 	}, nil
 }
@@ -747,72 +821,6 @@ func (c *OpenSearchConnector) validateStoredFilterCondition(resource *interfaces
 	return nil
 }
 
-// nestedTermsSize sets the size for each layer of terms in the nested group_by: the innermost layer uses limit to control the number of rows "under each parent bucket", and the outer layer uses a larger upper limit to expand the combination.
-func nestedTermsSize(levelIndex, numLevels, limit int) int {
-	if numLevels <= 1 {
-		if limit > 0 {
-			return limit
-		}
-		return 10
-	}
-	if levelIndex == numLevels-1 {
-		if limit > 0 {
-			return limit
-		}
-		return 10
-	}
-	outer := 1000
-	if limit > 0 {
-		if x := limit * 100; x > 10000 {
-			outer = 10000
-		} else if x < 100 {
-			outer = 100
-		} else {
-			outer = x
-		}
-	}
-	return outer
-}
-
-// ApplyTermsOrderToGroupAggNode recursive terms for each subtree of barrel written order (dimensional layer 2 d sort to fall, when the terms).
-// Sorting by metric only takes effect when the direct sub-aggs of that term contain the metric name, avoiding the illegal DSL caused by the outer terms referring to deeply nested sub-aggregations.
-func (c *OpenSearchConnector) applyTermsOrderToGroupAggNode(node map[string]any, params *interfaces.ResourceDataQueryParams, aggAlias string) {
-	if terms, ok := node["terms"].(map[string]any); ok {
-		field, _ := terms["field"].(string)
-		sub, _ := node["aggs"].(map[string]any)
-		metricDirectChild := aggAlias != "" && sub != nil && sub[aggAlias] != nil
-
-		var orderList []map[string]any
-		for _, sortItem := range params.Sort {
-			dir := strings.ToLower(sortItem.Direction)
-			if dir != "asc" && dir != "desc" {
-				dir = "asc"
-			}
-			if params.Aggregation != nil && metricDirectChild && (sortItem.Field == aggAlias || sortItem.Field == "__value") {
-				orderList = append(orderList, map[string]any{aggAlias: dir})
-			}
-			if sortItem.Field == field {
-				orderList = append(orderList, map[string]any{"_key": dir})
-			}
-		}
-		if len(orderList) > 0 {
-			terms["order"] = orderList
-		}
-	}
-	sub, ok := node["aggs"].(map[string]any)
-	if !ok {
-		return
-	}
-	for name, child := range sub {
-		if name == "having_filter" {
-			continue
-		}
-		if childMap, ok := child.(map[string]any); ok {
-			c.applyTermsOrderToGroupAggNode(childMap, params, aggAlias)
-		}
-	}
-}
-
 func (c *OpenSearchConnector) mergeMetricIntoRowFromBucket(bucket map[string]any, row map[string]any, aggAlias string) {
 	if aggAlias == "" {
 		return
@@ -828,132 +836,192 @@ func (c *OpenSearchConnector) mergeMetricIntoRowFromBucket(bucket map[string]any
 	}
 }
 
-// CollectGroupByRowsFromBucket since the outer barrel recursive on multiple lines (each row contains the dimension key and optional metrics).
-func (c *OpenSearchConnector) collectGroupByRowsFromBucket(bucket map[string]any, level int, params *interfaces.ResourceDataQueryParams, aggAlias string, rowSoFar map[string]any) []map[string]any {
-	if level < 0 || level >= len(params.GroupBy) {
-		return nil
+// buildHavingBucketSelector 使用数值参数比较聚合结果，不把输入值或别名拼入脚本。
+func (c *OpenSearchConnector) buildHavingBucketSelector(having *interfaces.HavingClause, aggAlias string, metricField *interfaces.Property) (map[string]any, error) {
+	source := ""
+	scriptParams := map[string]any{}
+	metricPath := aggAlias
+	if having.Field == "count(*)" {
+		metricPath = "_count"
+		metricField = nil
 	}
-	gb := params.GroupBy[level]
-	row := make(map[string]any, len(rowSoFar)+2)
-	for k, v := range rowSoFar {
-		row[k] = v
-	}
-	if key, ok := bucket["key"]; ok {
-		row[gb.Property] = key
-	} else if keyStr, ok := bucket["key_as_string"]; ok {
-		row[gb.Property] = keyStr
-	}
-
-	if level == len(params.GroupBy)-1 {
-		if params.Aggregation != nil {
-			c.mergeMetricIntoRowFromBucket(bucket, row, aggAlias)
+	decimalMetric := metricField != nil && metricField.Type == interfaces.DataType_Decimal
+	prefix := ""
+	if decimalMetric {
+		scale, ok := common.NumberAsInt64(metricField.Attributes["scale"])
+		if !ok || scale < 0 || scale > 308 {
+			return nil, interfaces.NewConditionBuildError("Decimal HAVING requires a valid field scale")
 		}
-		return []map[string]any{row}
+		scriptParams["scale"] = scale
+		prefix = "if (params.metric == null || Double.isNaN(params.metric)) return false; " +
+			"BigDecimal metric = BigDecimal.valueOf(params.metric).setScale(params.scale, RoundingMode.HALF_UP); "
 	}
-
-	nextName := "group_by_" + params.GroupBy[level+1].Property
-	// The sub-aggregation results of OpenSearch Buckets are directly tiled under the buckets instead of being hung in bucket["aggs"].
-	childAgg, ok := bucket[nextName].(map[string]any)
-	if !ok {
-		return []map[string]any{row}
-	}
-	nextBuckets, ok := childAgg["buckets"].([]any)
-	if !ok {
-		return []map[string]any{row}
-	}
-	var out []map[string]any
-	for _, nb := range nextBuckets {
-		nbm, ok := nb.(map[string]any)
-		if !ok {
-			continue
-		}
-		out = append(out, c.collectGroupByRowsFromBucket(nbm, level+1, params, aggAlias, row)...)
-	}
-	return out
-}
-
-// read the outermost group_by aggregation and flatten it into result rows, and then truncate it by limit.
-func (c *OpenSearchConnector) flattenNestedGroupByRows(rootAgg map[string]any, params *interfaces.ResourceDataQueryParams, aggAlias string) []map[string]any {
-	buckets, ok := rootAgg["buckets"].([]any)
-	if !ok {
-		return []map[string]any{}
-	}
-	var rows []map[string]any
-	for _, b := range buckets {
-		bm, ok := b.(map[string]any)
-		if !ok {
-			continue
-		}
-		rows = append(rows, c.collectGroupByRowsFromBucket(bm, 0, params, aggAlias, nil)...)
-	}
-	if params.Paging.Limit > 0 && len(rows) > params.Paging.Limit {
-		rows = rows[:params.Paging.Limit]
-	}
-	return rows
-}
-
-// BuildHavingBucketSelector building HAVING bucket_selector polymerization conditions
-func (c *OpenSearchConnector) buildHavingBucketSelector(having *interfaces.HavingClause, aggAlias string) map[string]any {
-	// OpenSearch implements HAVING using the bucket_selector aggregation
-	script := ""
 	switch having.Operation {
-	case "==":
-		script = fmt.Sprintf("params.%s == %v", aggAlias, having.Value)
-	case "!=":
-		script = fmt.Sprintf("params.%s != %v", aggAlias, having.Value)
-	case ">":
-		script = fmt.Sprintf("params.%s > %v", aggAlias, having.Value)
-	case ">=":
-		script = fmt.Sprintf("params.%s >= %v", aggAlias, having.Value)
-	case "<":
-		script = fmt.Sprintf("params.%s < %v", aggAlias, having.Value)
-	case "<=":
-		script = fmt.Sprintf("params.%s <= %v", aggAlias, having.Value)
-	case "in":
-		if values, ok := having.Value.([]any); ok {
-			script = fmt.Sprintf("%s.contains(params.%s.toString())", formatInValuesForScript(values), aggAlias)
+	case "==", "!=", ">", ">=", "<", "<=":
+		value, err := indexHavingValue(metricField, having.Value)
+		if err != nil {
+			return nil, err
 		}
-	case "not_in":
-		if values, ok := having.Value.([]any); ok {
-			script = fmt.Sprintf("!%s.contains(params.%s.toString())", formatInValuesForScript(values), aggAlias)
+		source = "params.metric " + having.Operation + " params.value"
+		if decimalMetric {
+			source = "return metric.compareTo(new BigDecimal(params.value)) " + having.Operation + " 0;"
 		}
-	case "range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			script = fmt.Sprintf("params.%s >= %v && params.%s <= %v", aggAlias, values[0], aggAlias, values[1])
+		scriptParams["value"] = value
+	case "in", "not_in", "range", "out_range":
+		var values []any
+		switch array := having.Value.(type) {
+		case []any:
+			values = array
+		case []string:
+			values = make([]any, len(array))
+			for i, value := range array {
+				values[i] = value
+			}
 		}
-	case "out_range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			script = fmt.Sprintf("params.%s < %v || params.%s > %v", aggAlias, values[0], aggAlias, values[1])
+		if len(values) == 0 {
+			return nil, interfaces.NewConditionBuildError("HAVING operation %s requires a non-empty array", having.Operation)
 		}
+		if (having.Operation == "range" || having.Operation == "out_range") && len(values) != 2 {
+			return nil, interfaces.NewConditionBuildError("HAVING range requires exactly two values")
+		}
+		numeric := make([]any, len(values))
+		for i, value := range values {
+			parsed, err := indexHavingValue(metricField, value)
+			if err != nil {
+				return nil, err
+			}
+			numeric[i] = parsed
+		}
+		switch having.Operation {
+		case "in", "not_in":
+			scriptParams["values"] = numeric
+			source = "for (def value : params.values) { if (params.metric == value) return true; } return false;"
+			if having.Operation == "not_in" {
+				source = "for (def value : params.values) { if (params.metric == value) return false; } return true;"
+			}
+			if decimalMetric {
+				source = "for (def value : params.values) { if (metric.compareTo(new BigDecimal(value)) == 0) return true; } return false;"
+				if having.Operation == "not_in" {
+					source = "for (def value : params.values) { if (metric.compareTo(new BigDecimal(value)) == 0) return false; } return true;"
+				}
+			}
+		case "range", "out_range":
+			scriptParams["lower"], scriptParams["upper"] = numeric[0], numeric[1]
+			source = "params.metric >= params.lower && params.metric <= params.upper"
+			if having.Operation == "out_range" {
+				source = "params.metric < params.lower || params.metric > params.upper"
+			}
+			if decimalMetric {
+				source = "return metric.compareTo(new BigDecimal(params.lower)) >= 0 && metric.compareTo(new BigDecimal(params.upper)) <= 0;"
+				if having.Operation == "out_range" {
+					source = "return metric.compareTo(new BigDecimal(params.lower)) < 0 || metric.compareTo(new BigDecimal(params.upper)) > 0;"
+				}
+			}
+		}
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported HAVING operation: %s", having.Operation)
 	}
-
 	return map[string]any{
 		"bucket_selector": map[string]any{
-			"buckets_path": map[string]any{
-				aggAlias: aggAlias,
-			},
-			"script": map[string]any{
-				"source": script,
-			},
+			"buckets_path": map[string]any{"metric": metricPath},
+			"script":       map[string]any{"source": prefix + source, "params": scriptParams},
 		},
-	}
+	}, nil
 }
 
-// formatInValuesForScript formats the list of values for IN operations into Painless script format
-func formatInValuesForScript(values []any) string {
-	if len(values) == 0 {
-		return "[]"
+// indexHavingValue 保留 Decimal 阈值的十进制文本；日期聚合使用 epoch milliseconds，包括 date_nanos。
+// 保留输入的亚毫秒部分；最终比较精度受 OpenSearch double 聚合值限制。
+func indexHavingValue(field *interfaces.Property, value any) (any, error) {
+	if field != nil && field.Type == interfaces.DataType_Decimal {
+		text := fmt.Sprint(value)
+		if len(text) > 1024 {
+			return nil, interfaces.NewConditionBuildError("Decimal HAVING value is too large")
+		}
+		number, err := decimal.NewFromString(text)
+		if err != nil || number.Exponent() < -1024 || number.Exponent() > 1024 {
+			return nil, interfaces.NewConditionBuildError("Decimal HAVING value must be a finite decimal")
+		}
+		return number.String(), nil
 	}
-
-	var strValues []string
-	for _, v := range values {
-		switch val := v.(type) {
-		case string:
-			strValues = append(strValues, fmt.Sprintf("'%s'", val))
+	if field != nil {
+		parsed, err := filter_condition.ParseTemporalValue(field.Type, value, common.ServerTimeZone())
+		if err != nil {
+			return nil, err
+		}
+		var instant time.Time
+		switch field.Type {
+		case interfaces.DataType_Datetime:
+			instant = parsed.(time.Time)
+		case interfaces.DataType_Date:
+			instant, err = time.Parse(time.DateOnly, parsed.(string))
+			if err != nil {
+				return nil, err
+			}
 		default:
-			strValues = append(strValues, fmt.Sprintf("%v", val))
+			return nil, interfaces.NewConditionBuildError("OpenSearch time fields do not support temporal aggregation")
+		}
+		return float64(instant.UnixMilli()) + float64(instant.Nanosecond()%int(time.Millisecond))/float64(time.Millisecond), nil
+	}
+	number, ok := common.NumberAsFloat64(value)
+	if text, isString := value.(string); isString {
+		var err error
+		number, err = strconv.ParseFloat(text, 64)
+		ok = err == nil
+	}
+	if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
+		return nil, interfaces.NewConditionBuildError("HAVING value must be a finite number")
+	}
+	return number, nil
+}
+
+// stringifyJSONQueryFields 只序列化协议已解码的 JSON 字段；文本和空值保持原样。
+func stringifyJSONQueryFields(source map[string]any, fieldTypes map[string]string) error {
+	names := make([]string, 0, len(fieldTypes))
+	for name, fieldType := range fieldTypes {
+		if fieldType == interfaces.DataType_Json {
+			names = append(names, name)
 		}
 	}
-
-	return fmt.Sprintf("[%s]", strings.Join(strValues, ", "))
+	// 父 JSON 字段先序列化，避免对子字段转换后再次编码而改变原值。
+	sort.Slice(names, func(i, j int) bool {
+		iDepth, jDepth := strings.Count(names[i], "."), strings.Count(names[j], ".")
+		if iDepth != jDepth {
+			return iDepth < jDepth
+		}
+		return names[i] < names[j]
+	})
+	var visit func(any, string) error
+	visit = func(node any, path string) error {
+		switch node := node.(type) {
+		case []any:
+			for _, item := range node {
+				if err := visit(item, path); err != nil {
+					return err
+				}
+			}
+		case map[string]any:
+			// 优先匹配完整键，保留 _source 中含字面点号的字段语义。
+			if value, exists := node[path]; exists {
+				text, err := common.JSONQueryValueText(value)
+				if err != nil {
+					return fmt.Errorf("failed to serialize JSON field %q", path)
+				}
+				node[path] = text
+				return nil
+			}
+			// 最长前缀优先，同时支持嵌套对象及中间节点的字面点号。
+			for split := strings.LastIndex(path, "."); split > 0; split = strings.LastIndex(path[:split], ".") {
+				if child, exists := node[path[:split]]; exists {
+					return visit(child, path[split+1:])
+				}
+			}
+		}
+		return nil
+	}
+	for _, name := range names {
+		if err := visit(source, name); err != nil {
+			return err
+		}
+	}
+	return nil
 }

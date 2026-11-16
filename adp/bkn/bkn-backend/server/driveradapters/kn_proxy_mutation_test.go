@@ -11,8 +11,8 @@ import (
 
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 type knProxyMutationPublisherStub struct {
@@ -57,7 +57,7 @@ func assertProxyMutation(t *testing.T, publisher *knProxyMutationPublisherStub, 
 func TestConceptGroupImportWithBindingsUsesKNProxyPublisher(t *testing.T) {
 	objectType := &interfaces.ObjectType{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "ot-1"}}
 	relationType := &interfaces.RelationType{RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "rt-1"}}
-	actionType := &interfaces.ActionType{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at-1"}}
+	actionType := &interfaces.ActionType{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at-1", OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"}}}
 	conceptGroup := &interfaces.ConceptGroup{
 		CGID: "cg-1", KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
 		ObjectTypes: []*interfaces.ObjectType{objectType}, RelationTypes: []*interfaces.RelationType{relationType},
@@ -228,7 +228,7 @@ func TestRelationTypeWritesUseKNProxyPublisher(t *testing.T) {
 
 func TestActionTypeWritesUseKNProxyPublisher(t *testing.T) {
 	actionType := &interfaces.ActionType{
-		ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at-1"},
+		ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at-1", OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"}},
 		KNID:                   "kn-1", Branch: interfaces.MAIN_BRANCH,
 	}
 
@@ -284,66 +284,6 @@ func TestActionTypeWritesUseKNProxyPublisher(t *testing.T) {
 			if len(changes.ActionTypes) != 1 || changes.ActionTypes[0].ATID != "at-1" ||
 				changes.ActionTypes[0].ActionSource.Type != "" {
 				t.Fatalf("delete action type changes = %#v", changes.ActionTypes)
-			}
-		})
-	})
-}
-
-func TestMetricWritesUseKNProxyPublisher(t *testing.T) {
-	metric := &interfaces.MetricDefinition{ID: "metric-1", KnID: "kn-1", Branch: interfaces.MAIN_BRANCH}
-
-	t.Run("create", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		service := bmock.NewMockMetricService(ctrl)
-		publisher := &knProxyMutationPublisherStub{}
-		service.EXPECT().CreateMetrics(gomock.Any(), nil, []*interfaces.MetricDefinition{metric}, true,
-			interfaces.ImportMode_Ignore).Return([]string{"metric-1"}, nil)
-		handler := &restHandler{ms: service, knProxyPublisher: publisher}
-
-		ids, err := handler.createMetrics(t.Context(), "kn-1", interfaces.MAIN_BRANCH,
-			[]*interfaces.MetricDefinition{metric}, true, interfaces.ImportMode_Ignore)
-		if err != nil || len(ids) != 1 || ids[0] != "metric-1" {
-			t.Fatalf("createMetrics() = %#v, %v", ids, err)
-		}
-		assertProxyMutation(t, publisher, interfaces.ImportMode_Ignore, func(changes *interfaces.KN) {
-			if len(changes.Metrics) != 1 || changes.Metrics[0] != metric {
-				t.Fatalf("metric changes = %#v", changes.Metrics)
-			}
-		})
-	})
-
-	t.Run("update", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		service := bmock.NewMockMetricService(ctrl)
-		publisher := &knProxyMutationPublisherStub{}
-		service.EXPECT().UpdateMetric(gomock.Any(), nil, metric, true).Return(nil)
-		handler := &restHandler{ms: service, knProxyPublisher: publisher}
-
-		if err := handler.updateMetric(t.Context(), metric, true); err != nil {
-			t.Fatal(err)
-		}
-		assertProxyMutation(t, publisher, interfaces.ImportMode_Overwrite, func(changes *interfaces.KN) {
-			if len(changes.Metrics) != 1 || changes.Metrics[0] != metric {
-				t.Fatalf("metric changes = %#v", changes.Metrics)
-			}
-		})
-	})
-
-	t.Run("delete", func(t *testing.T) {
-		ctrl := gomock.NewController(t)
-		service := bmock.NewMockMetricService(ctrl)
-		publisher := &knProxyMutationPublisherStub{}
-		service.EXPECT().DeleteMetricsByIDs(gomock.Any(), nil, "kn-1", interfaces.MAIN_BRANCH,
-			[]string{"metric-1"}).Return(nil)
-		handler := &restHandler{ms: service, knProxyPublisher: publisher}
-
-		if err := handler.deleteMetrics(t.Context(), "kn-1", interfaces.MAIN_BRANCH, []string{"metric-1"}); err != nil {
-			t.Fatal(err)
-		}
-		assertProxyMutation(t, publisher, interfaces.ImportMode_Overwrite, func(changes *interfaces.KN) {
-			if len(changes.Metrics) != 1 || changes.Metrics[0].ID != "metric-1" ||
-				changes.Metrics[0].ScopeRef != "" {
-				t.Fatalf("delete metric changes = %#v", changes.Metrics)
 			}
 		})
 	})

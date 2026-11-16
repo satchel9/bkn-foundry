@@ -16,6 +16,7 @@ const (
 
 	KNProxyLifecycleActive    = "active"
 	KNProxyLifecycleDisabling = "disabling"
+	KNProxyLifecycleDeleting  = "deleting"
 	KNProxyLifecycleArchived  = "archived"
 
 	KNProxySyncPending = "pending"
@@ -35,6 +36,9 @@ const (
 	// KNProxyTargetTypeSkill is the bkn-safe resource type of a mounted Skill.
 	// Its grant sources are best effort: see IsBestEffortProxyGrantSource.
 	KNProxyTargetTypeSkill = "skill"
+	// KNProxyTargetTypeKnowledgeBase is the bkn-safe resource type of a mounted knowledge base.
+	// Its grant sources are best effort as well.
+	KNProxyTargetTypeKnowledgeBase = "knowledge_base"
 )
 
 // ManagedProxyStatusError is a non-success status answered by bkn-safe's
@@ -63,12 +67,13 @@ const (
 // IsBestEffortProxyGrantSource reports whether a grant source may be left
 // unmaterialized without failing the network's proxy synchronization.
 //
-// Only a mounted Skill qualifies. A delegator who lacks execute on it, or an
-// authorization service that predates Skill sources, leaves that one Skill
-// unreadable through the proxy instead of blocking every proxied data read and
-// execution of the network.
+// Only a mounted Skill or knowledge base qualifies. A delegator who lacks the
+// operation on it, or an authorization service that predates its sources, leaves
+// that one capability unreadable through the proxy instead of blocking every
+// proxied data read and execution of the network.
 func IsBestEffortProxyGrantSource(source ProxyGrantSourceSpec) bool {
-	return source.BindingType == KNProxyBindingTypeCapability && source.ResourceType == KNProxyTargetTypeSkill
+	return source.BindingType == KNProxyBindingTypeCapability &&
+		(source.ResourceType == KNProxyTargetTypeSkill || source.ResourceType == KNProxyTargetTypeKnowledgeBase)
 }
 
 // KNProxyAccount is BKN's authoritative, environment-local mapping between one
@@ -155,6 +160,9 @@ type ManagedProxyAccount struct {
 	LoginEnabled              bool   `json:"login_enabled"`
 	CredentialIssuanceEnabled bool   `json:"credential_issuance_enabled"`
 	Version                   int64  `json:"version"`
+	// GrantSyncGeneration is bkn-safe's full-sync fence for this account. It
+	// survives network id reuse, so BKN's own counter must start above it.
+	GrantSyncGeneration int64 `json:"grant_sync_generation"`
 }
 
 // ProxyGrantSourceSpec is one published-model binding's requirement for one
@@ -194,31 +202,39 @@ type ProxyGrantSyncResult struct {
 	Unchanged   int `json:"unchanged"`
 }
 
+// AuthorizationCleanupTarget is a durable post-proxy cleanup carried by the
+// existing KN proxy outbox. ResourceIDs are canonical Safe resource IDs.
+type AuthorizationCleanupTarget struct {
+	ResourceType string   `json:"resource_type"`
+	ResourceIDs  []string `json:"resource_ids"`
+}
+
 // KNProxyOutboxEvent is one durable, ordered Safe grant delta. Bindings and
 // sources are persisted in the payload and are never reconstructed from newer
 // business rows while the event is being retried.
 type KNProxyOutboxEvent struct {
-	ID             string                 `json:"id"`
-	KNID           string                 `json:"kn_id"`
-	ProxyAccountID string                 `json:"proxy_account_id"`
-	GrantorID      string                 `json:"grantor_id"`
-	Generation     int64                  `json:"generation"`
-	BaseVersion    string                 `json:"base_version"`
-	TargetVersion  string                 `json:"target_version"`
-	Bindings       []KNProxyBindingRef    `json:"bindings"`
-	DesiredSources []ProxyGrantSourceSpec `json:"desired_sources"`
-	Upserts        []ProxyGrantSourceSpec `json:"upserts"`
-	Removals       []ProxyGrantSourceSpec `json:"removals"`
-	Status         string                 `json:"status"`
-	AttemptCount   int                    `json:"attempt_count"`
-	NextRetryAt    int64                  `json:"next_retry_at"`
-	LeaseOwner     string                 `json:"lease_owner"`
-	LeaseUntil     int64                  `json:"lease_until"`
-	LastError      string                 `json:"last_error"`
-	CreatedAt      int64                  `json:"created_at"`
-	UpdatedAt      int64                  `json:"updated_at"`
-	CompletedAt    int64                  `json:"completed_at"`
-	SafeApplied    bool                   `json:"-"`
+	ID                    string                       `json:"id"`
+	KNID                  string                       `json:"kn_id"`
+	ProxyAccountID        string                       `json:"proxy_account_id"`
+	GrantorID             string                       `json:"grantor_id"`
+	Generation            int64                        `json:"generation"`
+	BaseVersion           string                       `json:"base_version"`
+	TargetVersion         string                       `json:"target_version"`
+	Bindings              []KNProxyBindingRef          `json:"bindings"`
+	DesiredSources        []ProxyGrantSourceSpec       `json:"desired_sources"`
+	Upserts               []ProxyGrantSourceSpec       `json:"upserts"`
+	Removals              []ProxyGrantSourceSpec       `json:"removals"`
+	AuthorizationCleanups []AuthorizationCleanupTarget `json:"authorization_cleanups,omitempty"`
+	Status                string                       `json:"status"`
+	AttemptCount          int                          `json:"attempt_count"`
+	NextRetryAt           int64                        `json:"next_retry_at"`
+	LeaseOwner            string                       `json:"lease_owner"`
+	LeaseUntil            int64                        `json:"lease_until"`
+	LastError             string                       `json:"last_error"`
+	CreatedAt             int64                        `json:"created_at"`
+	UpdatedAt             int64                        `json:"updated_at"`
+	CompletedAt           int64                        `json:"completed_at"`
+	SafeApplied           bool                         `json:"-"`
 }
 
 type ProxyGrantReconcileResult struct {
@@ -311,6 +327,9 @@ type KNProxyAccess interface {
 	Ensure(ctx context.Context, mapping *KNProxyAccount) (*KNProxyAccount, bool, error)
 	SetPending(ctx context.Context, tx *sql.Tx, knID, modelVersion, grantorID, lockOwner string, updatedAt int64) (int64, error)
 	ReserveSyncGeneration(ctx context.Context, knID, lockOwner string, updatedAt int64) (int64, error)
+	// ReserveSyncGenerationAbove behaves like ReserveSyncGeneration but first
+	// raises the stored generation to at least floor, never lowering it.
+	ReserveSyncGenerationAbove(ctx context.Context, knID, lockOwner string, floor, updatedAt int64) (int64, error)
 	MarkSyncFailed(ctx context.Context, knID string, generation int64, lockOwner, lastError string, updatedAt int64) (bool, error)
 	ReplacePublishedSnapshotAndMarkReady(ctx context.Context, knID string, generation int64,
 		lockOwner, snapshotVersion string, sources []ProxyGrantSourceSpec, updatedAt int64) error
@@ -355,6 +374,7 @@ type KNProxyBindingResolver interface {
 
 type ManagedProxyAccess interface {
 	Create(ctx context.Context, knID, name string) (*ManagedProxyAccount, bool, error)
+	Get(ctx context.Context, proxyAccountID string) (*ManagedProxyAccount, error)
 	Restore(ctx context.Context, proxyAccountID string) (*ManagedProxyAccount, error)
 	Disable(ctx context.Context, proxyAccountID string) (*ManagedProxyAccount, error)
 	Archive(ctx context.Context, proxyAccountID string) (*ManagedProxyAccount, error)

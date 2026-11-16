@@ -14,7 +14,7 @@ import (
 func compileWhere(t *testing.T, where string) string {
 	t.Helper()
 	sql := mustCompile(t, "MATCH (o:Order) WHERE "+where+" RETURN o.id AS id")
-	const prefix = "SELECT t0.`f_id` AS `id` FROM {{.res_order}} t0 WHERE "
+	const prefix = "SELECT t0.`f_id` AS `id` FROM {{res_order}} t0 WHERE "
 	if !strings.HasPrefix(sql, prefix) {
 		t.Fatalf("unexpected statement shape: %s", sql)
 	}
@@ -131,7 +131,7 @@ func TestCompilePredicateRejections(t *testing.T) {
 		{
 			name:  "is null on something that is not a property",
 			query: "MATCH (o:Order) WHERE 1 IS NULL RETURN o.id",
-			want:  "IN and IS NULL apply to variable.property",
+			want:  "IS NULL to variable.property or $parameter",
 		},
 		{
 			name:  "comparing two conditions",

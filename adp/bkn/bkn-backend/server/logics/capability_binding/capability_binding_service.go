@@ -1,8 +1,6 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
-// Licensed under the Apache License, Version 2.0.
-// See the LICENSE file in the project root for details.
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
 
 package capability_binding
 
@@ -17,16 +15,16 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 // Column widths of t_kn_capability_binding, mirrored here so an over-long value is rejected
@@ -47,6 +45,9 @@ type capabilityBindingService struct {
 	db         *sql.DB
 	cba        interfaces.CapabilityBindingAccess
 	aoa        interfaces.AgentOperatorAccess
+	// kba reads knowledge base identities from kb-api; it answers ErrKnowledgeBaseUnavailable
+	// where kb-api is not deployed.
+	kba interfaces.KnowledgeBaseAccess
 	// ota and ata are read to answer why a capability is in the network. The model is the truth
 	// about what uses a tool, so the answer is computed from it rather than copied into the
 	// binding table — a copy has to be maintained on every edit, and the one that drifts is the
@@ -63,6 +64,7 @@ func NewCapabilityBindingService(appSetting *common.AppSetting) interfaces.Capab
 			db:         logics.DB,
 			cba:        logics.CBA,
 			aoa:        logics.AOA,
+			kba:        logics.KBA,
 			ota:        logics.OTA,
 			ata:        logics.ATA,
 			ps:         permission.NewPermissionService(appSetting),
@@ -73,7 +75,7 @@ func NewCapabilityBindingService(appSetting *common.AppSetting) interfaces.Capab
 
 // normalizeAttachEntry validates one mount item and returns its canonical three-part identity.
 //
-// A skill has no owning container, so a stray owner_id is dropped rather than stored: keeping it
+// A skill or a knowledge base has no owning container, so a stray owner_id is dropped rather than stored: keeping it
 // would create a second row for the same skill that the unique key cannot collapse, and repeated
 // mounts would stop being idempotent.
 func normalizeAttachEntry(ctx context.Context, entry *interfaces.AttachCapabilityEntry) (capabilityType, ownerID,
@@ -83,40 +85,40 @@ func normalizeAttachEntry(ctx context.Context, entry *interfaces.AttachCapabilit
 	capabilityID = strings.TrimSpace(entry.CapabilityID)
 
 	if !interfaces.IsValidCapabilityType(capabilityType) {
-		return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidCapabilityType).
 			WithErrorDetails(fmt.Sprintf("unsupported capability_type: %s", capabilityType))
 	}
 	if capabilityID == "" {
-		return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_NullParameter_CapabilityID)
 	}
 	// Column widths are checked here rather than left to the database: an over-long value would
 	// otherwise surface as a 500 under strict SQL mode, or be silently truncated into a binding
 	// that points at a different capability.
 	if len(capabilityID) > maxCapabilityIDLength {
-		return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("capability_id exceeds %d characters", maxCapabilityIDLength))
 	}
 	if len(ownerID) > maxOwnerIDLength {
-		return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("owner_id exceeds %d characters", maxOwnerIDLength))
 	}
 	if len(strings.TrimSpace(entry.Comment)) > maxCommentLength {
-		return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("comment exceeds %d characters", maxCommentLength))
 	}
 	switch capabilityType {
-	case interfaces.CAPABILITY_TYPE_SKILL:
+	case interfaces.CAPABILITY_TYPE_SKILL, interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE:
 		ownerID = ""
 	case interfaces.CAPABILITY_TYPE_FUNCTION, interfaces.CAPABILITY_TYPE_MCP_TOOL:
 		// Both name a tool inside a container — a tool box, or an MCP Server — and the id alone
 		// does not identify one: tool ids are scoped to their box, tool names to their server.
 		if ownerID == "" {
-			return "", "", "", rest.NewHTTPError(ctx, http.StatusBadRequest,
+			return "", "", "", httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 				berrors.BknBackend_CapabilityBinding_NullParameter_OwnerID)
 		}
 	}
@@ -136,7 +138,7 @@ func (cbs *capabilityBindingService) AttachCapabilities(ctx context.Context, tx 
 	}
 
 	if len(entries) == 0 {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidParameter).
 			WithErrorDetails("capabilities must not be empty")
 	}
@@ -173,7 +175,7 @@ func (cbs *capabilityBindingService) AttachCapabilities(ctx context.Context, tx 
 		if err != nil {
 			logger.Errorf("GetBindingByCapability in knowledge network[%s] error: %v", knID, err)
 			span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_CapabilityBinding_InternalError_CreateBindingsFailed).WithErrorDetails(err.Error())
 		}
 		// Mounting an already bound capability returns the existing row. Mounting is a statement
@@ -187,7 +189,7 @@ func (cbs *capabilityBindingService) AttachCapabilities(ctx context.Context, tx 
 		generatedID, generateErr := uuid.NewV7()
 		if generateErr != nil {
 			span.SetStatus(codes.Error, common.SafeErrorSummary(generateErr))
-			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_CapabilityBinding_InternalError).WithErrorDetails(generateErr.Error())
 		}
 		binding := &interfaces.CapabilityBinding{
@@ -213,9 +215,13 @@ func (cbs *capabilityBindingService) AttachCapabilities(ctx context.Context, tx 
 		if err := cbs.cba.CreateBindings(ctx, tx, toCreate); err != nil {
 			logger.Errorf("CreateBindings in knowledge network[%s] error: %v", knID, err)
 			span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_CapabilityBinding_InternalError_CreateBindingsFailed).WithErrorDetails(err.Error())
 		}
+	}
+
+	for _, binding := range toCreate {
+		binding.CreatedByAttach = true
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -240,12 +246,15 @@ func (cbs *capabilityBindingService) DetachCapabilities(ctx context.Context, tx 
 	}, []string{interfaces.OPERATION_TYPE_MODIFY}); err != nil {
 		return 0, err
 	}
+	if err := logics.CheckDefinitionRevision(ctx, tx, interfaces.RevisionKindCapabilityBinding, knID, branch, bindingIDs...); err != nil {
+		return 0, err
+	}
 
 	rows, err := cbs.cba.DeleteBindingsByIDs(ctx, tx, knID, branch, bindingIDs)
 	if err != nil {
 		logger.Errorf("DeleteBindingsByIDs in knowledge network[%s] error: %v", knID, err)
 		span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-		return 0, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return 0, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_DeleteBindingsFailed).WithErrorDetails(err.Error())
 	}
 	span.SetStatus(codes.Ok, "")
@@ -258,14 +267,14 @@ func (cbs *capabilityBindingService) ListCapabilities(ctx context.Context,
 	defer span.End()
 
 	if query.CapabilityType != "" && !interfaces.IsValidCapabilityType(query.CapabilityType) {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidCapabilityType).
 			WithErrorDetails(fmt.Sprintf("unsupported capability_type: %s", query.CapabilityType))
 	}
 	if metadataType := strings.TrimSpace(query.MetadataType); metadataType != "" &&
 		metadataType != interfaces.EXEC_BOX_METADATA_TYPE_OPENAPI &&
 		metadataType != interfaces.EXEC_BOX_METADATA_TYPE_FUNCTION {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("unsupported metadata_type: %s", metadataType))
 	}
@@ -296,7 +305,10 @@ func (cbs *capabilityBindingService) ListCapabilities(ctx context.Context,
 	// Why each capability is here, and what the model uses that is not mounted at all. Both come
 	// from one read of the branch's object types and action types, read before the metadata_type
 	// filter because the boxes of the unmounted ones are candidates for it too.
-	sources := cbs.collectProvenance(ctx, query.KNID, query.Branch)
+	var sources *provenance
+	if !query.MountedOnly {
+		sources = cbs.collectProvenance(ctx, query.KNID, query.Branch)
+	}
 
 	// metadata_type reaches SQL as a set of tool boxes. Resolving it here rather than filtering
 	// the fetched page is what keeps paging honest: the page is drawn from rows that already
@@ -310,6 +322,39 @@ func (cbs *capabilityBindingService) ListCapabilities(ctx context.Context,
 		// The kind belongs to a tool box, so this necessarily selects function bindings only.
 		// Saying so makes the answer the same whether or not the caller also passed type.
 		query.CapabilityType = interfaces.CAPABILITY_TYPE_FUNCTION
+	}
+
+	if query.MountedOnly {
+		// This path is a membership list. SQL pages stored bindings directly, and no model
+		// scan or backfill of reference-only tools is needed for a mount-management view.
+		total, countErr := cbs.cba.GetBindingsTotal(ctx, query)
+		if countErr != nil {
+			logger.Errorf("GetBindingsTotal in knowledge network[%s] error: %v", query.KNID, countErr)
+			span.SetStatus(codes.Error, common.SafeErrorSummary(countErr))
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_CapabilityBinding_InternalError_GetBindingsTotalFailed).WithErrorDetails(countErr.Error())
+		}
+		entries, listErr := cbs.cba.ListBindings(ctx, query)
+		if listErr != nil {
+			logger.Errorf("ListBindings in knowledge network[%s] error: %v", query.KNID, listErr)
+			span.SetStatus(codes.Error, common.SafeErrorSummary(listErr))
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
+				berrors.BknBackend_CapabilityBinding_InternalError_ListBindingsFailed).WithErrorDetails(listErr.Error())
+		}
+		for _, entry := range entries {
+			kind := interfaces.CAPABILITY_SOURCE_MANUAL
+			if entry.BoundAsBox {
+				kind = interfaces.CAPABILITY_SOURCE_BOX
+			}
+			entry.Sources = []*interfaces.CapabilitySource{{Kind: kind}}
+			entry.Releasable = true
+		}
+		backfilled := cbs.backfillMetadata(ctx, query, entries, query.WithDetail)
+		span.SetStatus(codes.Ok, "")
+		return &interfaces.CapabilityBindingsList{
+			Entries: entries, TotalCount: total, Boxes: backfilled.boxes,
+			MetadataAvailable: backfilled.available, SourcesAvailable: false,
+		}, nil
 	}
 
 	// The stored rows are fetched whole and paged in memory, because the page is not made of them
@@ -326,7 +371,7 @@ func (cbs *capabilityBindingService) ListCapabilities(ctx context.Context,
 	if err != nil {
 		logger.Errorf("ListBindings in knowledge network[%s] error: %v", query.KNID, err)
 		span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_ListBindingsFailed).WithErrorDetails(err.Error())
 	}
 
@@ -355,43 +400,15 @@ func (cbs *capabilityBindingService) GetCapabilityTotalsByType(ctx context.Conte
 	if err != nil {
 		logger.Errorf("GetBindingsTotalByType in knowledge network[%s] error: %v", knID, err)
 		span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_GetBindingsTotalFailed).WithErrorDetails(err.Error())
 	}
 
-	// Capabilities the model uses but nobody mounted are in the listing, so they are in the
-	// counts too. A count that disagreed with the list it labels is worse than either number
-	// alone: the workspace would show eight rows under a badge reading five.
-	sources := cbs.collectProvenance(ctx, knID, branch)
-	stored, storedErr := cbs.cba.ListBindings(ctx, interfaces.CapabilityBindingsQueryParams{
-		KNID: knID, Branch: branch,
-		PaginationQueryParameters: interfaces.PaginationQueryParameters{Limit: noPagingLimit},
-	})
-	// Unmounted function capabilities per box, so the split below weighs them by their box's kind
-	// like the mounted ones. Left out, an openapi tool the model uses would be counted as a function.
-	implicitPerBox := map[string]int{}
-	if storedErr != nil {
-		logger.Warnf("capability totals: bindings unreadable for kn_id=%s: %v", knID, storedErr)
-	} else {
-		mounted := make(map[capabilityKey]struct{}, len(stored))
-		for _, binding := range stored {
-			mounted[keyOfBinding(binding)] = struct{}{}
-		}
-		for key := range sources.byCapability {
-			if _, ok := mounted[key]; !ok {
-				totals[key.capabilityType]++
-				if key.capabilityType == interfaces.CAPABILITY_TYPE_FUNCTION {
-					implicitPerBox[key.ownerID]++
-				}
-			}
-		}
-	}
-
-	// Split the function count by the kind of box each capability belongs to. The kind is not in
-	// these rows — it belongs to the box, in the execution factory — so this costs one call per
-	// box, not one per capability, and only on the statistics path.
+	// Statistics describe direct mounts. Object and action types may reference the same tools
+	// without mounting them, so provenance must not inflate the Function, API, or MCP counts.
+	// Split Function mounts by the kind of box each one belongs to.
 	if totals[interfaces.CAPABILITY_TYPE_FUNCTION] > 0 {
-		apis, splitErr := cbs.countAPIBindings(ctx, knID, branch, implicitPerBox)
+		apis, splitErr := cbs.countAPIBindings(ctx, knID, branch)
 		if splitErr != nil {
 			// A box that cannot be read leaves its bindings counted as functions, which is the
 			// same fallback the count had before this split existed. Failing the whole
@@ -422,7 +439,7 @@ func (cbs *capabilityBindingService) boxesOfKind(ctx context.Context, knID, bran
 	metadataType string, sources *provenance) ([]string, error) {
 	perBox, err := cbs.cba.GetFunctionTotalsByOwner(ctx, knID, branch)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_ListBindingsFailed).
 			WithErrorDetails(err.Error())
 	}
@@ -441,7 +458,7 @@ func (cbs *capabilityBindingService) boxesOfKind(ctx context.Context, knID, bran
 
 	kinds, failedBox, err := cbs.boxKinds(ctx, candidates)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadGateway,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadGateway,
 			berrors.BknBackend_CapabilityBinding_ExecutionFactoryUnavailable).
 			WithErrorDetails(fmt.Sprintf("tool box lookup failed: box_id=%s", failedBox))
 	}
@@ -457,28 +474,19 @@ func (cbs *capabilityBindingService) boxesOfKind(ctx context.Context, knID, bran
 	return boxIDs, nil
 }
 
-// countAPIBindings counts the function capabilities whose tool box is an openapi box: the
-// mounted ones, plus implicitPerBox — the capabilities per box that the model uses without a
-// mount, which the totals already count as functions.
+// countAPIBindings counts the mounted Function capabilities whose tool box is an openapi box.
 //
 // A box that cannot be read counts as a function rather than failing: that is the pre-split
 // behaviour, and the dangling marker on the listing is what makes a missing box visible.
 func (cbs *capabilityBindingService) countAPIBindings(ctx context.Context, knID,
-	branch string, implicitPerBox map[string]int) (int, error) {
+	branch string) (int, error) {
 	perBox, err := cbs.cba.GetFunctionTotalsByOwner(ctx, knID, branch)
 	if err != nil {
 		return 0, err
 	}
 
-	counts := make(map[string]int, len(perBox)+len(implicitPerBox))
-	for boxID, count := range perBox {
-		counts[boxID] += count
-	}
-	for boxID, count := range implicitPerBox {
-		counts[boxID] += count
-	}
-	candidates := make(map[string]struct{}, len(counts))
-	for boxID := range counts {
+	candidates := make(map[string]struct{}, len(perBox))
+	for boxID := range perBox {
 		candidates[boxID] = struct{}{}
 	}
 
@@ -489,7 +497,7 @@ func (cbs *capabilityBindingService) countAPIBindings(ctx context.Context, knID,
 	apis := 0
 	for boxID, kind := range kinds {
 		if kind == interfaces.EXEC_BOX_METADATA_TYPE_OPENAPI {
-			apis += counts[boxID]
+			apis += perBox[boxID]
 		}
 	}
 	return apis, nil
@@ -572,7 +580,7 @@ func (cbs *capabilityBindingService) DeleteCapabilitiesByKnID(ctx context.Contex
 	if _, err := cbs.cba.DeleteBindingsByKnID(ctx, tx, knID, branch); err != nil {
 		logger.Errorf("DeleteBindingsByKnID in knowledge network[%s] error: %v", knID, err)
 		span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_DeleteBindingsFailed).WithErrorDetails(err.Error())
 	}
 	span.SetStatus(codes.Ok, "")
@@ -604,7 +612,7 @@ func (cbs *capabilityBindingService) ResolveCapabilities(ctx context.Context, kn
 
 	capabilityType = strings.TrimSpace(capabilityType)
 	if capabilityType != "" && !interfaces.IsValidCapabilityType(capabilityType) {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 			berrors.BknBackend_CapabilityBinding_InvalidCapabilityType).
 			WithErrorDetails(fmt.Sprintf("unsupported capability_type: %s", capabilityType))
 	}
@@ -617,7 +625,7 @@ func (cbs *capabilityBindingService) ResolveCapabilities(ctx context.Context, kn
 	if err != nil {
 		logger.Errorf("ResolveCapabilities in knowledge network[%s] error: %v", knID, err)
 		span.SetStatus(codes.Error, common.SafeErrorSummary(err))
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 			berrors.BknBackend_CapabilityBinding_InternalError_ListBindingsFailed).WithErrorDetails(err.Error())
 	}
 

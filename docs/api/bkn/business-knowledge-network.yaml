@@ -1,13 +1,24 @@
 ---
 openapi: 3.0.2
 info:
-  title: BusinessKnowledgeNetwork
+  title: BKN 知识网络 · 知识网络 API
   version: 0.1.0
   description: |
+    Authentication requires an OAuth access token, for example the token returned
+    by `openbkn auth token` after `openbkn auth login`. AppKeys (`bak_`) are not
+    supported by these BKN management REST APIs, including read-only list and
+    detail requests. An AppKey can be active in Safe and accepted by Context
+    Loader while this service rejects it with HTTP 401 / `Public.Unauthorized`.
+    Resource authorization is evaluated after successful authentication.
+
     Knowledge-network CRUD uses `knowledge_network:{kn_id}`. Create requires
     `knowledge_network:*:create`; detail, list, update, and delete use the
     corresponding instance operations. Lists are authorization-filtered before
     total and pagination. See `../knowledge-network-authorization.md`.
+
+    Resource IDs use lowercase letters, digits, underscores, and hyphens, start
+    with a letter or digit, and contain at most 128 characters. Resource names
+    contain at most 128 Unicode characters.
 
     Main-branch import and overwrite perform Proxy source preflight before strict child validation.
     The effective delegator chosen for retained or new sources is reused for the corresponding
@@ -72,6 +83,26 @@ paths:
       summary: List business knowledge networks
     post:
       parameters:
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases, lifecycle and property declarations), relation type or action type (aliases, lifecycle, and
+            for a relation type its other declarations), such as a 2.x package or an old JSON export, would clear
+            them. Without this parameter the request is refused with 409. Its `error_details.cleared` lists the
+            declarations of all three kinds of definition at once, each entry naming `object_type_id`,
+            `relation_type_id` or `action_type_id`; the error code is that of the first kind listed
+            (BknBackend.ObjectType.DeclarationsWouldBeCleared, then
+            BknBackend.RelationType.DeclarationsWouldBeCleared, then
+            BknBackend.ActionType.DeclarationsWouldBeCleared). Pass true to clear them.
+
+            If the network the overwrite would produce also breaks a rule that spans definitions (for example a
+            kept relation type whose `fallback_for` names a relation type the file overwrites without a cardinality),
+            `error_details.blocking` lists those problems as text: confirming does not make the import succeed
+            until they are resolved, so resolve them before confirming.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: Import mode. Supported values are normal, ignore, and overwrite. Defaults to normal.
           schema:
@@ -188,8 +219,17 @@ paths:
             enum: [full, summary]
             default: full
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/KnVersion"
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/DraftRevision"
       responses:
         "200":
+          headers:
+            X-Kn-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnVersion"
+            X-Kn-Running-Version:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnRunningVersion"
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           content:
             application/json:
               schema:
@@ -227,6 +267,10 @@ paths:
                     updater: a0f02238-6cec-11f0-82bb-fa1c4529a151
                     update_time: 1757583140948
           description: ok
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/ReadConflict"
+        "410":
+          $ref: "../_shared/kn-version.yaml#/components/responses/VersionPurged"
       summary: Get business knowledge network details
       description: Gets ontology model details and includes specification content when requested.
     put:
@@ -242,6 +286,26 @@ paths:
             type: boolean
             default: true
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases, lifecycle and property declarations), relation type or action type (aliases, lifecycle, and
+            for a relation type its other declarations), such as a 2.x package or an old JSON export, would clear
+            them. Without this parameter the request is refused with 409. Its `error_details.cleared` lists the
+            declarations of all three kinds of definition at once, each entry naming `object_type_id`,
+            `relation_type_id` or `action_type_id`; the error code is that of the first kind listed
+            (BknBackend.ObjectType.DeclarationsWouldBeCleared, then
+            BknBackend.RelationType.DeclarationsWouldBeCleared, then
+            BknBackend.ActionType.DeclarationsWouldBeCleared). Pass true to clear them.
+
+            If the network the overwrite would produce also breaks a rule that spans definitions (for example a
+            kept relation type whose `fallback_for` names a relation type the file overwrites without a cardinality),
+            `error_details.blocking` lists those problems as text: confirming does not make the import succeed
+            until they are resolved, so resolve them before confirming.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: |
             Import mode. normal reports an error for duplicate concept names; overwrite replaces them;
@@ -251,6 +315,7 @@ paths:
             enum: [normal, overwrite, ignore]
             default: normal
           in: query
+        - $ref: "../_shared/kn-version.yaml#/components/parameters/ExpectedDraftRevision"
       requestBody:
         content:
           application/json:
@@ -259,7 +324,20 @@ paths:
         required: true
       responses:
         "204":
+          headers:
+            X-Kn-Draft-Revision:
+              $ref: "../_shared/kn-version.yaml#/components/headers/XKnDraftRevision"
           description: Update succeeded
+        "404":
+          description: The network does not exist on the requested branch (BknBackend.KnowledgeNetwork.NotFound)
+          content:
+            application/json:
+              schema:
+                $ref: "../_shared/errors.yaml#/components/schemas/Error"
+        "428":
+          $ref: "../_shared/kn-version.yaml#/components/responses/PreconditionRequired"
+        "409":
+          $ref: "../_shared/kn-version.yaml#/components/responses/DefinitionModified"
       summary: Update a business knowledge network
     delete:
       parameters:
@@ -270,7 +348,7 @@ paths:
           in: path
           required: true
         - name: branch
-          description: Branch. Defaults to main.
+          description: main. The request deletes the whole network, on every branch. A network that no longer has a main branch is deleted through a branch it still has.
           schema:
             type: string
             default: main
@@ -278,8 +356,10 @@ paths:
       responses:
         "204":
           description: Deletion succeeded
+        "400":
+          description: A branch other than main was requested while the network has a main branch
       summary: Delete a business knowledge network
-      description: Deletes a business knowledge network and all of its object types, relation types, action types, and concept groups.
+      description: Deletes a business knowledge network on every branch it has, with all of its object types, relation types, action types, concept groups, capability bindings, and action schedules.
     parameters:
       - name: kn_id
         description: Business knowledge network ID
@@ -325,13 +405,35 @@ paths:
       description: |
         Internal, tokenless resource catalog for authorization configuration.
         It intentionally bypasses user-resource visibility filtering and returns
-        only knowledge-network IDs and names from the main branch. It must not
-        be exposed through an external ingress; cluster network reachability is
-        the access boundary.
+        only IDs and names from the main branch: knowledge networks by default, or
+        the child resources of one knowledge network when resource_type names a
+        child type. It must not be exposed through an external ingress; cluster
+        network reachability is the access boundary.
       security: []
       parameters:
+        - name: resource_type
+          description: |
+            Resource type to list. Empty or knowledge_network lists knowledge networks. The child types
+            object_type, relation_type, action_type, concept_group and metric list the children of the
+            knowledge network given by parent_id; any other value is rejected with 400. Child entry ids
+            have the form "{parent_id}/{child_id}".
+          schema:
+            type: string
+            enum: [knowledge_network, object_type, relation_type, action_type, concept_group, metric]
+          in: query
+        - name: parent_type
+          description: Required for child resource types and must be knowledge_network. Ignored when listing knowledge networks.
+          schema:
+            type: string
+            enum: [knowledge_network]
+          in: query
+        - name: parent_id
+          description: Required for child resource types. ID of the parent knowledge network. Ignored when listing knowledge networks.
+          schema:
+            type: string
+          in: query
         - name: name
-          description: Optional fuzzy match against the knowledge-network name.
+          description: Optional fuzzy match against the name of the listed resources.
           schema:
             type: string
           in: query
@@ -371,6 +473,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuthorizationResourceList"
+        "400":
+          description: resource_type is invalid, or parent_type is not knowledge_network or parent_id is missing for a child resource type.
   /api/bkn-backend/v1/knowledge-networks/{kn_id}/overview-graph:
     get:
       summary: Get a bounded ontology overview graph
@@ -378,7 +482,10 @@ paths:
         Returns a lightweight, authorization-filtered graph projection for large knowledge networks.
         Counts are calculated after authorization. The initial page and cursor pages are bounded;
         focus_object_type_id expands one node by one or two hops. A cursor is rejected when the
-        network snapshot has changed. Returned edges never reference a node omitted by authorization.
+        network snapshot has changed. When concept_group_id is provided, counts and truncation are
+        scoped to the visible object and relation types in that group. Concept-group cursors advance
+        node and relation pages independently, so an edge may reference a node returned by a later
+        page; clients should merge pages by ID before drawing the edge.
       parameters:
         - name: kn_id
           in: path
@@ -393,23 +500,23 @@ paths:
             default: main
         - name: node_limit
           in: query
-          description: Maximum returned nodes. Defaults to 60; maximum 200.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 200
-            default: 60
-        - name: edge_limit
-          in: query
-          description: Maximum candidate relations read for this response. Defaults to 120; maximum 500.
+          description: Maximum returned nodes per page. Defaults to 60; maximum 500.
           schema:
             type: integer
             minimum: 1
             maximum: 500
+            default: 60
+        - name: edge_limit
+          in: query
+          description: Maximum candidate relations read per page. Defaults to 120; maximum 1000.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
             default: 120
         - name: cursor
           in: query
-          description: Opaque cursor from next_cursor. Cannot be combined with focus or concept-group expansion.
+          description: Opaque cursor from next_cursor. Supported for network and concept-group projections; cannot be combined with focus_object_type_id.
           schema:
             type: string
         - name: focus_object_type_id
@@ -468,6 +575,26 @@ paths:
             type: boolean
             default: true
           in: query
+        - name: confirm_clear_declarations
+          in: query
+          description: |
+            With overwrite, a file that does not carry the BKN spec 3.0 declarations of an existing object type
+            (aliases, lifecycle and property declarations), relation type or action type (aliases, lifecycle, and
+            for a relation type its other declarations), such as a 2.x package or an old JSON export, would clear
+            them. Without this parameter the request is refused with 409. Its `error_details.cleared` lists the
+            declarations of all three kinds of definition at once, each entry naming `object_type_id`,
+            `relation_type_id` or `action_type_id`; the error code is that of the first kind listed
+            (BknBackend.ObjectType.DeclarationsWouldBeCleared, then
+            BknBackend.RelationType.DeclarationsWouldBeCleared, then
+            BknBackend.ActionType.DeclarationsWouldBeCleared). Pass true to clear them.
+
+            If the network the overwrite would produce also breaks a rule that spans definitions (for example a
+            kept relation type whose `fallback_for` names a relation type the file overwrites without a cardinality),
+            `error_details.blocking` lists those problems as text: confirming does not make the import succeed
+            until they are resolved, so resolve them before confirming.
+          schema:
+            type: boolean
+            default: false
         - name: import_mode
           description: Matches creation semantics. When neither import_mode nor mode is provided, uses normal. It validates persisted ID and name conflicts with normal, ignore, and overwrite semantics.
           schema:
@@ -533,9 +660,11 @@ components:
         object_type_total:
           type: integer
           minimum: 0
+          description: Total visible object types in the network, or in the selected concept group when concept_group_id is provided.
         relation_type_total:
           type: integer
           minimum: 0
+          description: Total visible relations in the network, or relations whose endpoints are both in the selected concept group when concept_group_id is provided.
         returned_nodes:
           type: integer
           minimum: 0
@@ -544,11 +673,20 @@ components:
           minimum: 0
         truncated:
           type: boolean
+          description: >
+            Whether the response is incomplete under the selected bounding mode. For a concept-group
+            projection, this compares the returned counts with the group-scoped totals. For other modes,
+            it also reflects pagination and edge-limit conditions; a focus projection can therefore be
+            marked truncated relative to the visible network-wide totals.
         snapshot:
           type: string
+          description: >
+            Opaque consistency token derived from the network version and the authorization-filtered
+            totals for this scope. A concept-group projection uses group-scoped totals, so its token can
+            differ from an unfiltered or focus projection of the same network version.
         next_cursor:
           type: string
-          description: Opaque cursor for the next bounded node page. Omitted when there is no next page.
+          description: Opaque cursor for the next bounded page. Concept-group cursors independently advance node and relation offsets. Omitted when both streams are complete.
     OverviewGraphNode:
       type: object
       required: [id, name]
@@ -561,11 +699,25 @@ components:
           type: string
         color:
           type: string
-        indexed:
-          type: boolean
+        index_status:
+          $ref: ./object-type.yaml#/components/schemas/ObjectTypeIndexStatus
         degree:
           type: integer
           minimum: 0
+        concept_groups:
+          type: array
+          description: Concept groups visible to the caller, sorted by name and ID.
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+        lifecycle:
+          description: Whether the object type is still in use (BKN spec 3.0, §4.3). Left out when it is active.
+          $ref: ./relation-type.yaml#/components/schemas/Lifecycle
     OverviewGraphEdge:
       type: object
       required: [id, name, source_id, target_id, mapping_mode]
@@ -581,6 +733,9 @@ components:
         mapping_mode:
           type: string
           enum: [direct, indirect, filtered_cross_join]
+        lifecycle:
+          description: Whether the relation type is still in use (BKN spec 3.0, §4.3). Left out when it is active.
+          $ref: ./relation-type.yaml#/components/schemas/Lifecycle
     AuthorizationResourceList:
       type: object
       required: [entries, total]
@@ -611,6 +766,8 @@ components:
         action_types:
           type: array
         concept_groups:
+          type: array
+        value_types:
           type: array
     BasicInfo:
       description: Basic resource information containing ID and name
@@ -780,9 +937,6 @@ components:
         - type
         - comment
         - mapped_field
-        - index
-        - fulltext_config
-        - vector_config
       type: object
       properties:
         name:
@@ -792,7 +946,7 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, supports metric, objective, event, trace, log, and operator.
+          description: Property data type, matching the type of the mapped view field.
           type: string
         comment:
           description: Property description
@@ -800,37 +954,6 @@ components:
         mapped_field:
           description: Field name mapped to the data source
           type: string
-        index:
-          description: Whether indexing is enabled. Defaults to true.
-          type: boolean
-        fulltext_config:
-          $ref: "#/components/schemas/FulltextConfig"
-          description: Full-text index configuration
-        vector_config:
-          $ref: "#/components/schemas/VectorConfig"
-          description: Vector index configuration
-    FulltextConfig:
-      description: Full-text index configuration
-      required:
-        - analyzer
-        - field_keyword
-      type: object
-      properties:
-        analyzer:
-          description: Analyzer ID. Available values come from fulltext_analyzers returned by GET /api/vega-backend/v1/index-capabilities and depend on the cluster capabilities.
-          type: string
-        field_keyword:
-          description: Whether to retain the original string for exact matching. Defaults to false.
-          type: boolean
-    VectorConfig:
-      description: Vector index configuration
-      required:
-        - dimension
-      type: object
-      properties:
-        dimension:
-          description: Vector dimension
-          type: integer
     LogicProperty:
       description: Logic properties
       required:
@@ -846,14 +969,11 @@ components:
           description: Property display name
           type: string
         type:
-          description: Property data type. In addition to view field types, supports metric, objective, event, trace, log, and operator.
+          description: Logic property type. Only tool is supported.
           type: string
         comment:
           description: Property description
           type: string
-        index:
-          description: Whether indexing is enabled. Defaults to true.
-          type: boolean
         data_source:
           $ref: "#/components/schemas/DataSource"
           description: Logic source
@@ -880,10 +1000,12 @@ components:
           enum:
             - property
             - input
+            - source_identity
+            - target_identity
           type: string
         value:
-          description: Parameter value. For value_from=property, provide the object type data property name. For value_from=input, omit this field.
-          type: string
+          description: Literal constant, or an object property name for property. Omit for input
+            and endpoint identity sources.
     FilteredCrossJoinMappingRule:
       description: |
         Matching rules for filtered_cross_join (FCJ). It does not use data views or key mappings.
@@ -898,45 +1020,61 @@ components:
           description: Target-side instance filter. Omit it for no target-side constraint.
           type: object
     ActionCondition:
-      description: Action condition
       type: object
+      required:
+      - operation
       properties:
         object_type_id:
-          description: Object type ID. Include it when filtering multiple object types; otherwise any matching property name can be filtered.
           type: string
         field:
-          description: Field name, which is the object type property name
           type: string
         operation:
-          description: Operator
-          enum:
-            - and
-            - or
-            - ==
-            - "!="
-            - ">"
-            - ">="
-            - <
-            - <=
-            - in
-            - not_in
-            - range
-            - out_range
-            - exist
-            - not_exist
           type: string
+          enum:
+          - and
+          - or
+          - ==
+          - '!='
+          - '>'
+          - '>='
+          - <
+          - <=
+          - in
+          - not_in
+          - empty
+          - not_empty
+          - 'true'
+          - 'false'
+          - range
+          - out_range
+          - before
+          - between
+          - exist
+          - not_exist
+          - like
+          - not_like
+          - prefix
+          - not_prefix
+          - 'null'
+          - not_null
+          - regex
+          - contain
+          - not_contain
+          - current
         sub_conditions:
-          description: Nested filter conditions
           type: array
           items:
-            $ref: "#/components/schemas/ActionCondition"
-        value:
-          description: Field value
+            $ref: '#/components/schemas/ActionCondition'
         value_from:
-          description: Field value source. Currently supports const only.
-          enum:
-            - const
           type: string
+          enum:
+          - const
+          - property
+          - input
+          default: const
+        value:
+          description: Literal value for const; same-endpoint property name for property; runtime parameter name for
+            input. Applicability does not supply target identities.
     ExpectedImpactOperation:
       description: Consistent with action_intent and action_type. impact_contracts[].expected_operation is required; affect.expected_operation must be valid when present.
       type: string
@@ -1028,10 +1166,10 @@ components:
           description: "Maximum path length, not greater than 5."
           type: integer
         direction:
-          description: "Direction: forward, reverse, or bidirectional"
+          description: "Direction: forward, backward, or bidirectional"
           enum:
             - forward
-            - reverse
+            - backward
             - bidirectional
           type: string
         path_select_policy:
@@ -1046,87 +1184,22 @@ components:
         id:
           description: id
           type: string
-    ReqBranch:
-      description: Branch creation information
-      required:
-        - name
-        - base_version
-      type: object
-      properties:
-        id:
-          description: Branch ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
-          type: string
-        name:
-          description: Branch name. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
-          type: string
-        tags:
-          description: Tags used for business identification
-          type: array
-          items:
-            type: string
-        comment:
-          description: Comment
-          type: string
-        base_version:
-          description: Source version
-          type: string
-    UpdateBranch:
-      description: Branch update information. Only tags and comment can be modified.
-      type: object
-      properties:
-        tags:
-          description: Tags used for business identification
-          type: array
-          items:
-            type: string
-        comment:
-          description: Comment
-          type: string
-    Branch:
-      description: Branch information
-      required:
-        - base_version
-        - comment
-        - id
-        - kn_id
-        - name
-        - tags
-      type: object
-      properties:
-        id:
-          description: Branch ID
-          type: string
-        name:
-          description: Branch name
-          type: string
-        tags:
-          description: Tags
-          type: array
-          items:
-            type: string
-        comment:
-          description: Comment
-          type: string
-        base_version:
-          description: Source version
-          type: string
-        kn_id:
-          description: Business knowledge network ID
-          type: string
     ReqConceptGroup:
       description: Concept group creation information
       required:
         - name
         - branch
-        - base_version
       type: object
       properties:
         id:
           description: ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name.
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1137,9 +1210,6 @@ components:
           type: string
         branch:
           description: Branch ID
-          type: string
-        base_version:
-          description: Source version
           type: string
         object_type_ids:
           description: Object type list included in the concept group
@@ -1159,13 +1229,13 @@ components:
     UpdateConceptGroup:
       description: Concept group update information
       required:
-        - base_version
         - branch
       type: object
       properties:
         name:
           description: Name.
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1176,9 +1246,6 @@ components:
           type: string
         branch:
           description: Branch ID
-          type: string
-        base_version:
-          description: Source version
           type: string
         object_type_ids:
           description: Object type list included in the concept group
@@ -1195,21 +1262,6 @@ components:
           type: array
           items:
             type: string
-    ListBranches:
-      description: Branch list
-      required:
-        - entries
-        - total_count
-      type: object
-      properties:
-        entries:
-          description: Entry list
-          type: array
-          items:
-            $ref: "#/components/schemas/Branch"
-        total_count:
-          description: Total count
-          type: integer
     ListObjectTypes:
       description: Object type list
       required:
@@ -1303,7 +1355,6 @@ components:
       description: Object type creation information
       required:
         - branch
-        - base_version
         - name
         - primary_keys
         - display_key
@@ -1313,9 +1364,12 @@ components:
         id:
           description: ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1369,9 +1423,12 @@ components:
         id:
           description: Business knowledge network ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Business knowledge network name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1389,8 +1446,22 @@ components:
         branch:
           description: Branch ID
           type: string
+        versioning:
+          description: >-
+            Set true to create the network with versioning from the start: what the request defines
+            is stored in its draft, and no version is running until the first one is published
+            (`POST /knowledge-networks/{kn_id}/versions`), so reads of the running version return
+            nothing meanwhile. `branch` must then be `main` or `draft`. Omit or false creates an
+            unversioned network; versioning can also be enabled later with
+            `POST /knowledge-networks/{kn_id}/versioning`. The version operations are described in
+            the knowledge-network versions API (`kn-versions.yaml`).
+          type: boolean
+          default: false
     UpdateKnowledgeNetwork:
-      description: Business knowledge network creation request body
+      description: >-
+        Business knowledge network update request body. Name, tags, comment, icon and color belong to
+        the network and apply to every branch. skill_content applies to the branch named by the
+        `branch` query parameter only.
       required:
         - branch
         - name
@@ -1399,6 +1470,7 @@ components:
         name:
           description: Business knowledge network name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1416,6 +1488,13 @@ components:
         branch:
           description: Branch ID
           type: string
+        skill_content:
+          description: >-
+            The network's SKILL.md body on this branch. Leave it out to keep the stored value; send an
+            empty string to remove it. On a versioned network it is written to the draft and the
+            request must carry `expected_draft_revision` (428 without it); updating only the name,
+            tags, comment, icon and color needs no precondition.
+          type: string
     UpdateObjectType:
       description: Object type update
       required:
@@ -1424,12 +1503,12 @@ components:
         - display_key
         - data_properties
         - branch
-        - base_version
       type: object
       properties:
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1478,16 +1557,18 @@ components:
       required:
         - name
         - branch
-        - base_version
         - type
       type: object
       properties:
         id:
           description: ID. Immutable after creation. May contain lowercase letters, digits, underscores, and hyphens, and cannot start with an underscore or hyphen.
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1513,9 +1594,13 @@ components:
         source_object_type_id:
           description: Source object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         target_object_type_id:
           description: Target object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         type:
           description: Relation type
           enum:
@@ -1535,7 +1620,6 @@ components:
       required:
         - name
         - branch
-        - base_version
         - source_object_type
         - target_object_type
       type: object
@@ -1543,6 +1627,7 @@ components:
         name:
           description: Name
           type: string
+          maxLength: 128
         tags:
           description: Tags used for business identification
           type: array
@@ -1568,9 +1653,13 @@ components:
         source_object_type_id:
           description: Source object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         target_object_type_id:
           description: Target object type ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         type:
           description: Relation type
           enum:
@@ -1585,25 +1674,31 @@ components:
             - $ref: "#/components/schemas/FilteredCrossJoinMappingRule"
           description: "Matching rules for the relation. direct uses key mapping; indirect uses IndirectMappingRule backed by a resource; filtered_cross_join (FCJ) uses FilteredCrossJoinMappingRule."
     ReqActionType:
-      description: Action type creation information
+      description: |
+        Action type creation information. object_type_id and object_type are not required for
+        independent tool actions (operation_config.type=tool). Object and relation operations
+        require object_type_id; object_type is a display projection resolved by the server.
       required:
+        - operation_config
         - action_type
         - groups
         - kn_id
         - name
-        - object_type
         - concept_type
         - branch
-        - base_version
-        - object_type_id
       type: object
       properties:
+        operation_config:
+          $ref: '#/components/schemas/ActionOperationConfig'
         id:
           description: Action type ID
           type: string
+          maxLength: 128
+          pattern: "^$|^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Action type name
           type: string
+          maxLength: 128
         tags:
           description: Tags。
           type: array
@@ -1643,8 +1738,10 @@ components:
             - delete
           type: string
         object_type_id:
-          description: Object type ID bound to the action type
+          description: Required for object and relation operations; omit for independent tool actions.
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         condition:
           $ref: "#/components/schemas/ActionCondition"
           description: Action condition
@@ -1669,22 +1766,26 @@ components:
           $ref: "#/components/schemas/Schedule"
           description: Action listener parameter configuration
     UpdateActionType:
-      description: Action type update information
+      description: |
+        Action type update information. object_type_id and object_type are not required for
+        independent tool actions (operation_config.type=tool). Object and relation operations
+        require object_type_id; object_type is a display projection resolved by the server.
       required:
+        - operation_config
         - action_type
         - groups
         - kn_id
         - name
-        - object_type
         - concept_type
         - branch
-        - base_version
-        - object_type_id
       type: object
       properties:
+        operation_config:
+          $ref: '#/components/schemas/ActionOperationConfig'
         name:
           description: Action type name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -1723,8 +1824,10 @@ components:
             - delete
           type: string
         object_type_id:
-          description: Object type ID bound to the action type
+          description: Required for object and relation operations; omit for independent tool actions.
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         condition:
           $ref: "#/components/schemas/ActionCondition"
           description: Action condition
@@ -1751,6 +1854,7 @@ components:
     ActionTypeDetail:
       description: Action type
       required:
+        - operation_config
         - action_type
         - comment
         - id
@@ -1768,6 +1872,8 @@ components:
         - object_type_name
       type: object
       properties:
+        operation_config:
+          $ref: '#/components/schemas/ActionOperationConfig'
         id:
           description: Action type ID
           type: string
@@ -1814,10 +1920,10 @@ components:
             - delete
           type: string
         object_type_id:
-          description: Object type ID bound to the action type
+          description: Bound object type ID; empty for an independent tool action.
           type: string
         object_type_name:
-          description: Object type name bound to the action type
+          description: Bound object type name; empty for an independent tool action.
           type: string
         condition:
           $ref: "#/components/schemas/ActionCondition"
@@ -2136,9 +2242,12 @@ components:
         id:
           description: Business knowledge network ID
           type: string
+          maxLength: 128
+          pattern: "^[a-z0-9][a-z0-9_-]{0,127}$"
         name:
           description: Business knowledge network name
           type: string
+          maxLength: 128
         tags:
           description: Tags. May be empty.
           type: array
@@ -2174,6 +2283,8 @@ components:
           format: int64
           description: Most recent update time
           type: integer
+        versioning:
+          $ref: "../_shared/kn-version.yaml#/components/schemas/KnVersioning"
         statistics:
           $ref: "#/components/schemas/Statistics"
           description: Concept statistics. Calculated only when include_statistics is true.
@@ -2197,6 +2308,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ActionTypeDetail"
+        value_types:
+          description: |
+            BKN spec 3.0 value types of the network (value-types.yaml). Returned in export mode and accepted
+            by the import, which writes them before the object types that name them. Absent when the
+            network has none.
+          type: array
+          items:
+            $ref: "./value-types.yaml#/components/schemas/ValueType"
 
         module_type:
           description: Module type of the concept
@@ -2206,3 +2325,42 @@ components:
           type: array
           items:
             type: string
+    ActionOperationConfig:
+      type: object
+      required:
+      - type
+      additionalProperties: false
+      description: Single-operation definition. Required by the new action runtime; migrate stored definitions before
+        switching services.
+      oneOf:
+        - properties:
+            type:
+              enum: [object, tool]
+          additionalProperties: false
+        - required: [relation_type_id, relation_operation]
+          properties:
+            type:
+              enum: [relation]
+      properties:
+        type:
+          type: string
+          enum:
+          - object
+          - relation
+          - tool
+        relation_type_id:
+          type: string
+          description: Required for relation operations; must connect the selected object type.
+        relation_operation:
+          type: string
+          enum:
+          - create
+          - delete
+        anchor_role:
+          type: string
+          enum:
+          - source
+          - target
+          description: Role of object_type_id in the relation. Self relations require an explicit role.
+        other_object_condition:
+          $ref: '#/components/schemas/ActionCondition'

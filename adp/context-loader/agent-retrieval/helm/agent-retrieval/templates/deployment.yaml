@@ -55,6 +55,18 @@ spec:
           imagePullPolicy: {{ .Values.image.service.pullPolicy }}
 
           env:
+            {{- with (.Values.licenseHub | default dict).url }}
+              - name: BKN_SAFE_URL
+                value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.mcpExtensionManifestURL }}
+              - name: CONTEXT_LOADER_EXTENSION_MANIFEST_URL
+                value: {{ .Values.mcpExtensionManifestURL | quote }}
+            {{- end }}
+            {{- if .Values.mcpExtensionManifestJSON }}
+              - name: CONTEXT_LOADER_EXTENSION_MANIFEST_JSON
+                value: {{ .Values.mcpExtensionManifestJSON | quote }}
+            {{- end }}
             {{- if .Values.service.loggerOutput}}
               - name: LOGOUT
                 value: {{ .Values.service.loggerOutput }}
@@ -85,6 +97,10 @@ spec:
                 value: {{ printf "http://%s.%s.svc.cluster.local:%v/api/agent-retrieval/v1/mcp/" .Release.Name .Values.namespace .Values.service.sandboxPort | quote }}
               - name: BKN_TRACE_CORE_URL
                 value: {{ required "observability.lifecycle.core_url is required" .Values.observability.lifecycle.core_url | quote }}
+              - name: BKN_TRACE_INTERACTION_FINISH_TIMEOUT_MS
+                value: {{ .Values.observability.lifecycle.finish_timeout_ms | default 5000 | quote }}
+              - name: BKN_TRACE_DURABLE_ANSWER_ENABLED
+                value: {{ .Values.observability.lifecycle.durable_answer_enabled | default false | quote }}
               - name: BKN_TRACE_ARTIFACT_ENDPOINT
                 value: {{ required "observability.evidence.artifact_endpoint is required" .Values.observability.evidence.artifact_endpoint | quote }}
             {{- if .Values.observability.evidence.artifact_secret_name }}

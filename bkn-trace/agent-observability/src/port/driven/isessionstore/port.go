@@ -13,6 +13,12 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/sessionvo"
 )
 
+type CanonicalTraceRoot struct {
+	SourceModule string
+	ToolName     string
+	HasTool      bool
+}
+
 type Transaction interface {
 	Now() time.Time
 	FindCurrentConversation(owner sessionvo.Owner, externalKey string) (sessionvo.Conversation, bool)
@@ -41,8 +47,10 @@ type Transaction interface {
 	SaveOperation(operation sessionvo.Operation)
 	FindOperationCallFact(operationID string, attempt uint32) (sessionvo.OperationCallFact, bool)
 	ListOperationCallFacts(interactionID string) []sessionvo.OperationCallFact
+	ListOperationCallSummaries(interactionID string) []sessionvo.OperationCallSummary
 	ListOperationCallFactsByTraceID(traceID string) []sessionvo.OperationCallFact
 	ListFirstOperationSourceModulesByTraceIDs(traceIDs []string) map[string]string
+	ListCanonicalTraceRootsByTraceIDs(traceIDs []string, scope evidencevo.QueryScope) map[string]CanonicalTraceRoot
 	SaveOperationCallFact(fact sessionvo.OperationCallFact)
 	PeekReceipt(receiptID string) (sessionvo.Receipt, bool)
 	FindReceipt(receiptID string) (sessionvo.Receipt, bool)
@@ -81,6 +89,8 @@ type Store interface {
 }
 
 type SummaryPageQuery struct {
+	Tool                   string
+	Service                string
 	IncludeRegisteredCalls bool
 	Scope                  evidencevo.QueryScope
 	From                   time.Time
@@ -103,4 +113,17 @@ type SummaryPageStore interface {
 	Store
 	ListTraceSummaryIdentities(context.Context, SummaryPageQuery) (SummaryIdentityPage, error)
 	ListConversationSummaryIdentities(context.Context, SummaryPageQuery) (SummaryIdentityPage, error)
+}
+
+// TraceSummaryFallbackStore supplies only metadata for the missing IDs of an
+// already-authorized ordinary identity page. It must not load all call payloads
+// or act as an alternative implementation of projection content filters.
+type TraceSummaryFallbackStore interface {
+	LoadTraceSummaryFallback(context.Context, []string, evidencevo.QueryScope) ([]evidencevo.TraceSummary, error)
+}
+
+// ProjectionLeaseGuard fences an asynchronous handler's SQL state transition.
+// External writes must be idempotent because an expired lease can be reclaimed.
+type ProjectionLeaseGuard interface {
+	CheckProjectionLease(uint64, string) error
 }

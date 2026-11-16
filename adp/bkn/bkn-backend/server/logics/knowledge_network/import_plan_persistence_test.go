@@ -10,9 +10,9 @@ import (
 
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/interfaces"
-	mock_interfaces "bkn-backend/interfaces/mock"
-	"bkn-backend/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	mock_interfaces "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 func TestPersistNormalizedImportPlanRestoresOnlyValidMemberships(t *testing.T) {
@@ -63,6 +63,8 @@ func TestPersistNormalizedImportPlanRestoresOnlyValidMemberships(t *testing.T) {
 	})
 	cga.EXPECT().GetConceptGroupsByIDs(gomock.Any(), gomock.Any(), "kn-1", interfaces.MAIN_BRANCH,
 		gomock.Any()).Return([]*interfaces.ConceptGroup{group}, nil)
+	ots.EXPECT().CheckOverwriteDeclarations(gomock.Any(), "kn-1", interfaces.MAIN_BRANCH, gomock.Any(),
+		interfaces.ImportMode_Overwrite).Return(nil)
 	ots.EXPECT().CreateObjectTypes(gomock.Any(), gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite,
 		false, true).DoAndReturn(func(_ context.Context, _ *sql.Tx, objects []*interfaces.ObjectType,
 		_ string, _ bool, _ bool) ([]string, error) {
@@ -200,5 +202,40 @@ func TestRestoreImportGroupMembersOverwriteReplacesObjectGroups(t *testing.T) {
 	if err := service.restoreImportGroupMembers(ctx, nil, plan, interfaces.ImportMode_Overwrite,
 		nil, map[string]struct{}{"ot-1": {}}); err != nil {
 		t.Fatalf("restoreImportGroupMembers() error = %v", err)
+	}
+}
+
+// An import writes its value types before the object types that name them, and the object types
+// resolve the value types it wrote although they are not committed yet. A value type ignore skips
+// stays as stored and is not offered in their place.
+func TestPersistNormalizedImportPlanWritesValueTypesFirst(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	vts := mock_interfaces.NewMockValueTypeService(ctrl)
+	ots := mock_interfaces.NewMockObjectTypeService(ctrl)
+	service := &knowledgeNetworkService{vts: vts, ots: ots}
+	written := &interfaces.ValueType{VTID: "amount_cny", KNID: "kn-1", Branch: interfaces.MAIN_BRANCH}
+	skipped := &interfaces.ValueType{VTID: "status", KNID: "kn-1", Branch: interfaces.MAIN_BRANCH}
+	plan := &NormalizedImportPlan{
+		KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
+		ValueTypes: []*interfaces.ValueType{written, skipped},
+		ObjectTypes: []*interfaces.ObjectType{{
+			ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "order", OTName: "order"},
+			KNID:                   "kn-1", Branch: interfaces.MAIN_BRANCH,
+		}},
+	}
+	gomock.InOrder(
+		vts.EXPECT().CreateValueTypes(gomock.Any(), gomock.Any(), plan.ValueTypes, interfaces.ImportMode_Ignore).
+			Return([]string{"amount_cny"}, nil),
+		ots.EXPECT().CreateObjectTypes(gomock.Any(), gomock.Any(), plan.ObjectTypes, interfaces.ImportMode_Ignore, false, true).
+			DoAndReturn(func(ctx context.Context, _ *sql.Tx, _ []*interfaces.ObjectType, _ string, _ bool, _ bool) ([]string, error) {
+				pending := interfaces.PendingValueTypes(ctx)
+				if len(pending) != 1 || pending[0] != written {
+					t.Fatalf("pending value types = %#v, want only the written one", pending)
+				}
+				return []string{"order"}, nil
+			}),
+	)
+	if err := service.persistNormalizedImportPlan(context.Background(), nil, plan, interfaces.ImportMode_Ignore, true); err != nil {
+		t.Fatalf("persistNormalizedImportPlan() error = %v", err)
 	}
 }

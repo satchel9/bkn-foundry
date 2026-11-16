@@ -13,7 +13,7 @@ import (
 	"sort"
 	"strings"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 type proxyModelBinding struct {
@@ -216,27 +216,24 @@ func buildProxyGrantSourcesWithCapabilities(kn *interfaces.KN,
 		}
 	}
 
-	for _, metric := range kn.Metrics {
-		if metric == nil {
+	for _, record := range kn.ObjectMetrics {
+		if record == nil {
 			continue
 		}
-		scopeType := strings.TrimSpace(metric.ScopeType)
-		scopeRef := strings.TrimSpace(metric.ScopeRef)
-		// Non-strict imports may persist metrics without a scope. Such metrics
-		// have no backing resource and therefore contribute no proxy grant.
-		if scopeType == "" && scopeRef == "" {
+		definition := &record.Definition
+		if definition.Lifecycle.Status != "published" && definition.Lifecycle.Status != "deprecated" {
 			continue
 		}
-		if _, exists := objectTypes[scopeRef]; !exists {
-			continue
-		}
-		resourceID := objectResources[scopeRef]
-		if resourceID == "" {
-			continue
-		}
-		if err := add(interfaces.MODULE_TYPE_METRIC, metric.ID, "resource", resourceID,
-			interfaces.OPERATION_TYPE_QUERY_DATA, scopeType+":"+scopeRef); err != nil {
-			return nil, "", err
+		for _, objectTypeID := range objectMetricReferencedObjectTypes(definition) {
+			resourceID := objectResources[objectTypeID]
+			if resourceID == "" {
+				continue
+			}
+			detail := fmt.Sprintf("object_metric_v1@%d:%s", definition.Version, objectTypeID)
+			if err := add(interfaces.MODULE_TYPE_METRIC, definition.ID, "resource", resourceID,
+				interfaces.OPERATION_TYPE_QUERY_DATA, detail); err != nil {
+				return nil, "", err
+			}
 		}
 	}
 
@@ -290,6 +287,19 @@ func buildProxyGrantSourcesWithCapabilities(kn *interfaces.KN,
 			if err := addSource(false, interfaces.KNProxyBindingTypeCapability, capability.ID,
 				interfaces.KNProxyTargetTypeSkill, capability.CapabilityID,
 				interfaces.OPERATION_TYPE_EXECUTE, detail); err != nil {
+				return nil, "", err
+			}
+		case interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE:
+			// The proxy reads a mounted knowledge base through kb-api's read API, which checks
+			// query_data (#2576). Best effort and outside the planning digest, like a Skill: a
+			// binder who loses access leaves this knowledge base unreadable through the proxy
+			// rather than blocking the network, and an incomplete row is skipped.
+			if strings.TrimSpace(capability.CapabilityID) == "" || strings.TrimSpace(capability.ID) == "" {
+				continue
+			}
+			if err := addSource(false, interfaces.KNProxyBindingTypeCapability, capability.ID,
+				interfaces.KNProxyTargetTypeKnowledgeBase, capability.CapabilityID,
+				interfaces.OPERATION_TYPE_QUERY_DATA, detail); err != nil {
 				return nil, "", err
 			}
 		case interfaces.CAPABILITY_TYPE_FUNCTION:

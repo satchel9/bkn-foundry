@@ -11,6 +11,9 @@ const (
 	DataType_Integer         = "integer"
 	DataType_UnsignedInteger = "unsigned integer"
 
+	// 超出 64 位的整数，以十进制字符串无损传输。
+	DataType_LargeInteger = "large_integer"
+
 	// Floating-point type
 	DataType_Float = "float"
 
@@ -58,6 +61,7 @@ var (
 
 	NUMBER_TYPES = map[string]struct{}{
 		DataType_Integer:         {},
+		DataType_LargeInteger:    {},
 		DataType_UnsignedInteger: {},
 		DataType_Float:           {},
 		DataType_Decimal:         {},
@@ -84,4 +88,48 @@ func DataType_IsNumber(t string) bool {
 func DataType_IsDate(t string) bool {
 	_, ok := DATE_TYPES[t]
 	return ok
+}
+
+// DataType_HasDatePart 判断类型是否包含日历日期部分，不包含仅表示日内时间的 time。
+func DataType_HasDatePart(t string) bool {
+	switch t {
+	case DataType_Date, DataType_Datetime, DataType_Timestamp:
+		return true
+	default:
+		return false
+	}
+}
+
+// legacyTypeFilterable 为历史字段和手动创建时缺失开关提供统一类型兼容值。
+// 扫描默认值由各连接器的 type_mapping.go 负责，不调用此兼容函数。
+// IP 过滤暂不启用，缺省关闭；类型和已有显式开关仍保留。
+func legacyTypeFilterable(dataType string) bool {
+	switch dataType {
+	case DataType_Integer, DataType_UnsignedInteger,
+		DataType_LargeInteger,
+		DataType_Float, DataType_Decimal,
+		DataType_String, DataType_Text,
+		DataType_Date, DataType_Time,
+		DataType_Datetime, DataType_Timestamp,
+		DataType_Boolean, DataType_Vector:
+		return true
+	default:
+		return false
+	}
+}
+
+// EffectiveFilterable resolves historical omission without mutating the schema.
+func (p *Property) EffectiveFilterable() bool {
+	if p.Filterable != nil {
+		return *p.Filterable
+	}
+	return legacyTypeFilterable(p.Type)
+}
+
+// SetDefaultFilterable fills only an omitted switch, preserving user settings.
+func (p *Property) SetDefaultFilterable() {
+	if p.Filterable == nil {
+		value := legacyTypeFilterable(p.Type)
+		p.Filterable = &value
+	}
 }

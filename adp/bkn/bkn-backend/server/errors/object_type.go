@@ -15,6 +15,9 @@ const (
 	BknBackend_ObjectType_InvalidParameter_ConceptCondition = "BknBackend.ObjectType.InvalidParameter.ConceptCondition"
 	BknBackend_ObjectType_InvalidParameter_PropertyName     = "BknBackend.ObjectType.InvalidParameter.PropertyName"
 	BknBackend_ObjectType_InvalidParameter_SmallModel       = "BknBackend.ObjectType.InvalidParameter.SmallModel"
+	BknBackend_ObjectType_InvalidParameter_Declarations     = "BknBackend.ObjectType.InvalidParameter.Declarations"
+	BknBackend_ObjectType_DeclarationsWouldBeCleared        = "BknBackend.ObjectType.DeclarationsWouldBeCleared"
+	BknBackend_ObjectType_StillReferenced                   = "BknBackend.ObjectType.StillReferenced"
 	BknBackend_ObjectType_LengthExceeded_Name               = "BknBackend.ObjectType.LengthExceeded.Name"
 	BknBackend_ObjectType_NullParameter_Name                = "BknBackend.ObjectType.NullParameter.Name"
 	BknBackend_ObjectType_NullParameter_PrimaryKeys         = "BknBackend.ObjectType.NullParameter.PrimaryKeys"
@@ -36,7 +39,6 @@ const (
 	BknBackend_ObjectType_InternalError_CheckObjectTypeIfExistFailed     = "BknBackend.ObjectType.InternalError.CheckObjectTypeIfExistFailed"
 	BknBackend_ObjectType_InternalError_CreateConceptGroupRelationFailed = "BknBackend.ObjectType.InternalError.CreateConceptGroupRelationFailed"
 	BknBackend_ObjectType_InternalError_GetDataViewByIDFailed            = "BknBackend.ObjectType.InternalError.GetDataViewByIDFailed"
-	BknBackend_ObjectType_InternalError_GetMetricModelByIDFailed         = "BknBackend.ObjectType.InternalError.GetMetricModelByIDFailed"
 	BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed          = "BknBackend.ObjectType.InternalError.GetObjectTypeByIDFailed"
 	BknBackend_ObjectType_InternalError_GetObjectTypesByIDsFailed        = "BknBackend.ObjectType.InternalError.GetObjectTypesByIDsFailed"
 	BknBackend_ObjectType_InternalError_GetSmallModelByIDFailed          = "BknBackend.ObjectType.InternalError.GetSmallModelByIDFailed"
@@ -52,6 +54,9 @@ var (
 		BknBackend_ObjectType_InvalidParameter_ConceptCondition,
 		BknBackend_ObjectType_InvalidParameter_PropertyName,
 		BknBackend_ObjectType_InvalidParameter_SmallModel,
+		BknBackend_ObjectType_InvalidParameter_Declarations,
+		BknBackend_ObjectType_DeclarationsWouldBeCleared,
+		BknBackend_ObjectType_StillReferenced,
 		BknBackend_ObjectType_LengthExceeded_Name,
 		BknBackend_ObjectType_NullParameter_Name,
 		BknBackend_ObjectType_NullParameter_PrimaryKeys,
@@ -73,7 +78,6 @@ var (
 		BknBackend_ObjectType_InternalError_CheckObjectTypeIfExistFailed,
 		BknBackend_ObjectType_InternalError_CreateConceptGroupRelationFailed,
 		BknBackend_ObjectType_InternalError_GetDataViewByIDFailed,
-		BknBackend_ObjectType_InternalError_GetMetricModelByIDFailed,
 		BknBackend_ObjectType_InternalError_GetObjectTypeByIDFailed,
 		BknBackend_ObjectType_InternalError_GetObjectTypesByIDsFailed,
 		BknBackend_ObjectType_InternalError_GetSmallModelByIDFailed,

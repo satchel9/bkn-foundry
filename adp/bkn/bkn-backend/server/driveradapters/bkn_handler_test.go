@@ -7,9 +7,15 @@
 package driveradapters
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -17,16 +23,17 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 func MockNewBKNRestHandler(
@@ -56,6 +63,109 @@ func newValidBKNTar(t *testing.T) []byte {
 	var buf bytes.Buffer
 	if err := bknsdk.WriteNetworkToTar(net, &buf); err != nil {
 		t.Fatalf("failed to create test BKN tar: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func newObjectMetricBKNTar(t *testing.T) []byte {
+	t.Helper()
+	net := &bknsdk.BknNetwork{
+		BknNetworkFrontmatter: bknsdk.BknNetworkFrontmatter{Type: "network", ID: "test-net", Name: "Test Network"},
+		ObjectTypes:           []*bknsdk.BknObjectType{{BknObjectTypeFrontmatter: bknsdk.BknObjectTypeFrontmatter{Type: "object_type", ID: "draft-object", Name: "Draft Object"}}},
+		ObjectMetrics:         []json.RawMessage{json.RawMessage(`{"definition":{"id":"metric-1","version":2,"code":"metric_one","name":"Metric One","owner_object_type_id":"draft-object","metric_type":"atomic","specification":{"measure":{"expression":{"node_type":"literal","value_type":"decimal","value":0.1234567890123456789012345}}},"lifecycle":{"status":"draft"}},"kn_id":"source","branch":"old"}`)},
+	}
+	var buf bytes.Buffer
+	if err := bknsdk.WriteNetworkToTar(net, &buf); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func newRemovedObjectMetricFieldBKNTar(t *testing.T) []byte {
+	t.Helper()
+	net := &bknsdk.BknNetwork{
+		BknNetworkFrontmatter: bknsdk.BknNetworkFrontmatter{Type: "network", ID: "test-net", Name: "Test Network"},
+		ObjectTypes:           []*bknsdk.BknObjectType{{BknObjectTypeFrontmatter: bknsdk.BknObjectTypeFrontmatter{Type: "object_type", ID: "draft-object", Name: "Draft Object"}}},
+		ObjectMetrics: []json.RawMessage{json.RawMessage(
+			`{"definition":{"id":"metric-1","version":1,"code":"metric_one","name":"Metric One","owner_object_type_id":"draft-object","metric_type":"atomic","calculation_scope":"object_instance","specification":{"measure":{"aggregation":"identity","property_name":"amount"}},"lifecycle":{"status":"draft"}}}`,
+		)},
+	}
+	var buf bytes.Buffer
+	if err := bknsdk.WriteNetworkToTar(net, &buf); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func newLegacyMetricBKNTar(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	for path, content := range map[string]string{
+		"network.bkn":        "---\ntype: network\nid: test-net\nname: Test Network\n---\n",
+		"metrics/legacy.bkn": "---\ntype: metric\nid: legacy\nname: Legacy\n---\n",
+	} {
+		if err := w.WriteHeader(&tar.Header{Name: path, Mode: 0644, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// newUnsupportedSpecBKNTar creates an archive that declares a bkn_spec this parser does not read.
+func newUnsupportedSpecBKNTar(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	content := "---\ntype: knowledge_network\nid: test-net\nname: Test Network\nbkn_spec: \"4.0\"\n---\n"
+	if err := w.WriteHeader(&tar.Header{Name: "network.bkn", Mode: 0644, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// newV3BKNTar creates a bkn_spec 3.0 archive whose name property carries the given Required cell,
+// with the extra files added.
+func newV3BKNTar(t *testing.T, required string, extra map[string]string) []byte {
+	t.Helper()
+	files := map[string]string{
+		"network.bkn": "---\ntype: knowledge_network\nid: test-net\nname: Test Network\ntags: []\nbkn_spec: \"3.0\"\n---\n\n# Test Network\n",
+		"object_types/pod.bkn": "---\ntype: object_type\nid: pod\nname: Pod\ntags: []\n---\n\n## ObjectType: Pod\n\n" +
+			"### Data Properties\n\n| Name | Display Name | Type | Required | Description | Mapped Field |\n" +
+			"|------|--------------|------|----------|-------------|--------------|\n" +
+			"| id | ID | string | | | id |\n| name | 名称 | string | " + required + " | | name |\n\n" +
+			"### Keys\n\nPrimary Keys: id\nDisplay Key: name\n",
+	}
+	paths := []string{"network.bkn", "object_types/pod.bkn"}
+	for path, content := range extra {
+		files[path] = content
+		paths = append(paths, path)
+	}
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	for _, path := range paths {
+		content := files[path]
+		if err := w.WriteHeader(&tar.Header{Name: path, Mode: 0644, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
 	}
 	return buf.Bytes()
 }
@@ -186,6 +296,139 @@ func Test_BKNRestHandler_UploadBKN(t *testing.T) {
 			engine.ServeHTTP(w, req)
 
 			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Imports object metric V1 records without changing their version", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite, false).
+				DoAndReturn(func(_ context.Context, kn *interfaces.KN, _ string, _ bool) (string, error) {
+					if len(kn.ObjectMetrics) != 1 || kn.ObjectMetrics[0].Definition.Version != 2 ||
+						kn.ObjectMetrics[0].KNID != "test-net" || kn.ObjectMetrics[0].Branch != interfaces.MAIN_BRANCH {
+						t.Fatalf("unexpected object metric import: %#v", kn.ObjectMetrics)
+					}
+					value := kn.ObjectMetrics[0].Definition.Specification.Measure.Expression.Value
+					if got, ok := value.(json.Number); !ok || got.String() != "0.1234567890123456789012345" {
+						t.Fatalf("imported literal = %#v, want exact json.Number", value)
+					}
+					return "kn1", nil
+				})
+			req := newMultipartRequest(t, url, "test.tar", newObjectMetricBKNTar(t))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Rejects removed single-instance fields in object metric records", func() {
+			req := newMultipartRequest(t, url, "test.tar", newRemovedObjectMetricFieldBKNTar(t))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusBadRequest)
+			So(w.Body.String(), ShouldContainSubstring, "calculation_scope")
+		})
+
+		Convey("Rejects old metric archives with an explicit error", func() {
+			req := newMultipartRequest(t, url, "test.tar", newLegacyMetricBKNTar(t))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusBadRequest)
+			So(w.Body.String(), ShouldContainSubstring, "legacy metrics")
+		})
+
+		Convey("Names the reason when the declared bkn_spec refuses the archive", func() {
+			req := newMultipartRequest(t, url, "test.tar", newUnsupportedSpecBKNTar(t))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusBadRequest)
+			So(w.Body.String(), ShouldContainSubstring, "unsupported bkn_spec")
+		})
+
+		Convey("Imports the property declarations of a 3.0 package", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite, false).
+				DoAndReturn(func(_ context.Context, kn *interfaces.KN, _ string, _ bool) (string, error) {
+					props := kn.ObjectTypes[0].DataProperties
+					if len(props) != 2 || props[1].Name != "name" || !props[1].Required {
+						t.Fatalf("Required of the name property did not reach the import: %#v", props)
+					}
+					return "kn1", nil
+				})
+			req := newMultipartRequest(t, url, "test.tar", newV3BKNTar(t, "true", nil))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Imports the value types and aliases of a 3.0 package", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite, false).
+				DoAndReturn(func(_ context.Context, kn *interfaces.KN, _ string, _ bool) (string, error) {
+					if len(kn.ValueTypes) != 1 || kn.ValueTypes[0].VTID != "phase" || kn.ValueTypes[0].BaseType != "keyword" {
+						t.Fatalf("the value type did not reach the import: %#v", kn.ValueTypes)
+					}
+					var node *interfaces.ObjectType
+					for _, ot := range kn.ObjectTypes {
+						if ot.OTID == "node" {
+							node = ot
+						}
+					}
+					if node == nil || len(node.Aliases) != 1 || node.Aliases[0] != "主机" ||
+						len(node.DataProperties) != 1 || len(node.DataProperties[0].Aliases) != 1 {
+						t.Fatalf("the object type aliases did not reach the import: %#v", node)
+					}
+					if len(kn.ActionTypes) != 1 || len(kn.ActionTypes[0].Aliases) != 1 || kn.ActionTypes[0].Aliases[0] != "重启容器组" {
+						t.Fatalf("the action type aliases did not reach the import: %#v", kn.ActionTypes)
+					}
+					return "kn1", nil
+				})
+			req := newMultipartRequest(t, url, "test.tar", newV3BKNTar(t, "", map[string]string{
+				"value_types/phase.bkn": "---\ntype: value_type\nid: phase\nname: 阶段\ntags: []\n---\n\n## ValueType: 阶段\n\n### Definition\n\n```yaml\nbase_type: keyword\n```\n",
+				"object_types/node.bkn": "---\ntype: object_type\nid: node\nname: 节点\ntags: []\naliases: [主机]\n---\n\n## ObjectType: 节点\n\n" +
+					"### Data Properties\n\n| Name | Display Name | Type | Aliases | Mapped Field |\n|------|--------------|------|---------|--------------|\n" +
+					"| host | 主机名 | string | 主机地址 | host |\n\n### Keys\n\nPrimary Keys: host\nDisplay Key: host\n",
+				"action_types/restart.bkn": "---\ntype: action_type\nid: restart\nname: 重启\ntags: []\naction_intent: modify\naliases: [重启容器组]\n---\n\n## ActionType: 重启\n\n### Operation Config\n\n```yaml\noperation_config:\n  type: tool\n```\n",
+			}))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Imports the lifecycles and relation declarations of a 3.0 package", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite, false).
+				DoAndReturn(func(_ context.Context, kn *interfaces.KN, _ string, _ bool) (string, error) {
+					var node *interfaces.ObjectType
+					for _, ot := range kn.ObjectTypes {
+						if ot.OTID == "node" {
+							node = ot
+						}
+					}
+					if node == nil || node.Lifecycle == nil || node.Lifecycle.Status != interfaces.LIFECYCLE_DEPRECATED || node.Lifecycle.Reason != "改用主机" {
+						t.Fatalf("the object type lifecycle did not reach the import: %#v", node)
+					}
+					var peer *interfaces.RelationType
+					for _, rt := range kn.RelationTypes {
+						if rt.RTID == "pod_peer" {
+							peer = rt
+						}
+					}
+					if peer == nil || peer.Verification != "confirmed" || peer.Cardinality != "many_to_many" || peer.ReverseName != "" {
+						t.Fatalf("the relation declarations did not reach the import: %#v", peer)
+					}
+					return "kn1", nil
+				})
+			req := newMultipartRequest(t, url, "test.tar", newV3BKNTar(t, "", map[string]string{
+				"object_types/node.bkn": "---\ntype: object_type\nid: node\nname: 节点\ntags: []\nlifecycle: {status: deprecated, reason: 改用主机}\n---\n\n## ObjectType: 节点\n",
+				"relation_types/pod_peer.bkn": "---\ntype: relation_type\nid: pod_peer\nname: 同组\ntags: []\nverification: confirmed\n---\n\n## RelationType: 同组\n\n" +
+					"### Endpoint\n\n| Source | Target | Type | Cardinality |\n|--------|--------|------|-------------|\n| pod | pod | direct | many_to_many |\n\n" +
+					"### Mapping Rules\n\n| Source Property | Target Property |\n|-----------------|-----------------|\n| name | name |\n",
+			}))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Imports a 3.0 package without property declarations", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), interfaces.ImportMode_Overwrite, false).Return("kn1", nil)
+			req := newMultipartRequest(t, url, "test.tar", newV3BKNTar(t, "", nil))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Code, ShouldEqual, http.StatusOK)
 		})
 
 		Convey("Passes ignore mode to CreateKN\n", func() {
@@ -322,10 +565,10 @@ func Test_BKNRestHandler_UploadBKN(t *testing.T) {
 		})
 
 		Convey("Failed when CreateKN returns error\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError,
 				},
 			}
@@ -351,7 +594,9 @@ func TestDetachBKNExternalBindingsPreservesTopology(t *testing.T) {
 			}},
 		},
 	}}
-	metric := &interfaces.MetricDefinition{ID: "metric-1", ScopeType: interfaces.ScopeTypeObjectType, ScopeRef: "ot-1"}
+	metric := &interfaces.ObjectMetricRecordV1{Definition: interfaces.ObjectMetricDefinitionV1{
+		ID: "metric-1", Version: 1, OwnerObjectTypeID: "ot-1",
+	}}
 	kn := &interfaces.KN{
 		ObjectTypes: []*interfaces.ObjectType{{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
 			OTID: "ot-1", DataSource: &interfaces.ResourceInfo{Type: interfaces.DATA_SOURCE_TYPE_RESOURCE, ID: "resource-1"},
@@ -361,10 +606,10 @@ func TestDetachBKNExternalBindingsPreservesTopology(t *testing.T) {
 			}},
 		}}},
 		RelationTypes: []*interfaces.RelationType{relation},
-		Metrics:       []*interfaces.MetricDefinition{metric},
+		ObjectMetrics: []*interfaces.ObjectMetricRecordV1{metric},
 		ActionTypes: []*interfaces.ActionType{{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 			ATID: "at-1", ObjectTypeID: "ot-1",
-			ActionSource: interfaces.ActionSource{Type: interfaces.ACTION_SOURCE_TYPE_MCP, McpID: "mcp-1", ToolName: "run"},
+			ActionSource: interfaces.ActionSource{Type: interfaces.ACTION_SOURCE_TYPE_MCP, McpID: "mcp-1", ToolName: "run"}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 		}}},
 	}
 
@@ -383,8 +628,8 @@ func TestDetachBKNExternalBindingsPreservesTopology(t *testing.T) {
 	if !ok || indirect.BackingDataSource != nil || len(indirect.SourceMappingRules) != 1 {
 		t.Fatalf("relation binding was not detached or mapping topology changed: %#v", relation.MappingRules)
 	}
-	if kn.Metrics[0] != metric || metric.ScopeRef != "ot-1" {
-		t.Fatalf("metric topology changed: %#v", kn.Metrics)
+	if kn.ObjectMetrics[0] != metric || metric.Definition.OwnerObjectTypeID != "ot-1" {
+		t.Fatalf("metric topology changed: %#v", kn.ObjectMetrics)
 	}
 	if kn.ActionTypes[0].ObjectTypeID != "ot-1" {
 		t.Fatalf("action object binding changed: %#v", kn.ActionTypes[0])
@@ -413,7 +658,7 @@ func Test_BKNRestHandler_DownloadBKN(t *testing.T) {
 		as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).AnyTimes().Return(hydra.Visitor{}, nil)
 
 		Convey("Success downloading BKN tar\n", func() {
-			bs.EXPECT().ExportToTar(gomock.Any(), "kn1", interfaces.MAIN_BRANCH).Return([]byte("tar-content"), nil)
+			bs.EXPECT().ExportToTar(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, interfaces.BKN_EXPORT_SPEC_AUTO).Return([]byte("tar-content"), nil)
 
 			req := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/v1/bkns/kn1", nil)
 			w := httptest.NewRecorder()
@@ -424,10 +669,10 @@ func Test_BKNRestHandler_DownloadBKN(t *testing.T) {
 		})
 
 		Convey("Failed when ExportToTar returns error\n", func() {
-			bs.EXPECT().ExportToTar(gomock.Any(), "kn1", gomock.Any()).Return(nil, &rest.HTTPError{
+			bs.EXPECT().ExportToTar(gomock.Any(), "kn1", gomock.Any(), gomock.Any()).Return(nil, &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError,
 				},
 			})
@@ -437,6 +682,75 @@ func Test_BKNRestHandler_DownloadBKN(t *testing.T) {
 			engine.ServeHTTP(w, req)
 
 			So(w.Result().StatusCode, ShouldEqual, http.StatusInternalServerError)
+		})
+
+		Convey("Passes the bkn_spec it is asked for to the export\n", func() {
+			for _, spec := range []string{interfaces.BKN_EXPORT_SPEC_2, interfaces.BKN_EXPORT_SPEC_3} {
+				bs.EXPECT().ExportToTar(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, spec).Return([]byte("tar-content"), nil)
+				req := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/v1/bkns/kn1?bkn_spec="+spec, nil)
+				w := httptest.NewRecorder()
+				engine.ServeHTTP(w, req)
+				So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+			}
+		})
+
+		Convey("Refuses a bkn_spec it cannot write\n", func() {
+			req := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/v1/bkns/kn1?bkn_spec=3", nil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Result().StatusCode, ShouldEqual, http.StatusBadRequest)
+			So(w.Body.String(), ShouldContainSubstring, berrors.BknBackend_KnowledgeNetwork_InvalidParameter_BknSpec)
+		})
+	})
+}
+
+func Test_BKNRestHandler_CheckBKN(t *testing.T) {
+	Convey("Test BKNHandler CheckBKN\n", t, func() {
+		test := setGinMode()
+		defer test()
+
+		engine := gin.New()
+		engine.Use(gin.Recovery())
+
+		mockCtrl := gomock.NewController(t)
+		defer mockCtrl.Finish()
+
+		as := bmock.NewMockAuthService(mockCtrl)
+		kns := bmock.NewMockKNService(mockCtrl)
+		bs := bmock.NewMockBKNService(mockCtrl)
+		handler := MockNewBKNRestHandler(&common.AppSetting{}, as, kns, bs)
+		handler.RegisterPublic(engine)
+		as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).AnyTimes().Return(hydra.Visitor{}, nil)
+
+		Convey("Returns what the check finds\n", func() {
+			bs.EXPECT().CheckNetwork(gomock.Any(), "kn1", "dev").Return(&interfaces.NetworkCheckResult{
+				MisplacedParameters: []interfaces.NetworkCheckParameter{{
+					ActionTypeID: "restart_pod", Parameter: "pod",
+					Current:   interfaces.NetworkCheckParameterValue{Source: "property", ValueFrom: "pod_name"},
+					Suggested: interfaces.NetworkCheckParameterValue{ValueFrom: "property", Value: "pod_name"},
+				}},
+			}, nil)
+			req := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/v1/bkns/kn1/check?branch=dev", nil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+
+			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+			var body interfaces.NetworkCheckResult
+			So(json.Unmarshal(w.Body.Bytes(), &body), ShouldBeNil)
+			So(body.MisplacedParameters, ShouldHaveLength, 1)
+			So(body.MisplacedParameters[0].Suggested.ValueFrom, ShouldEqual, "property")
+		})
+
+		Convey("Passes a classified error through\n", func() {
+			bs.EXPECT().CheckNetwork(gomock.Any(), "kn1", interfaces.MAIN_BRANCH).Return(nil, &httperrors.HTTPError{
+				HTTPCode:  http.StatusForbidden,
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_KnowledgeNetwork_InternalError},
+			})
+			req := httptest.NewRequest(http.MethodGet, "/api/bkn-backend/v1/bkns/kn1/check", nil)
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			So(w.Result().StatusCode, ShouldEqual, http.StatusForbidden)
 		})
 	})
 }
@@ -502,6 +816,28 @@ func Test_BKNRestHandler_UploadBKN_ExtensionCheck(t *testing.T) {
 			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("kn1", nil)
 
 			req := newMultipartRequestWithContentType(t, url, "test.tgz", "application/gzip", newValidBKNTar(t))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+
+			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		// filepath.Ext of "test.tar.gz" is ".gz", so this name used to be refused before the
+		// archive was even read; the content was not decompressed either.
+		Convey("Success when a gzip compressed tar is uploaded as .tar.gz\n", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("kn1", nil)
+
+			req := newMultipartRequestWithContentType(t, url, "test.tar.gz", "application/gzip", gzipBytes(t, newValidBKNTar(t)))
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+
+			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
+		})
+
+		Convey("Success when a zip archive is uploaded\n", func() {
+			kns.EXPECT().CreateKN(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("kn1", nil)
+
+			req := newMultipartRequestWithContentType(t, url, "test.zip", "application/zip", tarToZip(t, newValidBKNTar(t)))
 			w := httptest.NewRecorder()
 			engine.ServeHTTP(w, req)
 
@@ -576,4 +912,49 @@ func Test_BKNRestHandler_UploadBKN_BindingPolicyCapabilities(t *testing.T) {
 			So(w.Result().StatusCode, ShouldEqual, http.StatusOK)
 		})
 	})
+}
+
+// gzipBytes compresses data the way `tar czf` does.
+func gzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// tarToZip repacks a tar archive's regular files into a zip archive.
+func tarToZip(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.Typeflag != tar.TypeReg {
+			continue
+		}
+		w, err := zw.Create(header.Name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(w, tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }

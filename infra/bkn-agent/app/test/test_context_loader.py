@@ -695,3 +695,90 @@ def test_task_and_chat_propagate_session_owner_to_real_evidence(monkeypatch, mod
     assert seen[0]["conversation_id"] == "conv_owned"
     assert seen[0]["interaction_id"] == "int_owned"
     assert seen[0]["envelope"]["owner"] == owner
+
+
+_IN_PROGRESS = (
+    '{"error":{"code":"interaction_in_progress","current_status":"active",'
+    '"current_interaction_id":"int_stale","required_action":"bkn_finish_interaction"}}'
+)
+
+
+class _BusyOnce(_FakeTool):
+    """Start that reports a leftover open interaction on the first call only."""
+
+    def __init__(self):
+        super().__init__("bkn_start_interaction", args_schema={"type": "object", "properties": {}},
+                         result=_start_tool()._result)
+
+    async def coroutine(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise RuntimeError(_IN_PROGRESS)
+        return self._result
+
+
+def test_thread_turn_closes_an_interrupted_interaction_and_starts_again(monkeypatch):
+    start, finish = _BusyOnce(), _FakeTool("bkn_finish_interaction")
+    _install(monkeypatch, [start, finish, _FakeTool("search_schema")])
+    token = auth.set_caller_token("Bearer t")
+    try:
+        session = asyncio.run(context_loader.open_session("问题", host_conversation_key="thread-1"))
+    finally:
+        auth._caller_token.reset(token)
+
+    assert session is not None and session.interaction_id == "int_real"
+    assert finish.calls == [{
+        "interaction_id": "int_stale",
+        "outcome": "cancelled",
+        "reason": "the previous turn was interrupted before it finished",
+    }]
+    assert len(start.calls) == 2
+
+
+def test_without_a_thread_an_open_interaction_is_not_closed(monkeypatch):
+    # Only a thread-owned turn may assume the open interaction is its own leftover.
+    start, finish = _BusyOnce(), _FakeTool("bkn_finish_interaction")
+    _install(monkeypatch, [start, finish, _FakeTool("search_schema")])
+    token = auth.set_caller_token("Bearer t")
+    try:
+        assert asyncio.run(context_loader.open_session("问题")) is None
+    finally:
+        auth._caller_token.reset(token)
+
+    assert finish.calls == []
+    assert len(start.calls) == 1
+
+
+def test_client_sends_the_network_version_headers():
+    headers = context_loader._client("Bearer t", None, None, "draft", 7).connections[
+        context_loader._CONNECTION_NAME
+    ]["headers"]
+    assert headers["X-Kn-Version"] == "draft"
+    assert headers["X-Kn-Draft-Revision"] == "7"
+    running = context_loader._client("Bearer t", None, None, "running").connections[
+        context_loader._CONNECTION_NAME
+    ]["headers"]
+    assert running["X-Kn-Version"] == "running"
+    assert "X-Kn-Draft-Revision" not in running
+    plain = context_loader._client("Bearer t").connections[context_loader._CONNECTION_NAME]["headers"]
+    assert not {"X-Kn-Version", "X-Kn-Draft-Revision"} & set(plain)
+
+
+def test_open_session_passes_the_network_version_to_the_client(monkeypatch):
+    received = []
+
+    class _Client:
+        async def get_tools(self):
+            return [_start_tool(), _FakeTool("bkn_finish_interaction")]
+
+    def client(*args, **kwargs):
+        received.append(args)
+        return _Client()
+
+    monkeypatch.setattr(context_loader, "_client", client)
+    token = auth.set_caller_token("Bearer t")
+    try:
+        asyncio.run(context_loader.open_session(kn_version="draft", draft_revision=7))
+    finally:
+        auth._caller_token.reset(token)
+    assert received[0][3:] == ("draft", 7)

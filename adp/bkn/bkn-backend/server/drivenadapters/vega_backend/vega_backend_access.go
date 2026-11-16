@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bytedance/sonic"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
@@ -22,8 +23,8 @@ import (
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 var (
@@ -36,6 +37,15 @@ type vegaBackendAccess struct {
 	appSetting *common.AppSetting
 	httpClient rest.HTTPClient
 	baseUrl    string
+	// now reads the clock a raw query is timed with; nil is the wall clock.
+	now func() time.Time
+}
+
+func (vba *vegaBackendAccess) clock() time.Time {
+	if vba.now != nil {
+		return vba.now()
+	}
+	return time.Now()
 }
 
 // NewVegaBackendAccess creates a new vega-backend access instance
@@ -372,6 +382,40 @@ func (vba *vegaBackendAccess) GetResourceSchema(ctx context.Context, id, operati
 	}, nil
 }
 
+// rawQuerySourceUnsupported reports a raw query refused for where its
+// resources live rather than for what it says: a resource outside a SQL data
+// source, whose catalog has no SQL connector, or resources in more than one
+// data source. Only the error code and the start of its details are read; the
+// rest of the body never leaves this adapter.
+func rawQuerySourceUnsupported(status int, body []byte) bool {
+	var refusal struct {
+		ErrorCode    string `json:"error_code"`
+		ErrorDetails any    `json:"error_details"`
+	}
+	if json.Unmarshal(body, &refusal) != nil {
+		return false
+	}
+	switch {
+	case status == http.StatusNotImplemented && refusal.ErrorCode == "VegaBackend.Query.MultiCatalogNotSupported":
+		return true
+	case status == http.StatusBadRequest && refusal.ErrorCode == "VegaBackend.Query.InvalidParameter":
+		details, _ := refusal.ErrorDetails.(string)
+		return strings.HasPrefix(details, "unsupported connector type")
+	default:
+		return false
+	}
+}
+
+// rawQueryTimedOut reports a raw query vega-backend gave up on at the
+// statement's own timeout. vega-backend answers that with the same 500 as any
+// other failed statement and nothing in the body tells them apart, so it is
+// read off the time the failure took: one that ran the whole query_timeout_sec
+// is the statement having been stopped there.
+func rawQueryTimedOut(req *interfaces.RawQueryRequest, kind interfaces.DependencyErrorKind, elapsed time.Duration) bool {
+	return kind == interfaces.DependencyDownstreamError && req.QueryTimeoutSec > 0 &&
+		elapsed >= time.Duration(req.QueryTimeoutSec)*time.Second
+}
+
 func dependencyKindForStatus(status int) interfaces.DependencyErrorKind {
 	switch status {
 	case http.StatusOK:
@@ -489,11 +533,13 @@ func (vba *vegaBackendAccess) DeleteDatasetDocumentByID(ctx context.Context, dat
 		return fmt.Errorf("vega dependency request failed")
 	}
 
-	if respCode != http.StatusNoContent && respCode != http.StatusOK {
+	// Whole-network deletion is replayable. A document already absent from the
+	// index is the desired result, not a reason to strand the business row.
+	if respCode != http.StatusNoContent && respCode != http.StatusOK && respCode != http.StatusNotFound {
 		err := fmt.Errorf("DeleteDatasetDocumentByID returned HTTP %d", respCode)
 		common.LogSafeError(ctx, "DeleteDatasetDocumentByID failed", err)
 		logger.Debugf("DeleteDatasetDocumentByID response: %s", common.SafeTextSummary("response", string(respData)))
-		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 204 or 200")
+		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 204, 200 or 404")
 		return err
 	}
 
@@ -586,6 +632,64 @@ func (vba *vegaBackendAccess) QueryResourceData(ctx context.Context, resourceID 
 		common.LogSafeError(ctx, "Failed to unmarshal QueryDatasetData response", err)
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal QueryDatasetData response failed")
 		return nil, fmt.Errorf("failed to unmarshal QueryDatasetData response: %v", err)
+	}
+	oteltrace.AddHttpAttrs4Ok(span, respCode)
+	return &response, nil
+}
+
+func (vba *vegaBackendAccess) QueryResourceDataAs(ctx context.Context, account interfaces.AccountInfo,
+	resourceID string, params *interfaces.ResourceDataQueryParams) (*interfaces.DatasetQueryResponse, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "driven layer: Query resource data as account")
+	defer span.End()
+
+	if account.ID == "" || account.Type == "" {
+		err := fmt.Errorf("resource data query requires an account to run under, none given")
+		common.LogSafeError(ctx, "QueryResourceDataAs refused: account missing", err)
+		oteltrace.AddHttpAttrs4Error(span, 0, "InternalError", "Resource data query without an account")
+		return nil, err
+	}
+	request, err := resourceDataQueryRequest(params)
+	if err != nil {
+		return nil, err
+	}
+
+	httpUrl := fmt.Sprintf("%s/resources/%s/data", vba.baseUrl, url.PathEscape(resourceID))
+	oteltrace.AddAttrs4InternalHttp(span, oteltrace.TraceAttrs{
+		HttpUrl:         httpUrl,
+		HttpMethod:      http.MethodPost,
+		HttpContentType: rest.ContentTypeJson,
+	})
+	headers := map[string]string{
+		interfaces.CONTENT_TYPE_NAME:          interfaces.CONTENT_TYPE_JSON,
+		interfaces.HTTP_HEADER_ACCOUNT_ID:     account.ID,
+		interfaces.HTTP_HEADER_ACCOUNT_TYPE:   account.Type,
+		oteltrace.HTTP_HEADER_METHOD_OVERRIDE: http.MethodGet,
+	}
+	respCode, respData, err := vba.httpClient.PostNoUnmarshal(ctx, httpUrl, headers, request)
+	logger.Debugf("QueryResourceDataAs finished, response code is [%d], %s", respCode, common.SafeErrorSummary(err))
+
+	if err != nil {
+		// The filter carries the caller's values, so it never reaches the
+		// caller's error; only the summary goes to the log.
+		safeErr := interfaces.NewDependencyError("vega", "resource_data", interfaces.DependencyTransportKind(err), respCode)
+		common.LogSafeError(ctx, "QueryResourceDataAs failed: "+common.SafeErrorSummary(err), safeErr)
+		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http resource data query failed")
+		return nil, safeErr
+	}
+	if respCode != http.StatusOK {
+		err := interfaces.NewDependencyError("vega", "resource_data", dependencyKindForStatus(respCode), respCode)
+		common.LogSafeError(ctx, fmt.Sprintf("QueryResourceDataAs returned HTTP %d", respCode), err)
+		logger.Debugf("QueryResourceDataAs response: %s", common.SafeTextSummary("response", string(respData)))
+		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")
+		return nil, err
+	}
+
+	var response interfaces.DatasetQueryResponse
+	// Dynamic resource fields must keep their original JSON number representation.
+	if err := vegaResponseJSON.Unmarshal(respData, &response); err != nil {
+		common.LogSafeError(ctx, "Failed to unmarshal QueryResourceDataAs response", err)
+		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Unmarshal resource data response failed")
+		return nil, interfaces.NewDependencyError("vega", "resource_data", interfaces.DependencyInvalidResponse, respCode)
 	}
 	oteltrace.AddHttpAttrs4Ok(span, respCode)
 	return &response, nil
@@ -715,9 +819,6 @@ func (vba *vegaBackendAccess) rawQuery(ctx context.Context, span trace.Span, hea
 	if req == nil || req.Query == "" {
 		return nil, fmt.Errorf("raw query statement is required")
 	}
-	if req.InputDialect == "" {
-		return nil, fmt.Errorf("raw query input dialect is required")
-	}
 	if req.QueryFormat == "" {
 		req.QueryFormat = interfaces.VEGA_QUERY_FORMAT_SQL
 	}
@@ -729,7 +830,9 @@ func (vba *vegaBackendAccess) rawQuery(ctx context.Context, span trace.Span, hea
 		HttpContentType: rest.ContentTypeJson,
 	})
 
+	started := vba.clock()
 	respCode, respData, err := vba.httpClient.PostNoUnmarshal(ctx, httpUrl, headers, req)
+	elapsed := vba.clock().Sub(started)
 	logger.Debugf("RawQuery finished, response code is [%d], %s", respCode, common.SafeErrorSummary(err))
 
 	if err != nil {
@@ -742,7 +845,14 @@ func (vba *vegaBackendAccess) rawQuery(ctx context.Context, span trace.Span, hea
 	}
 
 	if respCode != http.StatusOK {
-		err := interfaces.NewDependencyError("vega", "raw_query", dependencyKindForStatus(respCode), respCode)
+		kind := dependencyKindForStatus(respCode)
+		if rawQuerySourceUnsupported(respCode, respData) {
+			kind = interfaces.DependencyUnsupportedSource
+		}
+		if rawQueryTimedOut(req, kind, elapsed) {
+			kind = interfaces.DependencyTimeout
+		}
+		err := interfaces.NewDependencyError("vega", "raw_query", kind, respCode)
 		common.LogSafeError(ctx, fmt.Sprintf("RawQuery returned HTTP %d", respCode), err)
 		logger.Debugf("RawQuery response: %s", common.SafeTextSummary("response", string(respData)))
 		oteltrace.AddHttpAttrs4Error(span, respCode, "InternalError", "Http status is not 200")

@@ -15,15 +15,16 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 func MockNewActionTypeRestHandler(appSetting *common.AppSetting,
@@ -69,7 +70,7 @@ func Test_ActionTypeRestHandler_CreateActionTypes(t *testing.T) {
 				ATID:         "at1",
 				ATName:       "action1",
 				ObjectTypeID: "ot1",
-				ActionType:   interfaces.ACTION_TYPE_ADD,
+				ActionType:   interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 			},
 		}
 		requestData := struct {
@@ -133,10 +134,10 @@ func Test_ActionTypeRestHandler_CreateActionTypes(t *testing.T) {
 		})
 
 		Convey("CheckKNExistByID failed\n", func() {
-			expectedErr := &rest.HTTPError{
+			expectedErr := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_ActionType_InternalError,
 				},
 			}
@@ -152,10 +153,10 @@ func Test_ActionTypeRestHandler_CreateActionTypes(t *testing.T) {
 		})
 
 		Convey("CreateActionTypes failed\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_ActionType_InternalError,
 				},
 			}
@@ -219,7 +220,7 @@ func Test_ActionTypeRestHandler_UpdateActionType(t *testing.T) {
 				ATID:         atID,
 				ATName:       "action1",
 				ObjectTypeID: "ot1",
-				ActionType:   interfaces.ACTION_TYPE_MODIFY,
+				ActionType:   interfaces.ACTION_TYPE_MODIFY, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 			},
 		}
 
@@ -435,14 +436,14 @@ func Test_ActionTypeRestHandler_GetActionTypes(t *testing.T) {
 					ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 						ATID:       "at1",
 						ATName:     "action1",
-						ActionType: interfaces.ACTION_TYPE_ADD,
+						ActionType: interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 					},
 				},
 				{
 					ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 						ATID:       "at2",
 						ATName:     "action2",
-						ActionType: interfaces.ACTION_TYPE_ADD,
+						ActionType: interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 					},
 				},
 			}, nil)
@@ -465,10 +466,10 @@ func Test_ActionTypeRestHandler_GetActionTypes(t *testing.T) {
 		})
 
 		Convey("GetActionTypesByIDs failed\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_ActionType_InternalError,
 				},
 			}
@@ -554,10 +555,10 @@ func Test_ActionTypeRestHandler_SearchActionTypes(t *testing.T) {
 		})
 
 		Convey("SearchActionTypes failed\n", func() {
-			err := &rest.HTTPError{
+			err := &httperrors.HTTPError{
 				HTTPCode: http.StatusInternalServerError,
-				Language: rest.DefaultLanguage,
-				BaseError: rest.BaseError{
+				Lang:     i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{
 					ErrorCode: berrors.BknBackend_ActionType_InternalError,
 				},
 			}
@@ -607,7 +608,7 @@ func Test_ActionTypeRestHandler_HandleActionTypeGetOverride(t *testing.T) {
 				ATID:         "at1",
 				ATName:       "action1",
 				ObjectTypeID: "ot1",
-				ActionType:   interfaces.ACTION_TYPE_ADD,
+				ActionType:   interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 			},
 		}
 		requestData := struct {
@@ -691,7 +692,7 @@ func Test_ActionTypeRestHandler_CreateActionTypesByIn(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			requestData := struct {
@@ -727,7 +728,7 @@ func Test_ActionTypeRestHandler_UpdateActionTypeByIn(t *testing.T) {
 					ATID:         atID,
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_MODIFY,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
@@ -836,7 +837,7 @@ func Test_ActionTypeRestHandler_HandleActionTypeGetOverrideByIn(t *testing.T) {
 				ATID:         "at1",
 				ATName:       "action1",
 				ObjectTypeID: "ot1",
-				ActionType:   interfaces.ACTION_TYPE_ADD,
+				ActionType:   interfaces.ACTION_TYPE_ADD, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 			},
 		}
 		requestData := struct {
@@ -921,15 +922,15 @@ func Test_ActionTypeRestHandler_UpdateActionType_extraCases(t *testing.T) {
 				ATID:         atID,
 				ATName:       "action1",
 				ObjectTypeID: "ot1",
-				ActionType:   interfaces.ACTION_TYPE_MODIFY,
+				ActionType:   interfaces.ACTION_TYPE_MODIFY, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 			},
 		}
 
 		Convey("Failed when CheckKNExistByID returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return("", false, httpErr)
 
@@ -942,10 +943,10 @@ func Test_ActionTypeRestHandler_UpdateActionType_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when CheckActionTypeExistByID returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
 			ats.EXPECT().CheckActionTypeExistByID(gomock.Any(), knID, gomock.Any(), atID).Return("", false, httpErr)
@@ -963,7 +964,7 @@ func Test_ActionTypeRestHandler_UpdateActionType_extraCases(t *testing.T) {
 				ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 					ATID:         atID,
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_MODIFY,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
@@ -978,10 +979,10 @@ func Test_ActionTypeRestHandler_UpdateActionType_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when CheckActionTypeExistByName returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
 			ats.EXPECT().CheckActionTypeExistByID(gomock.Any(), knID, gomock.Any(), atID).Return("old_name", true, nil)
@@ -1009,10 +1010,10 @@ func Test_ActionTypeRestHandler_UpdateActionType_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when UpdateActionType service returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
 			ats.EXPECT().CheckActionTypeExistByID(gomock.Any(), knID, gomock.Any(), atID).Return("old_name", true, nil)
@@ -1062,10 +1063,10 @@ func Test_ActionTypeRestHandler_DeleteActionTypes_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when CheckKNExistByID returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, nil)
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return("", false, httpErr)
@@ -1077,10 +1078,10 @@ func Test_ActionTypeRestHandler_DeleteActionTypes_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when CheckActionTypeExistByID returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, nil)
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)
@@ -1093,10 +1094,10 @@ func Test_ActionTypeRestHandler_DeleteActionTypes_extraCases(t *testing.T) {
 		})
 
 		Convey("Failed when DeleteActionTypesByIDs service returns error\n", func() {
-			httpErr := &rest.HTTPError{
+			httpErr := &httperrors.HTTPError{
 				HTTPCode:  http.StatusInternalServerError,
-				Language:  rest.DefaultLanguage,
-				BaseError: rest.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
+				Lang:      i18n.DefaultLanguage,
+				BaseError: httperrors.BaseError{ErrorCode: berrors.BknBackend_ActionType_InternalError},
 			}
 			as.EXPECT().VerifyToken(gomock.Any(), gomock.Any()).Return(hydra.Visitor{}, nil)
 			kns.EXPECT().CheckKNExistByID(gomock.Any(), knID, gomock.Any()).Return(knID, true, nil)

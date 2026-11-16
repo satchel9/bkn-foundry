@@ -8,17 +8,21 @@ package driveradapters
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
+	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
 )
@@ -44,6 +48,41 @@ func Test_BuildTaskRestHandler_CreateBuildTask(t *testing.T) {
 	defer restoreGinMode()
 
 	const url = "/api/vega-backend/in/v1/build-tasks"
+	t.Run("ignores client supplied schedule provenance", func(t *testing.T) {
+		engine, bts, _ := setupBuildTaskHandlerTest(t)
+		bts.EXPECT().Create(gomock.Any(), gomock.Any()).DoAndReturn(func(_ context.Context, req *interfaces.CreateBuildTaskRequest) (string, error) {
+			assert.Empty(t, req.ScheduleID)
+			assert.Empty(t, req.TriggerType)
+			return "task-1", nil
+		})
+		body := `{"resource_id":"res-1","mode":"batch","schedule_id":"forged-plan","trigger_type":"scheduled"}`
+		req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		engine.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusCreated, w.Code)
+	})
+	for _, tc := range []struct {
+		name   string
+		err    error
+		status int
+		code   string
+	}{
+		{"forbidden", httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden), http.StatusForbidden, httperrors.PublicError_Forbidden},
+		{"wrapped not found", fmt.Errorf("lookup: %w", httperrors.NewHTTPError(context.Background(), http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)), http.StatusNotFound, verrors.VegaBackend_Resource_NotFound},
+		{"unknown failure", errors.New("lookup failed"), http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			engine, bts, _ := setupBuildTaskHandlerTest(t)
+			bts.EXPECT().Create(gomock.Any(), gomock.Any()).Return("", tc.err)
+			req := httptest.NewRequest(http.MethodPost, url, strings.NewReader(`{"resource_id":"res-1","mode":"batch"}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			engine.ServeHTTP(w, req)
+			assert.Equal(t, tc.status, w.Code)
+			assert.Contains(t, w.Body.String(), tc.code)
+		})
+	}
 
 	t.Run("creates batch build task", func(t *testing.T) {
 		engine, bts, _ := setupBuildTaskHandlerTest(t)
@@ -119,6 +158,16 @@ func newBuildTaskListContext(query string) *gin.Context {
 
 func TestParseBuildTaskListParams(t *testing.T) {
 	ctx := context.Background()
+	t.Run("filters scheduled task provenance", func(t *testing.T) {
+		got, err := parseBuildTaskListParams(ctx, newBuildTaskListContext("schedule_id=plan-1&trigger_type=scheduled"))
+		require.NoError(t, err)
+		assert.Equal(t, "plan-1", got.ScheduleID)
+		assert.Equal(t, interfaces.BuildTaskTriggerScheduled, got.TriggerType)
+	})
+	t.Run("rejects unsupported trigger type", func(t *testing.T) {
+		_, err := parseBuildTaskListParams(ctx, newBuildTaskListContext("trigger_type=unknown"))
+		require.Error(t, err)
+	})
 
 	tests := []struct {
 		name    string

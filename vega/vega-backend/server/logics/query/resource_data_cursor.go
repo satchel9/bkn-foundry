@@ -1,10 +1,14 @@
+// Copyright openbkn.ai
+//
+// Licensed under the OpenBKN License. See LICENSE-OPENBKN.txt in the project root.
+
 package query
 
 import (
 	"context"
 	"net/http"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
@@ -13,15 +17,15 @@ import (
 // ResourceDataPageExecutor executes one normalized structured resource query.
 // It is supplied by resource_data to keep connector semantics out of this
 // package while sharing CursorSession lifecycle management with Raw Query.
-type ResourceDataPageExecutor func(context.Context, *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error)
+type ResourceDataPageExecutor func(context.Context, *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error)
 
 // ResourceDataPageRunner executes a page without requiring a function callback.
 type ResourceDataPageRunner interface {
-	ExecutePage(context.Context, *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error)
+	ExecutePage(context.Context, *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error)
 }
 
 func (execute ResourceDataPageExecutor) ExecutePage(ctx context.Context,
-	params *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+	params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 	return execute(ctx, params)
 }
 
@@ -80,7 +84,7 @@ func ExecuteResourceDataCursorContinuationWithRunner(ctx context.Context, accoun
 	}
 	defer rawQueryCursorSessions.release(session)
 	if session.AccountID != accountID {
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, verrors.VegaBackend_Query_InvalidParameter).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, verrors.VegaBackend_Query_InvalidParameter).
 			WithErrorDetails("cursor does not belong to the current account")
 	}
 	if resource == nil || session.ResourceDataResourceID != resource.ID {
@@ -126,10 +130,11 @@ func executeResourceDataCursorPage(ctx context.Context, session *interfaces.Curs
 		params.Paging.Limit = session.PageLimit
 	}
 	params.SearchAfter = append([]any(nil), session.SearchAfter...)
-	entries, total, err := execute.ExecutePage(ctx, params)
+	page, err := execute.ExecutePage(ctx, params)
 	if err != nil {
 		return nil, err
 	}
+	entries, total := page.Entries, page.TotalCount
 	if session.ResourceDataParams.NeedTotal && !session.HasTotalCount {
 		session.TotalCount = total
 		session.HasTotalCount = true
@@ -138,31 +143,36 @@ func executeResourceDataCursorPage(ctx context.Context, session *interfaces.Curs
 	if session.HasTotalCount {
 		responseTotal = session.TotalCount
 	}
+	page.TotalCount = responseTotal
+	page.NeedTotal = session.ResourceDataParams.NeedTotal
 	hasNext := len(entries) > session.PageLimit
 	if session.ResourceDataCategory == interfaces.ResourceCategoryIndex {
 		if session.HasTotalCount {
 			hasNext = len(entries) == session.PageLimit &&
-				int64(session.PageOffset+len(entries)) < session.TotalCount && len(params.SearchAfter) > 0
+				int64(session.PageOffset+len(entries)) < session.TotalCount && len(page.SearchAfter) > 0
 		} else {
-			hasNext = len(entries) == session.PageLimit && len(params.SearchAfter) > 0
+			hasNext = len(entries) == session.PageLimit && len(page.SearchAfter) > 0
 		}
 	}
 	if !hasNext {
 		rawQueryCursorSessions.closeSession(session.ID)
-		return &interfaces.ResourceDataQueryResult{Entries: entries, TotalCount: responseTotal, Paging: &interfaces.PagingResponse{}, NeedTotal: session.ResourceDataParams.NeedTotal}, nil
+		page.Paging = &interfaces.PagingResponse{}
+		return page, nil
 	}
 	if session.ResourceDataCategory != interfaces.ResourceCategoryIndex {
 		entries = entries[:session.PageLimit]
 	}
+	page.Entries = entries
 	session.PageOffset += len(entries)
-	if len(params.SearchAfter) > 0 {
-		session.SearchAfter = append([]any(nil), params.SearchAfter...)
+	if len(page.SearchAfter) > 0 {
+		session.SearchAfter = append([]any(nil), page.SearchAfter...)
 	}
 	rawQueryCursorSessions.markPageSuccess(session)
-	return &interfaces.ResourceDataQueryResult{Entries: entries, TotalCount: responseTotal, Paging: cursorPagingResponse(session), NeedTotal: session.ResourceDataParams.NeedTotal}, nil
+	page.Paging = cursorPagingResponse(session)
+	return page, nil
 }
 
 func cursorNotFoundError(ctx context.Context) error {
-	return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Query_InvalidParameter).
+	return httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Query_InvalidParameter).
 		WithErrorDetails("cursor not found or expired")
 }

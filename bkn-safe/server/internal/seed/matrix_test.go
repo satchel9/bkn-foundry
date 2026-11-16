@@ -36,16 +36,19 @@ func TestRoleResourceMatrix(t *testing.T) {
 		// Resource 的实例级操作由 bkn-safe 直接判定，并通过父子关系继承
 		// Catalog 的授权。
 		"resource":       "view_detail",
-		"connector_type": "create", "data_flow": "view", "knowledge_network": "create",
+		"connector_type": "create", "data_flow": "view", "knowledge_network": "create", "knowledge_base": "create",
+		"workshop_app": "create", "graph_analysis": "view",
 		"concept_group": "view_detail", "object_type": "query_data", "relation_type": "query_data",
 		"action_type": "execute", "metric": "query_data", "risk_type": "view_detail",
-		"tool_box": "execute", "function": "execute", "mcp": "execute", "operator": "execute", "skill": "execute",
+		"tool_box": "execute", "function": "execute", "mcp": "execute", "skill": "execute",
 		"small_model": "execute", "large_model": "execute", "agent": "use", "agent_tpl": "publish",
 	}
 	roleAllowed := map[string]map[string]string{
 		networkBuilder: {
 			"catalog":           "create",
 			"knowledge_network": "create",
+			"knowledge_base":    "create",
+			"workshop_app":      "create",
 			"small_model":       "execute",
 			"large_model":       "execute",
 		},

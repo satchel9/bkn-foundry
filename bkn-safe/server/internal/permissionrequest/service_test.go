@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -17,6 +18,52 @@ import (
 	"github.com/openbkn-ai/licverify"
 	"gorm.io/gorm"
 )
+
+func TestMissingUnrequestedPrerequisitesIncludesTransitiveDependencies(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	e, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&[]model.Operation{
+		{ResourceTypeID: "catalog", ID: "view_detail"},
+		{ResourceTypeID: "catalog", ID: "resource_manage", RequiredOperationIDs: "view_detail"},
+		{ResourceTypeID: "catalog", ID: "task_manage", RequiredOperationIDs: "resource_manage"},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	// A historical management grant need not carry view_detail. Requesting task
+	// must still report that missing transitive prerequisite before approval.
+	if err := e.GrantObjectPermission("builder", "catalog", "c1", "resource_manage"); err != nil {
+		t.Fatal(err)
+	}
+	err = e.Transaction(t.Context(), func(tx *authz.PolicyTransaction) error {
+		missing, err := missingUnrequestedPrerequisites(t.Context(), tx, "builder", "catalog", "c1", []string{"task_manage"})
+		if err != nil {
+			return err
+		}
+		if !reflect.DeepEqual(missing, []string{"view_detail"}) {
+			t.Fatalf("missing=%v, want [view_detail]", missing)
+		}
+		missing, err = missingUnrequestedPrerequisites(t.Context(), tx, "builder", "catalog", "c1", []string{"task_manage", "view_detail"})
+		if err != nil {
+			return err
+		}
+		if len(missing) != 0 {
+			t.Fatalf("complete request missing=%v", missing)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 type emptyOperationProposalHandler struct{}
 
@@ -77,6 +124,21 @@ func TestPermissionRequestTextUnicodeBoundaries(t *testing.T) {
 		if validCreate(&create) {
 			t.Fatalf("validCreate() accepted a reason containing %q", forbidden)
 		}
+	}
+}
+
+func TestPermissionRequestAcceptsMaximumLengthChildResourceID(t *testing.T) {
+	maximum := strings.Repeat("k", 128) + "/" + strings.Repeat("o", 128)
+	create := CreateInput{
+		RequesterID: "requester", ResourceType: "object_type", ResourceID: maximum,
+		Operation: "view_detail", Reason: "need access",
+	}
+	if !validCreate(&create) {
+		t.Fatal("validCreate rejected a 257-character child resource ID")
+	}
+	create.ResourceID = maximum + "x"
+	if validCreate(&create) {
+		t.Fatal("validCreate accepted a 258-character child resource ID")
 	}
 }
 
@@ -813,5 +875,56 @@ func TestTodoSummaryCountsOnlyActiveUnreviewedPendingRequests(t *testing.T) {
 	}
 	if summary.PendingCount != 1 {
 		t.Fatalf("todo summary = %#v, want one active unreviewed pending request", summary)
+	}
+}
+
+func TestRequestOperationValidationUsesStartupSnapshot(t *testing.T) {
+	entitlement.SetGateForTest(entitlement.FixedGate(licverify.EditionProfessional))
+	finegrained.ResetForTest()
+	finegrained.Register(licverify.EditionProfessional)
+	t.Cleanup(func() { finegrained.ResetForTest(); entitlement.ResetForTest() })
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = database.Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	en, err := authz.New(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Create(&model.ResourceType{ID: "catalog"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	noGrant := false
+	if err = db.Create(&[]model.Operation{
+		{ResourceTypeID: "catalog", ID: "view"},
+		{ResourceTypeID: "catalog", ID: "summary", Grantable: &noGrant},
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err = en.InitializeRegistry(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	const callback = "test:permission-request-static-metadata"
+	if err = db.Callback().Query().Before("gorm:query").Register(callback, func(tx *gorm.DB) {
+		if tx.Statement.Table == "operations" || tx.Statement.Table == "resource_types" {
+			t.Errorf("permission request queried static metadata: %s", tx.Statement.Table)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Callback().Query().Remove(callback) })
+	service := New(db, en)
+	for range 3 {
+		if err := service.validateRequestOperations(t.Context(), "catalog", []string{"view"}); err != nil {
+			t.Fatal(err)
+		}
+		for _, ops := range [][]string{{"summary"}, {"missing"}, {"view", "view"}} {
+			if err := service.validateRequestOperations(t.Context(), "catalog", ops); !errors.Is(err, ErrInvalidRequest) {
+				t.Fatalf("operations %v: %v", ops, err)
+			}
+		}
 	}
 }

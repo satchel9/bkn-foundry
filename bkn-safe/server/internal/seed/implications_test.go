@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/audit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/model"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/entitlement"
@@ -33,6 +32,13 @@ func TestValidateRequirementsRejectsAuthoringMistakes(t *testing.T) {
 			wantErr: "does not declare",
 		},
 		{
+			name: "empty requirement",
+			catalog: catalog{ResourceTypes: []catalogResourceType{
+				{ID: "catalog", Operations: []catalogOperation{{ID: "manage", Requires: []string{""}}}},
+			}},
+			wantErr: "does not declare",
+		},
+		{
 			name: "self requirement",
 			catalog: catalog{ResourceTypes: []catalogResourceType{
 				{ID: "catalog", Operations: []catalogOperation{
@@ -42,15 +48,26 @@ func TestValidateRequirementsRejectsAuthoringMistakes(t *testing.T) {
 			wantErr: "requires itself",
 		},
 		{
-			name: "multi-level requirement",
+			name: "cycle disconnected from the first operation",
+			catalog: catalog{ResourceTypes: []catalogResourceType{
+				{ID: "catalog", Operations: []catalogOperation{
+					{ID: "view"},
+					{ID: "a", Requires: []string{"b"}},
+					{ID: "b", Requires: []string{"a"}},
+				}},
+			}},
+			wantErr: "cycle",
+		},
+		{
+			name: "cyclic requirement",
 			catalog: catalog{ResourceTypes: []catalogResourceType{
 				{ID: "catalog", Operations: []catalogOperation{
 					{ID: "a", Requires: []string{"b"}},
 					{ID: "b", Requires: []string{"c"}},
-					{ID: "c"},
+					{ID: "c", Requires: []string{"a"}},
 				}},
 			}},
-			wantErr: "itself declares requires",
+			wantErr: "cycle",
 		},
 	}
 	for _, tc := range cases {
@@ -70,7 +87,7 @@ func TestValidateRequirementsAcceptsMultipleDirectPrerequisites(t *testing.T) {
 	c := catalog{ResourceTypes: []catalogResourceType{
 		{ID: "release", Operations: []catalogOperation{
 			{ID: "view"},
-			{ID: "approve"},
+			{ID: "approve", Requires: []string{"view"}},
 			{ID: "publish", Requires: []string{"view", "approve"}},
 		}},
 	}}
@@ -98,10 +115,13 @@ func TestShippedCatalogBindsOperationsToViewDetail(t *testing.T) {
 		for _, op := range rt.Operations {
 			operations[op.ID] = op.Requires
 		}
-		for _, operation := range []string{"modify", "delete", "authorize", "task_manage", "resource_manage", "query_data", "data_write"} {
+		for _, operation := range []string{"modify", "delete", "authorize", "resource_manage", "query_data", "data_write"} {
 			if got := operations[operation]; len(got) != 1 || got[0] != "view_detail" {
 				t.Errorf("catalog/%s requires %v, want [view_detail]", operation, got)
 			}
+		}
+		if got := operations["task_manage"]; len(got) != 1 || got[0] != "resource_manage" {
+			t.Errorf("catalog/task_manage requires %v, want [resource_manage]", got)
 		}
 		for _, operation := range []string{"view_detail", "create"} {
 			if got := operations[operation]; len(got) != 0 {
@@ -111,6 +131,44 @@ func TestShippedCatalogBindsOperationsToViewDetail(t *testing.T) {
 		return
 	}
 	t.Fatal("catalog type missing from authorization-registry.json")
+}
+
+// TestShippedKnowledgeBaseBindsOperationsToViewDetail pins the knowledge base
+// contract: every instance operation requires opening that knowledge base, and
+// creation remains a type-level capability.
+func TestShippedKnowledgeBaseBindsOperationsToViewDetail(t *testing.T) {
+	var c catalog
+	if err := json.Unmarshal(catalogJSON, &c); err != nil {
+		t.Fatalf("parse authorization-registry.json: %v", err)
+	}
+	for _, rt := range c.ResourceTypes {
+		if rt.ID != "knowledge_base" {
+			continue
+		}
+		operations := map[string][]string{}
+		for _, op := range rt.Operations {
+			operations[op.ID] = op.Requires
+		}
+		for _, operation := range []string{"modify", "delete", "authorize", "document_manage", "task_manage", "query_data"} {
+			if got := operations[operation]; len(got) != 1 || got[0] != "view_detail" {
+				t.Errorf("knowledge_base/%s requires %v, want [view_detail]", operation, got)
+			}
+		}
+		for _, operation := range []string{"view_detail", "create"} {
+			got, ok := operations[operation]
+			if !ok {
+				t.Errorf("knowledge_base/%s is missing", operation)
+			}
+			if len(got) != 0 {
+				t.Errorf("knowledge_base/%s unexpectedly requires %v", operation, got)
+			}
+		}
+		if len(operations) != 8 {
+			t.Errorf("knowledge_base declares %d operations, want 8", len(operations))
+		}
+		return
+	}
+	t.Fatal("knowledge_base type missing from authorization-registry.json")
 }
 
 func TestShippedConnectorTypeDeclaresViewRequirements(t *testing.T) {
@@ -163,7 +221,7 @@ func TestShippedIndependentResourceFamiliesDeclareViewRequirements(t *testing.T)
 		types[resourceType.ID] = operations
 	}
 
-	for _, resourceType := range []string{"tool_box", "function", "mcp", "operator", "skill"} {
+	for _, resourceType := range []string{"tool_box", "function", "mcp", "skill"} {
 		for _, operation := range []string{"modify", "delete", "publish", "unpublish", "authorize"} {
 			if got := types[resourceType][operation]; len(got) != 1 || got[0] != "view" {
 				t.Errorf("%s/%s requires %v, want [view]", resourceType, operation, got)
@@ -205,8 +263,12 @@ func TestSeedPersistsCatalogManagementRequirements(t *testing.T) {
 		if err := db.First(&row, "resource_type_id = ? AND id = ?", "catalog", operation).Error; err != nil {
 			t.Fatalf("load catalog/%s: %v", operation, err)
 		}
-		if row.RequiredOperationIDs != "view_detail" {
-			t.Errorf("catalog/%s required operation ids = %q, want view_detail", operation, row.RequiredOperationIDs)
+		want := "view_detail"
+		if operation == "task_manage" {
+			want = "resource_manage"
+		}
+		if row.RequiredOperationIDs != want {
+			t.Errorf("catalog/%s required operation ids = %q, want %q", operation, row.RequiredOperationIDs, want)
 		}
 	}
 }
@@ -402,7 +464,7 @@ func TestIndependentResourceRequirementsDoNotChangeChecksAndLists(t *testing.T) 
 	}
 
 	viewByType := map[string]string{
-		"tool_box": "view", "function": "view", "mcp": "view", "operator": "view", "skill": "view",
+		"tool_box": "view", "function": "view", "mcp": "view", "skill": "view",
 		"small_model": "display", "large_model": "display",
 	}
 	for resourceType, viewOperation := range viewByType {
@@ -446,152 +508,51 @@ func TestIndependentResourceRequirementsDoNotChangeChecksAndLists(t *testing.T) 
 	}
 }
 
-// TestBackfillRepairsGrantsWrittenBeforeTheRule is the reason the write-time
-// rule alone is not a fix: a grant made before it existed carries only
-// resource_manage, reaches nothing, and nobody tells the administrator to
-// re-save it.
-func TestBackfillRepairsGrantsWrittenBeforeTheRule(t *testing.T) {
+// Existing direct, role and public grants remain exactly as saved across seed restarts.
+func TestApplyPreservesHistoricalGrantsWithoutBackfill(t *testing.T) {
 	entitlement.SetGateForTest(entitlement.FixedGate(licverify.EditionProfessional))
 	t.Cleanup(entitlement.ResetForTest)
-	db := newDB(t)
-	e, err := authz.New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-
-	// The shape an operator could produce before #1121: management without the
-	// visibility every management route needs.
-	if err := e.GrantProfessionalObjectPermission(
-		"u-1", "catalog", "c1", "resource_manage", authz.EffectAllow, authz.AuthoritySourceAdminAuthz,
-	); err != nil {
-		t.Fatal(err)
-	}
-	// A data grant follows the same visibility prerequisite as management.
-	if err := e.GrantProfessionalObjectPermission(
-		"u-2", "catalog", "c2", "query_data", authz.EffectAllow, authz.AuthoritySourceAdminAuthz,
-	); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("re-apply: %v", err)
-	}
-
-	if ok, _ := e.Check("u-1", "catalog", "c1", "view_detail"); !ok {
-		t.Fatal("backfill did not repair the pre-existing grant")
-	}
-	if ok, _ := e.Check("u-1", "catalog", "c1", "resource_manage"); !ok {
-		t.Fatal("backfill dropped the operation it was repairing")
-	}
-	if ok, _ := e.Check("u-2", "catalog", "c2", "view_detail"); !ok {
-		t.Fatal("backfill did not repair the data grant")
-	}
-
-	// Idempotent: a start with nothing left to repair changes nothing.
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("third apply: %v", err)
-	}
-	grants, err := e.ListObjectGrants("u-1", "catalog", "c1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(grants) != 1 || len(grants[0].Operations) != 2 {
-		t.Fatalf("grant after repeated apply: %+v", grants)
-	}
-
-	// The repair is a permission change nobody asked for at the console, so it
-	// has to be findable there — one row per repaired grant, under the same
-	// resource/action an operator-issued object grant carries, and not repeated
-	// on the idempotent starts that followed.
-	entries, total, err := audit.New(db).List(t.Context(), audit.Filter{
-		Resource: "object-grants", Action: "grant",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if total != 2 {
-		t.Fatalf("audit rows for the backfill = %d, want 2", total)
-	}
-	byTarget := make(map[string]model.AuditLog, len(entries))
-	for _, entry := range entries {
-		byTarget[entry.TargetID] = entry
-	}
-	got := byTarget["c1"]
-	if got.ActorID != "system:seed" {
-		t.Fatalf("resource_manage audit row = %+v", got)
-	}
-	if !strings.Contains(got.Detail, "view_detail") || !strings.Contains(got.Detail, "resource_manage") {
-		t.Fatalf("resource_manage audit detail does not name the operations: %s", got.Detail)
-	}
-	if got := byTarget["c2"]; got.ActorID != "system:seed" ||
-		!strings.Contains(got.Detail, "query_data") || !strings.Contains(got.Detail, "view_detail") {
-		t.Fatalf("query_data audit row = %+v", got)
-	}
-}
-
-// TestBackfillAuditLabelsMatchTheSurfaceThatShowsTheGrant pins the vocabulary
-// per subject kind. An audit row naming a surface where the grant is absent is
-// worse than no row: it sends the auditor looking in a list that by
-// construction will never contain it. GET /object-grants excludes role
-// subjects, the public accessor and type-wide "type:*" rows alike.
-func TestBackfillAuditLabelsMatchTheSurfaceThatShowsTheGrant(t *testing.T) {
-	entitlement.SetGateForTest(entitlement.FixedGate(licverify.EditionProfessional))
-	t.Cleanup(entitlement.ResetForTest)
-	db := newDB(t)
-	e, err := authz.New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-	if err := db.Create(&model.Role{ID: "role-x", Name: "自定义角色", Source: model.RoleSourceCustom}).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	// One row of each shape, all holding the management verb without the
-	// visibility it requires.
-	if err := e.GrantProfessionalObjectPermission(
-		"u-1", "catalog", "c1", "resource_manage", authz.EffectAllow, authz.AuthoritySourceAdminAuthz,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.GrantRolePermission("role-x", "catalog", "*", "resource_manage"); err != nil {
-		t.Fatal(err)
-	}
-	if err := e.GrantSystemObjectPermission(authz.PublicAccessorID, "catalog", "c2", "resource_manage"); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("re-apply: %v", err)
-	}
-
-	trail := audit.New(db)
-	for _, tc := range []struct {
-		name             string
-		resource, action string
-		targetID         string
-	}{
-		{"user object grant", "object-grants", "grant", "c1"},
-		{"role permission", "roles", "grant_permission", "role-x"},
-		{"public accessor is not an object grant", "policies", "grant", "c2"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			entries, total, err := trail.List(t.Context(), audit.Filter{
-				Resource: tc.resource, Action: tc.action, TargetID: tc.targetID,
-			})
+	for _, source := range []string{"professional", "role", "public"} {
+		t.Run(source, func(t *testing.T) {
+			db := newDB(t)
+			e, err := authz.New(db)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if total != 1 {
-				t.Fatalf("rows = %d, want 1", total)
+			if err := Apply(db, e); err != nil {
+				t.Fatal(err)
 			}
-			if entries[0].ActorID != "system:seed" {
-				t.Fatalf("actor = %q", entries[0].ActorID)
+			accessor := "user-x"
+			switch source {
+			case "professional":
+				mustNoErrSeed(t, e.GrantProfessionalObjectPermission(accessor, "catalog", "catalog-1",
+					"task_manage", authz.EffectAllow, authz.AuthoritySourceAdminAuthz))
+			case "role":
+				if err := db.Create(&model.Role{ID: "role-x", Name: "custom", Source: model.RoleSourceCustom}).Error; err != nil {
+					t.Fatal(err)
+				}
+				mustNoErrSeed(t, e.GrantRolePermission("role-x", "catalog", "catalog-1", "task_manage"))
+				mustNoErrSeed(t, e.AssignRole(accessor, "role-x"))
+			case "public":
+				mustNoErrSeed(t, e.GrantSystemObjectPermission(authz.PublicAccessorID, "catalog", "catalog-1", "task_manage"))
+			}
+			for range 2 {
+				if err := Apply(db, e); err != nil {
+					t.Fatal(err)
+				}
+				for _, operation := range []string{"resource_manage", "view_detail"} {
+					allowed, err := e.Check(accessor, "catalog", "catalog-1", operation)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if allowed {
+						t.Fatalf("seed added %s to %s", operation, accessor)
+					}
+				}
+				allowed, err := e.Check(accessor, "catalog", "catalog-1", "task_manage")
+				if err != nil || !allowed {
+					t.Fatalf("historical task_manage for %s = %v, %v", accessor, allowed, err)
+				}
 			}
 		})
 	}

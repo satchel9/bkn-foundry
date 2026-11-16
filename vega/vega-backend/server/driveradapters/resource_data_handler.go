@@ -10,13 +10,16 @@ package driveradapters
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mitchellh/mapstructure"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/otellog"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
@@ -37,7 +40,7 @@ import (
 //	POST   → batch create documents (dataset category only)
 //	DELETE → delete documents by filter (dataset category only)
 func (r *restHandler) PostResourceDataByEx(c *gin.Context) {
-	visitor, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	visitor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return
 	}
@@ -77,8 +80,8 @@ func (r *restHandler) postResourceData(c *gin.Context, visitor hydra.Visitor, s2
 	case http.MethodDelete:
 		r.deleteResourceDataByQuery(c, ctx, span)
 	default:
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_OverrideMethod)
-		otellog.LogError(ctx, fmt.Sprintf("%s. %v", httpErr.BaseError.Description, httpErr.BaseError.ErrorDetails), httpErr)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_OverrideMethod)
+		otellog.LogError(ctx, fmt.Sprintf("%s. %v", httpErr.ErrorCode, httpErr.ErrorDetails), httpErr)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 	}
@@ -103,7 +106,7 @@ func (r *restHandler) queryResourceData(c *gin.Context, ctx context.Context, spa
 		return
 	}
 	if resource == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 		otellog.LogError(ctx, "Resource not found", httpErr)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -127,7 +130,7 @@ func (r *restHandler) queryProxyResourceData(c *gin.Context, ctx context.Context
 func bindResourceDataQuery(c *gin.Context, ctx context.Context, span trace.Span) (*interfaces.ResourceDataQueryParams, bool) {
 	var params interfaces.ResourceDataQueryParams
 	if err := common.BindPreciseJSON(c.Request.Body, &params); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
 			WithErrorDetails(err.Error())
 		otellog.LogError(ctx, "Bind resource data query request failed", httpErr)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
@@ -175,8 +178,9 @@ func (r *restHandler) executeResourceDataQuery(c *gin.Context, ctx context.Conte
 	}
 
 	resultData := map[string]any{
-		"query_source": result.QuerySource,
-		"entries":      result.Entries,
+		"query_source":   result.QuerySource,
+		"entries":        result.Entries,
+		"is_approximate": result.IsApproximate,
 	}
 	if params.NeedTotal || result.NeedTotal {
 		resultData["total_count"] = result.TotalCount
@@ -205,7 +209,7 @@ func (r *restHandler) createResourceData(c *gin.Context, ctx context.Context, sp
 
 	var document map[string]any
 	if err := common.BindPreciseJSON(c.Request.Body, &document); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
 			WithErrorDetails(err.Error())
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -237,7 +241,7 @@ func (r *restHandler) deleteResourceDataByQuery(c *gin.Context, ctx context.Cont
 
 	var params interfaces.ResourceDataQueryParams
 	if err := common.BindPreciseJSON(c.Request.Body, &params); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
 			WithErrorDetails(err.Error())
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -245,7 +249,7 @@ func (r *restHandler) deleteResourceDataByQuery(c *gin.Context, ctx context.Cont
 	}
 
 	if params.FilterCondition == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
 			WithErrorDetails("filter is required for delete-by-query (empty filter would delete all documents)")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -254,14 +258,14 @@ func (r *restHandler) deleteResourceDataByQuery(c *gin.Context, ctx context.Cont
 
 	var actualCond *interfaces.FilterCondCfg
 	if err := mapstructure.Decode(params.FilterCondition, &actualCond); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_FilterCondition).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_FilterCondition).
 			WithErrorDetails(fmt.Sprintf("mapstructure decode filters failed: %s", err.Error()))
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
 	if actualCond == nil || actualCond.Operation == "" {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_FilterCondition).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_FilterCondition).
 			WithErrorDetails("delete-by-query requires a filter condition with an operation")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -269,7 +273,8 @@ func (r *restHandler) deleteResourceDataByQuery(c *gin.Context, ctx context.Cont
 	}
 	params.FilterCondCfg = actualCond
 
-	if err := r.ds.DeleteDocumentsByQuery(ctx, resource, &params); err != nil {
+	result, err := r.ds.DeleteDocumentsByQuery(ctx, resource, &params)
+	if err != nil {
 		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Resource_InternalError)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -277,19 +282,90 @@ func (r *restHandler) deleteResourceDataByQuery(c *gin.Context, ctx context.Cont
 	}
 
 	logger.Debug("Handler deleteResourceDataByQuery Success")
-	oteltrace.AddHttpAttrs4Ok(span, http.StatusNoContent)
-	rest.ReplyOkWithHeaders(c, http.StatusNoContent, nil, map[string]string{
+	status := http.StatusNoContent
+	var body any
+	if strings.EqualFold(strings.TrimSpace(c.Query("return_result")), "true") {
+		status = http.StatusOK
+		body = result
+	}
+	oteltrace.AddHttpAttrs4Ok(span, status)
+	rest.ReplyOkWithHeaders(c, status, body, map[string]string{
 		interfaces.X_REQUEST_TOOK: time.Since(start).String(),
 	})
 }
 
 // =========================== PUT /resources/:id/data ===========================
 
+// PutResourceDataByEx 批量完整替换 Dataset 文档。
+func (r *restHandler) PutResourceDataByEx(c *gin.Context) {
+	visitor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
+	if err != nil {
+		return
+	}
+	r.putResourceData(c, visitor, false)
+}
+
+func (r *restHandler) PutResourceDataByIn(c *gin.Context) {
+	r.putResourceData(c, visitor.GenerateVisitor(c), true)
+}
+
+func (r *restHandler) putResourceData(c *gin.Context, visitor hydra.Visitor, internal bool) {
+	ctx, span := oteltrace.StartServerSpan(c)
+	defer span.End()
+
+	accountInfo := interfaces.AccountInfo{ID: visitor.ID, Type: string(visitor.Type)}
+	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, accountInfo)
+	if internal {
+		ctx = interfaces.WithS2SInternalAccess(ctx)
+	}
+	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
+
+	resource, ok := r.requireDatasetResource(c, ctx, span, c.Param("id"), interfaces.OPERATION_TYPE_DATA_WRITE)
+	if !ok {
+		return
+	}
+
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, interfaces.MaxDatasetBulkBodyBytes)
+	var request struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	data, err := io.ReadAll(c.Request.Body)
+	if err == nil {
+		err = common.UnmarshalPreciseJSON(data, &request)
+	}
+	if err != nil {
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(err.Error())
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
+
+	if len(request.Entries) == 0 || len(request.Entries) > interfaces.MaxDatasetBulkDocuments {
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails("bulk request must contain 1 to 1000 documents")
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
+
+	results, err := r.ds.BulkReplaceDocuments(ctx, resource, request.Entries)
+	if err != nil {
+		httpErr := httpErrorOrInternal(ctx, err, verrors.VegaBackend_Resource_InternalError_UpdateFailed)
+		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
+		rest.ReplyError(c, httpErr)
+		return
+	}
+
+	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
+	rest.ReplyOK(c, http.StatusOK, map[string]any{"entries": results})
+}
+
 // =========================== GET /resources/:id/data/:docid ===========================
 
 // GetResourceDataDocByEx handles GET /api/vega-backend/v1/resources/:id/data/:docid (External).
 func (r *restHandler) GetResourceDataDocByEx(c *gin.Context) {
-	visitor, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	visitor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return
 	}
@@ -334,7 +410,7 @@ func (r *restHandler) getResourceDataDoc(c *gin.Context, visitor hydra.Visitor, 
 
 	docIDs := parseRawIDs(c.Param("docid"))
 	if len(docIDs) == 0 {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("at least one document id is required")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -366,7 +442,7 @@ func (r *restHandler) getResourceDataDoc(c *gin.Context, visitor hydra.Visitor, 
 // PutResourceDataDocByEx handles PUT /api/vega-backend/v1/resources/:id/data/:docid (External).
 // Single-document update; docid from path takes precedence over any `_id` field in body.
 func (r *restHandler) PutResourceDataDocByEx(c *gin.Context) {
-	visitor, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	visitor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return
 	}
@@ -400,7 +476,7 @@ func (r *restHandler) putResourceDataDoc(c *gin.Context, visitor hydra.Visitor, 
 
 	docID := strings.TrimSpace(c.Param("docid"))
 	if docID == "" {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("exactly one document id is required")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -409,7 +485,7 @@ func (r *restHandler) putResourceDataDoc(c *gin.Context, visitor hydra.Visitor, 
 
 	var doc map[string]any
 	if err := common.BindPreciseJSON(c.Request.Body, &doc); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
 			WithErrorDetails(err.Error())
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -443,7 +519,7 @@ func (r *restHandler) putResourceDataDoc(c *gin.Context, visitor hydra.Visitor, 
 // Deletes one or more documents by IDs. Missing IDs reject the whole request by default;
 // callers can opt into skipping them with ?ignore_missing=true.
 func (r *restHandler) DeleteResourceDataByEx(c *gin.Context) {
-	visitor, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	visitor, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return
 	}
@@ -477,7 +553,7 @@ func (r *restHandler) deleteResourceData(c *gin.Context, visitor hydra.Visitor, 
 
 	docIDs := parseRawIDs(c.Param("docid"))
 	if len(docIDs) == 0 {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("at least one document id is required")
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
@@ -512,13 +588,13 @@ func (r *restHandler) requireDatasetResource(c *gin.Context, ctx context.Context
 		return nil, false
 	}
 	if resource == nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return nil, false
 	}
 	if resource.Category != interfaces.ResourceCategoryDataset {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).
 			WithErrorDetails(fmt.Sprintf("operation requires resource category=dataset, got: %s", resource.Category))
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)

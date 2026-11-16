@@ -15,6 +15,9 @@ const (
 	BknBackend_RelationType_RelationTypeIDExisted             = "BknBackend.RelationType.RelationTypeIDExisted"
 	BknBackend_RelationType_LengthExceeded_Name               = "BknBackend.RelationType.LengthExceeded.Name"
 	BknBackend_RelationType_NullParameter_Name                = "BknBackend.RelationType.NullParameter.Name"
+	BknBackend_RelationType_InvalidParameter_Declarations     = "BknBackend.RelationType.InvalidParameter.Declarations"
+	BknBackend_RelationType_DeclarationsWouldBeCleared        = "BknBackend.RelationType.DeclarationsWouldBeCleared"
+	BknBackend_RelationType_StillReferenced                   = "BknBackend.RelationType.StillReferenced"
 
 	// 500
 	BknBackend_RelationType_InternalError                                = "BknBackend.RelationType.InternalError"
@@ -36,6 +39,9 @@ var (
 		BknBackend_RelationType_RelationTypeIDExisted,
 		BknBackend_RelationType_LengthExceeded_Name,
 		BknBackend_RelationType_NullParameter_Name,
+		BknBackend_RelationType_InvalidParameter_Declarations,
+		BknBackend_RelationType_DeclarationsWouldBeCleared,
+		BknBackend_RelationType_StillReferenced,
 
 		// 500
 		BknBackend_RelationType_InternalError,

@@ -12,7 +12,7 @@ import (
 
 	. "github.com/smartystreets/goconvey/convey"
 
-	dtype "bkn-backend/interfaces/data_type"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 func TestNewNotLikeCond(t *testing.T) {
@@ -38,10 +38,8 @@ func TestNewNotLikeCond(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field3",
 				NameField: fieldsMap["field3"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Const,
-					Value:     "value1",
-				},
+				ValueFrom: ValueFrom_Const,
+				Value:     "value1",
 			}
 			cond, err := NewNotLikeCond(ctx, cfg, fieldsMap)
 			So(err, ShouldNotBeNil)
@@ -54,10 +52,8 @@ func TestNewNotLikeCond(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field1",
 				NameField: fieldsMap["field1"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Field,
-					Value:     "value1",
-				},
+				ValueFrom: ValueFrom_Field,
+				Value:     "value1",
 			}
 			cond, err := NewNotLikeCond(ctx, cfg, fieldsMap)
 			So(err, ShouldNotBeNil)
@@ -70,10 +66,8 @@ func TestNewNotLikeCond(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field1",
 				NameField: fieldsMap["field1"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Const,
-					Value:     123,
-				},
+				ValueFrom: ValueFrom_Const,
+				Value:     123,
 			}
 			cond, err := NewNotLikeCond(ctx, cfg, fieldsMap)
 			So(err, ShouldNotBeNil)
@@ -86,10 +80,8 @@ func TestNewNotLikeCond(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field1",
 				NameField: fieldsMap["field1"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Const,
-					Value:     "value1",
-				},
+				ValueFrom: ValueFrom_Const,
+				Value:     "value1",
 			}
 			cond, err := NewNotLikeCond(ctx, cfg, fieldsMap)
 			So(err, ShouldBeNil)
@@ -116,10 +108,8 @@ func TestNotLikeCond_Convert(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field1",
 				NameField: fieldsMap["field1"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Const,
-					Value:     "test",
-				},
+				ValueFrom: ValueFrom_Const,
+				Value:     "test",
 			}
 			cond, _ := NewNotLikeCond(ctx, cfg, fieldsMap)
 			notLikeCond := cond.(*NotLikeCond)
@@ -135,7 +125,8 @@ func TestNotLikeCond_Convert(t *testing.T) {
 			So(dsl, ShouldContainSubstring, "must_not")
 			So(dsl, ShouldContainSubstring, "wildcard")
 			So(dsl, ShouldContainSubstring, "field1")
-			So(dsl, ShouldContainSubstring, "*test*")
+			So(dsl, ShouldContainSubstring, `"field1": "test"`)
+			So(dsl, ShouldContainSubstring, `"exists"`)
 		})
 	})
 }
@@ -155,10 +146,8 @@ func TestNotLikeCond_Convert2SQL(t *testing.T) {
 				Operation: OperationNotLike,
 				Field:     "field1",
 				NameField: fieldsMap["field1"],
-				ValueOptCfg: ValueOptCfg{
-					ValueFrom: ValueFrom_Const,
-					Value:     "test",
-				},
+				ValueFrom: ValueFrom_Const,
+				Value:     "test",
 			}
 			cond, _ := NewNotLikeCond(ctx, cfg, fieldsMap)
 			notLikeCond := cond.(*NotLikeCond)
@@ -168,7 +157,7 @@ func TestNotLikeCond_Convert2SQL(t *testing.T) {
 			So(sql, ShouldNotBeEmpty)
 			So(sql, ShouldContainSubstring, "field1")
 			So(sql, ShouldContainSubstring, "NOT LIKE")
-			So(sql, ShouldContainSubstring, "%test%")
+			So(sql, ShouldEqual, `"field1" NOT LIKE 'test' ESCAPE '!'`)
 		})
 	})
 }

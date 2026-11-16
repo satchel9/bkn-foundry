@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS t_resource (
     -- 状态管理
     f_enabled                 BOOLEAN NOT NULL DEFAULT TRUE COMMENT '资源是否启用',
     f_status                  VARCHAR(20) NOT NULL DEFAULT 'active' COMMENT '数据资源状态: active, deprecated, stale',
-    f_status_message          VARCHAR(500) NOT NULL DEFAULT '' COMMENT '状态说明',
+    f_status_message          TEXT NOT NULL COMMENT '状态说明',
     f_last_discover_status    VARCHAR(32) NOT NULL DEFAULT '' COMMENT '最近一次扫描观察状态',
     f_last_discover_time      BIGINT NOT NULL DEFAULT 0 COMMENT '最近成功发现时间，Unix毫秒',
 
@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS t_resource (
     -- 物理数据资源专属字段
     f_schema                  VARCHAR(128) NOT NULL DEFAULT '' COMMENT '所属 schema 名称，由发现流程写入',
     f_source_identifier       VARCHAR(500) NOT NULL DEFAULT '' COMMENT '源端标识(表名/文件路径/索引名等)',
+    f_api_name                VARCHAR(64) NOT NULL DEFAULT '' COMMENT '语义理解给出的英文短名（snake_case），只写一次',
     f_source_metadata         MEDIUMTEXT NOT NULL COMMENT '源端元数据（JSON格式）',
 
     -- Schema相关
@@ -199,6 +200,10 @@ SELECT 'hana', 'hana', 'SAP HANA 关系型数据库连接器', 'local', 'table',
 FROM DUAL WHERE NOT EXISTS ( SELECT f_type FROM t_connector_type WHERE f_type = 'hana' );
 
 INSERT INTO t_connector_type (f_type, f_name, f_description, f_mode, f_category, f_enabled)
+SELECT 'doris', 'doris', 'Apache Doris 分析型数据库连接器', 'local', 'table', TRUE
+FROM DUAL WHERE NOT EXISTS (SELECT f_type FROM t_connector_type WHERE f_type = 'doris');
+
+INSERT INTO t_connector_type (f_type, f_name, f_description, f_mode, f_category, f_enabled)
 SELECT 'anyshare', 'anyshare', 'AnyShare 连接器', 'local', 'fileset', TRUE
 FROM DUAL WHERE NOT EXISTS ( SELECT f_type FROM t_connector_type WHERE f_type = 'anyshare' );
 
@@ -219,7 +224,7 @@ CREATE TABLE IF NOT EXISTS t_discover_task (
     -- 任务状态
     f_status                  VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT '任务状态: pending, running, completed, failed, cancelled',
     f_progress                INT NOT NULL DEFAULT 0 COMMENT '任务进度: 0-100',
-    f_message                 VARCHAR(1000) NOT NULL DEFAULT '' COMMENT '任务消息/错误信息',
+    f_message                 TEXT NOT NULL COMMENT '任务消息/错误信息',
 
     -- 时间信息
     f_start_time              BIGINT(20) NOT NULL DEFAULT 0 COMMENT '开始执行时间',

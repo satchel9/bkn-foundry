@@ -51,7 +51,7 @@ func literalFromParameter(value any) (Literal, error) {
 		}
 		return Literal{Kind: LiteralFloat, Float: typed}, nil
 	case nil:
-		return Literal{}, fmt.Errorf("is null; write IS NULL instead of comparing to a null parameter")
+		return Literal{}, fmt.Errorf("is null; to make the condition optional, write ($name IS NULL OR condition)")
 	default:
 		return Literal{}, fmt.Errorf("is %s; parameters must be a string, a number or a boolean", describeParameterValue(value))
 	}
@@ -72,7 +72,9 @@ func literalFromJSONNumber(number json.Number) (Literal, error) {
 // IN onto literals. Each element goes through literalFromParameter, so it is
 // bound and escaped exactly like a scalar parameter.
 //
-// The list has to be non-empty, at most MaxListParameterLength long, and hold
+// An empty list matches nothing, as IN [] written in the query does: a caller
+// with nothing to look for passes one, and is owed no rows rather than an
+// error. The list has to be at most MaxListParameterLength long and hold
 // scalars of one kind. Integers and floats count as one kind, numbers, as they
 // do in a list literal such as [1, 2.5]: JSON does not tell them apart, and an
 // integral float already arrives as an integer. Strings, numbers and booleans
@@ -86,9 +88,6 @@ func literalsFromListParameter(value any) ([]Literal, error) {
 	list, ok := value.([]any)
 	if !ok {
 		return nil, fmt.Errorf("is %s; IN $name needs the parameter to be a list of values", describeParameterValue(value))
-	}
-	if len(list) == 0 {
-		return nil, fmt.Errorf("is an empty list; IN over nothing matches nothing, so leave the condition out instead")
 	}
 	if len(list) > MaxListParameterLength {
 		return nil, fmt.Errorf("has %d values; a list parameter may carry at most %d", len(list), MaxListParameterLength)

@@ -11,10 +11,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 type proxyContextResolver struct {
@@ -48,6 +48,17 @@ func (r *proxyContextResolver) Resolve(
 	if r == nil || r.access == nil {
 		return nil, proxyUnavailable(ctx, "knowledge network proxy resolver is not configured")
 	}
+	// The proxy's grants cover only the running version. A query on the draft or a history
+	// version never reaches this point through a data read; refusing here keeps any other
+	// path from borrowing the proxy's identity for a version it does not cover.
+	pin := interfaces.KNVersionPinFromContext(ctx)
+	if pin.UsesCallerIdentity() {
+		return nil, proxyError(ctx, http.StatusForbidden, oerrors.OntologyQuery_Proxy_BindingInvalid,
+			"the knowledge network proxy covers only the running version")
+	}
+	if binding.Branch == "" {
+		binding.Branch = pin.ProxyBranch()
+	}
 
 	mapping, err := r.access.ResolveKnowledgeNetworkProxy(ctx, binding)
 	if err != nil {
@@ -63,6 +74,7 @@ func (r *proxyContextResolver) Resolve(
 	}
 	resolvedBinding := *mapping.ResolvedBinding
 	resolvedBinding.KNID = binding.KNID
+	resolvedBinding.Branch = binding.Branch
 	if err := validateBinding(resolvedBinding); err != nil {
 		return nil, proxyUnavailable(ctx, "published proxy binding is invalid")
 	}
@@ -167,15 +179,15 @@ func validateProxyBinding(binding interfaces.TrustedProxyBinding, requireTargetT
 	return nil
 }
 
-func proxyUnavailable(ctx context.Context, detail string) *rest.HTTPError {
+func proxyUnavailable(ctx context.Context, detail string) *httperrors.HTTPError {
 	return proxyError(ctx, http.StatusServiceUnavailable, oerrors.OntologyQuery_Proxy_Unavailable, detail)
 }
 
-func proxyError(ctx context.Context, status int, code, detail string) *rest.HTTPError {
-	return rest.NewHTTPError(ctx, status, code).WithErrorDetails(detail)
+func proxyError(ctx context.Context, status int, code, detail string) *httperrors.HTTPError {
+	return httperrors.NewHTTPError(ctx, status, code).WithErrorDetails(detail)
 }
 
-func mapProxyResolutionError(ctx context.Context, err error) *rest.HTTPError {
+func mapProxyResolutionError(ctx context.Context, err error) *httperrors.HTTPError {
 	var resolutionErr *interfaces.KnowledgeNetworkProxyResolveError
 	if !errors.As(err, &resolutionErr) {
 		return proxyUnavailable(ctx, "knowledge network proxy mapping is unavailable")

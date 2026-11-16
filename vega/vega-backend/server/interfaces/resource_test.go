@@ -51,8 +51,8 @@ func TestResourceLocalStateJSON(t *testing.T) {
 	}
 }
 
-func TestDerivedLogicDefinitionJSON(t *testing.T) {
-	precise, err := DecodeDerivedLogicDefinition(map[string]any{
+func TestDerivedLogicalViewDefinitionJSON(t *testing.T) {
+	precise, err := DecodeDerivedLogicalViewDefinition(map[string]any{
 		"source_resource_id": "source",
 		"filter_condition":   map[string]any{"value": json.Number("9007199254740993")},
 	})
@@ -64,20 +64,20 @@ func TestDerivedLogicDefinitionJSON(t *testing.T) {
 		t.Fatalf("filter value lost precision: %v", condition["value"])
 	}
 	var request ResourceRequest
-	err = json.Unmarshal([]byte(`{"category":"logical_view","logic_definition":{"source_resource_id":"source","distinct":false}}`), &request)
+	err = json.Unmarshal([]byte(`{"category":"logical_view","logical_view_definition":{"source_resource_id":"source","distinct":false}}`), &request)
 	if err != nil {
 		t.Fatalf("decode generic definition: %v", err)
 	}
-	if _, err := DecodeDerivedLogicDefinition(request.LogicDefinition); err == nil {
+	if _, err := DecodeDerivedLogicalViewDefinition(request.LogicalViewDefinition); err == nil {
 		t.Fatal("derived definition must reject unsupported fields")
 	}
-	if err := sonic.Unmarshal([]byte(`{"logic_definition":{"source_resource_id":"source","distinct":false}}`), &request); err != nil {
+	if err := sonic.Unmarshal([]byte(`{"logical_view_definition":{"source_resource_id":"source","distinct":false}}`), &request); err != nil {
 		t.Fatalf("sonic decode generic definition: %v", err)
 	}
-	if _, err := DecodeDerivedLogicDefinition(request.LogicDefinition); err == nil {
+	if _, err := DecodeDerivedLogicalViewDefinition(request.LogicalViewDefinition); err == nil {
 		t.Fatal("derived conversion must reject unsupported fields from sonic")
 	}
-	if _, err := DecodeDerivedLogicDefinition([]any{map[string]any{"type": "resource"}}); err == nil {
+	if _, err := DecodeDerivedLogicalViewDefinition([]any{map[string]any{"type": "resource"}}); err == nil {
 		t.Fatal("derived conversion must reject composite arrays")
 	}
 	for _, raw := range []any{
@@ -85,17 +85,17 @@ func TestDerivedLogicDefinitionJSON(t *testing.T) {
 		map[string]any{"source_resource_id": ""},
 		map[string]any{"source_resource_id": "  "},
 	} {
-		if _, err := DecodeDerivedLogicDefinition(raw); err == nil {
+		if _, err := DecodeDerivedLogicalViewDefinition(raw); err == nil {
 			t.Fatalf("derived conversion must reject missing source_resource_id: %#v", raw)
 		}
 	}
-	err = json.Unmarshal([]byte(`{"category":"logical_view","logic_definition":{"source_resource_id":"source"}}`), &request)
-	definition, decodeErr := DecodeDerivedLogicDefinition(request.LogicDefinition)
+	err = json.Unmarshal([]byte(`{"category":"logical_view","logical_view_definition":{"source_resource_id":"source"}}`), &request)
+	definition, decodeErr := DecodeDerivedLogicalViewDefinition(request.LogicalViewDefinition)
 	if err != nil || decodeErr != nil || definition.SourceResourceID != "source" {
-		t.Fatalf("decode derived definition: definition=%+v, err=%v", request.LogicDefinition, err)
+		t.Fatalf("decode derived definition: definition=%+v, err=%v", request.LogicalViewDefinition, err)
 	}
-	encoded, err := json.Marshal(&Resource{LogicDefinition: request.LogicDefinition})
-	if err != nil || !strings.Contains(string(encoded), `"logic_definition":{"source_resource_id":"source"}`) {
+	encoded, err := json.Marshal(&Resource{LogicalViewDefinition: request.LogicalViewDefinition})
+	if err != nil || !strings.Contains(string(encoded), `"logical_view_definition":{"source_resource_id":"source"}`) {
 		t.Fatalf("encode derived definition: %s, err=%v", encoded, err)
 	}
 }
@@ -119,5 +119,65 @@ func TestLocalIndexFieldContract(t *testing.T) {
 	}
 	if MaxKeywordIgnoreAbove != 8191 {
 		t.Fatalf("MaxKeywordIgnoreAbove = %d, want %d", MaxKeywordIgnoreAbove, 8191)
+	}
+}
+
+func TestIsPhysicalResourceCategory(t *testing.T) {
+	for _, tc := range []struct {
+		category string
+		want     bool
+	}{
+		{ResourceCategoryTable, true},
+		{ResourceCategoryFile, true},
+		{ResourceCategoryFileset, true},
+		{ResourceCategoryAPI, true},
+		{ResourceCategoryMetric, true},
+		{ResourceCategoryTopic, true},
+		{ResourceCategoryIndex, true},
+		{ResourceCategoryDataset, false},
+		{ResourceCategoryLogicalView, false},
+		{"", false},
+		{"unknown", false},
+		{CatalogTypePhysical, false},
+	} {
+		t.Run(tc.category, func(t *testing.T) {
+			if got := IsPhysicalResourceCategory(tc.category); got != tc.want {
+				t.Errorf("IsPhysicalResourceCategory(%q) = %v, want %v", tc.category, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPropertyFilterableJSON(t *testing.T) {
+	for _, literal := range []string{`{"type":"string"}`, `{"type":"string","filterable":false}`, `{"type":"json","filterable":true}`} {
+		for _, codec := range []struct {
+			name      string
+			marshal   func(any) ([]byte, error)
+			unmarshal func([]byte, any) error
+		}{{"json", json.Marshal, json.Unmarshal}, {"sonic", sonic.Marshal, sonic.Unmarshal}} {
+			t.Run(codec.name+literal, func(t *testing.T) {
+				var property Property
+				if err := codec.unmarshal([]byte(literal), &property); err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := codec.marshal(property)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var again Property
+				if err := codec.unmarshal(encoded, &again); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(property.Filterable, again.Filterable) {
+					t.Fatalf("filterable changed on round trip: %s", encoded)
+				}
+				if property.Filterable == nil && strings.Contains(string(encoded), "filterable") {
+					t.Fatalf("serialization filled a historical omission: %s", encoded)
+				}
+				if property.Filterable != nil && !*property.Filterable && !strings.Contains(string(encoded), `"filterable":false`) {
+					t.Fatalf("explicit false lost: %s", encoded)
+				}
+			})
+		}
 	}
 }

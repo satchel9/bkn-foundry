@@ -12,9 +12,9 @@ import (
 
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 // independentActionFixture contains directly readable action types with different bindings. The
@@ -23,7 +23,7 @@ import (
 func independentActionFixture() []*interfaces.ActionType {
 	action := func(id, bound string) *interfaces.ActionType {
 		return &interfaces.ActionType{
-			ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: id, ObjectTypeID: bound},
+			ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: id, ObjectTypeID: bound, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"}},
 			KNID:                   "kn-1",
 			Branch:                 interfaces.MAIN_BRANCH,
 		}

@@ -13,9 +13,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 
-	"ontology-query/common"
-	"ontology-query/common/bkntrace"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/bkntrace"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 const headerBKNEvidenceEventID = "bkn-evidence-event-id"
@@ -190,6 +190,7 @@ func safeSubgraphByObjectsQueryShape(query *interfaces.SubGraphQueryBaseOnObject
 	}
 }
 
+//nolint:unused // Intentionally retained.
 func safeMetricQueryShape(knID, branch, metricID string, query any) map[string]any {
 	return map[string]any{
 		"kn_id":      knID,

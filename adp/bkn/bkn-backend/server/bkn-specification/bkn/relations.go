@@ -1,0 +1,504 @@
+// Copyright openbkn.ai
+//
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in the project root for details.
+
+package bkn
+
+import (
+	"fmt"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Lifecycle statuses (SPECIFICATION.md §4.3).
+const (
+	LifecycleActive     = "active"
+	LifecycleDeprecated = "deprecated"
+)
+
+// Relation importance and verification (SPECIFICATION.md §7.6). An empty Importance is primary.
+const (
+	ImportancePrimary   = "primary"
+	ImportanceSecondary = "secondary"
+
+	VerificationConfirmed   = "confirmed"
+	VerificationUnconfirmed = "unconfirmed"
+)
+
+// Relation cardinalities, the ends of required and the characteristics (SPECIFICATION.md §7.6).
+const (
+	CardinalityOneToOne   = "one_to_one"
+	CardinalityOneToMany  = "one_to_many"
+	CardinalityManyToOne  = "many_to_one"
+	CardinalityManyToMany = "many_to_many"
+
+	EndSource = "source"
+	EndTarget = "target"
+
+	CharacteristicSymmetric  = "symmetric"
+	CharacteristicTransitive = "transitive"
+)
+
+var (
+	lifecycleKeys     = []string{"status", "reason", "replaced_by"}
+	lifecycleStatuses = []string{LifecycleActive, LifecycleDeprecated}
+	importances       = []string{ImportancePrimary, ImportanceSecondary}
+	verifications     = []string{VerificationConfirmed, VerificationUnconfirmed}
+	cardinalities     = []string{CardinalityOneToOne, CardinalityOneToMany, CardinalityManyToOne, CardinalityManyToMany}
+	relationEnds      = []string{EndSource, EndTarget}
+	characteristics   = []string{CharacteristicSymmetric, CharacteristicTransitive}
+	// relationConstraintKeys is the order the keys of ### Relation Constraints are written in.
+	relationConstraintKeys = []string{"required", "characteristics"}
+	// fallbackCardinalities are the cardinalities a primary relation with a fallback path declares:
+	// a Source instance has at most one primary counterpart.
+	fallbackCardinalities = []string{CardinalityManyToOne, CardinalityOneToOne}
+)
+
+// frontmatterString reads an optional scalar frontmatter field as written. A field that is present
+// but not a non-empty string is refused rather than read as absent.
+func frontmatterString(fm rawFrontmatter, key string) (string, error) {
+	node, ok := fm.values[key]
+	if !ok {
+		return "", nil
+	}
+	if node.Kind != yaml.ScalarNode || node.Tag == "!!null" || node.Value == "" {
+		return "", specErrorf("frontmatter %s must be a single value", key)
+	}
+	return node.Value, nil
+}
+
+// parseLifecycleNode reads the lifecycle of a frontmatter. status: active, written or not, is held
+// as nil.
+func parseLifecycleNode(id string, node *yaml.Node) (*Lifecycle, error) {
+	if node == nil {
+		return nil, nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, specErrorf("frontmatter lifecycle must be a mapping with status, such as {status: deprecated, reason: ...}")
+	}
+	lc := &Lifecycle{}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		key, value := node.Content[i].Value, node.Content[i+1]
+		if value.Kind != yaml.ScalarNode || value.Tag == "!!null" || value.Value == "" {
+			return nil, specErrorf("lifecycle %s must be a single value", key)
+		}
+		switch key {
+		case "status":
+			lc.Status = value.Value
+		case "reason":
+			lc.Reason = value.Value
+		case "replaced_by":
+			lc.ReplacedBy = value.Value
+		default:
+			return nil, specErrorf("lifecycle key %q is unknown; the keys are %s", key, strings.Join(lifecycleKeys, ", "))
+		}
+	}
+	if lc.Status == "" {
+		return nil, specErrorf("lifecycle needs status: %s", strings.Join(lifecycleStatuses, " or "))
+	}
+	if err := validateLifecycle("lifecycle", lc, id); err != nil {
+		return nil, err
+	}
+	if lc.Status == LifecycleActive {
+		return nil, nil
+	}
+	return lc, nil
+}
+
+// validateLifecycle checks a lifecycle on its own. A nil lifecycle is active.
+func validateLifecycle(where string, lc *Lifecycle, ownID string) error {
+	if lc == nil {
+		return nil
+	}
+	switch lc.Status {
+	case LifecycleActive:
+		if lc.Reason != "" || lc.ReplacedBy != "" {
+			return ruleErrorf(RuleLifecycleFieldsWithoutDeprecation, nil, "%s: reason and replaced_by go with status deprecated only", where)
+		}
+	case LifecycleDeprecated:
+		if strings.TrimSpace(lc.Reason) == "" {
+			return ruleErrorf(RuleLifecycleReasonMissing, nil, "%s: status deprecated needs a reason", where)
+		}
+		if lc.ReplacedBy != "" && !idPattern.MatchString(lc.ReplacedBy) {
+			return ruleErrorf(RuleLifecycleReplacedByInvalid, map[string]any{"replaced_by": lc.ReplacedBy}, "%s: replaced_by %q is not an id; an id must match %s", where, lc.ReplacedBy, idPattern.String())
+		}
+		if lc.ReplacedBy != "" && lc.ReplacedBy == ownID {
+			return ruleErrorf(RuleLifecycleReplacedBySelf, map[string]any{"replaced_by": lc.ReplacedBy}, "%s: replaced_by %q is the definition itself", where, lc.ReplacedBy)
+		}
+	default:
+		return ruleErrorf(RuleLifecycleStatusInvalid, map[string]any{"status": lc.Status, "allowed": lifecycleStatuses}, "%s: status must be %s, got %q", where, strings.Join(lifecycleStatuses, " or "), lc.Status)
+	}
+	return nil
+}
+
+// isDeprecated reports whether a lifecycle is deprecated.
+func isDeprecated(lc *Lifecycle) bool {
+	return lc != nil && lc.Status == LifecycleDeprecated
+}
+
+// readRelationFrontmatterV3 reads the 3.0 relation fields of a relation frontmatter. importance:
+// primary, written or not, is held as empty.
+func readRelationFrontmatterV3(rel *BknRelationType, fm rawFrontmatter) error {
+	for _, f := range []struct {
+		key string
+		dst *string
+	}{
+		{"reverse_name", &rel.ReverseName},
+		{"importance", &rel.Importance},
+		{"fallback_for", &rel.FallbackFor},
+		{"verification", &rel.Verification},
+	} {
+		value, err := frontmatterString(fm, f.key)
+		if err != nil {
+			return err
+		}
+		*f.dst = value
+	}
+	if rel.Importance == ImportancePrimary {
+		rel.Importance = ""
+	}
+	return nil
+}
+
+// parseRelationConstraintsV3 reads the yaml block of ### Relation Constraints.
+func parseRelationConstraintsV3(rel *BknRelationType, sectionText string) error {
+	content := scanContent(sectionText)
+	if len(content.blocks) == 0 {
+		return nil
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(content.blocks[0].body), &doc); err != nil {
+		return specErrorf("section \"### Relation Constraints\" yaml is invalid: %v", err)
+	}
+	if len(doc.Content) == 0 {
+		return nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return specErrorf("section \"### Relation Constraints\" must be a mapping with required, characteristics or both")
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key, value := root.Content[i].Value, root.Content[i+1]
+		var items []string
+		if value.Kind != yaml.SequenceNode {
+			return specErrorf("relation constraints %s must be a list such as [source]", key)
+		}
+		for _, item := range value.Content {
+			if item.Kind != yaml.ScalarNode || item.Tag == "!!null" {
+				return specErrorf("relation constraints %s must list single values", key)
+			}
+			items = append(items, item.Value)
+		}
+		switch key {
+		case "required":
+			rel.RequiredEnds = items
+		case "characteristics":
+			rel.Characteristics = items
+		default:
+			return specErrorf("relation constraints key %q is unknown; the keys are %s", key, strings.Join(relationConstraintKeys, ", "))
+		}
+	}
+	return nil
+}
+
+// ValidateRelationTypeDeclarations checks the declarations of a relation type on its own: the
+// frontmatter fields, Cardinality, ### Relation Constraints and the relation properties. Import runs
+// it on a 3.0 definition; a save through the API runs the same check.
+func ValidateRelationTypeDeclarations(rt *BknRelationType) error {
+	if rt.ReverseName != "" {
+		if msg := validateFieldDisplayName(rt.ReverseName); msg != "" {
+			return ruleErrorf(RuleReverseNameInvalid, map[string]any{"reverse_name": rt.ReverseName, "reason": msg}, "relation type reverse_name: %s", msg)
+		}
+	}
+	if err := validateAliases("relation type aliases", rt.Aliases, rt.Name, rt.ReverseName); err != nil {
+		return err
+	}
+	if err := validateLifecycle("relation type lifecycle", rt.Lifecycle, rt.ID); err != nil {
+		return err
+	}
+	if rt.Importance != "" && !containsString(importances, rt.Importance) {
+		return ruleErrorf(RuleImportanceInvalid, map[string]any{"importance": rt.Importance, "allowed": importances}, "relation type importance must be %s, got %q", strings.Join(importances, " or "), rt.Importance)
+	}
+	if rt.Verification != "" && !containsString(verifications, rt.Verification) {
+		return ruleErrorf(RuleVerificationInvalid, map[string]any{"verification": rt.Verification, "allowed": verifications}, "relation type verification must be %s, got %q", strings.Join(verifications, " or "), rt.Verification)
+	}
+	if err := validateEndpointDeclarations(rt); err != nil {
+		return err
+	}
+	if rt.FallbackFor != "" {
+		if !idPattern.MatchString(rt.FallbackFor) {
+			return ruleErrorf(RuleFallbackForInvalid, map[string]any{"fallback_for": rt.FallbackFor}, "relation type fallback_for %q is not a relation type id; an id must match %s", rt.FallbackFor, idPattern.String())
+		}
+		if rt.Importance != ImportanceSecondary {
+			return ruleErrorf(RuleFallbackForNotSecondary, map[string]any{"fallback_for": rt.FallbackFor}, "relation type fallback_for goes with importance: secondary; a fallback path is a secondary relation")
+		}
+		if rt.FallbackFor == rt.ID {
+			return ruleErrorf(RuleFallbackForSelf, map[string]any{"fallback_for": rt.FallbackFor}, "relation type fallback_for %q is the relation itself", rt.FallbackFor)
+		}
+		if err := checkFallbackShape("relation type fallback path", rt); err != nil {
+			return err
+		}
+	}
+	return validateRelationProperties(rt)
+}
+
+// validateEndpointDeclarations checks Cardinality, required and characteristics.
+func validateEndpointDeclarations(rt *BknRelationType) error {
+	card := rt.Endpoint.Cardinality
+	if card != "" && !containsString(cardinalities, card) {
+		return ruleErrorf(RuleCardinalityInvalid, map[string]any{"cardinality": card, "allowed": cardinalities}, "Endpoint Cardinality must be one of %s, got %q", strings.Join(cardinalities, ", "), card)
+	}
+	if rt.Endpoint.Type == RELATION_MAPPING_TYPE_FILTERED_CROSS_JOIN && card != "" && card != CardinalityManyToMany {
+		return ruleErrorf(RuleCardinalityCrossJoin, map[string]any{"cardinality": card}, "Endpoint Cardinality of a filtered_cross_join relation can only be many_to_many, which links every pair, got %q", card)
+	}
+	if err := checkSubset("required", "relation constraints required", rt.RequiredEnds, relationEnds); err != nil {
+		return err
+	}
+	if err := checkSubset("characteristics", "relation constraints characteristics", rt.Characteristics, characteristics); err != nil {
+		return err
+	}
+	if len(rt.Characteristics) > 0 && rt.Endpoint.Source != rt.Endpoint.Target {
+		return ruleErrorf(RuleCharacteristicsEndsDiffer, map[string]any{"source": rt.Endpoint.Source, "target": rt.Endpoint.Target}, "relation constraints characteristics apply to a relation whose Source and Target are the same object type, got %q and %q",
+			rt.Endpoint.Source, rt.Endpoint.Target)
+	}
+	if containsString(rt.Characteristics, CharacteristicSymmetric) {
+		if card == CardinalityOneToMany || card == CardinalityManyToOne {
+			return ruleErrorf(RuleSymmetricCardinality, map[string]any{"cardinality": card}, "a symmetric relation has the same count both ways, so its Cardinality is one_to_one, many_to_many or empty, got %s", card)
+		}
+		if rt.ReverseName != "" {
+			return ruleErrorf(RuleSymmetricReverseName, nil, "a symmetric relation reads the same both ways, so it has no reverse_name")
+		}
+		if len(rt.RequiredEnds) == 1 {
+			return ruleErrorf(RuleSymmetricRequired, nil, "a symmetric relation has no direction, so required is [source, target] or not written")
+		}
+	}
+	return nil
+}
+
+// checkSubset checks that a list holds allowed values, each once. field is the stable name
+// of the declaration field, reported as params.field; where is the English locator that
+// only the message carries.
+func checkSubset(field, where string, items, allowed []string) error {
+	seen := map[string]bool{}
+	for _, item := range items {
+		if !containsString(allowed, item) {
+			return ruleErrorf(RuleListValueInvalid, map[string]any{"field": field, "value": item, "allowed": allowed}, "%s: %q is not one of %s", where, item, strings.Join(allowed, ", "))
+		}
+		if seen[item] {
+			return ruleErrorf(RuleListValueDuplicated, map[string]any{"field": field, "value": item}, "%s: %q appears twice", where, item)
+		}
+		seen[item] = true
+	}
+	return nil
+}
+
+// checkFallbackShape checks what both a primary relation and its fallback path must be: direct or
+// indirect, without characteristics.
+func checkFallbackShape(where string, rt *BknRelationType) error {
+	if rt.Endpoint.Type == RELATION_MAPPING_TYPE_FILTERED_CROSS_JOIN {
+		return ruleErrorf(RuleFallbackCrossJoin, map[string]any{"relation_type": rt.ID}, "%s %q is a filtered_cross_join relation; fallback paths are direct or indirect", where, rt.ID)
+	}
+	if len(rt.Characteristics) > 0 {
+		return ruleErrorf(RuleFallbackCharacteristics, map[string]any{"relation_type": rt.ID}, "%s %q declares characteristics; fallback paths do not", where, rt.ID)
+	}
+	return nil
+}
+
+// validateRelationProperties checks the relation properties: only an indirect relation has them,
+// with the rules of object type properties, each row as ValidateNetwork checks it, no unique, and no
+// Mapped Field that joins the ends.
+func validateRelationProperties(rt *BknRelationType) error {
+	if len(rt.DataProperties) == 0 {
+		return nil
+	}
+	indirect, ok := rt.MappingRules.(*InDirectMappingRule)
+	if rt.Endpoint.Type != RELATION_MAPPING_TYPE_INDIRECT || !ok {
+		return ruleErrorf(RuleRelationPropertiesNotIndirect, map[string]any{"endpoint_type": rt.Endpoint.Type}, "only indirect relations have relation properties, but Endpoint Type is %s", rt.Endpoint.Type)
+	}
+	if len(rt.DataProperties) > maxPropertyNum {
+		return ruleErrorf(RuleRelationPropertiesTooMany, map[string]any{"count": len(rt.DataProperties), "max": maxPropertyNum}, "relation properties: count %d exceeds max %d", len(rt.DataProperties), maxPropertyNum)
+	}
+	rows := &ValidationResult{}
+	validateDataPropertyRows(rows, "", rt.DataProperties)
+	if !rows.OK() {
+		return ruleErrorf(RuleRelationPropertyInvalid, map[string]any{"reason": rows.Errors[0].Message}, "relation property: %s", rows.Errors[0].Message)
+	}
+	joins := map[string]bool{}
+	for _, r := range indirect.SourceMappingRules {
+		joins[r.TargetProperty] = true
+	}
+	for _, r := range indirect.TargetMappingRules {
+		joins[r.SourceProperty] = true
+	}
+	for _, p := range rt.DataProperties {
+		if p == nil {
+			continue
+		}
+		if joins[p.MappedField] {
+			return ruleErrorf(RuleRelationPropertyJoinsEnds, withProperty(p.Name, "mapped_field", p.MappedField), "relation property %q: Mapped Field %q joins the ends in Source Mapping or Target Mapping; a relation property maps another column",
+				p.Name, p.MappedField)
+		}
+		if p.Constraints != nil && p.Constraints.Unique {
+			return ruleErrorf(RuleRelationPropertyUnique, withProperty(p.Name), "relation property %q: unique does not apply, an edge has no primary key", p.Name)
+		}
+	}
+	return validatePropertyDeclarations(rt.DataProperties)
+}
+
+// DefinitionRef names one definition of a network: Kind is object_type, relation_type or
+// action_type.
+type DefinitionRef struct {
+	Kind string
+	ID   string
+}
+
+// DeclarationIssue is a declaration spanning definitions that does not hold. Involved lists the
+// definitions it concerns, the one that refers first; Err names them. A save through the API checks
+// the network it would produce and reports the issues that involve a definition it writes, so a
+// change to the definition referred to says which definition it breaks.
+type DeclarationIssue struct {
+	Involved []DefinitionRef
+	Err      error
+}
+
+// Involves reports whether the issue concerns the definition of the kind and ID.
+func (i DeclarationIssue) Involves(kind, id string) bool {
+	for _, ref := range i.Involved {
+		if ref.Kind == kind && ref.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// validateNetworkRelations checks the relation and lifecycle declarations that span definitions:
+// replaced_by references, endpoints that are deprecated, and fallback paths. It returns the first
+// issue NetworkRelationIssues finds.
+func validateNetworkRelations(doc *BknNetwork) error {
+	if issues := NetworkRelationIssues(doc); len(issues) > 0 {
+		return issues[0].Err
+	}
+	return nil
+}
+
+// NetworkRelationIssues lists every relation and lifecycle declaration of doc that spans definitions
+// and does not hold, in definition order: replaced_by references, endpoints that are deprecated, and
+// fallback paths. Import refuses a 3.0 package on the first one.
+func NetworkRelationIssues(doc *BknNetwork) []DeclarationIssue {
+	objects := map[string]*BknObjectType{}
+	for _, ot := range doc.ObjectTypes {
+		objects[ot.ID] = ot
+	}
+	relations := map[string]*BknRelationType{}
+	for _, rt := range doc.RelationTypes {
+		relations[rt.ID] = rt
+	}
+	actions := map[string]*BknActionType{}
+	for _, at := range doc.ActionTypes {
+		actions[at.ID] = at
+	}
+
+	var issues []DeclarationIssue
+	add := func(err error, involved ...DefinitionRef) {
+		issues = append(issues, DeclarationIssue{Involved: involved, Err: err})
+	}
+	replacedBy := func(kind, id string, lc *Lifecycle, lookup func(string) (*Lifecycle, bool)) {
+		if err := checkReplacedBy(kind, id, lc, lookup); err != nil {
+			add(err, DefinitionRef{kind, id}, DefinitionRef{kind, lc.ReplacedBy})
+		}
+	}
+
+	for _, ot := range doc.ObjectTypes {
+		replacedBy(kindObjectType, ot.ID, ot.Lifecycle, func(id string) (*Lifecycle, bool) {
+			o, ok := objects[id]
+			if !ok {
+				return nil, false
+			}
+			return o.Lifecycle, true
+		})
+	}
+	for _, at := range doc.ActionTypes {
+		replacedBy(kindActionType, at.ID, at.Lifecycle, func(id string) (*Lifecycle, bool) {
+			a, ok := actions[id]
+			if !ok {
+				return nil, false
+			}
+			return a.Lifecycle, true
+		})
+	}
+	fallbackOf := map[string]string{}
+	for _, rt := range doc.RelationTypes {
+		self := DefinitionRef{kindRelationType, rt.ID}
+		replacedBy(kindRelationType, rt.ID, rt.Lifecycle, func(id string) (*Lifecycle, bool) {
+			r, ok := relations[id]
+			if !ok {
+				return nil, false
+			}
+			return r.Lifecycle, true
+		})
+		if !isDeprecated(rt.Lifecycle) {
+			for _, end := range []string{rt.Endpoint.Source, rt.Endpoint.Target} {
+				if o, ok := objects[end]; ok && isDeprecated(o.Lifecycle) {
+					add(ruleErrorf(RuleEndpointDeprecated, map[string]any{"object_type": end}, "relation type %q: endpoint object type %q is deprecated, so the relation is deprecated too", rt.ID, end),
+						self, DefinitionRef{kindObjectType, end})
+					break
+				}
+			}
+		}
+		if rt.FallbackFor == "" {
+			continue
+		}
+		where := fmt.Sprintf("relation type %q fallback_for %q", rt.ID, rt.FallbackFor)
+		primaryRef := DefinitionRef{kindRelationType, rt.FallbackFor}
+		primary, ok := relations[rt.FallbackFor]
+		if !ok {
+			add(ruleErrorf(RuleFallbackTargetMissing, map[string]any{"fallback_for": rt.FallbackFor}, "%s: no relation type has this id", where), self, primaryRef)
+			continue
+		}
+		var err error
+		switch {
+		case primary.Importance != "" && primary.Importance != ImportancePrimary:
+			err = ruleErrorf(RuleFallbackTargetNotPrimary, map[string]any{"fallback_for": rt.FallbackFor}, "%s: the relation it stands in for is secondary; a fallback path stands in for a primary relation", where)
+		case isDeprecated(primary.Lifecycle):
+			err = ruleErrorf(RuleFallbackTargetDeprecated, map[string]any{"fallback_for": rt.FallbackFor}, "%s: the relation it stands in for is deprecated; a fallback path stands in for an active relation", where)
+		case primary.Endpoint.Source != rt.Endpoint.Source || primary.Endpoint.Target != rt.Endpoint.Target:
+			err = ruleErrorf(RuleFallbackEndsDiffer, map[string]any{"fallback_for": rt.FallbackFor, "source": rt.Endpoint.Source, "target": rt.Endpoint.Target, "primary_source": primary.Endpoint.Source, "primary_target": primary.Endpoint.Target}, "%s: the ends differ (%s -> %s and %s -> %s); a fallback path has the Source and Target of its primary relation",
+				where, rt.Endpoint.Source, rt.Endpoint.Target, primary.Endpoint.Source, primary.Endpoint.Target)
+		case !containsString(fallbackCardinalities, primary.Endpoint.Cardinality):
+			err = ruleErrorf(RuleFallbackPrimaryCardinality, map[string]any{"fallback_for": rt.FallbackFor, "cardinality": primary.Endpoint.Cardinality}, "%s: the primary relation declares Cardinality %q; it must be many_to_one or one_to_one, so a Source instance has at most one primary counterpart",
+				where, primary.Endpoint.Cardinality)
+		default:
+			err = checkFallbackShape(where+": primary relation", primary)
+		}
+		if err != nil {
+			add(err, self, primaryRef)
+			continue
+		}
+		if other, taken := fallbackOf[primary.ID]; taken {
+			add(ruleErrorf(RuleFallbackAlreadyTaken, map[string]any{"fallback_for": rt.FallbackFor, "other_fallback": other}, "%s: relation type %q is already its fallback path; a primary relation has one", where, other),
+				self, primaryRef, DefinitionRef{kindRelationType, other})
+			continue
+		}
+		fallbackOf[primary.ID] = rt.ID
+	}
+	return issues
+}
+
+// checkReplacedBy checks a deprecated definition's replaced_by: a definition of the same kind that is
+// not deprecated itself.
+func checkReplacedBy(kind, id string, lc *Lifecycle, lookup func(string) (*Lifecycle, bool)) error {
+	if lc == nil || lc.ReplacedBy == "" {
+		return nil
+	}
+	label := strings.ReplaceAll(kind, "_", " ")
+	target, ok := lookup(lc.ReplacedBy)
+	if !ok {
+		return ruleErrorf(RuleReplacedByMissing, map[string]any{"replaced_by": lc.ReplacedBy}, "%s %q lifecycle replaced_by %q: no %s has this id", label, id, lc.ReplacedBy, label)
+	}
+	if isDeprecated(target) {
+		return ruleErrorf(RuleReplacedByDeprecated, map[string]any{"replaced_by": lc.ReplacedBy}, "%s %q lifecycle replaced_by %q: that %s is deprecated too; replace with one in use", label, id, lc.ReplacedBy, label)
+	}
+	return nil
+}

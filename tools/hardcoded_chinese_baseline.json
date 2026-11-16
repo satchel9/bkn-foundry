@@ -1,7 +1,7 @@
 {
   "version": 1,
   "generated_by": "python3 tools/check_hardcoded_chinese.py --update-baseline",
-  "violation_count": 2502,
+  "violation_count": 2421,
   "violations": {
     "adp/bkn/bkn-backend/script/delete_concept_index/script.py": [
       "028026370fec2a882dbb",
@@ -38,10 +38,7 @@
       "50945c996308d0638140"
     ],
     "adp/bkn/bkn-backend/server/bkn-specification/bkn/parser.go": [
-      "e82a7c280e1e9667c322",
-      "d80f34213b9bc55ef58a",
-      "1c7b74bc2534c14efdb8",
-      "7365ac9e306eb1cd9bb8"
+      "e82a7c280e1e9667c322"
     ],
     "adp/bkn/bkn-backend/server/bkn-specification/bkn/tar_writer.go": [
       "f81488e2b1b6a7cc85c0",
@@ -55,7 +52,6 @@
       "c173b3498ca1c8ca83f7",
       "7b4d1418d7bb9a95aa80",
       "9fd99196dd1bf3bfb8fe",
-      "9d86d9ce9e4d7572e09b",
       "34833ecf481088e53aeb",
       "5c8a05a561e22e350d49",
       "779ce1cdb4a80aa2ba94",
@@ -75,7 +71,6 @@
       "95d9dcc79c7d85f9e6bc",
       "20457a0db3c06c5ae81d",
       "49b5c0a00cfd78ad6c3c",
-      "322c62e31f0a24dde9a5",
       "6501a965366e360a8951",
       "d20bab42e5fee65d84c4",
       "ac5c5568d4d5d3a77e04"
@@ -110,7 +105,6 @@
       "70e66c2473d8fa41b5c2"
     ],
     "adp/bkn/bkn-backend/server/driveradapters/operation_audit.go": [
-      "1d0311b25fe3a05f728b",
       "25093979c3910babd047",
       "9cdb25daf2da2e45cee2"
     ],
@@ -298,43 +292,12 @@
       "52b440a4cd6439e95479",
       "d038c5409f96290468ca",
       "44ae164e353b75291edf",
-      "d06290db521316960fae",
-      "baf787759e8fc264e83a",
-      "86b7bd5f1dc49c5817fb",
-      "1812eee7bde9dd4eaed7",
-      "f9569c85655dcd79bff0",
-      "d39d731f751219dca582",
-      "b775fd1aefba59943b61",
-      "b32ad3e17d962f64215b",
-      "7e3f1f43d0654b7667f8",
       "c2ffab82cab0df6fdd50",
       "a41bd818b8e17ff8a14c",
       "c0bb673241fb6e25b0b4",
-      "12edce2f681a1243d772",
       "0ab24c65465d0d0e6309",
       "10961b669f956bd8f431",
       "93a276015d2ed35a4f9b"
-    ],
-    "adp/bkn/bkn-backend/server/logics/metric/metric_service.go": [
-      "0efce0839a6d24c28f9a",
-      "d41236f89e1c02092877",
-      "82ce6bf5060e6bc68dcd",
-      "9f0b9e1c32f25febd3fa",
-      "c82ac4f42c1e6ca3366c",
-      "a73da4b9d063aaec5d22",
-      "b5893165c0e430e2444c",
-      "5569bd4c3d4e177dcc3b",
-      "cfef155db976634e2121",
-      "bb313f9c46d31f9570e4",
-      "57f6a967b814c0739605",
-      "00067ae1ba263361e7dd",
-      "079e8f68e81dfb5755dc",
-      "b021ada2f93d6b1c6f9e",
-      "c033b4e2ba848d9c53e3",
-      "6b56d799da781974d4d0",
-      "abe901ffc1bf06d53c55",
-      "223e0d1045762d631d24",
-      "4b18be2fea33b0902be1"
     ],
     "adp/bkn/bkn-backend/server/logics/object_type/object_type_service.go": [
       "04c37f0877e9d20a6fe3",
@@ -418,7 +381,6 @@
     ],
     "adp/bkn/ontology-query/server/drivenadapters/ontology_manager/ontology_manager_access.go": [
       "49646d83f3e2788626a4",
-      "2e5d52f606551526d4b7",
       "877295fbacb78debaf08",
       "5c6f7db610295fa2e8d8",
       "1825e497b16d9cc26aba",
@@ -428,9 +390,6 @@
     ],
     "adp/bkn/ontology-query/server/logics/action_logs/action_logs_service.go": [
       "76a3c707fc92d45711b7"
-    ],
-    "adp/bkn/ontology-query/server/logics/action_type/action_type_service.go": [
-      "d3a6cff656649dde8f68"
     ],
     "adp/bkn/ontology-query/server/logics/common.go": [
       "2681bac9a67fd71bf325",
@@ -462,7 +421,6 @@
       "9380035c0d87b37bb13c",
       "d8700fcf673eca4ebf03",
       "76ffd09ccaf6918f2a07",
-      "6ee16bf29f123fec54f8",
       "cd672e635dd30380b4c5"
     ],
     "adp/context-loader/agent-retrieval/cmd/ptc-stub/main.go": [
@@ -470,9 +428,6 @@
       "dcb642357cfc897c0b48"
     ],
     "adp/context-loader/agent-retrieval/scripts/gen_sandbox_tools.py": [
-      "79139428fc8a629b2292",
-      "fc4cb66d8dc0fa67b4ac",
-      "b2aa6c8b551bb45b4994",
       "1809fa77e73b9786f411",
       "dd8b54ee7628b9da1b24",
       "6720b42b7db687c8ce18",
@@ -536,11 +491,6 @@
       "ea5a7d3340c16df26371"
     ],
     "adp/context-loader/agent-retrieval/server/logics/knlogicpropertyresolver/dynamic_params_llm.go": [
-      "7fee40e49e8e983752aa",
-      "118acf83cdba309e6785",
-      "add26dd4cec9cb54d24e",
-      "dd8d4a6a8ea89cf11f13",
-      "41d8c6b7431f5866d118",
       "c88705cf71ee5da75345"
     ],
     "adp/context-loader/agent-retrieval/server/logics/knlogicpropertyresolver/index.go": [
@@ -1483,7 +1433,6 @@
       "1e46b1ae8285d71e846b",
       "a65e8dd4c3cca2c09e3f",
       "bd50e20debf315d408f1",
-      "bec35d4c842354cb1d1f",
       "e230fc065094f8f35f01",
       "e342bc06dec4a0628f70",
       "5f11ccb00b44a703058f",
@@ -1507,7 +1456,6 @@
       "59d874d21711b7963851",
       "16152697f6c61cf0df85",
       "1b5f8b0773eb3549527b",
-      "90ee30c26e68188fb811",
       "26d9751c5ea5c31d53f1",
       "c56c1e5a7a668a0bdaa5",
       "b66c96ed3c4a33cf2bc5",
@@ -1527,7 +1475,6 @@
       "b56fdc21848a4fe2fd1b",
       "8232534f9b34ca0607e3",
       "638c46ff6b10ce027455",
-      "75886d8aa9b3a6c5d11f",
       "65bbcd0017a47483f49a",
       "3a3b9c5b9ada300bef8b",
       "d3b992861a4559e272b8",
@@ -1551,7 +1498,6 @@
       "955683b622fc21c1f1c9",
       "715cb100e1f6d1d99bff",
       "68a8400bd675ffd51d26",
-      "5a1118d7f9bf45505414",
       "5ffe8aeabe13d2f77fa7",
       "c5f4e33e78330c10ef87",
       "0bdaf31037dbda6458e5",
@@ -1582,7 +1528,6 @@
       "57a9ed9750d6d88378ce",
       "f035c6c15a4194783169",
       "58dfa5f805a9eba7bca8",
-      "4f5e697dfc0d6a406e63",
       "91fa0fcb5f89f7a88489",
       "e327c0d80bd95a209957",
       "d2985e31cc889bd7c3c8",
@@ -1610,7 +1555,6 @@
       "3de36361a42c9cbbe931",
       "6078a7075af253df13ca",
       "c319538c60d5aa812d6f",
-      "b060a2d1f136e23cd8a2",
       "17a72b058e8fc577cd09",
       "80926bea196980cde3eb",
       "a8d5cc8f1f2c41f1c8bc",
@@ -1634,7 +1578,6 @@
       "b803a7a55dfeba9e50e4",
       "d185f1791aad5e6a41f5",
       "77463fc192a03c1a9509",
-      "aebe0d24c1abfedc8c74",
       "df4a95e1b63170abe346",
       "8c9305e72cbc322ee4ca",
       "30aa43d832cacf6f786d",
@@ -2219,7 +2162,6 @@
     ],
     "infra/mf-model-manager/app/logs/stand_log.py": [
       "ff86ed03d5effbc01c64",
-      "d391020f3375f0a24f4b",
       "009d7c32fd3d2b137de1",
       "f4d57cac060756179e8d"
     ],
@@ -2747,41 +2689,6 @@
     ],
     "vega/vega-backend/server/interfaces/common.go": [
       "5b81ba30abed40658417"
-    ],
-    "vega/vega-backend/server/logics/connector/local/fileset/anyshare/anyshare.go": [
-      "05e6aeaf6b9970378796",
-      "bae30c839ba49200c97f",
-      "6b00f9b595589002f3a7",
-      "ac01a1a95d1b5da6c289",
-      "ffd7cbb2f1163eaa8fda",
-      "1e176c9e4fab9a41a8c3",
-      "978bcfc0c751394e4cd0",
-      "c00c8d77eb0873d70978",
-      "cb3634718412f8b83c27"
-    ],
-    "vega/vega-backend/server/logics/connector/local/index/opensearch/opensearch.go": [
-      "0b380bc411e372a9db2b",
-      "596fd25b2d98db486cb4",
-      "7154e003b620fd9c1004",
-      "79fa622a2967d3a4c7ff",
-      "7419575f108f0d6d827a"
-    ],
-    "vega/vega-backend/server/logics/connector/local/table/mariadb/mariadb.go": [
-      "f6e81e6c82c981d10b20",
-      "f11a75619c9205b3d4d3",
-      "52a01a87e11bf4e6dadb",
-      "9be2b5dab21889edb697",
-      "d45e5983c286eba1d61a",
-      "be8f9bed1bfe811c4fcd"
-    ],
-    "vega/vega-backend/server/logics/connector/local/table/postgresql/postgresql.go": [
-      "853ab6674fd19c91d648",
-      "da8d01c7dd3085da9b55",
-      "fd11b7373811445f64da",
-      "7197e33c2e443f864010",
-      "27f83978d665c74fae40",
-      "5e94e0b951f8cd3a122b",
-      "febe1f4c6066133022a0"
     ]
   }
 }

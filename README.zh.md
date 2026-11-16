@@ -17,6 +17,7 @@
 [![License](https://img.shields.io/badge/license-multi--licensed-blue.svg)](LICENSE) [![Release](https://img.shields.io/github/v/release/openbkn-ai/bkn-foundry)](https://github.com/openbkn-ai/bkn-foundry/releases/latest)
 
 <a href="https://trendshift.io/repositories/109706?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-109706" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/109706" alt="openbkn-ai%2Fbkn-foundry | Trendshift" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/109706?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-109706" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/109706/daily?language=Go" alt="openbkn-ai%2Fbkn-foundry | Trendshift" width="250" height="55"/></a>
 
 </div>
 
@@ -104,7 +105,7 @@ sudo bash ./onboard.sh --help # 所有参数（--config=models.yaml、--enable-b
 
    > **为什么要 `sudo`？** `onboard.sh` 会读 `$HOME/.openbkn-ai/config.yaml`（由 `sudo deploy.sh` 写到 `/root/.openbkn-ai/` 下）并把 `openbkn` 认证 token 写到 `$HOME/.bkn`。不加 `sudo` 会回退到仓库内模板 `conf/config.yaml`，可能解析出和安装时不一致的 access URL。**macOS 开发路径**（`bash dev/mac.sh onboard`）**不需要** `sudo`。
 
-   可重复运行：脚本会先探测平台已有的模型与 ConfigMap 状态，已注册 / 已配置的会自动跳过。完整流程图、ISF 全量下 `openbkn` 的鉴权说明见 [help/zh/install.md — Post-install：`onboard.sh`](help/zh/install.md#post-installonboardsh安装后引导)。
+   可重复运行：脚本会先探测平台已有的模型与 ConfigMap 状态，已注册 / 已配置的会自动跳过。完整流程图、完整身份认证部署下 `openbkn` 的鉴权说明见 [help/zh/install.md — Post-install：`onboard.sh`](help/zh/install.md#post-installonboardsh安装后引导)。
 
 6. **验证 API 访问**
 
@@ -153,7 +154,7 @@ BKN Foundry 解决专有数据与智能体结合时的两大核心技术痛点�
 Agent 不仅要"看得更全"，更要"做得更稳"。BKN Foundry 提供约束工程能力，实现企业级安全执行：
 
 - **可解释决策** — 以"对象→动作→规则→约束"的知识结构表达业务意图，把工具调用与参数选择落到明确语义边界与规则依据上，解释清楚"为什么这么做"。
-- **可追溯证据链** — 从行动意图→知识节点→数据来源→映射/算子→最终调用全链路留痕，支持按实体/关系回溯到源数据与生效规则，做到可审计、可复盘。
+- **可追溯证据链** — 从行动意图→知识节点→数据来源→映射/工具→最终调用全链路留痕，支持按实体/关系回溯到源数据与生效规则，做到可审计、可复盘。
 - **可管控执行闭环** — 统一身份与访问控制绑定到知识网络的对象/动作权限，执行前置校验、执行中策略拦截、执行后审计回写，实现"可授权、可批准、可收敛"的安全闭环。
 - **可风险预防机制** — 将风险建模为"风险类"并与行动类关联，执行前做风险评估与仿真，命中阈值自动降级/阻断/二次确认，把高风险动作挡在执行之前。
 
@@ -168,7 +169,7 @@ Agent 不仅要"看得更全"，更要"做得更稳"。BKN Foundry 提供约束�
 | **VEGA** | 数据虚拟化——屏蔽底层多源 & 多模态数据差异 |
 | **Exec Factory** | 执行工厂——调度工具、MCP 与 Skills |
 | **BKN Safe** | 权限管控——统一身份、权限与策略入口，按业务对象 / 动作做安全管控与审计 |
-| **BKN Trace** | 证据链——追踪 BKN 调用链路（意图 → 知识节点 → 数据源 → 映射 / 算子），可追溯、可解释 |
+| **BKN Trace** | 证据链——追踪 BKN 调用链路（意图 → 知识节点 → 数据源 → 映射 / 工具），可追溯、可解释 |
 
 完整说明见 [BKN 参考架构](docs/bkn-architecture.zh.md)。
 

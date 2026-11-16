@@ -9,14 +9,16 @@ package driveradapters
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 
-	"bkn-backend/common/maskrule"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/maskrule"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 func Test_ValidateObjectType(t *testing.T) {
@@ -63,8 +65,8 @@ func Test_ValidateObjectType(t *testing.T) {
 			}
 			err := ValidateObjectType(ctx, ot, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_Name)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_Name)
 		})
 
 		Convey("Failed with empty primary keys\n", func() {
@@ -85,8 +87,8 @@ func Test_ValidateObjectType(t *testing.T) {
 			}
 			err := ValidateObjectType(ctx, ot, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_PrimaryKeys)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_PrimaryKeys)
 		})
 
 		Convey("Failed with invalid primary key type\n", func() {
@@ -127,8 +129,8 @@ func Test_ValidateObjectType(t *testing.T) {
 			}
 			err := ValidateObjectType(ctx, ot, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_DisplayKey)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_DisplayKey)
 		})
 
 		Convey("Failed with invalid data source type\n", func() {
@@ -343,7 +345,7 @@ func Test_ValidateObjectType(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Failed with logic property type mismatch with data source\n", func() {
+		Convey("Failed with unsupported logic property data source\n", func() {
 			ot := &interfaces.ObjectType{
 				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
 					OTID:   "ot1",
@@ -360,7 +362,7 @@ func Test_ValidateObjectType(t *testing.T) {
 					LogicProperties: []*interfaces.LogicProperty{
 						{
 							Name:        "logic1",
-							Type:        "metric",
+							Type:        "tool",
 							DisplayName: "logic1",
 							DataSource: &interfaces.ResourceInfo{
 								Type: "operator",
@@ -370,8 +372,10 @@ func Test_ValidateObjectType(t *testing.T) {
 					},
 				},
 			}
-			err := ValidateObjectType(ctx, ot, true)
+			err := ValidateObjectType(i18n.WithLanguage(ctx, i18n.AmericanEnglish), ot, true)
 			So(err, ShouldNotBeNil)
+			So(err.(*httperrors.HTTPError).ErrorDetails, ShouldEqual,
+				"Logic property logic1 on object type object1 has unsupported data-source type operator; only tool is supported.")
 		})
 
 		Convey("Failed with logic property empty parameter name\n", func() {
@@ -391,11 +395,12 @@ func Test_ValidateObjectType(t *testing.T) {
 					LogicProperties: []*interfaces.LogicProperty{
 						{
 							Name:        "logic1",
-							Type:        "metric",
+							Type:        "tool",
 							DisplayName: "logic1",
 							DataSource: &interfaces.ResourceInfo{
-								Type: "metric",
-								ID:   "metric-model-1",
+								Type:   "tool",
+								BoxID:  "box-1",
+								ToolID: "tool-1",
 							},
 							Parameters: []interfaces.Parameter{
 								{
@@ -406,8 +411,10 @@ func Test_ValidateObjectType(t *testing.T) {
 					},
 				},
 			}
-			err := ValidateObjectType(ctx, ot, true)
+			err := ValidateObjectType(i18n.WithLanguage(ctx, i18n.AmericanEnglish), ot, true)
 			So(err, ShouldNotBeNil)
+			So(err.(*httperrors.HTTPError).ErrorDetails, ShouldEqual,
+				"A parameter on logic property logic1 for object type object1 requires name.")
 		})
 
 		Convey("Failed with empty logic property type\n", func() {
@@ -437,7 +444,7 @@ func Test_ValidateObjectType(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Failed with logic property data source missing id\n", func() {
+		Convey("Failed with logic property data source missing tool id\n", func() {
 			ot := &interfaces.ObjectType{
 				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
 					OTID:   "ot1",
@@ -454,18 +461,20 @@ func Test_ValidateObjectType(t *testing.T) {
 					LogicProperties: []*interfaces.LogicProperty{
 						{
 							Name:        "logic1",
-							Type:        "metric",
+							Type:        "tool",
 							DisplayName: "logic1",
 							DataSource: &interfaces.ResourceInfo{
-								Type: "metric",
-								ID:   "",
+								Type:  "tool",
+								BoxID: "box-1",
 							},
 						},
 					},
 				},
 			}
-			err := ValidateObjectType(ctx, ot, true)
+			err := ValidateObjectType(i18n.WithLanguage(ctx, i18n.AmericanEnglish), ot, true)
 			So(err, ShouldNotBeNil)
+			So(err.(*httperrors.HTTPError).ErrorDetails, ShouldEqual,
+				"Logic property logic1 on object type object1 requires both box_id and tool_id.")
 		})
 
 		Convey("Success with valid tool logic property\n", func() {
@@ -597,72 +606,6 @@ func Test_ValidateObjectType(t *testing.T) {
 			So(err, ShouldNotBeNil)
 		})
 
-		Convey("Success with valid logic property metric type\n", func() {
-			ot := &interfaces.ObjectType{
-				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-					OTID:   "ot1",
-					OTName: "object1",
-					DataProperties: []*interfaces.DataProperty{
-						{
-							Name:        "prop1",
-							Type:        "string",
-							DisplayName: "prop1",
-						},
-					},
-					PrimaryKeys: []string{"prop1"},
-					DisplayKey:  "prop1",
-					LogicProperties: []*interfaces.LogicProperty{
-						{
-							Name:        "logic1",
-							Type:        "metric",
-							DisplayName: "logic1",
-							DataSource: &interfaces.ResourceInfo{
-								Type: "metric",
-								ID:   "metric-model-1",
-							},
-						},
-					},
-				},
-			}
-			err := ValidateObjectType(ctx, ot, true)
-			So(err, ShouldBeNil)
-		})
-
-		Convey("Success with metric logic property on resource object type\n", func() {
-			ot := &interfaces.ObjectType{
-				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-					OTID:   "ot1",
-					OTName: "object1",
-					DataProperties: []*interfaces.DataProperty{
-						{
-							Name:        "prop1",
-							Type:        "string",
-							DisplayName: "prop1",
-						},
-					},
-					PrimaryKeys: []string{"prop1"},
-					DisplayKey:  "prop1",
-					DataSource: &interfaces.ResourceInfo{
-						Type: interfaces.DATA_SOURCE_TYPE_RESOURCE,
-						ID:   "resource1",
-					},
-					LogicProperties: []*interfaces.LogicProperty{
-						{
-							Name:        "logic1",
-							Type:        "metric",
-							DisplayName: "logic1",
-							DataSource: &interfaces.ResourceInfo{
-								Type: "metric",
-								ID:   "metric-model-1",
-							},
-						},
-					},
-				},
-			}
-			err := ValidateObjectType(ctx, ot, true)
-			So(err, ShouldBeNil)
-		})
-
 		Convey("Failed with invalid data property\n", func() {
 			ot := &interfaces.ObjectType{
 				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
@@ -688,11 +631,11 @@ func Test_ValidateObjectType(t *testing.T) {
 func TestValidateObjectTypeLocalizesInvalidParameterDetails(t *testing.T) {
 	testCases := []struct {
 		name     string
-		language string
+		language i18n.Language
 		want     string
 	}{
-		{"English", rest.AmericanEnglish, "Object type customer uses unsupported data-source type table; only resource is supported."},
-		{"SimplifiedChinese", rest.SimplifiedChinese, "对象类 customer 的数据来源类型 table 不支持，仅支持 resource。"},
+		{"English", i18n.AmericanEnglish, "Object type customer uses unsupported data-source type table; only resource is supported."},
+		{"SimplifiedChinese", i18n.SimplifiedChinese, "对象类 customer 的数据来源类型 table 不支持，仅支持 resource。"},
 	}
 
 	for _, testCase := range testCases {
@@ -704,16 +647,84 @@ func TestValidateObjectTypeLocalizesInvalidParameterDetails(t *testing.T) {
 					DataSource: &interfaces.ResourceInfo{Type: "table"},
 				},
 			}
-			err := ValidateObjectType(rest.WithLanguage(context.Background(), testCase.language), objectType, false)
+			err := ValidateObjectType(i18n.WithLanguage(context.Background(), testCase.language), objectType, false)
 			if err == nil {
 				t.Fatal("ValidateObjectType() error = nil, want invalid parameter error")
 			}
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			if !ok {
-				t.Fatalf("error type = %T, want *rest.HTTPError", err)
+				t.Fatalf("error type = %T, want *httperrors.HTTPError", err)
 			}
-			if got, ok := httpErr.BaseError.ErrorDetails.(string); !ok || got != testCase.want {
-				t.Fatalf("error_details = %#v, want %q", httpErr.BaseError.ErrorDetails, testCase.want)
+			if got, ok := httpErr.ErrorDetails.(string); !ok || got != testCase.want {
+				t.Fatalf("error_details = %#v, want %q", httpErr.ErrorDetails, testCase.want)
+			}
+		})
+	}
+}
+
+func Test_PropertyDisplayNameBoundaries(t *testing.T) {
+	ctx := i18n.WithLanguage(context.Background(), i18n.AmericanEnglish)
+	testCases := []struct {
+		name        string
+		displayName string
+		wantError   bool
+	}{
+		{name: "ASCII 40", displayName: strings.Repeat("a", 40)},
+		{name: "ASCII 41", displayName: strings.Repeat("a", 41)},
+		{name: "Chinese 127", displayName: strings.Repeat("名", 127)},
+		{name: "mixed 128", displayName: strings.Repeat("a名", 63) + "😀b"},
+		{name: "emoji 128", displayName: strings.Repeat("😀", 128)},
+		{name: "emoji 129", displayName: strings.Repeat("😀", 129), wantError: true},
+		{name: "empty", displayName: "", wantError: true},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			dataErr := ValidateDataProperty(ctx, &interfaces.DataProperty{
+				Name:        "data_property",
+				Type:        "string",
+				DisplayName: testCase.displayName,
+			}, true)
+
+			logicErr := validateObjectTypeLogicProperties(ctx, &interfaces.ObjectType{
+				ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
+					OTName: "object type",
+					LogicProperties: []*interfaces.LogicProperty{
+						{
+							Name:        "logic_property",
+							Type:        interfaces.LOGIC_PROPERTY_TYPE_TOOL,
+							DisplayName: testCase.displayName,
+							DataSource: &interfaces.ResourceInfo{
+								Type:   interfaces.LOGIC_PROPERTY_TYPE_TOOL,
+								BoxID:  "box-1",
+								ToolID: "tool-1",
+							},
+						},
+					},
+				},
+			}, true)
+
+			if testCase.wantError {
+				if dataErr == nil || logicErr == nil {
+					t.Fatalf("display name validation errors = (%v, %v), want both non-nil", dataErr, logicErr)
+				}
+				if testCase.displayName != "" {
+					for _, err := range []error{dataErr, logicErr} {
+						httpErr, ok := err.(*httperrors.HTTPError)
+						if !ok {
+							t.Fatalf("error type = %T, want *httperrors.HTTPError", err)
+						}
+						details, ok := httpErr.ErrorDetails.(string)
+						if !ok || !strings.Contains(details, "128") {
+							t.Fatalf("error details = %#v, want 128-character limit", httpErr.ErrorDetails)
+						}
+					}
+				}
+				return
+			}
+
+			if dataErr != nil || logicErr != nil {
+				t.Fatalf("display name validation errors = (%v, %v), want nil", dataErr, logicErr)
 			}
 		})
 	}
@@ -731,8 +742,8 @@ func Test_ValidatePropertyName(t *testing.T) {
 		Convey("Failed with empty property name\n", func() {
 			err := ValidatePropertyName(ctx, "")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_PropertyName)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ObjectType_NullParameter_PropertyName)
 		})
 
 		Convey("Failed with property name starting with underscore\n", func() {
@@ -847,11 +858,11 @@ func Test_ValidateDataProperty(t *testing.T) {
 				DisplayName: "Secret",
 				MaskRule:    &maskrule.Rule{Kind: maskrule.KindFixed, Replacement: "*"},
 			}
-			err := ValidateDataProperty(rest.WithLanguage(ctx, rest.AmericanEnglish), prop, true)
+			err := ValidateDataProperty(i18n.WithLanguage(ctx, i18n.AmericanEnglish), prop, true)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
-			So(httpErr.BaseError.ErrorDetails, ShouldEqual,
+			So(httpErr.ErrorDetails, ShouldEqual,
 				"Data property secret has invalid mask_rule: property type is required when mask_rule is set.")
 		})
 

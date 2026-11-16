@@ -1324,7 +1324,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Derives the current lease and closure manifest from authoritative Operations and Receipts. Ordinary Agents do not submit concurrency or closure internals.",
+                "description": "Derives the current lease and closure manifest from authoritative Operations and Receipts. Ordinary Agents do not submit concurrency or closure internals. When durable answer handoff is enabled, optional answer_artifact uses the EvidenceArtifact contract (result type, at most 16 MiB) and is staged in the same SQL transaction as business completion. completed with evidence_status=assembling means evidence delivery is pending, not complete. Existing answer_artifact_ref requests remain supported.",
                 "consumes": [
                     "application/json"
                 ],
@@ -1525,6 +1525,16 @@ const docTemplate = `{
                         "name": "interaction_id",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "enum": [
+                            "full",
+                            "summary"
+                        ],
+                        "type": "string",
+                        "description": "Response view: full (default) or summary",
+                        "name": "view",
+                        "in": "query"
                     }
                 ],
                 "responses": {
@@ -1562,6 +1572,70 @@ const docTemplate = `{
                         "description": "Service Unavailable",
                         "schema": {
                             "$ref": "#/definitions/httphandler.lifecycleErrorEnvelope"
+                        }
+                    }
+                }
+            }
+        },
+        "/interactions/{interaction_id}/record-integrity-status": {
+            "get": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Read-only status for the interaction's current integrity source version. Uses the same canonical authorization as persisted integrity reads; shared-network candidates do not widen that authorization; unauthorized and missing interactions both return 404. Never performs live inspection, claims work, or requeues a retry. No query parameters are accepted. At most 8 attempts over 30 minutes with backoff from 30 seconds to 5 minutes; a new source version schedules a new generation while retaining old retry history. Fixed inspection limits stop the current generation immediately with exhausted/inspection_budget_exceeded (8 MiB per artifact response, 32 MiB or 128 reads per interaction); this is an unknown verdict, not evidence loss. Existing exhausted generations are not requeued or rewritten on upgrade. A succeeded job means a verdict was saved, not that records or business conclusions are complete. Reason may describe exhaustion or source replacement; last_failure_reason retains the last actual failure. Zero timestamps mean no attempt/lease has been recorded.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "evidence"
+                ],
+                "summary": "Get recorded integrity retry diagnostics for an authorized interaction",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Canonical interaction ID",
+                        "name": "interaction_id",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.RecordIntegrityRetryStatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "405": {
+                        "description": "Method Not Allowed",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
                         }
                     }
                 }
@@ -2401,9 +2475,115 @@ const docTemplate = `{
                 }
             }
         },
+        "/trace-root-services": {
+            "get": {
+                "description": "On-demand bounded discovery using the current Trace filters and authorization. The service filter itself is excluded. No Span counts or question/result bodies are loaded. Results contain at most 100 canonical names; has_more asks the caller to narrow q. A failed or budget-limited scan never returns a partial catalog.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "traces"
+                ],
+                "summary": "Discover authorized technical Trace root service options",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Started at or after this RFC3339 timestamp",
+                        "name": "from",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Started at or before this RFC3339 timestamp",
+                        "name": "to",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Exact Trace ID",
+                        "name": "trace_id",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Execution status",
+                        "name": "status",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Exact root operation",
+                        "name": "tool",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Recorded error summary substring",
+                        "name": "error_keyword",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Case-insensitive service-name substring; at most 256 Unicode characters",
+                        "name": "q",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Maximum options, 1..100; default 100",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/evidencevo.TraceRootServiceOptions"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "405": {
+                        "description": "Method Not Allowed",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/traces": {
             "get": {
-                "description": "Returns stable trace summaries with reverse request links, generated from authorized trace evidence.",
+                "description": "Returns authorized technical Trace summaries. Ordinary pages batch-read missing projection IDs from canonical SQL metadata; unavailable Span counts are explicit. Content/root-filtered pages and dependency failures retain their existing behavior.",
                 "produces": [
                     "application/json"
                 ],
@@ -2444,13 +2624,13 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Started at or after this RFC3339 timestamp",
+                        "description": "Started at or after this RFC3339 timestamp; omitted means no lower time bound",
                         "name": "from",
                         "in": "query"
                     },
                     {
                         "type": "string",
-                        "description": "Started at or before this RFC3339 timestamp",
+                        "description": "Started at or before this RFC3339 timestamp; omitted means no upper time bound",
                         "name": "to",
                         "in": "query"
                     },
@@ -2486,7 +2666,7 @@ const docTemplate = `{
                     },
                     {
                         "type": "string",
-                        "description": "Trace, request, operation, or error keyword",
+                        "description": "Case-insensitive substring of trace/request/conversation/interaction IDs, agent/app, root service/operation, or recorded error summary; incomplete searches return a resource error",
                         "name": "keyword",
                         "in": "query"
                     }
@@ -2510,8 +2690,20 @@ const docTemplate = `{
                             "$ref": "#/definitions/rdto.ErrorResponse"
                         }
                     },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "SUMMARY_QUERY_TIMEOUT, PROJECTION_LAG, or SUMMARY_DEPENDENCY_UNAVAILABLE",
                         "schema": {
                             "$ref": "#/definitions/rdto.ErrorResponse"
                         }
@@ -2559,6 +2751,95 @@ const docTemplate = `{
                     },
                     "500": {
                         "description": "Internal Server Error",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "504": {
+                        "description": "Gateway Timeout",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/traces/{trace_id}/spans": {
+            "get": {
+                "description": "Requires current global trace access and canonical trace visibility on every page. Signed cursors describe live Span-ID order; pages do not enlarge the graph or claim an exact total.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "traces"
+                ],
+                "summary": "Browse one bounded page of technical trace spans",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Trace ID",
+                        "name": "trace_id",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Signed continuation cursor",
+                        "name": "cursor",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/tracesvc.SpanPage"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Not Found",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "405": {
+                        "description": "Method Not Allowed",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "413": {
+                        "description": "Request Entity Too Large",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "422": {
+                        "description": "Unprocessable Entity",
+                        "schema": {
+                            "$ref": "#/definitions/rdto.ErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Service Unavailable",
                         "schema": {
                             "$ref": "#/definitions/rdto.ErrorResponse"
                         }
@@ -3494,6 +3775,20 @@ const docTemplate = `{
                 }
             }
         },
+        "evidencevo.TraceRootServiceOptions": {
+            "type": "object",
+            "properties": {
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "has_more": {
+                    "type": "boolean"
+                }
+            }
+        },
         "evidencevo.TraceSummary": {
             "type": "object",
             "properties": {
@@ -3971,6 +4266,8 @@ const docTemplate = `{
                         "receipt_pending",
                         "terminal_conflict",
                         "closure_manifest_invalid",
+                        "answer_artifact_storage_limit",
+                        "answer_artifact_handoff_disabled",
                         "feature_not_installed",
                         "trace_core_unavailable",
                         "authorization_unavailable",
@@ -4020,6 +4317,10 @@ const docTemplate = `{
                 "outcome"
             ],
             "properties": {
+                "answer_artifact": {
+                    "description": "AnswerArtifact is an opt-in EvidenceArtifact result object, at most 16 MiB, durably staged with the completed Interaction.",
+                    "type": "object"
+                },
                 "answer_artifact_ref": {
                     "type": "string"
                 },
@@ -4380,6 +4681,50 @@ const docTemplate = `{
                 }
             }
         },
+        "rdto.RecordIntegrityRetryStatusResponse": {
+            "type": "object",
+            "properties": {
+                "attempts": {
+                    "type": "integer"
+                },
+                "first_attempt_at": {
+                    "type": "string"
+                },
+                "interaction_id": {
+                    "type": "string"
+                },
+                "last_attempt_at": {
+                    "type": "string"
+                },
+                "last_failure_reason": {
+                    "type": "string"
+                },
+                "lease_until": {
+                    "type": "string"
+                },
+                "next_attempt_at": {
+                    "type": "string"
+                },
+                "reason": {
+                    "type": "string"
+                },
+                "source_version": {
+                    "type": "integer"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": [
+                        "pending",
+                        "active",
+                        "running",
+                        "retry_wait",
+                        "exhausted",
+                        "succeeded",
+                        "superseded"
+                    ]
+                }
+            }
+        },
         "rdto.TraceEvidenceConfigurationResponse": {
             "type": "object",
             "properties": {
@@ -4406,6 +4751,25 @@ const docTemplate = `{
                 },
                 "revision": {
                     "type": "integer"
+                }
+            }
+        },
+        "sessionvo.AnswerArtifactPersistence": {
+            "type": "object",
+            "properties": {
+                "content_hash": {
+                    "type": "string"
+                },
+                "event_id": {
+                    "type": "string"
+                },
+                "state": {
+                    "type": "string",
+                    "enum": [
+                        "pending",
+                        "settled",
+                        "dead"
+                    ]
                 }
             }
         },
@@ -4708,6 +5072,9 @@ const docTemplate = `{
                 "completion_reason"
             ],
             "properties": {
+                "answer_artifact_persistence": {
+                    "$ref": "#/definitions/sessionvo.AnswerArtifactPersistence"
+                },
                 "answer_artifact_ref": {
                     "type": "string"
                 },
@@ -5527,6 +5894,73 @@ const docTemplate = `{
                 "SupportOperationOutput"
             ]
         },
+        "tracesvc.SpanDisplayRange": {
+            "type": "object",
+            "properties": {
+                "browse_allowed": {
+                    "type": "boolean"
+                },
+                "browse_reason": {
+                    "type": "string"
+                },
+                "display_limit": {
+                    "type": "integer"
+                },
+                "first_start_at": {
+                    "type": "string"
+                },
+                "last_start_at": {
+                    "type": "string"
+                },
+                "loaded_count": {
+                    "type": "integer"
+                },
+                "raw_record_count": {
+                    "type": "integer"
+                },
+                "raw_record_limit": {
+                    "type": "integer"
+                },
+                "sort": {
+                    "type": "string"
+                },
+                "total_accuracy": {
+                    "type": "string"
+                },
+                "total_count": {
+                    "type": "integer"
+                },
+                "truncated": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "tracesvc.SpanPage": {
+            "type": "object",
+            "properties": {
+                "consistency": {
+                    "type": "string"
+                },
+                "entries": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/oteltracevo.TraceGraphNode"
+                    }
+                },
+                "has_more": {
+                    "type": "boolean"
+                },
+                "next_cursor": {
+                    "type": "string"
+                },
+                "sort": {
+                    "type": "string"
+                },
+                "trace_id": {
+                    "type": "string"
+                }
+            }
+        },
         "tracesvc.TechnicalOperation": {
             "type": "object",
             "properties": {
@@ -5568,6 +6002,9 @@ const docTemplate = `{
                         "type": "string"
                     }
                 },
+                "span_display": {
+                    "$ref": "#/definitions/tracesvc.SpanDisplayRange"
+                },
                 "summary": {
                     "$ref": "#/definitions/evidencevo.TraceSummary"
                 }
@@ -5591,7 +6028,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/api/agent-observability/v1",
 	Schemes:          []string{},
 	Title:            "Agent Observability API",
-	Description:      "APIs for querying agent traces from OpenSearch.",
+	Description:      "Community Core APIs for managed Conversation/Interaction facts, recorded Operations, and technical Trace reads. Standard record authorization applies.\nEnterprise business-provenance routes require an assembled EE image and runtime enterprise entitlement; they are not part of this Core specification.\nA plain 404 on an enterprise route does not identify its cause: an absent Community route, the EE availability gate, or an undisclosed record can return 404. A successful Core read does not establish access to an EE route.\nExplanation reads are separate from explicit EE generation requests. See the module README for the Community/EE read boundary.",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 }

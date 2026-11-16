@@ -13,12 +13,13 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 )
 
 type prepareViewService struct {
@@ -40,20 +41,24 @@ func (viewService *prepareViewService) Prepare(_ context.Context, req *interface
 		req.SourceMetadata = viewService.sourceMetadata
 	}
 	if viewService.decodeDefinition {
-		definition, err := interfaces.DecodeDerivedLogicDefinition(req.LogicDefinition)
+		definition, err := interfaces.DecodeDerivedLogicalViewDefinition(req.LogicalViewDefinition)
 		if err != nil {
 			return "", nil, err
 		}
-		req.LogicDefinition = definition
+		req.LogicalViewDefinition = definition
 	}
 	if viewService.schemaDefinition != nil {
-		return interfaces.LogicType_Derived, viewService.schemaDefinition, nil
+		return interfaces.LogicalType_Derived, viewService.schemaDefinition, nil
 	}
-	return interfaces.LogicType_Derived, []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}}, nil
+	return interfaces.LogicalType_Derived, []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}}, nil
 }
 
 func (*prepareViewService) QueryWithPaging(context.Context, *interfaces.Resource, *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 	return nil, errors.New("query is not expected")
+}
+
+func (*prepareViewService) PrepareSQLQuery(context.Context, *sqlbuilder.SelectBuilder, []*interfaces.Resource) (*interfaces.SQLViewQuery, error) {
+	return nil, errors.New("SQL preparation is not expected")
 }
 
 func TestLogicalViewServiceEntryPoints(t *testing.T) {
@@ -74,7 +79,7 @@ func TestLogicalViewServiceEntryPoints(t *testing.T) {
 			return err
 		}(),
 	} {
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusNotImplemented, httpErr.HTTPCode)
 	}
@@ -84,10 +89,10 @@ func TestLogicalViewServiceEntryPoints(t *testing.T) {
 	}}
 	SetLogicalViewService(service)
 	require.NoError(t, ValidateLogicalViewRequest(ctx, req))
-	logicType, schema, err := PrepareLogicalView(ctx, req)
+	logicalType, schema, err := PrepareLogicalView(ctx, req)
 	require.NoError(t, err)
 	assert.Same(t, req, service.request)
-	assert.Equal(t, interfaces.LogicType_Derived, logicType)
+	assert.Equal(t, interfaces.LogicalType_Derived, logicalType)
 	assert.Equal(t, []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}}, schema)
 	result, err := QueryLogicalViewWithPaging(ctx, view, params)
 	assert.Nil(t, result)
@@ -107,15 +112,17 @@ func TestResourceServiceCreateLogicalViewSourceMetadata(t *testing.T) {
 	mockRA.EXPECT().Create(gomock.Any(), gomock.Not(nil), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource) error {
 			assert.Equal(t, viewService.sourceMetadata, got.SourceMetadata)
+			assert.Equal(t, interfaces.LogicalType_Derived, got.LogicType)
+			assert.JSONEq(t, `{"source_resource_id":"source-1"}`, got.LogicDefinitionStr)
 			return nil
 		})
 
 	_, err := rs.Create(context.Background(), &interfaces.ResourceRequest{
 		CatalogID: "cat1", Name: "view", Category: interfaces.ResourceCategoryLogicalView,
-		LogicType:        interfaces.LogicType_Derived,
-		LogicDefinition:  map[string]any{"source_resource_id": "source-1"},
-		SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
-		SourceMetadata:   map[string]any{"injected": true},
+		LogicalType:           interfaces.LogicalType_Derived,
+		LogicalViewDefinition: map[string]any{"source_resource_id": "source-1"},
+		SchemaDefinition:      []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+		SourceMetadata:        map[string]any{"injected": true},
 	})
 	require.NoError(t, err)
 	assert.Nil(t, viewService.metadataAtPrepare)
@@ -130,12 +137,12 @@ func TestResourceServiceCreateLogicalViewRejectsMissingPreparedSourceMetadata(t 
 	rs, _, _, _, _, _, _ := newTestService(t)
 	_, err := rs.Create(context.Background(), &interfaces.ResourceRequest{
 		CatalogID: "cat1", Name: "view", Category: interfaces.ResourceCategoryLogicalView,
-		LogicType:        interfaces.LogicType_Derived,
-		LogicDefinition:  map[string]any{"source_resource_id": "source-1"},
-		SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
-		SourceMetadata:   map[string]any{"source_resource": map[string]any{"original_name": "forged"}},
+		LogicalType:           interfaces.LogicalType_Derived,
+		LogicalViewDefinition: map[string]any{"source_resource_id": "source-1"},
+		SchemaDefinition:      []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+		SourceMetadata:        map[string]any{"source_resource": map[string]any{"original_name": "forged"}},
 	})
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	require.ErrorAs(t, err, &httpErr)
 	assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
 	assert.Nil(t, viewService.metadataAtPrepare)
@@ -157,11 +164,11 @@ func TestPrepareLogicalViewRejectsIncompleteSourceMetadata(t *testing.T) {
 			t.Cleanup(func() { SetLogicalViewService(previous) })
 
 			req := &interfaces.ResourceRequest{SourceMetadata: map[string]any{"source_resource": map[string]any{"original_name": "forged"}}}
-			logicType, fields, err := PrepareLogicalView(context.Background(), req)
-			var httpErr *rest.HTTPError
+			logicalType, fields, err := PrepareLogicalView(context.Background(), req)
+			var httpErr *httperrors.HTTPError
 			require.ErrorAs(t, err, &httpErr)
 			assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-			assert.Empty(t, logicType)
+			assert.Empty(t, logicalType)
 			assert.Nil(t, fields)
 			assert.Nil(t, viewService.metadataAtPrepare)
 		})
@@ -251,9 +258,9 @@ func TestResourceServiceUpdateLogicalViewSourceMetadata(t *testing.T) {
 			resource := &interfaces.Resource{
 				RowCount: &count, RowCountTime: &countTime,
 				ID: "r1", CatalogID: "cat1", Category: interfaces.ResourceCategoryLogicalView,
-				Name: "orders", LogicType: interfaces.LogicType_Derived,
-				LogicDefinition:  storedDefinition,
-				SchemaDefinition: storedSchema,
+				Name: "orders", LogicalType: interfaces.LogicalType_Derived,
+				LogicalViewDefinition: storedDefinition,
+				SchemaDefinition:      storedSchema,
 				SourceMetadata: map[string]any{
 					"properties":      map[string]any{"row_count": 6},
 					"source_resource": map[string]any{"original_name": "old.orders"},
@@ -274,6 +281,10 @@ func TestResourceServiceUpdateLogicalViewSourceMetadata(t *testing.T) {
 						assert.Equal(t, int64(100), *got.RowCountTime)
 						assert.Equal(t, viewService.sourceMetadata["source_resource"], got.SourceMetadata["source_resource"])
 						assert.NotContains(t, got.SourceMetadata, "injected")
+						assert.Equal(t, interfaces.LogicalType_Derived, got.LogicType)
+						storedJSON, err := json.Marshal(tc.definition)
+						require.NoError(t, err)
+						assert.JSONEq(t, string(storedJSON), got.LogicDefinitionStr)
 						return 1, nil
 					})
 			}
@@ -286,13 +297,13 @@ func TestResourceServiceUpdateLogicalViewSourceMetadata(t *testing.T) {
 			}
 			err := updateResourceForTest(t, rs, resource, &interfaces.ResourceRequest{
 				CatalogID: "cat1", Category: interfaces.ResourceCategoryLogicalView,
-				Name: "renamed orders", LogicType: interfaces.LogicType_Derived,
-				LogicDefinition:  tc.definition,
-				SchemaDefinition: requestedSchema,
-				SourceMetadata:   map[string]any{"properties": map[string]any{"row_count": 999}, "injected": true},
+				Name: "renamed orders", LogicalType: interfaces.LogicalType_Derived,
+				LogicalViewDefinition: tc.definition,
+				SchemaDefinition:      requestedSchema,
+				SourceMetadata:        map[string]any{"properties": map[string]any{"row_count": 999}, "injected": true},
 			})
 			if tc.withoutPreparedMetadata {
-				var httpErr *rest.HTTPError
+				var httpErr *httperrors.HTTPError
 				require.ErrorAs(t, err, &httpErr)
 				assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
 			} else {
@@ -301,4 +312,25 @@ func TestResourceServiceUpdateLogicalViewSourceMetadata(t *testing.T) {
 			assert.Nil(t, viewService.metadataAtPrepare)
 		})
 	}
+}
+
+func TestResourceServiceInternalCreateStoresLogicFields(t *testing.T) {
+	previous := GetLogicalViewService()
+	SetLogicalViewService(&prepareViewService{sourceMetadata: map[string]any{"source_resource": map[string]any{"original_name": "orders"}}})
+	t.Cleanup(func() { SetLogicalViewService(previous) })
+	rs, ra, _, _, _, _, _ := newTestService(t)
+	expectResourceServiceTransaction(t, rs, true)
+	ra.EXPECT().Create(gomock.Any(), gomock.Not(nil), gomock.Any()).DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource) error {
+		assert.Equal(t, interfaces.LogicalType_Derived, got.LogicType)
+		assert.JSONEq(t, `{"source_resource_id":"source-1"}`, got.LogicDefinitionStr)
+		return nil
+	})
+	got, err := rs.InternalCreate(t.Context(), &interfaces.ResourceRequest{
+		ID: "view", CatalogID: "cat1", Category: interfaces.ResourceCategoryLogicalView,
+		LogicalType:           interfaces.LogicalType_Derived,
+		LogicalViewDefinition: &interfaces.DerivedLogicalViewDefinition{SourceResourceID: "source-1"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, interfaces.LogicalType_Derived, got.LogicalType)
+	require.NotNil(t, got.LogicalViewDefinition)
 }

@@ -10,11 +10,11 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics/permission"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 const conceptGroupSummaryAuthorizationPredicateLimit = 1000
@@ -251,6 +251,6 @@ func (cgs *conceptGroupService) hydrateConceptGroupSummaries(ctx context.Context
 }
 
 func (cgs *conceptGroupService) conceptGroupSummaryError(ctx context.Context, err error) error {
-	return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+	return httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 		berrors.BknBackend_ConceptGroup_InternalError).WithErrorDetails(fmt.Sprint(err))
 }

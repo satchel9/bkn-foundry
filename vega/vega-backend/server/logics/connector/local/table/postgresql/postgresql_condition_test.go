@@ -9,6 +9,7 @@ package postgresql
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,9 +17,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sb "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
+// testFieldsMap provides properties for filter-conversion tests.
 func testFieldsMap() map[string]*interfaces.Property {
 	return map[string]*interfaces.Property{
 		"age":        {Name: "age", OriginalName: "age", Type: interfaces.DataType_Integer},
@@ -30,35 +33,222 @@ func testFieldsMap() map[string]*interfaces.Property {
 func TestBooleanConditionRejectsNumericField(t *testing.T) {
 	fields := testFieldsMap()
 	for _, operation := range []string{"true", "false"} {
-		condition, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Name: "age", Operation: operation}, fields)
+		condition, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Field: "age", Operation: operation}, fields)
 		require.NoError(t, err)
-		_, err = (&PostgresqlConnector{}).ConvertFilterCondition(condition)
+		_, err = (&PostgresqlConnector{}).ConvertFilterCondition(condition, nil, nil)
 		require.ErrorContains(t, err, "requires BOOLEAN")
 	}
 }
 
+// mustNewCond compiles a filter condition and fails the test on invalid input.
 func mustNewCond(t *testing.T, name, op string, value any) interfaces.FilterCondition {
 	t.Helper()
 	cfg := &interfaces.FilterCondCfg{
-		Name:      name,
+		Field:     name,
 		Operation: op,
-		ValueOptCfg: interfaces.ValueOptCfg{
-			ValueFrom: interfaces.ValueFrom_Const,
-			Value:     value,
-		},
+		ValueFrom: interfaces.ValueFrom_Const,
+		Value:     value,
 	}
 	cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, testFieldsMap())
 	require.NoError(t, err)
 	return cond
 }
 
+// renderFilterSQL 使用生产 PG 生成器输出单个节点，便于核对谓词和参数。
+func renderFilterSQL(node sb.SqlNode) (string, []any, error) {
+	text, args, err := ToSql(sb.Select(node))
+	return strings.TrimPrefix(text, "SELECT "), args, err
+}
+
+// toSQL renders a converted filter and returns its bound arguments.
 func toSQL(t *testing.T, connector *PostgresqlConnector, cond interfaces.FilterCondition) (string, []interface{}) {
 	t.Helper()
-	sqlizer, err := connector.ConvertFilterCondition(cond)
+	sqlizer, err := connector.ConvertFilterCondition(cond, nil, nil)
 	require.NoError(t, err)
-	sql, args, err := sqlizer.ToSql()
+	sql, args, err := renderFilterSQL(sqlizer)
 	require.NoError(t, err)
 	return sql, args
+}
+
+// TestPostgresqlConnectorConvertFilterCondition 校验 LIKE 参数绑定仅转义模式字符，不额外转义 SQL 字面量。
+func TestPostgresqlConnectorConvertFilterCondition(t *testing.T) {
+	t.Run("resource columns preserve full names with or without metadata", func(t *testing.T) {
+		for _, name := range []string{"tenant.id", " tenant.id ", "tenant.part.id", "tenant`id.part"} {
+			t.Run(name, func(t *testing.T) {
+				field := &interfaces.Property{Name: "public", OriginalName: name, Type: interfaces.DataType_Integer}
+				before := *field
+				columns := map[string]interfaces.TableColumnMeta{name: {Name: name, Type: "integer"}}
+				cfg := &interfaces.FilterCondCfg{Field: field.Name, Operation: "==", Value: json.Number("7")}
+				condition, err := filter_condition.NewFilterCondition(t.Context(), cfg, map[string]*interfaces.Property{field.Name: field})
+				require.NoError(t, err)
+				for _, metadata := range []map[string]interfaces.TableColumnMeta{nil, columns} {
+					node, err := (&PostgresqlConnector{}).ConvertFilterCondition(condition, []*interfaces.Property{field}, metadata)
+					require.NoError(t, err)
+					text, args, err := renderFilterSQL(node)
+					require.NoError(t, err)
+					quoted := "\"" + strings.ReplaceAll(name, "\"", "\"\"") + "\""
+					assert.Equal(t, "("+quoted+" = $1)", text)
+					assert.Equal(t, []any{"7"}, args)
+				}
+				assert.Equal(t, before, *field, "binding must not rewrite shared schema")
+				assert.Equal(t, interfaces.TableColumnMeta{Name: name, Type: "integer"}, columns[name])
+			})
+		}
+	})
+	t.Run("full physical names bind both fields and nested conditions", func(t *testing.T) {
+		left := &interfaces.Property{Name: "left", OriginalName: "a.b", Type: interfaces.DataType_Integer}
+		right := &interfaces.Property{Name: "right", OriginalName: " a.b ", Type: interfaces.DataType_Integer}
+		left.Type, right.Type = interfaces.DataType_Decimal, interfaces.DataType_Decimal
+		left.OriginalType, right.OriginalType = "money", "money"
+		columns := map[string]interfaces.TableColumnMeta{"a.b": {Name: "a.b"}, " a.b ": {Name: " a.b "}}
+		condition := &filter_condition.AndCond{SubConds: []interfaces.FilterCondition{
+			&filter_condition.EqualCond{Lfield: left, Rfield: right},
+			&filter_condition.OrCond{SubConds: []interfaces.FilterCondition{
+				&filter_condition.NullCond{Lfield: left},
+				&filter_condition.GtCond{Lfield: right, Value: json.Number("7")},
+			}},
+		}}
+		for _, metadata := range []map[string]interfaces.TableColumnMeta{nil, columns} {
+			node, err := (&PostgresqlConnector{}).ConvertFilterCondition(condition, []*interfaces.Property{left, right}, metadata)
+			require.NoError(t, err)
+			text, args, err := renderFilterSQL(node)
+			require.NoError(t, err)
+			assert.Equal(t, `((CAST("a.b" AS NUMERIC) = CAST(" a.b " AS NUMERIC)) AND ((CAST("a.b" AS NUMERIC) IS NULL) OR (CAST(" a.b " AS NUMERIC) > $1)))`, text)
+			assert.Equal(t, []any{"7"}, args)
+		}
+	})
+	t.Run("full physical names remain intact inside date functions", func(t *testing.T) {
+		field := &interfaces.Property{Name: "created", OriginalName: "created.time", Type: interfaces.DataType_Datetime}
+		condition := &filter_condition.CurrentCond{Lfield: field, Value: filter_condition.CurrentDay}
+		for _, metadata := range []map[string]interfaces.TableColumnMeta{nil, {"created.time": {Name: "created.time"}}} {
+			node, err := (&PostgresqlConnector{}).ConvertFilterCondition(condition, []*interfaces.Property{field},
+				metadata)
+			require.NoError(t, err)
+			text, args, err := renderFilterSQL(node)
+			require.NoError(t, err)
+			assert.Equal(t, `(DATE_TRUNC('day', "created.time") = DATE_TRUNC('day', TRANSACTION_TIMESTAMP()))`, text)
+			assert.Empty(t, args)
+		}
+	})
+	t.Run("physical names do not infer a qualifier from a dot", func(t *testing.T) {
+		field := &interfaces.Property{Name: "logical", OriginalName: "t1.col", Type: interfaces.DataType_Integer}
+		condition := &filter_condition.EqualCond{Lfield: field, Value: json.Number("7")}
+		connector := &PostgresqlConnector{}
+		for _, columns := range []map[string]interfaces.TableColumnMeta{
+			nil,
+			{"col": {Name: "col"}},
+			{"t1.col": {Name: "another"}},
+		} {
+			node, err := connector.ConvertFilterCondition(condition, []*interfaces.Property{field}, columns)
+			require.NoError(t, err)
+			text, args, err := renderFilterSQL(node)
+			require.NoError(t, err)
+			assert.Equal(t, `("t1.col" = $1)`, text)
+			assert.Equal(t, []any{"7"}, args)
+		}
+	})
+	t.Run("money predicates use numeric values without locale formatting", func(t *testing.T) {
+		fields := map[string]*interfaces.Property{
+			"amount": {Name: "amount", OriginalName: "p.source_amount", OriginalType: "money", Type: interfaces.DataType_Decimal},
+			"credit": {Name: "credit", OriginalType: "money", Type: interfaces.DataType_Decimal},
+		}
+		for _, tc := range []struct {
+			name string
+			cfg  *interfaces.FilterCondCfg
+			sql  string
+			args []any
+		}{
+			{name: "exact comparison", cfg: &interfaces.FilterCondCfg{Field: "amount", Operation: ">=", Value: json.Number("92233720368547758.07")}, sql: `(CAST("p.source_amount" AS NUMERIC) >= $1)`, args: []any{"92233720368547758.07"}},
+			{name: "set", cfg: &interfaces.FilterCondCfg{Field: "amount", Operation: "in", Value: []any{json.Number("-0.01"), json.Number("123.456")}}, sql: `(CAST("p.source_amount" AS NUMERIC) IN ($1, $2))`, args: []any{"-0.01", "123.456"}},
+			{name: "range", cfg: &interfaces.FilterCondCfg{Field: "amount", Operation: "range", Value: []any{json.Number("-1.00"), json.Number("0.00")}}, sql: `((CAST("p.source_amount" AS NUMERIC) >= $1) AND (CAST("p.source_amount" AS NUMERIC) <= $2))`, args: []any{"-1.00", "0.00"}},
+			{name: "field comparison", cfg: &interfaces.FilterCondCfg{Field: "amount", Operation: "==", ValueFrom: interfaces.ValueFrom_Field, Value: "credit"}, sql: `(CAST("p.source_amount" AS NUMERIC) = CAST("credit" AS NUMERIC))`},
+			{name: "null", cfg: &interfaces.FilterCondCfg{Field: "amount", Operation: "null", Value: nil}, sql: `(CAST("p.source_amount" AS NUMERIC) IS NULL)`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				cond, err := filter_condition.NewFilterCondition(t.Context(), tc.cfg, fields)
+				require.NoError(t, err)
+				statement, args := toSQL(t, &PostgresqlConnector{}, cond)
+				assert.Equal(t, tc.sql, statement)
+				assert.Equal(t, tc.args, args)
+			})
+		}
+	})
+
+	t.Run("structured decimal parameters preserve scientific notation exactly", func(t *testing.T) {
+		field := &interfaces.Property{Name: "amount", OriginalName: "amount", Type: interfaces.DataType_Decimal}
+		for _, value := range []json.Number{"10.1234567890", "10.123456789000000001e0"} {
+			cfg := &interfaces.FilterCondCfg{Field: "amount", Operation: "==", Value: value}
+			cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"amount": field})
+			require.NoError(t, err)
+			text, args := toSQL(t, &PostgresqlConnector{}, cond)
+			assert.Equal(t, `("amount" = $1)`, text)
+			assert.Equal(t, []any{value.String()}, args)
+			assert.Equal(t, value, cfg.Value)
+		}
+	})
+
+	t.Run("conditions compose directly into the shared Builder", func(t *testing.T) {
+		cond := mustNewCond(t, "age", ">=", 18)
+		predicate, err := (&PostgresqlConnector{}).ConvertFilterCondition(cond, nil, nil)
+		require.NoError(t, err)
+		query := sb.Select(&sb.Column{Name: "age"}).
+			From(&sb.Table{SourceIdentifier: `"public"."people"`}).
+			Where(predicate)
+		text, args, err := ToSql(query)
+		require.NoError(t, err)
+		assert.Equal(t, `SELECT "age" FROM "public"."people" WHERE ("age" >= CAST($1 AS BIGINT))`, text)
+		assert.Equal(t, []any{18}, args)
+	})
+
+	field := &interfaces.Property{Name: "name", OriginalName: "name", Type: interfaces.DataType_String}
+	for _, operation := range []struct{ op, sql, prefix, suffix string }{
+		{"prefix", `("name" LIKE $1)`, "", "%"},
+		{"not_prefix", `("name" NOT LIKE $1)`, "", "%"},
+	} {
+		t.Run(operation.op, func(t *testing.T) {
+			for _, value := range []struct{ name, likeInput, prefixInput, pattern string }{
+				{"plain", "plain", "plain", "plain"},
+				{"backslash", `\one`, `\one`, `\\one`},
+				{"single quote", "O'Reilly", "O'Reilly", "O'Reilly"},
+				{"literal wildcards", `\%_`, "%_", `\%\_`},
+				{"mixed", `O'Reilly\\\%_`, `O'Reilly\%_`, `O'Reilly\\\%\_`},
+			} {
+				t.Run(value.name, func(t *testing.T) {
+					// prefix 输入沿用字面前缀语义。
+					input := value.likeInput
+					if operation.op == "prefix" || operation.op == "not_prefix" {
+						input = value.prefixInput
+					}
+					cfg := &interfaces.FilterCondCfg{Field: "name", Operation: operation.op, ValueFrom: interfaces.ValueFrom_Const, Value: input}
+					cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"name": field})
+					require.NoError(t, err)
+					sql, args := toSQL(t, &PostgresqlConnector{}, cond)
+					assert.Equal(t, operation.sql, sql)
+					assert.Equal(t, []any{operation.prefix + value.pattern + operation.suffix}, args)
+					assert.Equal(t, input, cfg.Value, "filter input must remain unchanged")
+				})
+			}
+		})
+	}
+}
+
+func TestPostgresqlConnectorConvertFilterConditionLike(t *testing.T) {
+	field := &interfaces.Property{Name: "name", OriginalName: "name", Type: interfaces.DataType_String}
+	for _, operation := range []string{"like", "not_like"} {
+		for _, pattern := range []string{"", "%", "_", "%ali%", "ali%", "%ali", "中文_😀%", ".*", `a*b?c`, `50\%`, `a\_b`, `a\\b`, `a\nb`, "O'Reilly%_!"} {
+			t.Run(operation+"/"+pattern, func(t *testing.T) {
+				condition, err := filter_condition.NewFilterCondition(t.Context(), &interfaces.FilterCondCfg{Field: "name", Operation: operation, Value: pattern}, map[string]*interfaces.Property{"name": field})
+				require.NoError(t, err)
+				text, args := toSQL(t, &PostgresqlConnector{}, condition)
+				keyword := "LIKE"
+				if operation == "not_like" {
+					keyword = "NOT LIKE"
+				}
+				assert.Equal(t, `("name" `+keyword+` $1 ESCAPE E'\\')`, text)
+				assert.Equal(t, []any{pattern}, args)
+			})
+		}
+	}
 }
 
 func TestPostgresqlConnectorConvertFilterConditionPrefix(t *testing.T) {
@@ -66,23 +256,23 @@ func TestPostgresqlConnectorConvertFilterConditionPrefix(t *testing.T) {
 
 	t.Run("convert constant prefix", func(t *testing.T) {
 		cond := &filter_condition.PrefixCond{
-			Cfg:    &interfaces.FilterCondCfg{ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const}},
+			Cfg:    &interfaces.FilterCondCfg{ValueFrom: interfaces.ValueFrom_Const},
 			Lfield: field, Value: "ali",
 		}
 		expr, err := (&PostgresqlConnector{}).ConvertFilterConditionPrefix(cond)
 		require.NoError(t, err)
-		sql, args, err := expr.ToSql()
+		sql, args, err := renderFilterSQL(expr)
 		require.NoError(t, err)
-		assert.Equal(t, `"name" LIKE ?`, sql)
+		assert.Equal(t, `("name" LIKE $1)`, sql)
 		assert.Equal(t, []any{"ali%"}, args)
 	})
 	t.Run("reject field source", func(t *testing.T) {
 		cond := &filter_condition.PrefixCond{
-			Cfg:    &interfaces.FilterCondCfg{ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Field}},
+			Cfg:    &interfaces.FilterCondCfg{ValueFrom: interfaces.ValueFrom_Field},
 			Lfield: field, Value: "ali",
 		}
-		expr, err := (&PostgresqlConnector{}).ConvertFilterConditionPrefix(cond)
-		require.ErrorContains(t, err, "only supports ValueFrom_Const")
+		expr, err := cond.New(context.Background(), &interfaces.FilterCondCfg{Field: "name", ValueFrom: interfaces.ValueFrom_Field, Value: "ali"}, map[string]*interfaces.Property{"name": field})
+		require.ErrorContains(t, err, "value_from")
 		assert.Nil(t, expr)
 	})
 }
@@ -93,77 +283,78 @@ func TestConvertGteKeepsNonDateFieldAsParameter(t *testing.T) {
 		cond := mustNewCond(t, "age", ">=", 18)
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"age" >= ?`, sql)
+		assert.Equal(t, `("age" >= CAST($1 AS BIGINT))`, sql)
 		assert.Equal(t, []interface{}{18}, args)
 	})
 }
 
-func TestConvertDateGteUsesToTimestamp(t *testing.T) {
-	t.Run("uses to_timestamp for datetime field", func(t *testing.T) {
+func TestConvertDateGteBindsNormalizedDatetime(t *testing.T) {
+	t.Run("binds normalized datetime for datetime field", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := mustNewCond(t, "created_at", ">=", json.Number("1710000000000"))
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" >= to_timestamp(?::double precision / 1000.0)`, sql)
-		assert.Equal(t, []interface{}{int64(1710000000000)}, args)
+		assert.Equal(t, `("created_at" >= CAST($1 AS TIMESTAMP))`, sql)
+		assert.Equal(t, []interface{}{time.UnixMilli(1710000000000).UTC()}, args)
 	})
 }
 
-func TestConvertDateEqualityUsesToTimestamp(t *testing.T) {
+func TestConvertDateEqualityBindsNormalizedDatetime(t *testing.T) {
 	c := &PostgresqlConnector{}
 
-	t.Run("uses to_timestamp for equal", func(t *testing.T) {
+	t.Run("binds normalized datetime for equal", func(t *testing.T) {
 		cond := mustNewCond(t, "created_at", "==", float64(1785295334428))
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" = to_timestamp(?::double precision / 1000.0)`, sql)
-		assert.Equal(t, []interface{}{int64(1785295334428)}, args)
+		assert.Equal(t, `("created_at" = CAST($1 AS TIMESTAMP))`, sql)
+		assert.Equal(t, []interface{}{time.UnixMilli(1785295334428).UTC()}, args)
 	})
 
-	t.Run("uses to_timestamp for not equal", func(t *testing.T) {
+	t.Run("binds normalized datetime for not equal", func(t *testing.T) {
 		cond := mustNewCond(t, "created_at", "!=", float64(1785295334428))
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" <> to_timestamp(?::double precision / 1000.0)`, sql)
-		assert.Equal(t, []interface{}{int64(1785295334428)}, args)
+		assert.Equal(t, `("created_at" <> CAST($1 AS TIMESTAMP))`, sql)
+		assert.Equal(t, []interface{}{time.UnixMilli(1785295334428).UTC()}, args)
 	})
 }
 
-func TestConvertDateSetMembershipUsesToTimestamp(t *testing.T) {
+func TestConvertDateSetMembershipBindsNormalizedDatetime(t *testing.T) {
 	c := &PostgresqlConnector{}
 	values := []any{1785295334428, 1785381734428}
 
-	t.Run("uses to_timestamp for in", func(t *testing.T) {
+	t.Run("binds normalized datetime for in", func(t *testing.T) {
 		cond := mustNewCond(t, "created_at", "in", values)
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" IN (to_timestamp(?::double precision / 1000.0), to_timestamp(?::double precision / 1000.0))`, sql)
-		assert.Equal(t, []interface{}{int64(1785295334428), int64(1785381734428)}, args)
+		assert.Equal(t, `("created_at" IN (CAST($1 AS TIMESTAMP), CAST($2 AS TIMESTAMP)))`, sql)
+		assert.Equal(t, []interface{}{time.UnixMilli(1785295334428).UTC(), time.UnixMilli(1785381734428).UTC()}, args)
 	})
 
-	t.Run("uses to_timestamp for not in", func(t *testing.T) {
+	t.Run("binds normalized datetime for not in", func(t *testing.T) {
 		cond := mustNewCond(t, "created_at", "not_in", values)
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" NOT IN (to_timestamp(?::double precision / 1000.0), to_timestamp(?::double precision / 1000.0))`, sql)
-		assert.Equal(t, []interface{}{int64(1785295334428), int64(1785381734428)}, args)
+		assert.Equal(t, `("created_at" NOT IN (CAST($1 AS TIMESTAMP), CAST($2 AS TIMESTAMP)))`, sql)
+		assert.Equal(t, []interface{}{time.UnixMilli(1785295334428).UTC(), time.UnixMilli(1785381734428).UTC()}, args)
 	})
 }
 
-func TestPostgresqlDateCompareExprUsesSessionTimezoneForTimestampWithoutTimezone(t *testing.T) {
+func TestSQLComparisonUsesSessionTimezoneForTimestampWithoutTimezone(t *testing.T) {
 	for _, originalType := range []string{"timestamp", "timestamp without time zone"} {
 		t.Run(originalType, func(t *testing.T) {
 			field := &interfaces.Property{
 				OriginalName: "created_at",
 				OriginalType: originalType,
+				Type:         interfaces.DataType_Timestamp,
 			}
 
-			expr, err := dateCompareExpr(field, ">=", float64(1785295334428))
+			expr, err := sqlComparison(field, nil, float64(1785295334428), ">=")
 			require.NoError(t, err)
-			sql, args, err := expr.ToSql()
+			sql, args, err := renderFilterSQL(expr)
 			require.NoError(t, err)
-			assert.Equal(t, `"created_at" >= (to_timestamp(?::double precision / 1000.0) AT TIME ZONE current_setting('TimeZone'))`, sql)
-			assert.Equal(t, []interface{}{int64(1785295334428)}, args)
+			assert.Equal(t, "(\"created_at\" >= CAST(TO_TIMESTAMP(CAST((CAST(CAST($1 AS BIGINT) AS NUMERIC) / CAST(CAST(1000 AS BIGINT) AS NUMERIC)) AS DOUBLE PRECISION)) AS TIMESTAMP))", sql)
+			assert.Equal(t, []any{int64(1785295334428)}, args)
 		})
 	}
 }
@@ -177,9 +368,9 @@ func TestPostgresqlDateExpressionsKeepCursorTimestampsNative(t *testing.T) {
 		fieldType    string
 		wantSQL      string
 	}{
-		{originalType: "timestamp", fieldType: interfaces.DataType_Timestamp, wantSQL: `"created_at" > ?::timestamp`},
-		{originalType: "date", fieldType: interfaces.DataType_Date, wantSQL: `"created_at" > ?::timestamp`},
-		{originalType: "timestamptz", fieldType: interfaces.DataType_Timestamp, wantSQL: `"created_at" > ?`},
+		{originalType: "timestamp", fieldType: interfaces.DataType_Timestamp, wantSQL: `("created_at" > CAST($1 AS TIMESTAMP))`},
+		{originalType: "date", fieldType: interfaces.DataType_Date, wantSQL: `("created_at" > CAST($1 AS DATE))`},
+		{originalType: "timestamptz", fieldType: interfaces.DataType_Timestamp, wantSQL: `("created_at" > $1)`},
 	}
 	for _, test := range tests {
 		field := &interfaces.Property{
@@ -193,12 +384,21 @@ func TestPostgresqlDateExpressionsKeepCursorTimestampsNative(t *testing.T) {
 			"RFC3339":   wantTime.Format(time.RFC3339Nano),
 		} {
 			t.Run(test.originalType+"/"+name, func(t *testing.T) {
-				expr, err := dateCompareExpr(field, ">", value)
+				expr, err := sqlComparison(field, nil, value, ">")
+				if test.fieldType == interfaces.DataType_Date && name == "RFC3339" {
+					require.ErrorContains(t, err, "invalid date value")
+					assert.Nil(t, expr)
+					return
+				}
 				require.NoError(t, err)
-				sql, args, err := expr.ToSql()
+				sql, args, err := renderFilterSQL(expr)
 				require.NoError(t, err)
 				assert.Equal(t, test.wantSQL, sql)
-				assert.Equal(t, []interface{}{wantTime}, args)
+				if test.fieldType == interfaces.DataType_Date {
+					assert.Equal(t, []any{wantTime.Format(time.DateOnly)}, args)
+				} else {
+					assert.Equal(t, []interface{}{wantTime}, args)
+				}
 			})
 		}
 	}
@@ -212,11 +412,11 @@ func TestPostgresqlDateExpressionsKeepTimeOfDayValuesRaw(t *testing.T) {
 			Type:         interfaces.DataType_Time,
 		}
 
-		expr, err := dateCompareExpr(field, ">=", "14:30:00")
+		expr, err := sqlComparison(field, nil, "14:30:00", ">=")
 		require.NoError(t, err)
-		sql, args, err := expr.ToSql()
+		sql, args, err := renderFilterSQL(expr)
 		require.NoError(t, err)
-		assert.Equal(t, `"event_time" >= ?`, sql)
+		assert.Equal(t, `("event_time" >= $1)`, sql)
 		assert.Equal(t, []interface{}{"14:30:00"}, args)
 	})
 
@@ -225,13 +425,14 @@ func TestPostgresqlDateExpressionsKeepTimeOfDayValuesRaw(t *testing.T) {
 			field := &interfaces.Property{
 				OriginalName: "event_time",
 				OriginalType: originalType,
+				Type:         interfaces.DataType_Time,
 			}
 
-			expr, err := dateCompareExpr(field, ">=", "14:30:00")
+			expr, err := sqlComparison(field, nil, "14:30:00", ">=")
 			require.NoError(t, err)
-			sql, args, err := expr.ToSql()
+			sql, args, err := renderFilterSQL(expr)
 			require.NoError(t, err)
-			assert.Equal(t, `"event_time" >= ?`, sql)
+			assert.Equal(t, `("event_time" >= $1)`, sql)
 			assert.Equal(t, []interface{}{"14:30:00"}, args)
 		})
 	}
@@ -241,78 +442,90 @@ func TestPostgresqlDateExpressionsKeepTimeOfDayValuesRaw(t *testing.T) {
 		cond := mustNewCond(t, "event_time", "in", []any{"14:30:00", "16:45:00"})
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"event_time" IN (?, ?)`, sql)
+		assert.Equal(t, `("event_time" IN ($1, $2))`, sql)
 		assert.Equal(t, []interface{}{"14:30:00", "16:45:00"}, args)
 	})
 
-	t.Run("rejects numeric time values", func(t *testing.T) {
-		c := &PostgresqlConnector{}
-		cond := mustNewCond(t, "event_time", ">=", float64(1785295334428))
-
-		expr, err := c.ConvertFilterCondition(cond)
-		require.Error(t, err)
-		assert.Nil(t, expr)
-		assert.Contains(t, err.Error(), "requires a time string")
+	t.Run("rejects numeric time values before conversion", func(t *testing.T) {
+		cond, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{Field: "event_time", Operation: ">=", Value: float64(1785295334428)}, testFieldsMap())
+		require.ErrorContains(t, err, "invalid time value")
+		assert.Nil(t, cond)
 	})
 }
 
-func TestConvertDateRangeUsesToTimestamp(t *testing.T) {
-	t.Run("uses to_timestamp for both range bounds", func(t *testing.T) {
+func TestConvertDateRangeBindsNormalizedDatetime(t *testing.T) {
+	t.Run("binds normalized datetime for both range bounds", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := mustNewCond(t, "created_at", "range", []any{1710000000000, 1710003600000})
 		sql, args := toSQL(t, c, cond)
 
-		assert.Contains(t, sql, `"created_at" >= to_timestamp(?::double precision / 1000.0)`)
-		assert.Contains(t, sql, `"created_at" <= to_timestamp(?::double precision / 1000.0)`)
-		assert.Equal(t, []interface{}{int64(1710000000000), int64(1710003600000)}, args)
+		assert.Contains(t, sql, `"created_at" >= CAST($1 AS TIMESTAMP)`)
+		assert.Contains(t, sql, `"created_at" <= CAST($2 AS TIMESTAMP)`)
+		assert.Equal(t, []interface{}{time.UnixMilli(1710000000000).UTC(), time.UnixMilli(1710003600000).UTC()}, args)
 	})
 }
 
-func TestConvertDateOutRangeUsesToTimestamp(t *testing.T) {
-	t.Run("uses to_timestamp for both out range bounds", func(t *testing.T) {
+func TestConvertDateOutRangeBindsNormalizedDatetime(t *testing.T) {
+	t.Run("binds normalized datetime for both out range bounds", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := mustNewCond(t, "created_at", "out_range", []any{1710000000000, 1710003600000})
 		sql, args := toSQL(t, c, cond)
 
-		assert.Contains(t, sql, `"created_at" < to_timestamp(?::double precision / 1000.0)`)
-		assert.Contains(t, sql, `"created_at" > to_timestamp(?::double precision / 1000.0)`)
-		assert.Equal(t, []interface{}{int64(1710000000000), int64(1710003600000)}, args)
+		assert.Contains(t, sql, `"created_at" < CAST($1 AS TIMESTAMP)`)
+		assert.Contains(t, sql, `"created_at" > CAST($2 AS TIMESTAMP)`)
+		assert.Equal(t, []interface{}{time.UnixMilli(1710000000000).UTC(), time.UnixMilli(1710003600000).UTC()}, args)
 	})
 }
 
-func TestConvertDateBetweenUsesToTimestamp(t *testing.T) {
-	t.Run("uses to_timestamp for both between bounds", func(t *testing.T) {
+func TestConvertDateBetweenBindsNormalizedDatetime(t *testing.T) {
+	t.Run("binds normalized datetime for both between bounds", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := mustNewCond(t, "created_at", "between", []any{1710000000000, 1710003600000})
 		sql, args := toSQL(t, c, cond)
 
-		assert.Contains(t, sql, `"created_at" >= to_timestamp(?::double precision / 1000.0)`)
-		assert.Contains(t, sql, `"created_at" <= to_timestamp(?::double precision / 1000.0)`)
-		assert.Equal(t, []interface{}{int64(1710000000000), int64(1710003600000)}, args)
+		assert.Contains(t, sql, `"created_at" >= CAST($1 AS TIMESTAMP)`)
+		assert.Contains(t, sql, `"created_at" <= CAST($2 AS TIMESTAMP)`)
+		assert.Equal(t, []interface{}{time.UnixMilli(1710000000000).UTC(), time.UnixMilli(1710003600000).UTC()}, args)
 	})
 }
 
 func TestPostgresqlConnectorConvertFilterConditionBefore(t *testing.T) {
+	for _, fieldType := range []string{interfaces.DataType_Date, interfaces.DataType_Datetime} {
+		for _, unit := range []string{"week", "weeks", " WEEKS "} {
+			t.Run(fieldType+"/"+unit, func(t *testing.T) {
+				field := &interfaces.Property{Name: "created", OriginalName: "created_at", Type: fieldType}
+				cond, err := filter_condition.NewFilterCondition(context.Background(), &interfaces.FilterCondCfg{
+					Field: "created", Operation: "before", ValueFrom: interfaces.ValueFrom_Const,
+					Value: []any{json.Number("3"), unit},
+				}, map[string]*interfaces.Property{"created": field})
+				require.NoError(t, err)
+				sql, args := toSQL(t, &PostgresqlConnector{}, cond)
+				assert.Equal(t, `("created_at" < (TRANSACTION_TIMESTAMP() - (CAST(CAST($1 AS BIGINT) AS DOUBLE PRECISION) * INTERVAL '1 week')))`, sql)
+				assert.Equal(t, []any{int64(3)}, args)
+			})
+		}
+	}
+
 	t.Run("converts before condition to interval expression", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := &filter_condition.BeforeCond{
 			Cfg: &interfaces.FilterCondCfg{
-				ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const},
+				ValueFrom: interfaces.ValueFrom_Const,
 			},
 			Lfield: testFieldsMap()["created_at"],
 			Value:  []any{json.Number("2"), "days"},
 		}
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `"created_at" < NOW() - (?::bigint * INTERVAL '1 day')`, sql)
+		assert.Equal(t, `("created_at" < (TRANSACTION_TIMESTAMP() - (CAST(CAST($1 AS BIGINT) AS DOUBLE PRECISION) * INTERVAL '1 day')))`, sql)
 		assert.Equal(t, []interface{}{int64(2)}, args)
 	})
 
 	t.Run("returns error for unsupported interval unit", func(t *testing.T) {
 		c := &PostgresqlConnector{}
-		cond := mustNewCond(t, "created_at", "before", []any{float64(2), "fortnight"})
+		cond := &filter_condition.BeforeCond{Lfield: testFieldsMap()["created_at"], Value: []any{float64(2), "fortnight"}}
 
-		got, err := c.ConvertFilterCondition(cond)
+		got, err := c.ConvertFilterCondition(cond, nil, nil)
 
 		require.Error(t, err)
 		assert.Nil(t, got)
@@ -326,19 +539,19 @@ func TestPostgresqlConnectorConvertFilterConditionCurrent(t *testing.T) {
 		cond := mustNewCond(t, "created_at", "current", filter_condition.CurrentDay)
 		sql, args := toSQL(t, c, cond)
 
-		assert.Equal(t, `date_trunc('day', "created_at"::timestamptz) = date_trunc('day', CURRENT_TIMESTAMP)`, sql)
-		assert.Empty(t, args)
+		assert.Equal(t, "(DATE_TRUNC('day', \"created_at\") = DATE_TRUNC('day', TRANSACTION_TIMESTAMP()))", sql)
+		assert.Equal(t, []any(nil), args)
 	})
 
 	t.Run("returns error for unsupported format", func(t *testing.T) {
 		c := &PostgresqlConnector{}
 		cond := &filter_condition.CurrentCond{
-			Cfg:    &interfaces.FilterCondCfg{ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const}},
+			Cfg:    &interfaces.FilterCondCfg{ValueFrom: interfaces.ValueFrom_Const},
 			Lfield: testFieldsMap()["created_at"],
 			Value:  "quarter",
 		}
 
-		got, err := c.ConvertFilterCondition(cond)
+		got, err := c.ConvertFilterCondition(cond, nil, nil)
 
 		require.Error(t, err)
 		assert.Nil(t, got)
@@ -355,6 +568,9 @@ func TestPgIntervalUnit(t *testing.T) {
 			"HOUR":    "hour",
 			"MINUTES": "minute",
 			"seconds": "second",
+			"week":    "week",
+			"WEEKS":   "week",
+			" Week ":  "week",
 		}
 		for input, want := range tests {
 			got, err := intervalUnit(input)
@@ -364,10 +580,79 @@ func TestPgIntervalUnit(t *testing.T) {
 	})
 
 	t.Run("returns error for unsupported unit", func(t *testing.T) {
-		got, err := intervalUnit("week")
+		got, err := intervalUnit("fortnight")
 
 		require.Error(t, err)
 		assert.Empty(t, got)
 		assert.Contains(t, err.Error(), "unsupported interval unit")
 	})
+}
+
+func TestPostgresqlConnectorTemporalInputContract(t *testing.T) {
+	t.Setenv("TZ", "Asia/Shanghai")
+	t.Run("timezone-aware source column retains the instant", func(t *testing.T) {
+		field := &interfaces.Property{Name: "value", OriginalName: "value", Type: interfaces.DataType_Datetime, OriginalType: "timestamp with time zone"}
+		cfg := &interfaces.FilterCondCfg{Field: "value", Operation: "==", Value: "2026-10-19 00:00:00"}
+		cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"value": field})
+		require.NoError(t, err)
+		expr, err := (&PostgresqlConnector{}).ConvertFilterCondition(cond, nil, nil)
+		require.NoError(t, err)
+		_, args, err := renderFilterSQL(expr)
+		require.NoError(t, err)
+		require.Len(t, args, 1)
+		instant, ok := args[0].(time.Time)
+		require.True(t, ok, "bound: %T", args[0])
+		assert.Equal(t, int64(1792339200000), instant.UnixMilli())
+	})
+
+	for _, kind := range []string{interfaces.DataType_Datetime, interfaces.DataType_Date, interfaces.DataType_Time} {
+		t.Run(kind, func(t *testing.T) {
+			field := &interfaces.Property{Name: "value", OriginalName: "value", Type: kind, OriginalType: "timestamp without time zone"}
+			literals := []any{"2026-10-19T00:00:00+08:00", "2026-10-19 00:00:00", json.Number("1792339200000"), "1792339200000", "2026-10-19 00:00:00.000000789", "2026-10-19T00:00:00.000000789+08:00"}
+			if kind == interfaces.DataType_Date {
+				literals = []any{"2026-10-19"}
+			}
+			if kind == interfaces.DataType_Time {
+				literals = []any{"14:30:00.123"}
+			}
+			for _, op := range []string{"==", "!=", ">", ">=", "<", "<=", "in", "not_in", "range", "out_range", "between"} {
+				t.Run(op, func(t *testing.T) {
+					for _, literal := range literals {
+						value := literal
+						count := 1
+						switch op {
+						case "in", "not_in", "range", "out_range", "between":
+							value = []any{literal, literal}
+							count = 2
+						}
+						cfg := &interfaces.FilterCondCfg{Field: "value", Operation: op, Value: value}
+						cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, map[string]*interfaces.Property{"value": field})
+						require.NoError(t, err)
+						expr, err := (&PostgresqlConnector{}).ConvertFilterCondition(cond, nil, nil)
+						require.NoError(t, err)
+						sql, args, err := renderFilterSQL(expr)
+						require.NoError(t, err)
+						assert.NotEmpty(t, sql)
+						require.Len(t, args, count)
+						for _, bound := range args {
+							if kind == interfaces.DataType_Datetime {
+								timestamp, ok := bound.(time.Time)
+								require.True(t, ok, "bound: %T", bound)
+								assert.Equal(t, "2026-10-19 00:00:00", timestamp.Format(time.DateTime))
+								wantNanos := 0
+								if literal == "2026-10-19 00:00:00.000000789" || literal == "2026-10-19T00:00:00.000000789+08:00" {
+									wantNanos = 789
+								}
+								assert.Equal(t, wantNanos, timestamp.Nanosecond())
+								assert.Equal(t, int64(1792339200000), timestamp.UnixMilli())
+							} else {
+								assert.Equal(t, literal, bound)
+							}
+						}
+						assert.Equal(t, value, cfg.Value, "stored condition must retain its original literal")
+					}
+				})
+			}
+		})
+	}
 }

@@ -19,7 +19,9 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/remote"
 )
 
@@ -206,13 +208,14 @@ func (cf *connectorFactory) GetConnectorAvailability(tp string) interfaces.Conne
 	cf.mu.RLock()
 	defer cf.mu.RUnlock()
 
-	_, exists := cf.connectors[tp]
+	connector, exists := cf.connectors[tp]
 	if !exists {
 		return interfaces.ConnectorAvailability{}
 	}
 	minimumEdition, hasMinimumEdition := cf.connectorRequiredEditions[tp]
 	return interfaces.ConnectorAvailability{
 		Available:       !hasMinimumEdition || entitlement.AtLeast(minimumEdition),
+		Disabled:        !connector.GetEnabled(),
 		RequiredEdition: minimumEdition,
 	}
 }
@@ -239,16 +242,147 @@ func (cf *connectorFactory) CreateConnectorInstance(ctx context.Context, tp stri
 	return nil, fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
 }
 
-// GetSensitiveFields returns a list of sensitive fields based on the connector type
-func (cf *connectorFactory) GetSensitiveFields(tp string) []string {
+// ValidateBuildSchema 复用已注册 builder，只读校验 schema，无需连接配置或源端 I/O。
+func (cf *connectorFactory) ValidateBuildSchema(tp string, resource *interfaces.Resource) error {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
+	}
+	if minimumEdition, exists := cf.connectorRequiredEditions[tp]; exists && !entitlement.AtLeast(minimumEdition) {
+		return fmt.Errorf("connector %s requires edition %s: %w", tp, minimumEdition, ErrConnectorEntitlementDenied)
+	}
+	if !connector.GetEnabled() {
+		return fmt.Errorf("connector %s is disabled: %w", tp, ErrConnectorDisabled)
+	}
+	return connector.ValidateBuildSchema(resource)
+}
+
+// ValidateFilterCondition 直接复用连接器的完整条件转换，不访问源端。
+func (cf *connectorFactory) ValidateFilterCondition(tp string, condition interfaces.FilterCondition, resource *interfaces.Resource) error {
+	if condition == nil {
+		return nil
+	}
 	cf.mu.RLock()
 	defer cf.mu.RUnlock()
 
-	if connector, ok := cf.connectors[tp]; ok {
-		if minimumEdition, hasMinimumEdition := cf.connectorRequiredEditions[tp]; hasMinimumEdition && !entitlement.AtLeast(minimumEdition) {
-			return nil
-		}
-		return connector.GetSensitiveFields()
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
 	}
-	return nil
+	if minimumEdition, exists := cf.connectorRequiredEditions[tp]; exists && !entitlement.AtLeast(minimumEdition) {
+		return fmt.Errorf("connector %s requires edition %s: %w", tp, minimumEdition, ErrConnectorEntitlementDenied)
+	}
+	if !connector.GetEnabled() {
+		return fmt.Errorf("connector %s is disabled: %w", tp, ErrConnectorDisabled)
+	}
+	switch converter := connector.(type) {
+	case interfaces.TableConnector:
+		columns, err := table.ColumnMetadata(resource)
+		if err != nil {
+			return err
+		}
+		_, err = converter.ConvertFilterCondition(condition, resource.SchemaDefinition, columns)
+		return err
+	case interfaces.IndexConnector:
+		_, err := converter.ConvertFilterCondition(condition, resource.SchemaDefinition)
+		return err
+	default:
+		return interfaces.NewConditionBuildError("connector %s does not support filter condition conversion", tp)
+	}
+}
+
+// ConvertSQLFilterCondition 为 SQL View 保留完整条件转换的结构化输出。
+func (cf *connectorFactory) ConvertSQLFilterCondition(tp string, condition interfaces.FilterCondition, source *interfaces.Resource) (sqlbuilder.SqlNode, error) {
+	if condition == nil {
+		return nil, nil //nolint:nilnil // 无固定过滤时不产生 SQL 条件。
+	}
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return nil, fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
+	}
+	if minimumEdition, exists := cf.connectorRequiredEditions[tp]; exists && !entitlement.AtLeast(minimumEdition) {
+		return nil, fmt.Errorf("connector %s requires edition %s: %w", tp, minimumEdition, ErrConnectorEntitlementDenied)
+	}
+	if !connector.GetEnabled() {
+		return nil, fmt.Errorf("connector %s is disabled: %w", tp, ErrConnectorDisabled)
+	}
+	converter, ok := connector.(interfaces.TableConnector)
+	if !ok || source == nil || source.Category != interfaces.ResourceCategoryTable {
+		return nil, interfaces.NewConditionBuildError("SQL filter conversion requires a table source and connector")
+	}
+	columns, err := table.ColumnMetadata(source)
+	if err != nil {
+		return nil, err
+	}
+	return converter.ConvertFilterCondition(condition, source.SchemaDefinition, columns)
+}
+
+// ValidateFilterability 只校验显式开启的字段，复用注册连接器且不创建源端连接。
+func (cf *connectorFactory) ValidateFilterability(tp string, resource *interfaces.Resource) error {
+	enabled := false
+	for _, property := range resource.SchemaDefinition {
+		if property.Filterable != nil && *property.Filterable {
+			enabled = true
+			break
+		}
+	}
+	if !enabled {
+		return nil
+	}
+
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
+	}
+	if minimum, exists := cf.connectorRequiredEditions[tp]; exists && !entitlement.AtLeast(minimum) {
+		return fmt.Errorf("connector %s requires edition %s: %w", tp, minimum, ErrConnectorEntitlementDenied)
+	}
+	if !connector.GetEnabled() {
+		return fmt.Errorf("connector %s is disabled: %w", tp, ErrConnectorDisabled)
+	}
+
+	switch connector := connector.(type) {
+	case interfaces.TableConnector:
+		columns, err := table.ColumnMetadata(resource)
+		if err != nil {
+			return err
+		}
+		return table.ValidateFilterability(resource, connector, columns)
+	case interfaces.IndexConnector:
+		return connector.ValidateFilterability(resource)
+	case interfaces.FilesetConnector:
+		return connector.ValidateFilterability(resource)
+	default:
+		return interfaces.NewConditionBuildError("connector %s does not support field filterability validation", tp)
+	}
+}
+
+// SupportDiscover reads discovery capability without creating a source connection.
+func (cf *connectorFactory) SupportDiscover(tp string) (bool, error) {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return false, fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
+	}
+	return connector.SupportDiscover(), nil
+}
+
+// GetSensitiveFields delegates configuration-specific protection paths without creating a source instance.
+func (cf *connectorFactory) GetSensitiveFields(tp string, cfg interfaces.ConnectorConfig) ([]string, error) {
+	cf.mu.RLock()
+	defer cf.mu.RUnlock()
+
+	connector, ok := cf.connectors[tp]
+	if !ok {
+		return nil, fmt.Errorf("connector %s not found: %w", tp, ErrConnectorUnavailable)
+	}
+	return connector.GetSensitiveFields(cfg)
 }

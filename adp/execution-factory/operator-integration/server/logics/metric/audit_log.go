@@ -12,13 +12,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/auditpublisher"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/common/operationaudit"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/bknaudit"
 	infraCommon "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/config"
-	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/localize"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/auditpublisher"
 )
 
 // constant definition.
@@ -69,9 +70,8 @@ const (
 type AuditLogObjectType string
 
 const (
-	AuditLogObjectOperator AuditLogObjectType = "operator" // operator.
-	AuditLogObjectTool     AuditLogObjectType = "tool"     // Tools.
-	AuditLogObjectMCP      AuditLogObjectType = "mcp"      // mcp
+	AuditLogObjectTool AuditLogObjectType = "tool" // Tools.
+	AuditLogObjectMCP  AuditLogObjectType = "mcp"  // mcp
 )
 
 // AuditLogObject operation object information.
@@ -145,7 +145,7 @@ const (
 
 // AuditLogBuilder audit log builder.
 type AuditLogBuilder struct {
-	ts        *localize.I18nTranslator
+	language  i18n.Language
 	logger    interfaces.Logger
 	publisher auditPublisher
 	env       string
@@ -164,7 +164,7 @@ func NewAuditLogBuilder() *AuditLogBuilder {
 		publisher = configuredPublisher
 	}
 	return &AuditLogBuilder{
-		ts:        localize.NewI18nTranslator(cfg.Project.Language),
+		language:  i18n.ResolveLanguage(cfg.Project.Language),
 		logger:    logger,
 		publisher: publisher,
 		env:       strings.TrimSpace(os.Getenv("BKN_AUDIT_ENVIRONMENT")),
@@ -210,8 +210,6 @@ type OperationCode string
 
 // Tool additional information.
 const (
-	// "Import tool "%s" from operator successfully".
-	ImportToolFromOperator OperationCode = "import_tool_from_operator"
 	// "Add tool "%s" to toolbox successfully".
 	AddTool OperationCode = "add_tool"
 	// "Editing tool "%s" successful".
@@ -228,6 +226,7 @@ const (
 	UnknownOperation OperationCode = "unknown_operation"
 )
 
+//nolint:unused // Intentionally retained.
 func (b *AuditLogBuilder) getToolDetailsAndExMsg(param interface{}) (detils interface{}, exMsg string) {
 	if param == nil {
 		return
@@ -254,14 +253,17 @@ func (b *AuditLogBuilder) getToolDetailsAndExMsg(param interface{}) (detils inte
 		}
 		toolNames += "," + info.ToolName
 	}
-	switch p.OperationCode {
-	case ImportToolFromOperator, AddTool, EditTool, DeleteTool, UpdateToolStatus, DebugTool, ExecuteTool:
-		exMsg = fmt.Sprintf(b.ts.Trans(fmt.Sprintf("audit_log.%s", p.OperationCode)), toolNames)
-	case UnknownOperation:
-		exMsg = fmt.Sprintf(b.ts.Trans(fmt.Sprintf("audit_log.%s", UnknownOperation)), toolNames)
+	operationCode := p.OperationCode
+	switch operationCode {
+	case AddTool, EditTool, DeleteTool, UpdateToolStatus, DebugTool, ExecuteTool:
 	default:
-		exMsg = fmt.Sprintf(b.ts.Trans(fmt.Sprintf("audit_log.%s", UnknownOperation)), toolNames)
+		operationCode = UnknownOperation
 	}
+	rendered, renderErr := i18n.Render(b.language, "AgentOperatorIntegration.audit_log."+string(operationCode), map[string]any{"Name": toolNames})
+	if renderErr != nil {
+		b.logger.Errorf("audit detail rendering failed: %v", renderErr)
+	}
+	exMsg = rendered
 	if len(exMsg) > ExMsgLimit {
 		exMsg = exMsg[:ExMsgLimit]
 	}
@@ -292,6 +294,8 @@ func (p *AuditLogBuilderParams) GetOperatorType() error {
 }
 
 // Build build audit log model.
+//
+//nolint:unused // Intentionally retained.
 func (b *AuditLogBuilder) build(p *AuditLogBuilderParams) (interface{}, error) {
 	if p.TokenInfo == nil {
 		return nil, fmt.Errorf("token info is nil")
@@ -354,15 +358,19 @@ func (b *AuditLogBuilder) build(p *AuditLogBuilderParams) (interface{}, error) {
 	if logObj.Description != "" {
 		return logObj, nil
 	}
-	logObj.Description = b.ts.Trans(fmt.Sprintf("audit_log.%s_%s", p.Operation, p.Object.Type),
-		p.Object.Name)
+	key := fmt.Sprintf("audit_log.%s_%s", p.Operation, p.Object.Type)
 	switch p.Object.Type {
-	case AuditLogObjectOperator, AuditLogObjectMCP:
-		logObj.Description = fmt.Sprintf(b.ts.Trans(fmt.Sprintf("audit_log.%s_%s", p.Object.Type, p.Operation)), p.Object.Name)
+	case AuditLogObjectMCP:
+		key = fmt.Sprintf("audit_log.%s_%s", p.Object.Type, p.Operation)
 	case AuditLogObjectTool:
 		logObj.Detail, logObj.ExMsg = b.getToolDetailsAndExMsg(logObj.Detail)
-		logObj.Description = fmt.Sprintf(b.ts.Trans(fmt.Sprintf("audit_log.%s_%s", p.Object.Type, p.Operation)), p.Object.Name)
+		key = fmt.Sprintf("audit_log.%s_%s", p.Object.Type, p.Operation)
 	}
+	description, renderErr := i18n.Render(b.language, "AgentOperatorIntegration."+key, map[string]any{"Name": p.Object.Name})
+	if renderErr != nil {
+		return logObj, renderErr
+	}
+	logObj.Description = description
 	return logObj, nil
 }
 
@@ -389,8 +397,6 @@ func (b *AuditLogBuilder) Logger(ctx context.Context, p *AuditLogBuilderParams) 
 	}
 	var targetType string
 	switch p.Object.Type {
-	case AuditLogObjectOperator:
-		targetType = "operator"
 	case AuditLogObjectMCP:
 		targetType = "mcp"
 	case AuditLogObjectTool:

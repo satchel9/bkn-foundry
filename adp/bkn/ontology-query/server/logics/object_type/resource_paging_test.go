@@ -14,12 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.uber.org/mock/gomock"
 
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
 )
 
 // vegaSessionPoolStub models Vega's global cursor session pool: every initial
@@ -30,6 +31,137 @@ type vegaSessionPoolStub struct {
 	sessions      int
 	singleReads   int
 	lastSessionID string
+}
+
+type vegaCursorPageStub struct {
+	params        *interfaces.ResourceDataQueryParams
+	failNextPage  bool
+	missingPaging bool
+}
+
+type changingRowFilterStub struct {
+	calls int
+}
+
+func (s *changingRowFilterStub) ResolveRowFilters(_ context.Context,
+	refs []string) ([]interfaces.RowFilterDecisionEntry, error) {
+	s.calls++
+	digest := "sha256:stable"
+	if s.calls >= 3 {
+		digest = "sha256:changed"
+	}
+	return []interfaces.RowFilterDecisionEntry{{
+		ObjectTypeRef: refs[0], Predicate: interfaces.RowFilterPredicate{Kind: "true"},
+		EffectiveRowFilterDigest: digest,
+	}}, nil
+}
+
+func (v *vegaCursorPageStub) GetResourceSchema(context.Context, string) (*interfaces.ResourceSchemaResponse, error) {
+	return &interfaces.ResourceSchemaResponse{}, nil
+}
+
+func (v *vegaCursorPageStub) QueryResourceData(_ context.Context, resourceID string,
+	params *interfaces.ResourceDataQueryParams) (*interfaces.DatasetQueryResponse, error) {
+	if resourceID != "resource-1" {
+		return nil, fmt.Errorf("unexpected resource %q", resourceID)
+	}
+	if params.Paging.Cursor == "" {
+		first := *params
+		v.params = &first
+		if v.missingPaging {
+			return &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"customer_id": "customer-1"}}}, nil
+		}
+		cursor := "cursor-1"
+		return &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"customer_id": "customer-1"}},
+			QuerySource: "local_index", Paging: &interfaces.ResourceDataPagingResponse{NextCursor: &cursor}}, nil
+	}
+	if params.Paging.Cursor != "cursor-1" {
+		return nil, fmt.Errorf("unexpected cursor %q", params.Paging.Cursor)
+	}
+	if v.failNextPage {
+		return nil, errors.New("cursor continuation failed")
+	}
+	return &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"customer_id": "customer-2"}},
+		QuerySource: "local_index", Paging: &interfaces.ResourceDataPagingResponse{}}, nil
+}
+
+func TestStreamObjectsByObjectTypeIDProjectsEveryManagedBatch(t *testing.T) {
+	vega := &vegaCursorPageStub{}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(1)
+	query.IncludeTypeInfo = true
+	var batches []interfaces.Objects
+	err := service.StreamObjectsByObjectTypeID(resourcePagingContext(), query, func(batch interfaces.Objects) error {
+		batches = append(batches, batch)
+		return nil
+	})
+	if err != nil || len(batches) != 2 || batches[0].Datas[0]["id"] != "customer-1" ||
+		batches[1].Datas[0]["id"] != "customer-2" || batches[0].ObjectType == nil ||
+		batches[0].EffectivePermissions["id"] != interfaces.PropertyAccessFull {
+		t.Fatalf("managed object batches=%#v error=%v", batches, err)
+	}
+	if vega.params == nil || vega.params.Paging.Mode != interfaces.ResourceDataPagingModeCursor ||
+		vega.params.IgnoreLocalIndex != nil ||
+		len(vega.params.Sort) == 0 || vega.params.Sort[len(vega.params.Sort)-1].Field != "customer_id" {
+		t.Fatalf("managed stream plan=%#v", vega.params)
+	}
+}
+
+func TestStreamObjectsByObjectTypeIDStopsWhenAuthorizationChanges(t *testing.T) {
+	vega := &vegaCursorPageStub{}
+	service := resourcePagingService(t, vega, 1)
+	filters := &changingRowFilterStub{}
+	service.rowFilters = filters
+	query := resourcePagingQuery(1)
+	consumed := 0
+	err := service.StreamObjectsByObjectTypeID(resourcePagingContext(), query, func(interfaces.Objects) error {
+		consumed++
+		return nil
+	})
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusConflict || consumed != 1 || filters.calls != 3 {
+		t.Fatalf("stream authorization change: error=%v consumed=%d filter_calls=%d", err, consumed, filters.calls)
+	}
+}
+
+func TestStreamObjectsByObjectTypeIDRejectsFailedCursorContinuation(t *testing.T) {
+	vega := &vegaCursorPageStub{failNextPage: true}
+	service := resourcePagingService(t, vega, 1)
+	consumed := 0
+	err := service.StreamObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		func(interfaces.Objects) error { consumed++; return nil })
+	if err == nil || consumed != 1 {
+		t.Fatalf("failed cursor continuation: error=%v consumed=%d", err, consumed)
+	}
+}
+
+func TestStreamObjectsByObjectTypeIDRejectsMissingPagingEnvelope(t *testing.T) {
+	vega := &vegaCursorPageStub{missingPaging: true}
+	service := resourcePagingService(t, vega, 1)
+	consumed := 0
+	err := service.StreamObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		func(interfaces.Objects) error { consumed++; return nil })
+	if err == nil || consumed != 0 {
+		t.Fatalf("missing cursor envelope: error=%v consumed=%d", err, consumed)
+	}
+}
+
+func TestStreamObjectsByObjectTypeIDRejectsCancellationAfterFinalPage(t *testing.T) {
+	vega := &vegaCursorPageStub{}
+	service := resourcePagingService(t, vega, 1)
+	ctx, cancel := context.WithCancel(resourcePagingContext())
+	defer cancel()
+	consumed := 0
+	err := service.StreamObjectsByObjectTypeID(ctx, resourcePagingQuery(1), func(interfaces.Objects) error {
+		consumed++
+		if consumed == 2 {
+			cancel()
+		}
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) || consumed != 2 {
+		t.Fatalf("canceled final page: error=%v consumed=%d", err, consumed)
+	}
 }
 
 func (v *vegaSessionPoolStub) QueryResourceData(_ context.Context, _ string,
@@ -114,10 +246,10 @@ func TestVegaCursorSessionLimitIsReportedAsTooManyRequests(t *testing.T) {
 	next := resourcePagingQuery(1)
 	next.Cursor = first.Cursor
 	_, err = service.GetObjectsByObjectTypeID(ctx, next)
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusTooManyRequests ||
-		httpErr.BaseError.ErrorCode != oerrors.OntologyQuery_ObjectType_TooManyRequests ||
-		httpErr.BaseError.ErrorDetails != "cursor session limit reached, please retry later" {
+		httpErr.ErrorCode != oerrors.OntologyQuery_ObjectType_TooManyRequests ||
+		httpErr.ErrorDetails != "cursor session limit reached, please retry later" {
 		t.Fatalf("error = %#v", err)
 	}
 }
@@ -154,6 +286,459 @@ func TestResourceContinuationBeyondIndexWindowReplaysFromFirstPage(t *testing.T)
 	}
 	if continued.Paging.Cursor != sessionID {
 		t.Fatalf("continuation request = %#v", continued.Paging)
+	}
+}
+
+func TestContinuousObjectScanDoesNotReplayFirstPage(t *testing.T) {
+	const firstPageSize = 10000
+	firstPage := make([]map[string]any, firstPageSize)
+	for i := range firstPage {
+		firstPage[i] = map[string]any{"customer_id": fmt.Sprintf("customer-%d", i)}
+	}
+	sessionID := "session-1"
+	lastPage := make([]map[string]any, 2190)
+	for i := range lastPage {
+		lastPage[i] = map[string]any{"customer_id": fmt.Sprintf("customer-%d", firstPageSize+i)}
+	}
+	vega := &vegaStubForOTQuery{responses: []*interfaces.DatasetQueryResponse{
+		{Entries: firstPage, TotalCount: 12190, Paging: &interfaces.ResourceDataPagingResponse{NextCursor: &sessionID}},
+		{Entries: lastPage, TotalCount: 12190,
+			Paging: &interfaces.ResourceDataPagingResponse{}},
+	}}
+	service := resourcePagingService(t, vega, 2)
+	ctx := resourcePagingContext()
+	firstQuery := resourcePagingQuery(firstPageSize)
+	firstQuery.NeedTotal = false
+	first, err := service.GetObjectsByObjectTypeIDForScan(ctx, firstQuery)
+	if err != nil || len(first.Datas) != firstPageSize || first.Cursor == "" {
+		t.Fatalf("first page = %d rows, cursor %q, error %v", len(first.Datas), first.Cursor, err)
+	}
+	next := resourcePagingQuery(firstPageSize)
+	next.NeedTotal = false
+	next.Cursor = first.Cursor
+	second, err := service.GetObjectsByObjectTypeIDForScan(ctx, next)
+	if err != nil || len(second.Datas) != 2190 || second.Cursor != "" || second.Datas[0]["id"] != "customer-10000" {
+		t.Fatalf("second page = %d rows, cursor %q, error %v", len(second.Datas), second.Cursor, err)
+	}
+	if len(vega.paramsHistory) != 2 ||
+		vega.paramsHistory[0].Paging.Mode != interfaces.ResourceDataPagingModeCursor ||
+		vega.paramsHistory[0].Paging.Offset != 0 ||
+		vega.paramsHistory[1].Paging.Cursor != sessionID {
+		t.Fatalf("continuous scan sent unexpected Vega requests: %#v", vega.paramsHistory)
+	}
+}
+
+func TestContinuousObjectScanBoundaryRowCounts(t *testing.T) {
+	for _, total := range []int{9999, 10000, 10001} {
+		t.Run(fmt.Sprint(total), func(t *testing.T) {
+			firstSize := min(total, 10000)
+			firstRows := make([]map[string]any, firstSize)
+			for index := range firstRows {
+				firstRows[index] = map[string]any{"customer_id": fmt.Sprintf("customer-%d", index)}
+			}
+			var nextCursor *string
+			responses := []*interfaces.DatasetQueryResponse{{Entries: firstRows, TotalCount: int64(total),
+				Paging: &interfaces.ResourceDataPagingResponse{}}}
+			if total >= 10000 {
+				session := "session-1"
+				nextCursor = &session
+				responses[0].Paging.NextCursor = nextCursor
+				lastRows := make([]map[string]any, total-10000)
+				for index := range lastRows {
+					lastRows[index] = map[string]any{"customer_id": fmt.Sprintf("customer-%d", 10000+index)}
+				}
+				responses = append(responses, &interfaces.DatasetQueryResponse{Entries: lastRows,
+					TotalCount: int64(total), Paging: &interfaces.ResourceDataPagingResponse{}})
+			}
+			vega := &vegaStubForOTQuery{responses: responses}
+			service := resourcePagingService(t, vega, len(responses))
+			query := resourcePagingQuery(10000)
+			query.NeedTotal = false
+			first, err := service.GetObjectsByObjectTypeIDForScan(resourcePagingContext(), query)
+			if err != nil || len(first.Datas) != firstSize || (first.Cursor != "") != (nextCursor != nil) {
+				t.Fatalf("first page: rows=%d cursor=%q err=%v", len(first.Datas), first.Cursor, err)
+			}
+			counted := len(first.Datas)
+			if first.Cursor != "" {
+				next := resourcePagingQuery(10000)
+				next.NeedTotal = false
+				next.Cursor = first.Cursor
+				second, nextErr := service.GetObjectsByObjectTypeIDForScan(resourcePagingContext(), next)
+				if nextErr != nil || second.Cursor != "" {
+					t.Fatalf("last page: rows=%d cursor=%q err=%v", len(second.Datas), second.Cursor, nextErr)
+				}
+				counted += len(second.Datas)
+				if len(second.Datas) > 0 && second.Datas[0]["id"] != "customer-10000" {
+					t.Fatalf("continuation repeated or skipped first row: %#v", second.Datas[0])
+				}
+			}
+			if counted != total || len(vega.paramsHistory) != len(responses) ||
+				vega.paramsHistory[0].Paging.Mode != interfaces.ResourceDataPagingModeCursor {
+				t.Fatalf("counted=%d requests=%#v", counted, vega.paramsHistory)
+			}
+		})
+	}
+}
+
+func TestContinuousObjectScanFallsBackWhenCursorIsUnsupported(t *testing.T) {
+	vega := &vegaStubForOTQuery{
+		errors: []error{interfaces.NewVegaDownstreamError(http.StatusNotImplemented,
+			`{"error_code":"VegaBackend.Query.InvalidParameter"}`)},
+		responses: []*interfaces.DatasetQueryResponse{{Entries: []map[string]any{{"customer_id": "customer-1"}},
+			Paging: &interfaces.ResourceDataPagingResponse{}}},
+	}
+	service := resourcePagingService(t, vega, 1)
+	result, err := service.GetObjectsByObjectTypeIDForScan(resourcePagingContext(), resourcePagingQuery(10000))
+	if err != nil || len(result.Datas) != 1 || len(vega.paramsHistory) != 2 ||
+		vega.paramsHistory[0].Paging.Mode != interfaces.ResourceDataPagingModeCursor ||
+		vega.paramsHistory[1].Paging.Mode != interfaces.ResourceDataPagingModeSingle {
+		t.Fatalf("cursor fallback: rows=%d requests=%#v err=%v", len(result.Datas), vega.paramsHistory, err)
+	}
+}
+
+func TestObjectAggregateUsesAuthorizedResourceQuery(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries:     []map[string]any{{"customer_id": "customer-1", "__value": int64(4)}},
+		QuerySource: "local_index", Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(10000)
+	query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationEq,
+		Value: "customer-1"}
+	result, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "id", "count", []string{"id"})
+	if err != nil || len(result.Datas) != 1 || result.Datas[0]["id"] != "customer-1" ||
+		result.Datas[0]["__value"] != int64(4) || result.QuerySource != "local_index" {
+		t.Fatalf("authorized aggregate = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.FilterCondition == nil || params.Paging.Mode != interfaces.ResourceDataPagingModeSingle ||
+		params.Aggregation["property"] != "customer_id" || len(params.GroupBy) != 1 ||
+		params.GroupBy[0]["property"] != "customer_id" {
+		t.Fatalf("aggregate request = %#v", params)
+	}
+}
+
+func TestObjectAggregateRejectsMaskedMeasureBeforeVega(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+	service := resourcePagingService(t, vega, 1)
+	service.propertyAccess = propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+		"id":     interfaces.PropertyAccessMasked,
+		"mobile": interfaces.PropertyAccessMasked,
+		"notes":  interfaces.PropertyAccessSchema,
+		"secret": interfaces.PropertyAccessNone,
+	}}
+	_, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(100), "id", "count", nil)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest || len(vega.paramsHistory) != 0 {
+		t.Fatalf("masked aggregate error = %v, Vega requests = %d", err, len(vega.paramsHistory))
+	}
+}
+
+func TestObjectCountRowsUsesAuthorizedVegaTotal(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: []map[string]any{{"customer_id": "customer-1"}}, TotalCount: 100001, QuerySource: "local_index",
+		Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(10000)
+	query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationEq,
+		Value: "customer-1"}
+	result, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "", "count_rows", nil)
+	if err != nil || len(result.Datas) != 1 || result.Datas[0]["__value"] != json.Number("100001") ||
+		result.QuerySource != "local_index" {
+		t.Fatalf("authorized row count = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.FilterCondition == nil || params.Paging.Mode != interfaces.ResourceDataPagingModeSingle ||
+		params.Paging.Limit != 1 || !params.NeedTotal || params.Aggregation != nil ||
+		params.IgnoreLocalIndex != nil || len(params.GroupBy) != 0 {
+		t.Fatalf("count request = %#v", params)
+	}
+}
+
+func TestObjectGroupedCountRowsUsesAuthorizedVegaAggregate(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: []map[string]any{
+			{"phone": "north", "notes": "priority", "__value": json.Number("100001")},
+			{"phone": nil, "notes": "standard", "__value": json.Number("2")},
+		},
+		// Index-backed aggregates may report matched documents rather than
+		// result groups as total_count. The object aggregate normalizes this.
+		TotalCount: 100003, QuerySource: "local_index", Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(1)
+	query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationEq,
+		Value: "customer-1"}
+	result, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "", "count_rows",
+		[]string{"mobile", "notes"})
+	if err != nil || len(result.Datas) != 2 || result.Datas[0]["mobile"] != "north" ||
+		result.Datas[0]["notes"] != "priority" || result.Datas[0]["__value"] != json.Number("100001") ||
+		result.Datas[1]["mobile"] != nil || result.Datas[1]["notes"] != "standard" ||
+		result.Datas[1]["__value"] != json.Number("2") || result.TotalCount != 2 || result.QuerySource != "local_index" {
+		t.Fatalf("authorized grouped row count = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.FilterCondition == nil || params.Paging.Mode != interfaces.ResourceDataPagingModeSingle ||
+		params.Paging.Limit != interfaces.MAX_LIMIT || !params.NeedTotal ||
+		params.Aggregation["property"] != "*" || params.Aggregation["aggr"] != "count" ||
+		params.Aggregation["alias"] != "__value" || len(params.GroupBy) != 2 ||
+		params.GroupBy[0]["property"] != "phone" || params.GroupBy[1]["property"] != "notes" ||
+		params.IgnoreLocalIndex != nil {
+		t.Fatalf("grouped count request = %#v", params)
+	}
+}
+
+func TestObjectGroupedCountRowsRejectsIncompleteAggregate(t *testing.T) {
+	entries := make([]map[string]any, interfaces.MAX_LIMIT)
+	for index := range entries {
+		entries[index] = map[string]any{"phone": fmt.Sprintf("region-%d", index), "__value": json.Number("1")}
+	}
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: entries, TotalCount: int64(len(entries)), QuerySource: "source",
+		Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	result, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		"", "count_rows", []string{"mobile"})
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest || len(result.Datas) != 0 ||
+		len(vega.paramsHistory) != 1 {
+		t.Fatalf("incomplete grouped count result = %#v, error = %v", result, err)
+	}
+}
+
+func TestObjectGroupedCountRowsRequiresFullDimensionAccess(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+	service := resourcePagingService(t, vega, 1)
+	service.propertyAccess = propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+		"id":     interfaces.PropertyAccessFull,
+		"mobile": interfaces.PropertyAccessMasked,
+		"notes":  interfaces.PropertyAccessSchema,
+		"secret": interfaces.PropertyAccessNone,
+	}}
+	_, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		"", "count_rows", []string{"mobile"})
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest || len(vega.paramsHistory) != 0 {
+		t.Fatalf("masked grouped count error = %v, Vega requests = %d", err, len(vega.paramsHistory))
+	}
+}
+
+func TestObjectMetricReadsTreatDeniedRowsAsCompleteEmptyResult(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		read         func(*objectTypeService, *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error)
+		wantCountRow bool
+	}{
+		{name: "row count", read: func(service *objectTypeService, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+			return service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "", "count_rows", nil)
+		}, wantCountRow: true},
+		{name: "grouped row count", read: func(service *objectTypeService, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+			return service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "", "count_rows", []string{"mobile"})
+		}},
+		{name: "property count", read: func(service *objectTypeService, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+			return service.AggregateObjectsByObjectTypeID(resourcePagingContext(), query, "id", "count_present", nil)
+		}},
+		{name: "continuous scan", read: func(service *objectTypeService, query *interfaces.ObjectQueryBaseOnObjectType) (interfaces.Objects, error) {
+			return service.GetObjectsByObjectTypeIDForScan(resourcePagingContext(), query)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+			service := resourcePagingService(t, vega, 1)
+			service.rowFilters = predicateRowFilterStub{predicate: interfaces.RowFilterPredicate{Kind: "false"}}
+			query := resourcePagingQuery(10000)
+			query.IgnoreLocalIndex = true
+			result, err := tc.read(service, query)
+			wantRows := 0
+			if tc.wantCountRow {
+				wantRows = 1
+			}
+			if err != nil || result.QuerySource != "" || !result.RowFilterApplied ||
+				result.Cursor != "" || len(vega.paramsHistory) != 0 || len(result.Datas) != wantRows {
+				t.Fatalf("authorized empty result = %#v, Vega reads = %d, error = %v", result, len(vega.paramsHistory), err)
+			}
+			if tc.wantCountRow && result.Datas[0]["__value"] != json.Number("0") {
+				t.Fatalf("empty row count = %#v", result.Datas)
+			}
+		})
+	}
+}
+
+func TestObjectCountRowsDoesNotRequireMappedPrimaryProjection(t *testing.T) {
+	objectType := accessPlanObjectType()
+	objectType.DataSource = &interfaces.ResourceInfo{Type: interfaces.DATA_SOURCE_TYPE_RESOURCE, ID: "resource-1"}
+	for index := range objectType.DataProperties {
+		if objectType.DataProperties[index].Name == "id" {
+			objectType.DataProperties[index].MappedField.Name = ""
+		}
+	}
+	models := omock.NewMockOntologyManagerAccess(gomock.NewController(t))
+	models.EXPECT().GetObjectType(gomock.Any(), "kn-1", "main", "customer").Return(objectType, true, nil)
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+	service := &objectTypeService{
+		omAccess: models, vba: vega, proxy: &objectTypeProxyResolverStub{},
+		propertyAccess: fullPropertyAccessStub{}, rowFilters: trueRowFilterStub{}, cursor: testQueryCursorCodec(t, time.Now()),
+	}
+	_, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(100), "", "count_rows", nil)
+	if err != nil || len(vega.paramsHistory) != 1 || vega.lastParams.IgnoreLocalIndex != nil {
+		t.Fatalf("row count error = %v, Vega requests = %d, params = %#v", err, len(vega.paramsHistory), vega.lastParams)
+	}
+}
+
+func TestObjectCountPropertyKeepsEmptySetDistinctFromNullValues(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: []map[string]any{{"__value": json.Number("0")}}, QuerySource: "source",
+		Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	result, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		"id", "count_present", nil)
+	if err != nil || len(result.Datas) != 1 || result.Datas[0]["__value"] != json.Number("0") {
+		t.Fatalf("property count = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.Aggregation["property"] != "customer_id" ||
+		params.Aggregation["aggr"] != "count" || params.Having["field"] != "count(*)" ||
+		params.Having["operation"] != ">" || params.Having["value"] != 0 {
+		t.Fatalf("property count request = %#v", params)
+	}
+}
+
+func TestObjectCountPropertyRequiresPropertyAccess(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+	service := resourcePagingService(t, vega, 1)
+	service.propertyAccess = propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+		"id": interfaces.PropertyAccessMasked,
+	}}
+	_, err := service.AggregateObjectsByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1), "id", "count_present", nil)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || len(vega.paramsHistory) != 0 {
+		t.Fatalf("incomplete primary projection error = %v, Vega requests = %d", err, len(vega.paramsHistory))
+	}
+}
+
+func TestObjectPropertyAggregateRetainsAuthorization(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: []map[string]any{{"__value": "100001.25"}}, QuerySource: "source",
+		Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(1)
+	query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationEq,
+		Value: "customer-1"}
+	result, err := service.AggregatePropertyByObjectTypeID(resourcePagingContext(), query, "id", "sum")
+	if err != nil || len(result.Datas) != 1 || result.Datas[0]["__value"] != "100001.25" {
+		t.Fatalf("property aggregate = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.FilterCondition == nil || params.IgnoreLocalIndex != nil ||
+		params.Aggregation["property"] != "customer_id" || params.Aggregation["aggr"] != "sum" ||
+		params.Having["field"] != "count(*)" || params.Having["operation"] != ">" {
+		t.Fatalf("property aggregate request = %#v", params)
+	}
+}
+
+func TestObjectPropertyAggregateAccuracy(t *testing.T) {
+	for _, allow := range []*bool{nil, new(true), new(false)} {
+		actual := allow == nil || *allow
+		vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"__value": int64(3)}}, IsApproximate: &actual}}
+		service := resourcePagingService(t, vega, 1)
+		query := resourcePagingQuery(1)
+		query.AggregateAllowApproximate = allow
+		result, err := service.AggregatePropertyByObjectTypeID(resourcePagingContext(), query, "id", "count_distinct")
+		if err != nil || result.IsApproximate != actual {
+			t.Fatalf("accuracy was lost: result=%#v err=%v", result, err)
+		}
+		forwarded, exists := vega.lastParams.Aggregation["allow_approximate"]
+		if allow == nil && exists || allow != nil && (!exists || forwarded != *allow) {
+			t.Fatalf("allowance was lost: %#v", vega.lastParams.Aggregation)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		allow *bool
+	}{
+		{name: "old Vega accepts default approximation"},
+		{name: "old Vega accepts explicit approximation", allow: new(true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"__value": int64(3)}}}}
+			service := resourcePagingService(t, vega, 1)
+			query := resourcePagingQuery(1)
+			query.AggregateAllowApproximate = tc.allow
+			result, err := service.AggregatePropertyByObjectTypeID(resourcePagingContext(), query, "id", "count_distinct")
+			if err != nil || !result.IsApproximate || len(result.Datas) != 1 || result.Datas[0]["__value"] != int64(3) {
+				t.Fatalf("old Vega approximate response was not preserved: result=%#v err=%v", result, err)
+			}
+		})
+	}
+	t.Run("old Vega cannot silently satisfy an exact request", func(t *testing.T) {
+		vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{Entries: []map[string]any{{"__value": int64(3)}}}}
+		service := resourcePagingService(t, vega, 1)
+		query := resourcePagingQuery(1)
+		query.AggregateAllowApproximate = new(false)
+		_, err := service.AggregatePropertyByObjectTypeID(resourcePagingContext(), query, "id", "count_distinct")
+		var httpErr *httperrors.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadGateway {
+			t.Fatalf("missing accuracy evidence accepted: %v", err)
+		}
+	})
+}
+
+func TestObjectPropertyAggregateRequiresPropertyAccess(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{}}
+	service := resourcePagingService(t, vega, 1)
+	service.propertyAccess = propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+		"id": interfaces.PropertyAccessMasked,
+	}}
+	_, err := service.AggregatePropertyByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1), "id", "sum")
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || len(vega.paramsHistory) != 0 {
+		t.Fatalf("incomplete primary projection error = %v, Vega requests = %d", err, len(vega.paramsHistory))
+	}
+}
+
+func TestObjectMetricAggregateMapsGroupedPlanAndHaving(t *testing.T) {
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: []map[string]any{{"phone": "east", "__value": "42.5"}},
+		Paging:  &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(1)
+	query.ActualCondition = &cond.CondCfg{Name: "id", Operation: cond.OperationEq, Value: "customer-1"}
+	result, err := service.AggregateObjectMetricByObjectTypeID(resourcePagingContext(), query,
+		interfaces.ObjectAggregateQuery{MeasureProperty: "id", Operation: "sum", GroupBy: []string{"mobile"},
+			Having: &interfaces.ObjectAggregateHaving{Operation: cond.OperationGt, Value: 10}})
+	if err != nil || len(result.Datas) != 1 || result.Datas[0]["mobile"] != "east" ||
+		result.Datas[0]["__value"] != "42.5" || result.TotalCount != 1 {
+		t.Fatalf("metric aggregate = %#v, error %v", result, err)
+	}
+	params := vega.lastParams
+	if params == nil || params.FilterCondition == nil || params.Paging.Limit != interfaces.MAX_LIMIT ||
+		params.Aggregation["property"] != "customer_id" || params.Aggregation["aggr"] != "sum" ||
+		len(params.GroupBy) != 1 || params.GroupBy[0]["property"] != "phone" ||
+		params.Having["field"] != "__value" || params.Having["operation"] != cond.OperationGt ||
+		params.Having["value"] != 10 {
+		t.Fatalf("metric aggregate request = %#v", params)
+	}
+}
+
+func TestObjectMetricGroupedAggregateRejectsIncompletePage(t *testing.T) {
+	entries := make([]map[string]any, interfaces.MAX_LIMIT)
+	for index := range entries {
+		entries[index] = map[string]any{"phone": fmt.Sprintf("region-%d", index), "__value": json.Number("1")}
+	}
+	vega := &vegaStubForOTQuery{resp: &interfaces.DatasetQueryResponse{
+		Entries: entries, Paging: &interfaces.ResourceDataPagingResponse{},
+	}}
+	service := resourcePagingService(t, vega, 1)
+	_, err := service.AggregateObjectMetricByObjectTypeID(resourcePagingContext(), resourcePagingQuery(1),
+		interfaces.ObjectAggregateQuery{MeasureProperty: "id", Operation: "count_distinct", GroupBy: []string{"mobile"}})
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusBadRequest || len(vega.paramsHistory) != 1 {
+		t.Fatalf("incomplete metric aggregate error = %v, Vega requests = %d", err, len(vega.paramsHistory))
 	}
 }
 
@@ -201,7 +786,7 @@ func TestUnstableResourceSortNeverReturnsContinuation(t *testing.T) {
 	service := &objectTypeService{vba: vega}
 	var result interfaces.Objects
 	if err := service.getObjectsFromResource(context.Background(), query, objectType, &result,
-		plan.fieldPropertyMap(), plan); err != nil {
+		plan.fieldPropertyMap(), plan, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if vega.lastParams.Paging.Mode != interfaces.ResourceDataPagingModeSingle || result.ResourceNextOffset != 0 {
@@ -280,5 +865,17 @@ func TestObjectQueryLocalIndexContract(t *testing.T) {
 				t.Fatalf("unexpected Vega requests: %d", len(vega.paramsHistory))
 			}
 		})
+	}
+}
+
+func TestStreamObjectsByObjectTypeIDPreservesSourcePreference(t *testing.T) {
+	vega := &vegaCursorPageStub{}
+	service := resourcePagingService(t, vega, 1)
+	query := resourcePagingQuery(1)
+	query.IgnoreLocalIndex = true
+	batches := 0
+	err := service.StreamObjectsByObjectTypeID(resourcePagingContext(), query, func(interfaces.Objects) error { batches++; return nil })
+	if err != nil || batches != 2 || vega.params == nil || vega.params.IgnoreLocalIndex == nil || !*vega.params.IgnoreLocalIndex {
+		t.Fatalf("source preference lost: params=%#v batches=%d error=%v", vega.params, batches, err)
 	}
 }

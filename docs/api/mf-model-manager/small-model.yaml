@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: mf-model-manager small model
+  title: 模型管理 · 小模型管理 API
   version: 0.1.0
   description: Public HTTP contract derived from the current route signatures and Pydantic request models.
     Internal /api/private routes are excluded. Dynamic controller results remain an open JSON schema.
@@ -221,7 +221,9 @@ paths:
             application/json:
               schema: {}
         '400':
-          description: Invalid request (Model Factory validation/error envelope).
+          description: Invalid request (Model Factory validation/error envelope). Once the caller
+            passes the display permission check, an unknown `model_id` returns 400 with code
+            `ModelFactory.ExternalSmallModel.GetInfo.IdNotExist`, not 404.
           content:
             application/json:
               schema:
@@ -278,7 +280,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/FastApiError'
         '401':
-          description: Missing, invalid or expired Bearer access token.
+          description: Missing, invalid or expired Bearer token, or a disabled/deleted account.
           content:
             application/json:
               schema:
@@ -295,14 +297,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FastApiError'
+        '503':
+          description: Current account state could not be verified; no business operation is performed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastApiError'
         '500':
           description: Internal model service failure.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/FastApiError'
-      description: Current route signature. Successful results are returned by the controller without
-        a FastAPI response_model; no fixed response object is enforced at this route.
+      description: |
+        Requires an enabled account and small_model display authorization.
+        Authorized callers receive an empty object when no default is configured.
+        Successful results use an open JSON schema.
+
       x-implementation: infra/mf-model-manager/app/routers/small_model_router.py
   /small-model/set-default:
     post:
@@ -485,7 +496,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/FastApiError'
         '401':
-          description: Missing, invalid or expired Bearer access token.
+          description: Missing, invalid or expired Bearer token, or a disabled/deleted account.
           content:
             application/json:
               schema:
@@ -502,14 +513,23 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/FastApiError'
+        '503':
+          description: Current account state could not be verified; no business operation is performed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FastApiError'
         '500':
           description: Internal model service failure.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/FastApiError'
-      description: Current route signature. Successful results are returned by the controller without
-        a FastAPI response_model; no fixed response object is enforced at this route.
+      description: |
+        Requires an enabled account and small_model execute authorization.
+        New configurations use the type-wide resource; saved configurations use their model ID. Authorization precedes configuration loading and provider calls.
+        Successful results use an open JSON schema.
+
       x-implementation: infra/mf-model-manager/app/routers/small_model_router.py
 components:
   schemas:
@@ -542,6 +562,15 @@ components:
           type: integer
           title: Batch Size
           description: Batch size
+        max_documents:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 2147483647
+          description: >-
+            Maximum input documents per rerank request; only supported for reranker models.
+            Null disables the local limit. Creation without this field has no local limit.
+            Editing without this field preserves the saved limit; explicit null clears it.
+            Requests exceeding the limit return HTTP 400 without calling the provider.
         max_tokens:
           type: integer
           title: Max Tokens
@@ -601,6 +630,15 @@ components:
           type: integer
           title: Batch Size
           description: Batch size
+        max_documents:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 2147483647
+          description: >-
+            Maximum input documents per rerank request; only supported for reranker models.
+            Null disables the local limit. Creation without this field has no local limit.
+            Editing without this field preserves the saved limit; explicit null clears it.
+            Requests exceeding the limit return HTTP 400 without calling the provider.
         max_tokens:
           type: integer
           title: Max Tokens
@@ -667,6 +705,15 @@ components:
           type: integer
           title: Batch Size
           description: Batch size
+        max_documents:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 2147483647
+          description: >-
+            Maximum input documents per rerank request; only supported for reranker models.
+            Null disables the local limit. Creation without this field has no local limit.
+            Editing without this field preserves the saved limit; explicit null clears it.
+            Requests exceeding the limit return HTTP 400 without calling the provider.
         max_tokens:
           type: integer
           title: Max Tokens

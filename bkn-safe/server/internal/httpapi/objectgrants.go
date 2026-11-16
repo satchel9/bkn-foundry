@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/authzresource"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/finegrained"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/directory"
@@ -26,7 +27,7 @@ import (
 // under /admin (admin-only). It manages the "grant a specific object to a
 // specific user or role" matrix that sits ON TOP of role-based RBAC: each grant
 // binds one accessor to concrete ops on one concrete resource instance
-// (catalog/operator/knowledge_network/…).
+// (catalog/tool_box/knowledge_network/…).
 //
 // This is the gateway-exposed, audited management surface for object grants.
 // The internal /api/safe/v1/authz/policies endpoints stay for service-to-service
@@ -58,6 +59,18 @@ func isConcreteResourceID(id string) bool {
 // here would reintroduce an unsupported exception to that contract.
 func isModelAuthorizationResourceType(resourceType string) bool {
 	return resourceType == "small_model" || resourceType == "large_model"
+}
+
+// rejectUnentitledType answers a grant on a paid resource type the licence in
+// force does not reach the way an absent type is answered (#2512). Revocations
+// are not gated: cleaning up after a deleted resource must keep working, and
+// keeping policies is what lets a renewed licence restore them unchanged.
+func rejectUnentitledType(c *gin.Context, resourceType string) bool {
+	if authzresource.Entitled(resourceType) {
+		return false
+	}
+	replyPublicError(c, http.StatusNotFound)
+	return true
 }
 
 // opAuthorize is the resource-level operation that lets someone who is NOT a
@@ -100,11 +113,11 @@ const (
 	//
 	// The three types that carry data no longer have one: sharing a knowledge
 	// network, a data connection or a table is its creator's call, so the grant
-	// sits on the object rather than the type (#513, #977, #1150). network_builder
-	// still holds it type-wide on connector_type, stream_data_pipeline and the
-	// execution-factory types (operator, skill, mcp, tool_box), and a custom role
-	// may be given one anywhere — this branch is what makes such a grant decide
-	// something.
+	// sits on the object rather than the type (#513, #977, #1150). A role may
+	// still hold it type-wide — for example on connector_type or the
+	// execution-factory types (tool_box, function, mcp, skill) — and a custom
+	// role may be given one anywhere; this branch is what makes such a grant
+	// decide something.
 	authorityTypeAuthorize grantAuthority = "type-authorize"
 )
 
@@ -176,7 +189,7 @@ func authorizeDelegatedResourceManagement(ctx context.Context, enforcer *authz.E
 	if operatorID == "" || !isConcreteResourceID(ref.ID) {
 		return resourceRef{}, false, nil
 	}
-	root, ok, err := grantAuthorizationRoot(ctx, db, ref)
+	root, ok, err := grantAuthorizationRoot(ctx, db, enforcer.Registry(), ref)
 	if err != nil || !ok {
 		return resourceRef{}, false, err
 	}
@@ -184,7 +197,7 @@ func authorizeDelegatedResourceManagement(ctx context.Context, enforcer *authz.E
 	if err != nil || !authorized {
 		return root, authorized, err
 	}
-	viewOp, err := resourceViewOperation(ctx, db, ref.Type)
+	viewOp, err := resourceViewOperation(ctx, enforcer.Registry(), ref.Type)
 	if err != nil {
 		return root, false, err
 	}
@@ -195,9 +208,9 @@ func authorizeDelegatedResourceManagement(ctx context.Context, enforcer *authz.E
 // grantAuthorizationRoot applies the BKN boundary: a knowledge-network is the
 // sole authorization-management root for its registered child resources.
 // Other resource families manage grants on the concrete resource itself.
-func grantAuthorizationRoot(ctx context.Context, db *gorm.DB, ref resourceRef) (resourceRef, bool, error) {
-	var resourceType model.ResourceType
-	if err := db.WithContext(ctx).First(&resourceType, "id = ?", ref.Type).Error; err != nil {
+func grantAuthorizationRoot(ctx context.Context, db *gorm.DB, registry *authz.Registry, ref resourceRef) (resourceRef, bool, error) {
+	resourceType, err := registry.ResourceType(ctx, ref.Type)
+	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return resourceRef{}, false, nil
 		}
@@ -207,7 +220,7 @@ func grantAuthorizationRoot(ctx context.Context, db *gorm.DB, ref resourceRef) (
 		return ref, true, nil
 	}
 	var parent model.ResourceParent
-	err := db.WithContext(ctx).First(&parent,
+	err = db.WithContext(ctx).First(&parent,
 		"resource_type_id = ? AND resource_id = ?", ref.Type, ref.ID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return resourceRef{}, false, nil
@@ -224,34 +237,27 @@ func grantAuthorizationRoot(ctx context.Context, db *gorm.DB, ref resourceRef) (
 // resourceViewOperation resolves the view vocabulary from the registered
 // operation catalog. The authorization engine does not normalize these names:
 // BKN/Vega use view_detail, execution-factory uses view, and models use display.
-func resourceViewOperation(ctx context.Context, db *gorm.DB, resourceType string) (string, error) {
-	var ids []string
-	if err := db.WithContext(ctx).Model(&model.Operation{}).
-		Where("resource_type_id = ? AND id IN ?", resourceType, []string{"view_detail", "view", "display"}).
-		Pluck("id", &ids).Error; err != nil {
+func resourceViewOperation(ctx context.Context, registry *authz.Registry, resourceType string) (string, error) {
+	ops, err := registry.Operations(ctx, resourceType)
+	if err != nil {
 		return "", err
 	}
 	for _, preferred := range []string{"view_detail", "view", "display"} {
-		for _, id := range ids {
-			if id == preferred {
-				return id, nil
+		for _, op := range ops {
+			if op.ID == preferred {
+				return preferred, nil
 			}
 		}
 	}
 	return "", fmt.Errorf("resource type %q does not declare a view operation", resourceType)
 }
 
-func isBKNChildResourceType(ctx context.Context, db *gorm.DB, resourceType string) (bool, error) {
-	var parentTypeID string
-	result := db.WithContext(ctx).Model(&model.ResourceType{}).
-		Select("parent_type_id").Where("id = ?", resourceType).Scan(&parentTypeID)
-	if result.Error != nil {
-		return false, result.Error
+func isBKNChildResourceType(ctx context.Context, registry *authz.Registry, resourceType string) (bool, error) {
+	rt, err := registry.ResourceType(ctx, resourceType)
+	if err != nil {
+		return false, err
 	}
-	if result.RowsAffected == 0 {
-		return false, gorm.ErrRecordNotFound
-	}
-	return parentTypeID == "knowledge_network", nil
+	return rt.ParentTypeID == "knowledge_network", nil
 }
 
 // restrictDelegatedOps enforces the two limits on a non-administrator writing a
@@ -562,6 +568,9 @@ func previewObjectGrantHandler(e *authz.Enforcer) gin.HandlerFunc {
 			replyPublicError(c, http.StatusNotFound)
 			return
 		}
+		if rejectUnentitledType(c, req.Resource.Type) {
+			return
+		}
 		bundleOps, supported := authz.CommunityBundleOperations(req.Resource.Type)
 		if req.Bundle != authz.ActFullBusinessAccess || !supported || !isConcreteResourceID(req.Resource.ID) {
 			replyPublicError(c, http.StatusBadRequest)
@@ -747,9 +756,9 @@ func objectGrantQueryParam(c *gin.Context, primary, alias string) string {
 // catalogOpSet returns the resource type's grantable operation ids as a set.
 // Read-only/computed operations remain available from the registry and the
 // decision APIs, but never appear valid on an authorization write request.
-func catalogOpSet(db *gorm.DB, resourceType string) (map[string]bool, error) {
-	var operations []model.Operation
-	if err := db.Where("resource_type_id = ?", resourceType).Find(&operations).Error; err != nil {
+func catalogOpSet(ctx context.Context, registry *authz.Registry, resourceType string) (map[string]bool, error) {
+	operations, err := registry.Operations(ctx, resourceType)
+	if err != nil {
 		return nil, err
 	}
 	set := make(map[string]bool, len(operations))
@@ -845,6 +854,10 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 			}
 			entries = append(entries, entry)
 		}
+		if err := populateGrantCreators(c, db, entries); err != nil {
+			serverError(c, err)
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"entries": entries})
 	})
 
@@ -937,6 +950,54 @@ func registerMeObjectGrants(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB, 
 	g.DELETE("/object-grants", revokeObjectGrantHandler(e, db, dir, catalog))
 }
 
+// populateGrantCreators enriches only sources already authorized by the object-scoped
+// read. Grantors need not be grantees. Do not expose directory fields beyond the
+// display name/account, or treat historical/system actors as directory users.
+func populateGrantCreators(c *gin.Context, db *gorm.DB, entries []gin.H) error {
+	ids := make([]string, 0)
+	seen := map[string]bool{}
+	var sources []gin.H
+	for _, entry := range entries {
+		grants, _ := entry["grants"].([]gin.H)
+		for _, grant := range grants {
+			id, _ := grant["created_by"].(string)
+			authority, _ := grant["authority_source"].(string)
+			if id == "" || id == authority || strings.HasPrefix(id, "system:") {
+				continue
+			}
+			sources = append(sources, grant)
+			if !seen[id] {
+				seen[id] = true
+				ids = append(ids, id)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	var users []model.User
+	if err := db.WithContext(c.Request.Context()).Select("id", "name", "account").
+		Where("id IN ?", ids).Find(&users).Error; err != nil {
+		return err
+	}
+	identities := make(map[string]model.User, len(users))
+	for _, user := range users {
+		identities[user.ID] = user
+	}
+	for _, source := range sources {
+		id, _ := source["created_by"].(string)
+		if user, ok := identities[id]; ok {
+			if user.Name != "" {
+				source["created_by_name"] = user.Name
+			}
+			if user.Account != "" {
+				source["created_by_account"] = user.Account
+			}
+		}
+	}
+	return nil
+}
+
 type grantAccessorIdentity struct {
 	kind    string
 	account string
@@ -991,6 +1052,9 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Servic
 		}
 		if isModelAuthorizationResourceType(req.Resource.Type) {
 			replyPublicError(c, http.StatusNotFound)
+			return
+		}
+		if rejectUnentitledType(c, req.Resource.Type) {
 			return
 		}
 
@@ -1104,7 +1168,7 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Servic
 			return
 		}
 
-		valid, err := catalogOpSet(db, req.Resource.Type)
+		valid, err := catalogOpSet(c.Request.Context(), e.Registry(), req.Resource.Type)
 		if err != nil {
 			serverError(c, err)
 			return
@@ -1113,7 +1177,7 @@ func setObjectGrantHandler(e *authz.Enforcer, db *gorm.DB, dir *directory.Servic
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
-		bknChild, err := isBKNChildResourceType(c.Request.Context(), db, req.Resource.Type)
+		bknChild, err := isBKNChildResourceType(c.Request.Context(), e.Registry(), req.Resource.Type)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			replyPublicError(c, http.StatusBadRequest)
 			return
@@ -1235,9 +1299,8 @@ func effectiveObjectGrantDecisions(ctx context.Context, e *authz.Enforcer, db *g
 				!errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, err
 			} else if err == nil {
-				var op model.Operation
-				if err := db.WithContext(ctx).First(&op,
-					"resource_type_id = ? AND id = ?", ref.Type, operation).Error; err != nil &&
+				op, err := e.Registry().Operation(ctx, ref.Type, operation)
+				if err != nil &&
 					!errors.Is(err, gorm.ErrRecordNotFound) {
 					return nil, err
 				} else if err == nil {

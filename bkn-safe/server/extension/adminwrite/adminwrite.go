@@ -69,9 +69,24 @@ var (
 	// sentinel through errors.Is.
 	ErrNoUpdatableFields      = fmt.Errorf("%w: no updatable fields provided", ErrInvalid)
 	ErrWildcardGrant          = fmt.Errorf("%w: wildcard grant", ErrInvalid)
+	ErrSubResourceWildcard    = fmt.Errorf("%w: sub-resource wildcard grant", ErrInvalid)
 	ErrTypeWideActionExecute  = fmt.Errorf("%w: type-wide action execute", ErrInvalid)
 	ErrAdminConsolePermission = fmt.Errorf("%w: admin console permission", ErrForbidden)
 )
+
+// UnregisteredPermissionError identifies invalid registry input without exposing
+// backend diagnostics.
+type UnregisteredPermissionError struct {
+	ResourceType        string
+	Operation           string
+	UnknownResourceType bool
+}
+
+func (e *UnregisteredPermissionError) Error() string {
+	return fmt.Sprintf("%s: unregistered permission %s/%s", ErrInvalid, e.ResourceType, e.Operation)
+}
+
+func (e *UnregisteredPermissionError) Unwrap() error { return ErrInvalid }
 
 // RoleSpec creates a custom role. Source is always forced to "custom" by the
 // implementation; the API cannot mint system or business roles.

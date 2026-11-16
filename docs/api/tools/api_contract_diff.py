@@ -150,7 +150,7 @@ class SpecLoader:
         if schema.get("type") == "array" or "items" in schema:
             # 记下数组形态本身。oneOf 分支里的数组(如 mapping_rules 的 direct
             # 形态)否则只会留下父级的 object 记录,和实际的 `key[]` 对不上。
-            # prefix 为空 = 响应根就是数组(如 GET /operator/category),此时
+            # prefix 为空 = 响应根就是数组(如 GET /category),此时
             # actual_paths 会产出一条裸 "[]",文档侧不记就会误报「文档未声明」,
             # 所以根节点也要记,不能只在 prefix 非空时记。
             out.setdefault(prefix + "[]",
@@ -461,7 +461,7 @@ SUB_DISCOVERY = [
     (_KN + "/relation-types", ["rt_id", "rt_ids"], _KN + "/relation-types"),
     (_KN + "/action-types", ["at_id", "at_ids"], _KN + "/action-types"),
     (_KN + "/concept-groups", ["group_id", "cg_id"], _KN + "/concept-groups"),
-    (_KN + "/metrics", ["metric_id", "metric_ids"], _KN + "/metrics"),
+    (_KN + "/object-metrics", ["metric_id", "metric_ids"], _KN + "/object-metrics"),
     (_KN + "/action-schedules", ["schedule_id", "schedule_ids"], _KN + "/action-schedules"),
     (_KN + "/risk-types", ["rt_id", "rt_ids"], _KN + "/risk-types"),
     # ontology-query 的执行/日志 id 只能从 action-logs 列表里取

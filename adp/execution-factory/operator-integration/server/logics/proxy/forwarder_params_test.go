@@ -8,14 +8,48 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	. "github.com/smartystreets/goconvey/convey"
 
 	myErr "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/logger"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
-	. "github.com/smartystreets/goconvey/convey"
 )
+
+func TestForwarderPreservesLargeJSONIntegers(t *testing.T) {
+	f := newTestForwarder()
+	request := &interfaces.HTTPRequest{
+		HTTPRouter: interfaces.HTTPRouter{URL: "http://example.test/function", Method: http.MethodPost},
+		HTTPRequestParams: interfaces.HTTPRequestParams{
+			Body: map[string]any{"payload": map[string]any{"large_integer": json.Number("9007199254740993")}},
+		},
+	}
+	httpRequest, err := f.buildRequest(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readAll(t, httpRequest.Body); !strings.Contains(got, `"large_integer":9007199254740993`) {
+		t.Fatalf("forwarded body = %s", got)
+	}
+
+	response := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"payload":{"large_integer":9007199254740993}}`)),
+	}
+	parsed, err := f.processResponse(response, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := parsed.Body.(map[string]any)["payload"].(map[string]any)["large_integer"]
+	if value != json.Number("9007199254740993") {
+		t.Fatalf("result large_integer = %#v (%T)", value, value)
+	}
+}
 
 // newTestForwarder manually assembles the forwarder to avoid NewForwarder/NewClientPool from reading the configuration file.
 func newTestForwarder() *forwarder {
@@ -131,10 +165,10 @@ func TestBuildRequest_PathParams(t *testing.T) {
 
 			So(httpReq, ShouldBeNil)
 			So(err, ShouldNotBeNil)
-			httpErr, ok := err.(*myErr.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			So(ok, ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusBadRequest)
-			So(httpErr.Code, ShouldEndWith, string(myErr.ErrExtProxyPathParamMissing))
+			So(httpErr.ErrorCode, ShouldEndWith, string(myErr.ErrExtProxyPathParamMissing))
 			So(httpErr.ErrorDetails, ShouldContainSubstring, "operator_id")
 		})
 
@@ -153,7 +187,7 @@ func TestBuildRequest_PathParams(t *testing.T) {
 
 			So(httpReq, ShouldBeNil)
 			So(err, ShouldNotBeNil)
-			So(err.(*myErr.HTTPError).ErrorDetails, ShouldContainSubstring, "tool_id")
+			So(err.(*httperrors.HTTPError).ErrorDetails, ShouldContainSubstring, "tool_id")
 		})
 
 		Convey("query 里的花括号是业务值，不触发占位符拦截", func() {

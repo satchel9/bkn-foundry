@@ -13,17 +13,24 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/auditpublisher"
+
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/locale"
 )
 
 var vegaAuditTargetTypes = map[string]string{
-	"catalog": "catalog", "resource": "resource",
+	"catalog":                       "catalog",
+	"resource":                      "resource",
 	"catalog_health_check_schedule": "catalog",
-	"discover_schedule":             "discovery_schedule", "index_task": "build_task",
-	"connector_type": "connector_type", "discover_task": "discovery_task",
-	"semantic_understanding_task": "semantic_understanding_task",
+	"discover_schedule":             "discovery_schedule",
+	"index_task":                    "build_task",
+	"build_schedule":                "build_schedule",
+	"connector_type":                "connector_type",
+	"discover_task":                 "discovery_task",
+	"semantic_understanding_task":   "semantic_understanding_task",
 }
 
 var vegaAuditActions = map[string]struct{}{
@@ -101,6 +108,12 @@ func BuildKafkaAuditRecord(entry Entry, environment string) ([]byte, error) {
 		}
 		seen[field] = struct{}{}
 	}
+	actorName := safeAuditDisplayName(entry.ActorName, 256)
+	targetName := safeAuditDisplayName(entry.TargetName, 512)
+	if actorName == "" || actorName == entry.ActorID || entry.ActorID == "unauthenticated" || targetName == "" || targetName == entry.TargetID {
+		return nil, &InvalidAuditFieldError{Field: "display_snapshot", Reason: "missing readable business snapshot"}
+	}
+
 	actorType := "service_account"
 	if entry.ActorType == "user" {
 		actorType = "user"
@@ -141,7 +154,7 @@ func BuildKafkaAuditRecord(entry Entry, environment string) ([]byte, error) {
 			"source_channel": sourceChannel, "transport": "http", "method": method,
 		},
 		"correlation": map[string]any{"request_id": requestID},
-		"summary":     entry.Action + " " + targetType,
+		"summary":     auditSummary(entry.Action, targetType, targetName),
 		"facts": map[string]any{
 			"action": entry.Action, "decision": decision, "changed_fields": changedFields,
 		},
@@ -175,7 +188,7 @@ func boundedAuditReference(value string, limit int) string {
 
 func safeAuditDisplayName(value string, limit int) string {
 	name := strings.TrimSpace(value)
-	if len(name) > limit {
+	if utf8.RuneCountInString(name) > limit {
 		return ""
 	}
 	return name
@@ -189,3 +202,10 @@ func validAuditEnvironment(value string) bool {
 		return false
 	}
 }
+
+func auditSummary(action, target, name string) string {
+	return locale.AuditSummary(action, target, name)
+}
+
+// init loads immutable audit copy before this package builds ledger snapshots.
+func init() { locale.Register() }

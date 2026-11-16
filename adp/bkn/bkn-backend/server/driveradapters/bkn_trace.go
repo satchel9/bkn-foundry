@@ -18,8 +18,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	"bkn-backend/common/bkntrace"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/bkntrace"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -172,27 +172,6 @@ func emitActionTypeSchemaRead(ctx context.Context, c *gin.Context, vis hydra.Vis
 		ReturnedCount: len(items),
 		TotalCount:    total,
 	}, bkntrace.ActionTypeRefs(items))
-	setEvidenceEventHeader(c, eventID)
-}
-
-func emitMetricSchemaRead(ctx context.Context, c *gin.Context, vis hydra.Visitor, operation, knID, branch string, requestedIDs []string, items []*interfaces.MetricDefinition, total int64) {
-	if !bkntrace.EvidenceEnabled() {
-		return
-	}
-	requestContext, err := bknTraceRequestContext(c, vis)
-	if err != nil {
-		logger.Errorf("build BKN trace request context failed: %v", err)
-		return
-	}
-	eventID := bkntrace.EmitSchemaReadEvents(ctx, requestContext, bkntrace.ReadSubject{
-		EntityKind:    bkntrace.EntityKindMetric,
-		Operation:     operation,
-		KNID:          knID,
-		Branch:        branch,
-		RequestedIDs:  requestedIDs,
-		ReturnedCount: len(items),
-		TotalCount:    total,
-	}, bkntrace.MetricRefs(items))
 	setEvidenceEventHeader(c, eventID)
 }
 

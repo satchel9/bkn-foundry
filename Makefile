@@ -11,12 +11,18 @@ TPL_DIR      := $(API_DIR)/_templates
 # 发布的模块及其展示顺序。手写列表而非目录通配：通配按目录名排序，出来的是
 # "bkn-agent 排在 bkn 前面" 这种字典序巧合，且无法把某个模块暂时撤下发布面。
 # 顺序即站点首页的卡片分组顺序，改这里就改了线上顺序。
-MODULES      := bkn bkn-safe-admin context-loader ontology-query vega execution-factory mf-model-manager mf-model-api \
+MODULES      := bkn bkn-safe-admin bkn-safe context-loader ontology-query vega execution-factory mf-model-manager mf-model-api \
                 agent-observability bkn-agent
-# 暂不发布的模块目录（YAML 保留在仓库，只是不进站点、不参与 lint）：
-#   bkn-safe      Self-service reads and cluster-internal authz / managed-proxy contracts are not published as general integration APIs
+# 按文件放行：设了 MODFILES_<module> 的模块只发布列出的资源（文件名去 .yaml），
+# 其余 YAML 仍只参与 lint。未设置的模块发布目录下全部 YAML。
+#   bkn-safe  只发布对外集成用的 MCP 客户端注册 / 已连接客户端；自助读取与集群内部的
+#             授权、受管代理契约不作为通用集成 API 发布
+MODFILES_bkn-safe := oauth-clients
+# 暂不发布的模块目录（YAML 保留在仓库，只是不进站点；仍参与 lint）：
 #   observability 只有 observability.json，没有可发布的 YAML，渲染出来是空分组
-MODULES_UNPUBLISHED := bkn-safe observability sandbox-control-plane sandbox-executor
+MODULES_UNPUBLISHED := observability sandbox-control-plane sandbox-executor
+# 某模块实际发布的 YAML 列表（见 MODFILES_<module>）
+mod_yamls = $(if $(MODFILES_$(1)),$(foreach r,$(MODFILES_$(1)),$(API_DIR)/$(1)/$(r).yaml),$(wildcard $(API_DIR)/$(1)/*.yaml))
 # Unpublished modules are linted too, so service-to-service request and error
 # schemas cannot drift silently.
 LINT_MODULES := $(MODULES) $(MODULES_UNPUBLISHED)
@@ -44,7 +50,7 @@ CONTRACT_OUT        ?= $(GEN_DIR)/contract-report.md
 # 想退回纯 GET：make api-contract-diff CONTRACT_ARGS=
 CONTRACT_ARGS       ?= --include-probe-post
 
-.PHONY: api-docs api-docs-html api-docs-lint api-docs-clean api-contract-diff print-modtitle print-moddesc print-resname
+.PHONY: api-docs api-docs-html api-docs-lint api-docs-clean api-contract-diff print-modtitle print-moddesc print-modyamls print-resname
 
 ## api-docs-lint: 校验各模块 OpenAPI 文档合法且 $ref（含共享 schema）可解析。
 ## _shared/ 是 $ref 片段（无 openapi/info/paths 顶层），不作独立文档 lint，
@@ -82,7 +88,7 @@ api-docs:
 	for m in $(MODULES); do \
 	  echo "==> rendering $$m"; \
 	  : > "$(GEN_DIR)/$$m.md"; \
-	  for y in $(API_DIR)/$$m/*.yaml; do \
+	  for y in $$(make -s print-modyamls MOD="$$m"); do \
 	    [ -e "$$y" ] || continue; \
 	    npx widdershins --code --summary --omitHeader "$$y" -o "$$tmp" >/dev/null 2>&1 || { echo "render failed: $$y"; rm -f "$$tmp"; exit 1; }; \
 	    cat "$$tmp" >> "$(GEN_DIR)/$$m.md"; \
@@ -94,28 +100,38 @@ api-docs:
 	@echo "done -> $(GEN_DIR)/"
 
 ## 模块显示标题（index 分区标题用）。未列出的模块回落为目录名。
-MODTITLE_bkn               := BKN
-MODTITLE_bkn-safe-admin    := BKN Safe 管理
-MODTITLE_bkn-agent         := BKN 专属 Agent
-MODTITLE_execution-factory := 执行工厂
-MODTITLE_agent-observability := BKN Trace
-MODTITLE_context-loader    := 上下文加载
-MODTITLE_mf-model-manager  := 模型管理
-MODTITLE_ontology-query    := Ontology 查询
-MODTITLE_vega              := VEGA 引擎
+MODTITLE_bkn                    := BKN 知识网络
+MODTITLE_bkn-safe-admin         := BKN Safe 管理
+MODTITLE_bkn-agent              := BKN 专属 Agent
+MODTITLE_execution-factory      := 执行工厂
+MODTITLE_agent-observability    := BKN Trace
+MODTITLE_context-loader         := 上下文加载
+MODTITLE_mf-model-manager       := 模型管理
+MODTITLE_ontology-query         := 本体查询
+MODTITLE_vega                   := VEGA 引擎
+
+MODTITLE_sandbox-control-plane  := 沙箱管理
+
+MODTITLE_sandbox-executor       := 沙箱执行器
+
+MODTITLE_bkn-safe               := 身份与授权
 
 ## 模块中文描述（index 卡片副标题用）。未列出的模块回落为空。
-MODDESC_bkn               := 业务知识网络：对象类 / 关系类 / 行动类 / 概念组 / 指标 / 导入导出
-MODDESC_bkn-safe-admin    := 企业版安全策略：行过滤策略配置与生效说明
+MODDESC_bkn               := 业务知识网络：对象类 / 关系类 / 行动类 / 概念组 / 指标 / 版本管理 / 导入导出
+MODDESC_bkn-safe-admin    := 企业版安全策略：角色权限 / 行过滤策略配置与生效说明
 MODDESC_bkn-agent         := Agent 运行时：Agent 增删改查 / 对话与调用 / 任务 / 提示词版本 / 会话 / 导入导出
-MODDESC_execution-factory := 执行工厂：函数与沙箱执行 / 算子 / 工具箱 / MCP / Skill / 导入导出
+MODDESC_execution-factory := 执行工厂：函数与沙箱执行 / 工具箱 / MCP / Skill / 导入导出
 MODDESC_agent-observability := BKN Trace：受管会话生命周期 / 业务证据 / 技术链路 / 快照
 MODDESC_context-loader    := Agent 上下文入口：Schema 检索 / 实例与子图查询 / 逻辑属性 / 行动执行 / Skill 召回 / 数据直查 / MCP
 MODDESC_mf-model-manager  := 模型工厂：大小模型 / 配额 / 提示词 / 默认模型 / 监控
-MODTITLE_mf-model-api      := 模型调用
+MODTITLE_mf-model-api           := 模型调用
 MODDESC_mf-model-api       := 模型调用：聊天补全 / embedding / rerank
 MODDESC_ontology-query    := 本体查询与语义检索
 MODDESC_vega              := 数据可观测：目录 / 资源 / 连接器 / 构建任务 / 发现任务 / 原生查询
+
+MODDESC_sandbox-control-plane  := 沙箱会话 / 代码执行 / 模板 / 文件 / 内部回调
+MODDESC_sandbox-executor       := 代码提交 / 执行状态 / 会话依赖同步
+MODDESC_bkn-safe               := MCP 客户端自注册（RFC 7591）/ 已连接客户端查看与断开 / 管理员清理
 
 # 资源中文名（侧栏显示用；未列出的回落为文件名）
 RESNAME_bkn-agent                 := Agent 运行时
@@ -152,15 +168,52 @@ RESNAME_action                    := 行动召回与执行
 RESNAME_data-access               := 数据层直查
 # context-loader（模块限定，避免与 execution-factory 的同名文件互相覆盖）
 RESNAME_context-loader_mcp        := MCP 服务
-RESNAME_context-loader_skill      := Skill 召回
+RESNAME_context-loader_skill                       := Skill 读取与执行
 # execution-factory
 RESNAME_function                  := 函数
 RESNAME_sandbox                   := 沙箱观测
 RESNAME_impex                     := 导入导出
-RESNAME_operator                  := 算子
+RESNAME_category                  := 分类
 RESNAME_toolbox                   := 工具箱
 RESNAME_execution-factory_mcp     := MCP
 RESNAME_execution-factory_skill   := Skill
+RESNAME_bkn-capabilities                           := 能力绑定
+RESNAME_cypher-queries                             := Cypher 查询
+RESNAME_proxy-accounts                             := 代理账户
+RESNAME_kn-versions                                := 版本管理
+RESNAME_context-loader_cypher                      := Cypher 查询
+RESNAME_context-loader_tool                        := 能力检索与调用
+RESNAME_catalog-health-check-schedule              := 目录健康检查调度
+RESNAME_health                                     := 健康检查
+RESNAME_index-capabilities                         := 索引能力
+RESNAME_proxy-resource-read                        := 代理资源读取
+RESNAME_authorization-resources                    := 授权资源目录
+RESNAME_execution-factory_capabilities-lab         := 能力实验室
+RESNAME_mf-model-manager_large-model               := 大模型测试与监控
+RESNAME_mf-model-manager_llm                       := 大模型管理
+RESNAME_mf-model-manager_model-quota               := 模型配额
+RESNAME_mf-model-manager_prompt                    := 提示词管理
+RESNAME_mf-model-manager_small-model               := 小模型管理
+RESNAME_mf-model-api_llm                           := 聊天补全
+RESNAME_mf-model-api_small-model                   := 向量化与重排
+RESNAME_sandbox-control-plane_sandbox-control-plane := 会话与执行管理
+RESNAME_sandbox-executor_sandbox-executor          := 执行与依赖同步
+RESNAME_bkn-safe_authorization                     := 授权校验
+RESNAME_bkn-safe_managed-proxy                     := 受管代理账户
+RESNAME_bkn-safe_oauth-access-origins              := OAuth 访问入口
+RESNAME_bkn-safe_object-grants                     := 对象授权
+RESNAME_bkn-safe_property-grants                   := 属性授权
+RESNAME_bkn-safe_proxy-execution-pep               := 代理执行校验
+RESNAME_bkn-safe_proxy-grants                      := 代理授权
+RESNAME_bkn-safe_oauth-clients                     := 客户端注册与连接
+RESNAME_bkn-safe_departments                       := 部门管理
+RESNAME_bkn-safe_build-grants                      := 构建委托授权
+RESNAME_bkn-safe-admin_role-permissions            := 角色权限
+RESNAME_bkn_bkn-object-metrics-v1                  := 对象指标
+RESNAME_bkn_value-types                            := 值类型
+RESNAME_bkn_kn-events                              := 事件
+RESNAME_ontology-query_object-metrics-v1           := 对象指标
+RESNAME_bkn-safe_self-service                      := 用户自助授权
 
 ## api-docs-html: 用 redocly 为每个 YAML 渲染交互式 HTML 文档（带搜索/折叠/示例），
 ## 输出到 _generated/html/<module>/<resource>.html，并生成一个卡片式 index.html 汇总入口。
@@ -176,8 +229,8 @@ api-docs-html:
 	@cp "$(TPL_DIR)/openbkn-logo.png" "$(HTML_DIR)/openbkn-logo.png"
 	@cp "$(TPL_DIR)/favicon.png" "$(HTML_DIR)/favicon.png"
 	@cp "$(TPL_DIR)/auth.html" "$(HTML_DIR)/auth.html"
-	@echo "==> html: rendering $(words $(foreach m,$(MODULES),$(wildcard $(API_DIR)/$(m)/*.yaml))) yaml (parallel)"
-	@printf '%s\n' $(foreach m,$(MODULES),$(wildcard $(API_DIR)/$(m)/*.yaml)) | \
+	@echo "==> html: rendering $(words $(foreach m,$(MODULES),$(call mod_yamls,$(m)))) yaml (parallel)"
+	@printf '%s\n' $(foreach m,$(MODULES),$(call mod_yamls,$(m))) | \
 	  xargs -n 1 -P 8 sh -c 'y="$$1"; m=$$(basename "$$(dirname "$$y")"); b=$$(basename "$$y" .yaml); \
 	    npx @redocly/cli build-docs "$$y" -o "$(HTML_DIR)/$$m/$$b.html" >/dev/null 2>&1 \
 	    || { echo "build-docs failed: $$y" >&2; exit 1; }' _ \
@@ -187,11 +240,11 @@ api-docs-html:
 	for m in $(MODULES); do \
 	  mt=$$(make -s print-modtitle MOD="$$m"); [ -n "$$mt" ] || mt="$$m"; \
 	  desc=$$(make -s print-moddesc MOD="$$m"); \
-	  count=$$(ls $(API_DIR)/$$m/*.yaml 2>/dev/null | wc -l | tr -d ' '); \
+	  count=$$(make -s print-modyamls MOD="$$m" | wc -w | tr -d ' '); \
 	  printf '<section class="mod">\n<div class="mod-h"><h2>%s</h2><span class="count">%s</span></div>\n' "$$mt" "$$count" >> "$$idx"; \
 	  [ -n "$$desc" ] && printf '<p class="mod-desc">%s</p>\n' "$$desc" >> "$$idx"; \
 	  printf '<div class="grid">\n' >> "$$idx"; \
-	  for y in $(API_DIR)/$$m/*.yaml; do \
+	  for y in $$(make -s print-modyamls MOD="$$m"); do \
 	    [ -e "$$y" ] || continue; \
 	    base=$$(basename "$$y" .yaml); \
 	    rn=$$(make -s print-resname MOD="$$m" RES="$$base"); [ -n "$$rn" ] || rn="$$base"; \
@@ -205,6 +258,10 @@ api-docs-html:
 ## print-modtitle: 内部辅助，回显某模块的显示标题（供 index 生成用）
 print-modtitle:
 	@echo "$(MODTITLE_$(MOD))"
+
+## print-modyamls: 内部辅助，回显某模块实际发布的 YAML 路径（见 MODFILES_<module>）
+print-modyamls:
+	@echo "$(call mod_yamls,$(MOD))"
 
 ## print-moddesc: 内部辅助，回显某模块的中文描述（供 index 生成用）
 print-moddesc:

@@ -22,15 +22,16 @@ import (
 	"github.com/gin-gonic/gin"
 	libdb "github.com/openbkn-ai/bkn-foundry/comm-go/db"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/entitlement"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	_ "go.uber.org/automaxprocs"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common/operationaudit"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/auth"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/bkn_agent"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/build_schedule"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/build_task"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/catalog"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/drivenadapters/catalog_health_check_schedule"
@@ -129,6 +130,7 @@ func (app *App) start() error {
 // connectors, but does not finalize the factory, start workers, or listen for
 // HTTP requests.
 func Boot(_ Options) (*App, error) {
+
 	logger.Info("Server Initializing")
 
 	// Initialize the service configuration
@@ -136,7 +138,7 @@ func Boot(_ Options) (*App, error) {
 	logger.Info("Server Init Setting Success")
 
 	// Set the error code language
-	rest.SetLang(appSetting.ServerSetting.Language)
+	i18n.SetLang(appSetting.ServerSetting.Language)
 	logger.Info("Server Set Language Success")
 
 	// Set the running mode of gin
@@ -161,6 +163,7 @@ func Boot(_ Options) (*App, error) {
 	logics.SetProxyAuthorizationAccess(permission.NewProxyAuthorizationAccess())
 
 	logics.SetBuildTaskAccess(build_task.NewBuildTaskAccess(appSetting))
+	logics.SetBuildScheduleAccess(build_schedule.NewBuildScheduleAccess(appSetting))
 	logics.SetCatalogAccess(catalog.NewCatalogAccess(appSetting))
 	logics.SetCatalogHealthCheckScheduleAccess(catalog_health_check_schedule.NewCatalogHealthCheckScheduleAccess(appSetting))
 	logics.SetConnectorTypeAccess(connector_type.NewConnectorTypeAccess(appSetting))

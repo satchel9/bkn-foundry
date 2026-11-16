@@ -34,6 +34,18 @@ data-migrator executes `init.sql` from the highest version directory and records
 that version as installed. Every version directory must therefore provide a
 complete `init.sql` that can initialize the target database independently.
 
+`init.sql` initializes the current schema and default data directly. Keep
+`UPDATE`, `DELETE`, `ALTER`, and transitions between historical versions in
+numbered incremental scripts. Fresh installations and upgrades must resolve the
+same current defaults; upgrade-only history need not be recreated on a fresh
+installation.
+
+The `bkn-backend/mariadb/0.2.2/init.sql` snapshot also creates the 26 Eval
+storage tables. The community `core-data-migrator` owns their initialization;
+Eval execution and license checks remain in EE. EE startup only verifies the
+installed table/column contract. This addition covers fresh deployment only;
+there is no historical Eval upgrade script or separate EE initializer.
+
 ### Version upgrades
 
 For an existing installation, data-migrator skips every `init.sql` and executes
@@ -70,6 +82,7 @@ When adding a version, all of the following are required:
 | `bkn-backend` | `openbkn` | `adp/bkn/bkn-backend` |
 | `bkn-backend-trace-outbox` | `openbkn` | `adp/bkn/bkn-backend` |
 | `ontology-query-trace-outbox` | `openbkn` | `adp/bkn/ontology-query` |
+| `bkn-project` | `openbkn` | `adp/bkn/bkn-project` |
 | `vega-backend` | `openbkn` | `vega/vega-backend` |
 | `agent-operator-integration` | `openbkn` | `adp/execution-factory/operator-integration` |
 | `mf-model-manager` | `openbkn` | `infra/mf-model-manager` |

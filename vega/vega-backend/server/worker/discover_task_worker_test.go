@@ -10,11 +10,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -87,7 +88,7 @@ func TestDiscoverTaskWorkerCancelsTaskWhenCatalogWasDeleted(t *testing.T) {
 	}, nil)
 	dts.EXPECT().InternalMarkRunning(gomock.Any(), "task-1").Return(true, nil)
 	cs.EXPECT().InternalGetByID(gomock.Any(), "catalog-1", true).
-		Return(nil, &rest.HTTPError{HTTPCode: http.StatusNotFound})
+		Return(nil, &httperrors.HTTPError{HTTPCode: http.StatusNotFound})
 	dts.EXPECT().InternalMarkCancelled(gomock.Any(), "task-1", "catalog deleted").Return(true, nil)
 
 	require.NoError(t, worker.Run(context.Background(), "task-1"))
@@ -522,6 +523,9 @@ func TestDiscoverTaskWorkerCountResources(t *testing.T) {
 			require.NoError(t, err)
 			switch scenario {
 			case "mixed":
+				require.Len(t, result.Failures, 1)
+				assert.Equal(t, "bad", result.Failures[0].ResourceID)
+				assert.Equal(t, "timeout", result.Failures[0].Code)
 				require.Equal(t, 1, result.UpdatedCount)
 				require.Equal(t, 1, result.FailedCount)
 				require.Equal(t, 1, result.SkippedCount)
@@ -641,6 +645,17 @@ func TestDiscoverTaskWorkerCountResourcesIndexes(t *testing.T) {
 			result, err = worker.countResources(ctx, catalog, task)
 			require.NoError(t, err)
 			if scenario == "query failure" || scenario == "save failure" || scenario == "cancelled during query" {
+				require.Len(t, result.Failures, 1)
+				assert.Equal(t, "index", result.Failures[0].ResourceID)
+				switch scenario {
+				case "save failure":
+					assert.Equal(t, "save_failed", result.Failures[0].Code)
+				case "query failure":
+					assert.Equal(t, "timeout", result.Failures[0].Code)
+				default:
+					assert.Equal(t, "count_failed", result.Failures[0].Code)
+				}
+
 				require.True(t, result.Failed)
 				require.Equal(t, 1, result.FailedCount)
 				require.Zero(t, result.UpdatedCount)
@@ -731,7 +746,7 @@ func TestDiscoverTaskWorkerCombinedDiscoveryAndCount(t *testing.T) {
 						}
 						if !countWithoutRefresh {
 
-							metadataCall = c.EXPECT().GetTableMeta(gomock.Any(), table).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta) error {
+							metadataCall = c.EXPECT().GetTableMeta(gomock.Any(), table, entry == "resource").DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta, _ bool) error {
 								meta.Properties = map[string]any{"estimated_row_count": int64(99)}
 								table.Properties = meta.Properties
 								return metadataErr
@@ -920,9 +935,9 @@ func TestDiscoverTaskWorkerCountLogicalView(t *testing.T) {
 			resourcelogic.SetLogicalViewService(lvs)
 			t.Cleanup(func() { resourcelogic.SetLogicalViewService(previous) })
 			view := &interfaces.Resource{ID: "view", CatalogID: "logical", Category: interfaces.ResourceCategoryLogicalView, UpdateTime: 10,
-				LogicType:       interfaces.LogicType_Derived,
-				LogicDefinition: &interfaces.DerivedLogicDefinition{SourceResourceID: "source", FilterCondition: map[string]any{"field": "status", "operation": "==", "value": "active"}},
-				SourceMetadata:  map[string]any{"properties": map[string]any{"row_count": int64(99), "row_count_time": int64(20)}},
+				LogicalType:           interfaces.LogicalType_Derived,
+				LogicalViewDefinition: &interfaces.DerivedLogicalViewDefinition{SourceResourceID: "source", FilterCondition: map[string]any{"field": "status", "operation": "==", "value": "active"}},
+				SourceMetadata:        map[string]any{"properties": map[string]any{"row_count": int64(99), "row_count_time": int64(20)}},
 			}
 			catalog := &interfaces.Catalog{ID: "logical", Type: interfaces.CatalogTypeLogical}
 			task := &interfaces.DiscoverTask{ID: "task", ResourceID: "view"}
@@ -944,7 +959,7 @@ func TestDiscoverTaskWorkerCountLogicalView(t *testing.T) {
 			}
 			lvs.EXPECT().QueryWithPaging(gomock.Any(), view, gomock.Any()).DoAndReturn(func(queryCtx context.Context, got *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				require.Same(t, view, got)
-				require.Same(t, view.LogicDefinition, got.LogicDefinition, "the view service must receive the complete fixed filter")
+				require.Same(t, view.LogicalViewDefinition, got.LogicalViewDefinition, "the view service must receive the complete fixed filter")
 				require.True(t, params.NeedTotal)
 				require.NotNil(t, params.IgnoreLocalIndex)
 				require.True(t, *params.IgnoreLocalIndex)
@@ -992,6 +1007,16 @@ func TestDiscoverTaskWorkerCountLogicalView(t *testing.T) {
 				require.Zero(t, result.FailedCount)
 			} else {
 				require.Equal(t, 1, result.FailedCount)
+				require.Len(t, result.Failures, 1)
+				assert.Equal(t, "view", result.Failures[0].ResourceID)
+				switch scenario {
+				case "save failure":
+					assert.Equal(t, "save_failed", result.Failures[0].Code)
+				case "query failure":
+					assert.Equal(t, "count_failed", result.Failures[0].Code)
+				default:
+					assert.Equal(t, "invalid_count", result.Failures[0].Code)
+				}
 				require.Equal(t, int64(99), view.SourceMetadata["properties"].(map[string]any)["row_count"])
 			}
 			if scenario == "catalog" {
@@ -1013,7 +1038,7 @@ func TestDiscoverTaskWorkerDiscoverResource(t *testing.T) {
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
 		connector.EXPECT().Close(gomock.Any()).Return(nil)
 		connector.EXPECT().DecodeTableMeta(resource.SourceMetadata).Return(&interfaces.TableMeta{Name: "orders", Database: "app", Schema: "public", Description: "old comment"}, nil)
-		connector.EXPECT().GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "orders", Database: "app", Schema: "public", Description: "old comment"}).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta) error {
+		connector.EXPECT().GetTableMeta(gomock.Any(), &interfaces.TableMeta{Name: "orders", Database: "app", Schema: "public", Description: "old comment"}, true).DoAndReturn(func(_ context.Context, meta *interfaces.TableMeta, _ bool) error {
 			meta.Description = "new comment"
 			return nil
 		})
@@ -1113,7 +1138,7 @@ func TestDiscoverTaskWorkerDiscoverResource(t *testing.T) {
 			if !tc.invalid {
 				meta := &interfaces.TableMeta{Database: "app", Schema: "sales.eu", Name: "order.items", Description: "source comment", Columns: []interfaces.TableColumnMeta{{Name: "id", Type: "int"}}}
 				connector.EXPECT().DecodeTableMeta(tc.metadata).Return(meta, nil)
-				connector.EXPECT().GetTableMeta(gomock.Any(), meta).DoAndReturn(func(_ context.Context, table *interfaces.TableMeta) error {
+				connector.EXPECT().GetTableMeta(gomock.Any(), meta, true).DoAndReturn(func(_ context.Context, table *interfaces.TableMeta, _ bool) error {
 					table.Description = "new source comment"
 					return nil
 				})
@@ -1134,5 +1159,50 @@ func TestDiscoverTaskWorkerDiscoverResource(t *testing.T) {
 				assert.Zero(t, result.FailedCount)
 			}
 		})
+	}
+}
+
+func TestRecordCountQueryFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name, code string
+		err        error
+	}{
+		{"wrapped timeout", "timeout", fmt.Errorf("source query: %w", context.DeadlineExceeded)},
+		{"unavailable", "count_unavailable", interfaces.ErrRowCountUnavailable},
+		{"invalid", "invalid_count", errInvalidExactCount},
+		{"forbidden", "source_read_forbidden", interfaces.NewSourceReadForbiddenError(errors.New("private-value"))},
+		{"wrapped memory error", "source_memory_limit", fmt.Errorf("count query: %w", interfaces.NewSourceMemoryLimitError(errors.New("private-value")))},
+		{"unknown", "count_failed", errors.New("private-value")},
+		{"unclassified source text", "count_failed", errors.New("[MEM_ALLOC_FAILED] private-value")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := &interfaces.DiscoverResult{UpdatedCount: 1}
+			recordCountQueryFailure(result, &interfaces.Resource{ID: "r1", Name: "Orders"}, tc.err)
+			recordCountQueryFailure(result, &interfaces.Resource{ID: "r2", Name: "Items"}, tc.err)
+			require.Len(t, result.Failures, 2)
+			assert.Equal(t, 2, result.FailedCount)
+			assert.Equal(t, 1, result.UpdatedCount)
+			assert.Equal(t, "r2", result.Failures[1].ResourceID)
+			assert.Equal(t, tc.code, result.Failures[0].Code)
+			assert.NotContains(t, result.Failures[0].Message, "private-value")
+			assert.NotEmpty(t, result.Failures[0].Message)
+		})
+	}
+}
+
+func TestRecordCountSaveFailure(t *testing.T) {
+	result := &interfaces.DiscoverResult{UpdatedCount: 1}
+	recordCountSaveFailure(result, &interfaces.Resource{ID: "r1", Name: "Orders"})
+	recordCountSaveFailure(result, &interfaces.Resource{ID: "r2", Name: "Items"})
+	require.Len(t, result.Failures, 2)
+	assert.Equal(t, 2, result.FailedCount)
+	assert.Equal(t, 1, result.UpdatedCount)
+	assert.Equal(t, "r1", result.Failures[0].ResourceID)
+	assert.Equal(t, "Orders", result.Failures[0].ResourceName)
+	assert.Equal(t, "r2", result.Failures[1].ResourceID)
+	assert.Equal(t, "Items", result.Failures[1].ResourceName)
+	for _, failure := range result.Failures {
+		assert.Equal(t, "save_failed", failure.Code)
+		assert.NotEmpty(t, failure.Message)
 	}
 }

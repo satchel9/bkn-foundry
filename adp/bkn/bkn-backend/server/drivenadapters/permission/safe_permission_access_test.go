@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // capturedFilter is the decoded /resource-filter request body.
@@ -66,6 +66,22 @@ func newFilterStub(t *testing.T, reply map[string][]string) (*safePermissionAcce
 	}))
 	t.Cleanup(srv.Close)
 	return &safePermissionAccess{safe: newSafeClient(srv.URL)}, calls
+}
+
+func TestSafeClientUsesDedicatedResourceCleanupTimeout(t *testing.T) {
+	t.Setenv(resourceCleanupTimeoutEnv, "17s")
+	client := newSafeClient("http://bkn-safe:3000")
+	if client.http.Timeout != defaultSafeTimeout {
+		t.Fatalf("regular timeout = %s, want %s", client.http.Timeout, defaultSafeTimeout)
+	}
+	if client.cleanupHTTP.Timeout != 17*time.Second {
+		t.Fatalf("cleanup timeout = %s, want 17s", client.cleanupHTTP.Timeout)
+	}
+
+	t.Setenv(resourceCleanupTimeoutEnv, "invalid")
+	if got := newSafeClient("http://bkn-safe:3000").cleanupHTTP.Timeout; got != defaultResourceCleanupTimeout {
+		t.Fatalf("invalid cleanup timeout fallback = %s, want %s", got, defaultResourceCleanupTimeout)
+	}
 }
 
 func TestSafeCheckUsesDefaultEffectiveDecision(t *testing.T) {
@@ -173,6 +189,40 @@ func TestSafeListAccessibleResourcesWithAnyOperationUsesQuery(t *testing.T) {
 	if err != nil || scope.Unrestricted || scope.RequiresCandidateFilter ||
 		!reflect.DeepEqual(scope.ResourceIDs, []string{"kn-1/query-only"}) {
 		t.Fatalf("ListAccessibleResourcesWithAnyOperation() = %#v, %v", scope, err)
+	}
+}
+
+func TestSafeListAccessibleResourcesWithAnyOperationFallsBackForLegacySafe(t *testing.T) {
+	calls := []string{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		if query.Get("any_operation") == "true" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		operation := query.Get("operation")
+		calls = append(calls, operation)
+		if operation == interfaces.OPERATION_TYPE_QUERY_DATA {
+			_, _ = w.Write([]byte(`{"ids":["kn-1/query-only"],"unrestricted":false,"requires_candidate_filter":false}`))
+			return
+		}
+		if operation == interfaces.OPERATION_TYPE_MODIFY {
+			_, _ = w.Write([]byte(`{"ids":["kn-1/query-only","kn-1/modify-only"],"unrestricted":false,"requires_candidate_filter":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ids":[],"unrestricted":false,"requires_candidate_filter":false}`))
+	}))
+	defer srv.Close()
+
+	scope, err := NewPermissionAccess(srv.URL).ListAccessibleResourcesWithAnyOperation(
+		context.Background(), interfaces.PermissionAccessor{ID: "u-1", Type: interfaces.ACCESSOR_TYPE_USER},
+		interfaces.RESOURCE_TYPE_OBJECT_TYPE)
+	if err != nil || scope.Unrestricted || !scope.RequiresCandidateFilter ||
+		!reflect.DeepEqual(scope.ResourceIDs, []string{"kn-1/query-only", "kn-1/modify-only"}) {
+		t.Fatalf("legacy fallback scope = %#v, %v", scope, err)
+	}
+	if len(calls) != len(concreteResourceOperations) {
+		t.Fatalf("legacy fallback calls = %v, want %d concrete operations", calls, len(concreteResourceOperations))
 	}
 }
 

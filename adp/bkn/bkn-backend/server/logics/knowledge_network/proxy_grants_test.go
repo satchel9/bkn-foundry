@@ -12,12 +12,12 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.uber.org/mock/gomock"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 // projectionFixture is the persisted main model ExportKNForProjection returns.
@@ -51,7 +51,6 @@ func newProjectionService(t *testing.T, fixture *projectionFixture, kpa interfac
 	ota := bmock.NewMockObjectTypeAccess(ctrl)
 	rta := bmock.NewMockRelationTypeAccess(ctrl)
 	ata := bmock.NewMockActionTypeAccess(ctrl)
-	ma := bmock.NewMockMetricAccess(ctrl)
 	cba := bmock.NewMockCapabilityBindingAccess(ctrl)
 	kna.EXPECT().GetKNByID(gomock.Any(), fixture.kn.KNID, interfaces.MAIN_BRANCH).DoAndReturn(
 		func(context.Context, string, string) (*interfaces.KN, error) {
@@ -65,14 +64,14 @@ func newProjectionService(t *testing.T, fixture *projectionFixture, kpa interfac
 		}).AnyTimes()
 	rta.EXPECT().ListRelationTypes(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	ata.EXPECT().ListActionTypes(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
-	ma.EXPECT().ListMetrics(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	cba.EXPECT().ListBindings(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(context.Context, interfaces.CapabilityBindingsQueryParams) ([]*interfaces.CapabilityBinding, error) {
 			return fixture.bindings, nil
 		}).AnyTimes()
-	return &knowledgeNetworkService{kna: kna, cga: cga, ota: ota, rta: rta, ata: ata, ma: ma, cba: cba, kpa: kpa, mpa: mpa}
+	return &knowledgeNetworkService{kna: kna, cga: cga, ota: ota, rta: rta, ata: ata, cba: cba, kpa: kpa, mpa: mpa}
 }
 
+//nolint:unused // Intentionally retained.
 func fixtureVersion(t *testing.T, fixture *projectionFixture) string {
 	t.Helper()
 	_, version, err := buildProxyGrantSourcesWithCapabilities(fixture.kn, fixture.bindings)
@@ -150,14 +149,14 @@ func TestPreflightStillRefusesMissingDataPermissionWithoutListingSkills(t *testi
 	service := &knowledgeNetworkService{mpa: safe}
 
 	_, err := service.preflightProxySources(t.Context(), "proxy-1", "editor-1", skillAndDataSources())
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusForbidden ||
-		httpErr.BaseError.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyPermissionMissing {
+		httpErr.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyPermissionMissing {
 		t.Fatalf("preflight error = %v, want ProxyPermissionMissing", err)
 	}
-	details, ok := httpErr.BaseError.ErrorDetails.(missingProxyPermissionDetails)
+	details, ok := httpErr.ErrorDetails.(missingProxyPermissionDetails)
 	if !ok || len(details.MissingPermissions) != 1 || details.MissingPermissions[0].ResourceID != "resource-1" {
-		t.Fatalf("missing permissions = %#v, want only the data source", httpErr.BaseError.ErrorDetails)
+		t.Fatalf("missing permissions = %#v, want only the data source", httpErr.ErrorDetails)
 	}
 }
 
@@ -190,7 +189,7 @@ func TestPreflightKeepsSkillsWhenSafeIsUnavailable(t *testing.T) {
 	service := &knowledgeNetworkService{mpa: safe}
 
 	_, err := service.preflightProxySources(t.Context(), "proxy-1", "editor-1", skillAndDataSources())
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) || httpErr.HTTPCode != http.StatusServiceUnavailable {
 		t.Fatalf("preflight error = %v, want unavailable", err)
 	}
@@ -315,8 +314,8 @@ func TestResolveKNProxyBindingFollowsPublishedSkillSnapshot(t *testing.T) {
 		t.Fatalf("newly mounted skill was refused: %v", err)
 	}
 	_, err = service.ResolveKNProxyBinding(t.Context(), "kn-1", skill("binding-skill-1", "skill-1"))
-	var httpErr *rest.HTTPError
-	if !errors.As(err, &httpErr) || httpErr.BaseError.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyBindingInvalid {
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyBindingInvalid {
 		t.Fatalf("released skill resolve error = %v, want ProxyBindingInvalid", err)
 	}
 }
@@ -347,19 +346,24 @@ func TestPublishKNCapabilityMutationRequiresExecuteOnANewlyMountedSkill(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer db.Close()
+		defer func() {
+			sqlMock.ExpectClose()
+			if err := db.Close(); err != nil {
+				t.Errorf("close mock database: %v", err)
+			}
+		}()
 		sqlMock.ExpectBegin()
 		sqlMock.ExpectRollback()
 		service.db = db
 
 		_, err = service.PublishKNCapabilityMutation(ctx, "kn-1", interfaces.MAIN_BRANCH, nil, mutate)
-		var httpErr *rest.HTTPError
-		if !errors.As(err, &httpErr) || httpErr.BaseError.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyPermissionMissing {
+		var httpErr *httperrors.HTTPError
+		if !errors.As(err, &httpErr) || httpErr.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyPermissionMissing {
 			t.Fatalf("mount error = %v, want ProxyPermissionMissing", err)
 		}
-		details, _ := httpErr.BaseError.ErrorDetails.(missingProxyPermissionDetails)
+		details, _ := httpErr.ErrorDetails.(missingProxyPermissionDetails)
 		if len(details.MissingPermissions) != 1 || details.MissingPermissions[0].ResourceType != interfaces.KNProxyTargetTypeSkill {
-			t.Fatalf("missing permissions = %#v", httpErr.BaseError.ErrorDetails)
+			t.Fatalf("missing permissions = %#v", httpErr.ErrorDetails)
 		}
 		if kpa.pendingCount != 0 || safe.syncCalls != 0 {
 			t.Fatal("a refused mount marked the proxy pending or synchronized it")
@@ -380,7 +384,12 @@ func TestPublishKNCapabilityMutationRequiresExecuteOnANewlyMountedSkill(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer db.Close()
+		defer func() {
+			sqlMock.ExpectClose()
+			if err := db.Close(); err != nil {
+				t.Errorf("close mock database: %v", err)
+			}
+		}()
 		sqlMock.ExpectBegin()
 		sqlMock.ExpectCommit()
 		service.db = db
@@ -399,6 +408,58 @@ func TestPublishKNCapabilityMutationRequiresExecuteOnANewlyMountedSkill(t *testi
 	})
 }
 
+// A knowledge base the editor cannot read is refused at mount time, like a Skill they cannot run
+// (#2576): a mount the proxy could never read would only advertise something unusable.
+func TestPublishKNCapabilityMutationRequiresQueryDataOnANewlyMountedKnowledgeBase(t *testing.T) {
+	ctx := context.WithValue(t.Context(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "editor-1"})
+	newKB := &interfaces.CapabilityBinding{
+		ID: "binding-kb-7", KNID: "kn-1", Branch: interfaces.MAIN_BRANCH,
+		CapabilityType: interfaces.CAPABILITY_TYPE_KNOWLEDGE_BASE, CapabilityID: "7",
+	}
+	mutate := func(context.Context, *sql.Tx) (*interfaces.KNCapabilityMutationResult, error) {
+		return &interfaces.KNCapabilityMutationResult{Bindings: []*interfaces.CapabilityBinding{newKB}}, nil
+	}
+	fixture := newSkillProjectionFixture()
+	fixture.bindings = nil
+	kpa := &proxyAccessStub{mapping: &interfaces.KNProxyAccount{KNID: "kn-1", ProxyAccountID: "proxy-1",
+		LifecycleStatus: interfaces.KNProxyLifecycleActive}}
+	safe := &skillAwareSafeStub{managedProxyAccessStub: &managedProxyAccessStub{
+		allowed: true, deniedResources: map[string]bool{"7": true},
+	}}
+	service := newProjectionService(t, fixture, kpa, safe)
+	db, sqlMock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		sqlMock.ExpectClose()
+		if err := db.Close(); err != nil {
+			t.Errorf("close mock database: %v", err)
+		}
+	}()
+	sqlMock.ExpectBegin()
+	sqlMock.ExpectRollback()
+	service.db = db
+
+	_, err = service.PublishKNCapabilityMutation(ctx, "kn-1", interfaces.MAIN_BRANCH, nil, mutate)
+	var httpErr *httperrors.HTTPError
+	if !errors.As(err, &httpErr) || httpErr.ErrorCode != berrors.BknBackend_KnowledgeNetwork_ProxyPermissionMissing {
+		t.Fatalf("mount error = %v, want ProxyPermissionMissing", err)
+	}
+	details, _ := httpErr.ErrorDetails.(missingProxyPermissionDetails)
+	if len(details.MissingPermissions) != 1 ||
+		details.MissingPermissions[0].ResourceType != interfaces.KNProxyTargetTypeKnowledgeBase ||
+		details.MissingPermissions[0].Operation != interfaces.OPERATION_TYPE_QUERY_DATA {
+		t.Fatalf("missing permissions = %#v", httpErr.ErrorDetails)
+	}
+	if kpa.pendingCount != 0 || safe.syncCalls != 0 {
+		t.Fatal("a refused mount marked the proxy pending or synchronized it")
+	}
+	if err := sqlMock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPublishKNCapabilityMutationMountsASkillWhileSafePredatesSkillSources(t *testing.T) {
 	ctx := context.WithValue(t.Context(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "editor-1"})
 	fixture := newSkillProjectionFixture()
@@ -411,7 +472,12 @@ func TestPublishKNCapabilityMutationMountsASkillWhileSafePredatesSkillSources(t 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		sqlMock.ExpectClose()
+		if err := db.Close(); err != nil {
+			t.Errorf("close mock database: %v", err)
+		}
+	}()
 	sqlMock.ExpectBegin()
 	sqlMock.ExpectCommit()
 	service.db = db
@@ -455,7 +521,12 @@ func TestPublishKNCapabilityMutationKeepsFunctionGrantType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() {
+		sqlMock.ExpectClose()
+		if err := db.Close(); err != nil {
+			t.Errorf("close mock database: %v", err)
+		}
+	}()
 	sqlMock.ExpectBegin()
 	sqlMock.ExpectCommit()
 	service.db = db

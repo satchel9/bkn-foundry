@@ -9,15 +9,15 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	cond "ontology-query/common/condition"
-	"ontology-query/common/maskrule"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	"ontology-query/logics"
-	propertyaccess "ontology-query/logics/property_access"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/maskrule"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
+	propertyaccess "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/property_access"
 )
 
 type propertyAccessPlan struct {
@@ -157,8 +157,8 @@ func buildPropertyAccessPlan(ctx context.Context, resolver interfaces.PropertyAc
 		!logics.ShouldExcludeSystemProperty(interfaces.SORT_FIELD_SCORE, query.ExcludeSystemProperties)
 
 	if len(plan.returnData) == 0 && len(plan.returnLogic) == 0 {
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
-			WithErrorDetails("the request has no returnable properties")
+		return nil, withPropertyUnavailableReason(httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden).
+			WithErrorDetails("the request has no returnable properties"))
 	}
 	return plan, nil
 }
@@ -384,22 +384,28 @@ func (plan *propertyAccessPlan) filterResourceSchema(response *interfaces.Resour
 	response.EffectivePermissions = plan.effective
 }
 
-func unavailablePropertyError(ctx context.Context) error {
-	return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
-		WithErrorDetails("the request contains an unavailable property")
+func unavailablePropertyError(ctx context.Context) *httperrors.HTTPError {
+	return withPropertyUnavailableReason(httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
+		WithErrorDetails("the request contains an unavailable property"))
 }
 
-func unavailableOperationPropertyError(ctx context.Context) error {
-	return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
-		WithErrorDetails("the request contains a property unavailable for this operation")
+func unavailableOperationPropertyError(ctx context.Context) *httperrors.HTTPError {
+	return withPropertyUnavailableReason(httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
+		WithErrorDetails("the request contains a property unavailable for this operation"))
+}
+
+// A missing property and a denied property must remain indistinguishable to callers.
+// The reason identifies an unavailable input without exposing whether it exists.
+func withPropertyUnavailableReason(err *httperrors.HTTPError) *httperrors.HTTPError {
+	return err.WithMetadata(map[string]any{"reason": "property_unavailable"})
 }
 
 func propertyDecisionUnavailable(ctx context.Context, err error) error {
-	return rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+	return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 		oerrors.OntologyQuery_InternalError_CheckPermissionFailed).WithErrorDetails(err.Error())
 }
 
 func invalidQueryCursorError(ctx context.Context) error {
-	return rest.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
+	return httperrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.OntologyQuery_ObjectType_InvalidParameter).
 		WithErrorDetails("query cursor is invalid or expired")
 }

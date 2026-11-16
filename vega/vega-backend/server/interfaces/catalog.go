@@ -34,6 +34,8 @@ var CATALOG_SORT = map[string]struct{}{
 	CatalogSortUpdateTime: {},
 }
 
+// CatalogDeletionTaskImpact 统计全部关联任务记录，包括待执行任务和终态历史。
+// 存在阻断任务时，整个目录均不可删除。
 type CatalogDeletionTaskImpact struct {
 	WillDelete int64 `json:"will_delete"`
 	Blocking   int64 `json:"blocking"`
@@ -48,6 +50,7 @@ type CatalogDeletionImpact struct {
 	BuildTasks                  CatalogDeletionTaskImpact `json:"build_tasks"`
 	DiscoverTasks               CatalogDeletionTaskImpact `json:"discover_tasks"`
 	SemanticUnderstandingTasks  CatalogDeletionTaskImpact `json:"semantic_understanding_tasks"`
+	BuildSchedules              int64                     `json:"build_schedules"`
 	DiscoverSchedules           int64                     `json:"discover_schedules"`
 	CatalogHealthCheckSchedules int64                     `json:"catalog_health_check_schedules"`
 	Resources                   int                       `json:"resources"`
@@ -74,6 +77,7 @@ type Catalog struct {
 	Builtin bool `json:"built_in"`
 
 	ConnectorType string          `json:"connector_type"`
+	Category      string          `json:"category"` // Server-derived connector category; empty for logical catalogs.
 	ConnectorCfg  ConnectorConfig `json:"connector_config"`
 	Metadata      map[string]any  `json:"metadata"`
 
@@ -101,6 +105,7 @@ type CatalogSummary struct {
 	Builtin bool   `json:"built_in"`
 
 	ConnectorType string   `json:"connector_type"`
+	Category      string   `json:"category"` // Server-derived connector category; empty for logical catalogs.
 	Schemas       []string `json:"schemas"`
 
 	CatalogHealthCheckStatus

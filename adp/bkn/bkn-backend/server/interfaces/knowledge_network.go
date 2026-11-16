@@ -7,8 +7,8 @@
 package interfaces
 
 import (
-	cond "bkn-backend/common/condition"
-	"bkn-backend/interfaces/data_type"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 const (
@@ -118,16 +118,31 @@ type KN struct {
 	KNName     string `json:"name" mapstructure:"name"`
 	CommonInfo `mapstructure:",squash"`
 
+	// ImportSkipped is a transient service result, never accepted from or sent to clients.
+	ImportSkipped bool `json:"-" mapstructure:"-"`
+
 	SkillContent string `json:"skill_content,omitempty" mapstructure:"skill_content"`
+	// KeepSkillContent tells UpdateKN to leave the stored skill content alone, set when an
+	// update request leaves skill_content out.
+	KeepSkillContent bool `json:"-" mapstructure:"-"`
+	// ReplaceContent makes an overwrite import delete the definitions the package leaves out.
+	ReplaceContent bool `json:"-" mapstructure:"-"`
 
 	Branch string `json:"branch,omitempty" mapstructure:"branch"`
+	// Versioning is true in a create request for a network versioned from the start, and the
+	// version state in a read of a versioned network.
+	Versioning *KNVersioningField `json:"versioning,omitempty" mapstructure:"-"`
 
-	ConceptGroups []*ConceptGroup     `json:"concept_groups,omitempty" mapstructure:"concept_groups"`
-	ObjectTypes   []*ObjectType       `json:"object_types,omitempty" mapstructure:"object_types"`
-	RelationTypes []*RelationType     `json:"relation_types,omitempty" mapstructure:"relation_types"`
-	ActionTypes   []*ActionType       `json:"action_types,omitempty" mapstructure:"action_types"`
-	RiskTypes     []*RiskType         `json:"risk_types,omitempty" mapstructure:"risk_types"`
-	Metrics       []*MetricDefinition `json:"metrics,omitempty" mapstructure:"metrics"`
+	ConceptGroups []*ConceptGroup `json:"concept_groups,omitempty" mapstructure:"concept_groups"`
+	ObjectTypes   []*ObjectType   `json:"object_types,omitempty" mapstructure:"object_types"`
+	RelationTypes []*RelationType `json:"relation_types,omitempty" mapstructure:"relation_types"`
+	ActionTypes   []*ActionType   `json:"action_types,omitempty" mapstructure:"action_types"`
+	RiskTypes     []*RiskType     `json:"risk_types,omitempty" mapstructure:"risk_types"`
+	// ValueTypes are the BKN spec 3.0 value types of the network; an import writes them before the
+	// object types that name them.
+	ValueTypes []*ValueType `json:"value_types,omitempty" mapstructure:"value_types"`
+	// ObjectMetrics is an internal BKN archive projection, not a bulk-create API field.
+	ObjectMetrics []*ObjectMetricRecordV1 `json:"-" mapstructure:"-"`
 
 	Creator    AccountInfo `json:"creator" mapstructure:"creator"`
 	CreateTime int64       `json:"create_time" mapstructure:"create_time"`
@@ -166,13 +181,21 @@ type OverviewGraphQuery struct {
 	ConceptGroupID    string
 }
 
+type OverviewGraphConceptGroup struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type OverviewGraphNode struct {
-	ID          string                 `json:"id"`
-	Name        string                 `json:"name"`
-	Icon        string                 `json:"icon,omitempty"`
-	Color       string                 `json:"color,omitempty"`
-	IndexStatus *ObjectTypeIndexStatus `json:"index_status,omitempty"`
-	Degree      int                    `json:"degree,omitempty"`
+	ID            string                      `json:"id"`
+	Name          string                      `json:"name"`
+	Icon          string                      `json:"icon,omitempty"`
+	Color         string                      `json:"color,omitempty"`
+	IndexStatus   *ObjectTypeIndexStatus      `json:"index_status,omitempty"`
+	Degree        int                         `json:"degree,omitempty"`
+	ConceptGroups []OverviewGraphConceptGroup `json:"concept_groups,omitempty"`
+	// Lifecycle is left out while the object type is active.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 }
 
 type OverviewGraphEdge struct {
@@ -181,6 +204,8 @@ type OverviewGraphEdge struct {
 	SourceID    string `json:"source_id"`
 	TargetID    string `json:"target_id"`
 	MappingMode string `json:"mapping_mode"`
+	// Lifecycle is left out while the relation type is active.
+	Lifecycle *Lifecycle `json:"lifecycle,omitempty"`
 }
 
 type OverviewGraph struct {
@@ -333,6 +358,10 @@ type AuthorizationResourcesQuery struct {
 type ConceptsQuery struct {
 	ConceptGroups []string       `json:"concept_groups,omitempty"`
 	Condition     map[string]any `json:"condition,omitempty"`
+	// ExcludeDeprecated leaves deprecated object types, relation types and action types out, as
+	// concept recall does; a query by ID still returns them. A backend before it ignores the field
+	// and returns them, so a newer caller degrades to no filtering instead of failing.
+	ExcludeDeprecated bool `json:"exclude_deprecated,omitempty"`
 	// Pagination information.
 	NeedTotal bool          `json:"need_total"`
 	Limit     int           `json:"limit"`
@@ -386,9 +415,8 @@ type BatchIDIndex struct {
 	Branch string
 
 	ObjectTypes     map[string]*ObjectType
+	RelationTypes   map[string]*RelationType
 	RelationTypeIDs map[string]struct{}
 	ActionTypeIDs   map[string]struct{}
 	ConceptGroupIDs map[string]struct{}
-	// Metrics maps metric id -> declaration from the KN payload for duplicate/conflict checks and strict cross-validation against batch.ObjectTypes (same batch OT semantics as relation/action validators).
-	Metrics map[string]*MetricDefinition
 }

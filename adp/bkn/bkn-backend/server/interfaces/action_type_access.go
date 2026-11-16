@@ -17,6 +17,10 @@ type ActionTypeAccess interface {
 	CheckActionTypeExistByName(ctx context.Context, knID string, branch string, atName string) (string, bool, error)
 	GetActionTypeIdentitiesByIDsOrNames(ctx context.Context, knID string, branch string,
 		atIDs, atNames []string) ([]*ActionType, error)
+	// ListAliasedActionTypes lists the ID, name and aliases of every action type of the branch that has aliases.
+	ListAliasedActionTypes(ctx context.Context, knID string, branch string) ([]*ActionType, error)
+	// ListDeprecatedActionTypes lists the ID, name and lifecycle of every deprecated action type of the branch.
+	ListDeprecatedActionTypes(ctx context.Context, knID string, branch string) ([]*ActionType, error)
 
 	CreateActionType(ctx context.Context, tx *sql.Tx, actionType *ActionType) error
 	CreateActionTypes(ctx context.Context, tx *sql.Tx, actionTypes []*ActionType) error

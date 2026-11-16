@@ -1,5 +1,4 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
 // Licensed under the Apache License, Version 2.0. See the LICENSE file in the project root for details.
 
@@ -9,55 +8,13 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bytedance/sonic"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
-
-func TestOpenSearchConnectorMetadataAndNew(t *testing.T) {
-	connector := &OpenSearchConnector{}
-
-	assert.Equal(t, interfaces.ConnectorTypeOpenSearch, connector.GetType())
-	assert.Equal(t, interfaces.ConnectorTypeOpenSearch, connector.GetName())
-	assert.Equal(t, interfaces.ConnectorModeLocal, connector.GetMode())
-	assert.Equal(t, interfaces.ConnectorCategoryIndex, connector.GetCategory())
-	assert.Equal(t, []string{"password"}, connector.GetSensitiveFields())
-
-	assert.False(t, connector.GetEnabled())
-	connector.SetEnabled(true)
-	assert.True(t, connector.GetEnabled())
-	fields := connector.GetFieldConfig()
-	assert.Equal(t, map[string]interfaces.ConnectorFieldConfig{
-		"host":           {Name: "主机地址", Type: "string", Description: "OpenSearch 服务器主机地址", Required: true, Encrypted: false},
-		"port":           {Name: "端口号", Type: "integer", Description: "OpenSearch 服务器端口", Required: true, Encrypted: false},
-		"username":       {Name: "用户名", Type: "string", Description: "认证用户名", Required: false, Encrypted: false},
-		"password":       {Name: "密码", Type: "string", Description: "认证密码", Required: false, Encrypted: true},
-		"index_patterns": {Name: "索引模式", Type: "array", Description: "索引匹配模式列表（可选，如 log-*）", Required: false, Encrypted: false},
-	}, fields)
-	require.Contains(t, fields, "password")
-	assert.True(t, fields["password"].Encrypted)
-	require.Contains(t, fields, "index_patterns")
-	assert.False(t, fields["index_patterns"].Required)
-
-	instance, err := connector.New(interfaces.ConnectorConfig{
-		"host":           "127.0.0.1",
-		"port":           9200,
-		"username":       "admin",
-		"password":       "secret",
-		"index_patterns": []string{"log-*", "metric-*"},
-	})
-	require.NoError(t, err)
-	require.IsType(t, &OpenSearchConnector{}, instance)
-	osConnector := instance.(*OpenSearchConnector)
-	require.NotNil(t, osConnector.Config)
-	assert.Equal(t, "127.0.0.1", osConnector.Config.Host)
-	assert.Equal(t, 9200, osConnector.Config.Port)
-	assert.Equal(t, []string{"log-*", "metric-*"}, osConnector.Config.IndexPatterns)
-	require.NoError(t, osConnector.Close(t.Context()))
-	assert.Nil(t, osConnector.client)
-}
 
 func TestOpenSearchConnectorMapType(t *testing.T) {
 	connector := &OpenSearchConnector{}
@@ -106,9 +63,7 @@ func TestOpenSearchConnectorMapType(t *testing.T) {
 
 	t.Run("wildcard accepts regex conditions", func(t *testing.T) {
 		property := &interfaces.Property{Name: "name", Type: connector.MapType("wildcard")}
-		cfg := &interfaces.FilterCondCfg{Name: property.Name, ValueOptCfg: interfaces.ValueOptCfg{
-			ValueFrom: interfaces.ValueFrom_Const, Value: "prefix.*",
-		}}
+		cfg := &interfaces.FilterCondCfg{Field: property.Name, ValueFrom: interfaces.ValueFrom_Const, Value: "prefix.*"}
 		condition, err := (&filter_condition.RegexCond{}).New(t.Context(), cfg,
 			map[string]*interfaces.Property{property.Name: property})
 		require.NoError(t, err)
@@ -117,9 +72,7 @@ func TestOpenSearchConnectorMapType(t *testing.T) {
 
 	t.Run("structured features reject scalar ranges", func(t *testing.T) {
 		property := &interfaces.Property{Name: "features", Type: connector.MapType("rank_features")}
-		cfg := &interfaces.FilterCondCfg{Name: property.Name, ValueOptCfg: interfaces.ValueOptCfg{
-			ValueFrom: interfaces.ValueFrom_Const, Value: []any{1, 10},
-		}}
+		cfg := &interfaces.FilterCondCfg{Field: property.Name, ValueFrom: interfaces.ValueFrom_Const, Value: []any{1, 10}}
 		condition, err := (&filter_condition.RangeCond{}).New(t.Context(), cfg,
 			map[string]*interfaces.Property{property.Name: property})
 		require.ErrorContains(t, err, "not a date/number field")
@@ -129,9 +82,7 @@ func TestOpenSearchConnectorMapType(t *testing.T) {
 	t.Run("unsupported vectors reject OpenSearch knn conditions", func(t *testing.T) {
 		for _, nativeType := range []string{"dense_vector", "sparse_vector"} {
 			property := &interfaces.Property{Name: "embedding", Type: connector.MapType(nativeType)}
-			cfg := &interfaces.FilterCondCfg{Name: property.Name, ValueOptCfg: interfaces.ValueOptCfg{
-				ValueFrom: interfaces.ValueFrom_Const, Value: []float32{0.1, 0.2, 0.3},
-			}}
+			cfg := &interfaces.FilterCondCfg{Field: property.Name, ValueFrom: interfaces.ValueFrom_Const, Value: []float32{0.1, 0.2, 0.3}}
 			condition, err := (&filter_condition.KnnVectorCond{}).New(t.Context(), cfg,
 				map[string]*interfaces.Property{property.Name: property})
 			require.ErrorContains(t, err, "type must be vector", nativeType)
@@ -146,12 +97,10 @@ func TestOpenSearchConnectorMapType(t *testing.T) {
 			OriginalType: "knn_vector",
 		}
 		cfg := &interfaces.FilterCondCfg{
-			Name:      property.Name,
+			Field:     property.Name,
 			Operation: filter_condition.OperationKnnVector,
-			ValueOptCfg: interfaces.ValueOptCfg{
-				ValueFrom: interfaces.ValueFrom_Const,
-				Value:     []float32{0.1, 0.2, 0.3},
-			},
+			ValueFrom: interfaces.ValueFrom_Const,
+			Value:     []float32{0.1, 0.2, 0.3},
 		}
 
 		condition, err := (&filter_condition.KnnVectorCond{}).New(context.Background(), cfg,
@@ -161,5 +110,79 @@ func TestOpenSearchConnectorMapType(t *testing.T) {
 		require.IsType(t, &filter_condition.KnnVectorCond{}, condition)
 		assert.Equal(t, property.Name, condition.(*filter_condition.KnnVectorCond).FilterFieldName)
 		assert.Equal(t, cfg, condition.(*filter_condition.KnnVectorCond).Cfg)
+	})
+}
+
+func TestOpenSearchConnectorIsFilterable(t *testing.T) {
+	connector := &OpenSearchConnector{}
+
+	for _, tc := range []struct {
+		nativeType string
+		want       bool
+	}{
+		{"keyword", true},
+		{"text", true},
+		{"long", true},
+		{"unsigned_long", true},
+		{"scaled_float", true},
+		{"boolean", true},
+		{"date_nanos", true},
+		{"knn_vector", true},
+		{"binary", false},
+		{"nested", false},
+		{"integer_range", false},
+		{"sparse_vector", false},
+		{"completion", false},
+		{"murmur3", false},
+		{"rank_feature", false},
+		{"alias", false},
+		{"ip", false},
+		{"geo_point", false},
+		{"dense_vector", false},
+		{"future_type", false},
+		{"", false},
+	} {
+		t.Run(tc.nativeType, func(t *testing.T) {
+			assert.Equal(t, tc.want, connector.IsFilterable(&interfaces.IndexFieldMeta{Type: tc.nativeType}))
+		})
+	}
+	t.Run("uses complete mapping attributes and leaves metadata unchanged", func(t *testing.T) {
+		assert.False(t, connector.IsFilterable(nil))
+		for _, tc := range []struct {
+			name  string
+			field interfaces.IndexFieldMeta
+			want  bool
+		}{
+			{name: "unindexed text", field: interfaces.IndexFieldMeta{Type: "text", Attributes: map[string]any{"index": false}}},
+			{name: "text ignores doc values", field: interfaces.IndexFieldMeta{Type: "text", Attributes: map[string]any{"index": false, "doc_values": true}}},
+			{name: "keyword doc values", field: interfaces.IndexFieldMeta{Type: "keyword", Attributes: map[string]any{"index": false}}, want: true},
+			{name: "keyword neither indexed nor doc values", field: interfaces.IndexFieldMeta{Type: "keyword", Attributes: map[string]any{"index": false, "doc_values": false}}},
+			{name: "numeric doc values", field: interfaces.IndexFieldMeta{Type: "long", Attributes: map[string]any{"index": false, "doc_values": true}}, want: true},
+			{name: "numeric no query path", field: interfaces.IndexFieldMeta{Type: "long", Attributes: map[string]any{"index": false, "doc_values": false}}},
+			{name: "date doc values", field: interfaces.IndexFieldMeta{Type: "date_nanos", Attributes: map[string]any{"index": false}}, want: true},
+			{name: "boolean doc values", field: interfaces.IndexFieldMeta{Type: "boolean", Attributes: map[string]any{"index": false}}, want: true},
+			{name: "vector has no doc value filter path", field: interfaces.IndexFieldMeta{Type: "knn_vector", Attributes: map[string]any{"index": false, "doc_values": true}}},
+			{name: "indexed without doc values", field: interfaces.IndexFieldMeta{Type: "keyword", Attributes: map[string]any{"doc_values": false}}, want: true},
+			{name: "disabled mapping", field: interfaces.IndexFieldMeta{Type: "keyword", Attributes: map[string]any{"enabled": false}}},
+			{name: "searchable child does not enable parent", field: interfaces.IndexFieldMeta{Type: "text", Attributes: map[string]any{"index": false}, SubFields: []interfaces.IndexSubFieldMeta{{Name: "raw", Type: "keyword"}}}},
+			{name: "keyword child unsearchable", field: interfaces.IndexFieldMeta{Type: "text", Attributes: map[string]any{"index": false}, SubFields: []interfaces.IndexSubFieldMeta{{Name: "raw", Type: "keyword", Attributes: map[string]any{"index": false, "doc_values": false}}}}},
+			{name: "unsearchable child does not disable parent", field: interfaces.IndexFieldMeta{Type: "text", SubFields: []interfaces.IndexSubFieldMeta{{Name: "raw", Type: "keyword", Attributes: map[string]any{"index": false, "doc_values": false}}}}, want: true},
+			{name: "independent searchable child", field: interfaces.IndexFieldMeta{Name: "title.raw", Type: "keyword", Attributes: map[string]any{"index": false}}, want: true},
+			{name: "independent unsearchable child", field: interfaces.IndexFieldMeta{Name: "title.raw", Type: "keyword", Attributes: map[string]any{"index": false, "doc_values": false}}},
+			{name: "only resolved alias type", field: interfaces.IndexFieldMeta{Type: "alias", ResolvedType: "keyword"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				for _, stored := range []bool{false, true} {
+					tc.field.Filterable = &stored
+					before, err := sonic.Marshal(tc.field)
+					require.NoError(t, err)
+					assert.Equal(t, tc.want, connector.IsFilterable(&tc.field))
+					after, err := sonic.Marshal(tc.field)
+					require.NoError(t, err)
+					assert.JSONEq(t, string(before), string(after))
+					assert.Equal(t, stored, *tc.field.Filterable)
+				}
+			})
+		}
 	})
 }

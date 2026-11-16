@@ -24,6 +24,30 @@ type listingBknBackend struct {
 	listCalls  int
 	byIDCalls  int
 	namedByIDs []string
+	// comment, when set, is every listed or read object type's comment.
+	comment string
+}
+
+type branchListingBknBackend struct {
+	*listingBknBackend
+	interfaces.BranchBknBackendAccess
+	gotBranch string
+}
+
+func (s *branchListingBknBackend) ListObjectTypesBranch(ctx context.Context, knID, branch string, offset, limit int) (*interfaces.ObjectTypePage, error) {
+	s.gotBranch = branch
+	return s.ListObjectTypes(ctx, knID, offset, limit)
+}
+
+func TestGetObjectTypesListingUsesRequestedBranch(t *testing.T) {
+	bkn := &branchListingBknBackend{listingBknBackend: &listingBknBackend{total: 1}}
+	handler := handleGetObjectTypes(bkn, knmetrics.NewKnMetricsServiceWith(nil, bkn, nil), nil)
+	result, err := handler(context.Background(), mcpReq(map[string]any{
+		"kn_id": "kn-001", "branch": "release", "response_format": "json",
+	}))
+	if err != nil || result.IsError || bkn.gotBranch != "release" {
+		t.Fatalf("branch=%q err=%v result=%+v", bkn.gotBranch, err, result)
+	}
 }
 
 func (s *listingBknBackend) ListObjectTypes(_ context.Context, _ string, offset, limit int) (*interfaces.ObjectTypePage, error) {
@@ -33,7 +57,7 @@ func (s *listingBknBackend) ListObjectTypes(_ context.Context, _ string, offset,
 	for i := offset; i < offset+limit && int64(i) < s.total; i++ {
 		// With fields, because a listed entry carries what naming its id would
 		// have carried -- the adapter reads the window and then reads it in full.
-		entries = append(entries, &interfaces.ObjectType{ID: fmt.Sprintf("ot-%04d", i),
+		entries = append(entries, &interfaces.ObjectType{ID: fmt.Sprintf("ot-%04d", i), Comment: s.comment,
 			DataSource:     &interfaces.ResourceInfo{Type: "resource", ID: "res"},
 			DataProperties: []*interfaces.DataProperty{{Name: "id", Type: "string"}}})
 	}
@@ -45,7 +69,7 @@ func (s *listingBknBackend) GetObjectTypeDetail(_ context.Context, _ string, ids
 	s.namedByIDs = ids
 	out := make([]*interfaces.ObjectType, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, &interfaces.ObjectType{ID: id, DataSource: &interfaces.ResourceInfo{Type: "resource", ID: "res"}})
+		out = append(out, &interfaces.ObjectType{ID: id, Comment: s.comment, DataSource: &interfaces.ResourceInfo{Type: "resource", ID: "res"}})
 	}
 	return out, nil
 }

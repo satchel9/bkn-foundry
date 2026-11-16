@@ -1,3 +1,9 @@
+// Copyright openbkn.ai
+// Copyright The kweaver.ai Authors.
+//
+// Licensed under the Apache License, Version 2.0.
+// See the LICENSE file in the project root for details.
+
 // Package anyshare implements the AnyShare fileset connector.
 package anyshare
 
@@ -238,10 +244,6 @@ func (c *AnyShareConnector) convertFilterConditionOr(ctx context.Context, condit
 		return nil, fmt.Errorf("condition is not *filter_condition.OrCond")
 	}
 
-	if len(condOr.SubConds) == 0 {
-		return &FilterResult{}, nil
-	}
-
 	// Check if all subconditions are valid
 	for _, subCond := range condOr.SubConds {
 		if err := c.validateCustomCondition(subCond, tracker); err != nil {
@@ -283,7 +285,7 @@ func (c *AnyShareConnector) convertFilterConditionOr(ctx context.Context, condit
 }
 
 // convertFilterConditionMatch processes MATCH condition
-func (c *AnyShareConnector) convertFilterConditionMatch(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionMatch(_ context.Context, condition interfaces.FilterCondition, _ *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.MatchCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.MatchCond")
@@ -325,7 +327,7 @@ func (c *AnyShareConnector) convertFilterConditionMatch(ctx context.Context, con
 }
 
 // convertFilterConditionMatchPhrase processes MATCH_PHRASE condition
-func (c *AnyShareConnector) convertFilterConditionMatchPhrase(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionMatchPhrase(_ context.Context, condition interfaces.FilterCondition, _ *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.MatchPhraseCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.MatchPhraseCond")
@@ -390,7 +392,7 @@ func (c *AnyShareConnector) convertFilterConditionWithOpr(ctx context.Context, c
 	case filter_condition.OperationBetween:
 		return c.convertFilterConditionBetween(ctx, condition, tracker)
 	default:
-		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), filter_condition.QueryChannelFileset)
+		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), fmt.Errorf("the fileset query channel does not support this operation"))
 	}
 }
 
@@ -480,7 +482,7 @@ func (c *AnyShareConnector) validateCustomCondition(condition interfaces.FilterC
 }
 
 // convertFilterConditionEqual processes EQUAL condition
-func (c *AnyShareConnector) convertFilterConditionEqual(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionEqual(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.EqualCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.EqualCond")
@@ -558,7 +560,7 @@ func (c *AnyShareConnector) convertFilterConditionEqual(ctx context.Context, con
 }
 
 // convertFilterConditionGte processes GTE condition
-func (c *AnyShareConnector) convertFilterConditionGte(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionGte(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.GteCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.GteCond")
@@ -608,7 +610,7 @@ func (c *AnyShareConnector) convertFilterConditionGte(ctx context.Context, condi
 }
 
 // convertFilterConditionGt processes GT condition
-func (c *AnyShareConnector) convertFilterConditionGt(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionGt(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.GtCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.GtCond")
@@ -658,7 +660,7 @@ func (c *AnyShareConnector) convertFilterConditionGt(ctx context.Context, condit
 }
 
 // convertFilterConditionLte processes LTE condition
-func (c *AnyShareConnector) convertFilterConditionLte(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionLte(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.LteCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.LteCond")
@@ -708,7 +710,7 @@ func (c *AnyShareConnector) convertFilterConditionLte(ctx context.Context, condi
 }
 
 // convertFilterConditionLt processes LT condition
-func (c *AnyShareConnector) convertFilterConditionLt(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionLt(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.LtCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.LtCond")
@@ -758,14 +760,10 @@ func (c *AnyShareConnector) convertFilterConditionLt(ctx context.Context, condit
 }
 
 // convertFilterConditionIn processes IN condition
-func (c *AnyShareConnector) convertFilterConditionIn(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionIn(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.InCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.InCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 
 	customFields := map[string]bool{
@@ -853,14 +851,10 @@ func (c *AnyShareConnector) convertFilterConditionIn(ctx context.Context, condit
 }
 
 // convertFilterConditionNotIn processes NOT IN condition
-func (c *AnyShareConnector) convertFilterConditionNotIn(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionNotIn(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.NotInCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotInCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 
 	customFields := map[string]bool{
@@ -924,14 +918,10 @@ func (c *AnyShareConnector) convertFilterConditionNotIn(ctx context.Context, con
 }
 
 // convertFilterConditionRange processes RANGE condition
-func (c *AnyShareConnector) convertFilterConditionRange(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionRange(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.RangeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.RangeCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 
 	customFields := map[string]bool{
@@ -984,14 +974,10 @@ func (c *AnyShareConnector) convertFilterConditionRange(ctx context.Context, con
 }
 
 // convertFilterConditionBetween processes BETWEEN condition
-func (c *AnyShareConnector) convertFilterConditionBetween(ctx context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
+func (c *AnyShareConnector) convertFilterConditionBetween(_ context.Context, condition interfaces.FilterCondition, tracker *FieldUsageTracker) (*FilterResult, error) {
 	cond, ok := condition.(*filter_condition.BetweenCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.BetweenCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 
 	customFields := map[string]bool{

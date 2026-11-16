@@ -23,8 +23,9 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	"bkn-backend/common/operationaudit"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/operationaudit"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/locale"
 )
 
 const (
@@ -65,14 +66,20 @@ var operationAuditRoutes = map[string]operationAuditRule{
 	"POST /knowledge-networks/:kn_id/action-types":                                       {Action: "create", TargetType: "action_type"},
 	"PUT /knowledge-networks/:kn_id/action-types/:at_id":                                 {Action: "update", TargetType: "action_type"},
 	"DELETE /knowledge-networks/:kn_id/action-types/:at_ids":                             {Action: "delete", TargetType: "action_type"},
-	"POST /knowledge-networks/:kn_id/metrics":                                            {Action: "create", TargetType: "metric"},
-	"PUT /knowledge-networks/:kn_id/metrics/:metric_ids":                                 {Action: "update", TargetType: "metric"},
-	"DELETE /knowledge-networks/:kn_id/metrics/:metric_ids":                              {Action: "delete", TargetType: "metric"},
+	"POST /knowledge-networks/:kn_id/object-metrics":                                     {Action: "create", TargetType: "metric"},
+	"PUT /knowledge-networks/:kn_id/object-metrics/:metric_id":                           {Action: "update", TargetType: "metric"},
+	"DELETE /knowledge-networks/:kn_id/object-metrics/:metric_id":                        {Action: "delete", TargetType: "metric"},
+	"POST /knowledge-networks/:kn_id/object-metrics/:metric_id/versions":                 {Action: "update", TargetType: "metric"},
+	"POST /knowledge-networks/:kn_id/object-metrics/:metric_id/publish":                  {Action: "update", TargetType: "metric"},
+	"POST /knowledge-networks/:kn_id/object-metrics/:metric_id/deprecate":                {Action: "update", TargetType: "metric"},
 	"POST /knowledge-networks/:kn_id/capabilities":                                       {Action: "attach", TargetType: "kn_capability_binding"},
 	"DELETE /knowledge-networks/:kn_id/capabilities/:binding_ids":                        {Action: "detach", TargetType: "kn_capability_binding"},
 	"POST /knowledge-networks/:kn_id/risk-types":                                         {Action: "create", TargetType: "risk_type"},
 	"PUT /knowledge-networks/:kn_id/risk-types/:rt_id":                                   {Action: "update", TargetType: "risk_type"},
 	"DELETE /knowledge-networks/:kn_id/risk-types/:rt_ids":                               {Action: "delete", TargetType: "risk_type"},
+	"POST /knowledge-networks/:kn_id/value-types":                                        {Action: "create", TargetType: "value_type"},
+	"PUT /knowledge-networks/:kn_id/value-types/:vt_id":                                  {Action: "update", TargetType: "value_type"},
+	"DELETE /knowledge-networks/:kn_id/value-types/:vt_id":                               {Action: "delete", TargetType: "value_type"},
 	"POST /knowledge-networks/:kn_id/concept-groups":                                     {Action: "create", TargetType: "concept_group"},
 	"PUT /knowledge-networks/:kn_id/concept-groups/:cg_id":                               {Action: "update", TargetType: "concept_group"},
 	"DELETE /knowledge-networks/:kn_id/concept-groups/:cg_id":                            {Action: "delete", TargetType: "concept_group"},
@@ -91,8 +98,7 @@ func registeredOperationAudit(method, fullPath, methodOverride string) (operatio
 	}
 	path := strings.TrimSpace(fullPath)
 	for _, prefix := range []string{
-		"/api/bkn-backend/v1", "/api/ontology-manager/v1",
-		"/api/bkn-backend/in/v1", "/api/ontology-manager/in/v1",
+		"/api/bkn-backend/v1", "/api/bkn-backend/v2", "/api/bkn-backend/in/v1",
 	} {
 		if strings.HasPrefix(path, prefix) {
 			path = strings.TrimPrefix(path, prefix)
@@ -125,7 +131,7 @@ func basicOperationAuditActor(authorization string, visitor hydra.Visitor) opera
 		actorType = "user"
 	}
 	return operationAuditActor{
-		ActorID: strings.TrimSpace(visitor.ID), ActorName: strings.TrimSpace(visitor.ID),
+		ActorID:   strings.TrimSpace(visitor.ID),
 		ActorType: actorType, AuthMethod: authMethod, CredentialID: strings.TrimSpace(visitor.TokenID),
 	}
 }
@@ -145,7 +151,7 @@ func (r *restHandler) OperationAudit() gin.HandlerFunc {
 		c.Writer = responseBody
 		c.Next()
 
-		if r == nil || r.auditRecorder == nil {
+		if r == nil || r.auditRecorder == nil || c.GetBool("operation_audit_skip") || c.Writer.Status() < 200 || c.Writer.Status() >= 300 || c.Writer.Status() == http.StatusAccepted {
 			return
 		}
 		requestID, err := operationAuditRequestID(c)
@@ -160,10 +166,15 @@ func (r *restHandler) OperationAudit() gin.HandlerFunc {
 		}
 		visitor, _ := operationAuditVisitor(c)
 		actor := r.operationAuditIdentity(c.Request.Context(), c.GetHeader("Authorization"), visitor)
-		if actor.ActorID == "" {
-			actor.ActorID, actor.ActorName, actor.ActorType = "unauthenticated", "未认证调用者", "unknown"
+		if actor.ActorID == "" || actor.ActorName == "" || actor.ActorName == actor.ActorID {
+			logger.Errorf("operation audit fact rejected: missing readable authenticated actor")
+			return
 		}
 		facts := operationAuditFacts(c, rule, requestBody, responseBody.body.Bytes(), requestID)
+		if facts.targetID == "" || facts.targetName == "" || facts.targetName == facts.targetID {
+			logger.Errorf("operation audit fact rejected: missing business target snapshot")
+			return
+		}
 		now := time.Now().UTC()
 		entry := operationaudit.Entry{
 			EventID:            attemptID.String(),
@@ -267,8 +278,7 @@ func operationAuditVisitor(c *gin.Context) (hydra.Visitor, bool) {
 
 func operationAuditInternalRoute(fullPath string) bool {
 	path := strings.TrimSpace(fullPath)
-	return strings.HasPrefix(path, "/api/bkn-backend/in/v1/") ||
-		strings.HasPrefix(path, "/api/ontology-manager/in/v1/")
+	return strings.HasPrefix(path, "/api/bkn-backend/in/v1/")
 }
 
 type extractedOperationAuditFacts struct {
@@ -299,16 +309,23 @@ func operationAuditFacts(c *gin.Context, rule operationAuditRule, requestBody, r
 	} else if len(requestNames) > 0 {
 		targetName = strings.Join(requestNames, "、")
 	}
-	observedTargetID := targetID
-	if targetID == "" {
-		targetID = rule.TargetType + ":" + requestID
+	if snapshot, ok := c.Get("operation_audit_target_ids"); ok {
+		if ids, ok := snapshot.([]string); ok && len(ids) > 0 {
+			targetID = strings.Join(ids, ",")
+		}
 	}
+	observedTargetID := targetID
+
 	if len(targetID) > 256 {
 		digest := sha256.Sum256([]byte(targetID))
 		targetID = fmt.Sprintf("%s:sha256:%x", rule.TargetType, digest)
 	}
-	if targetName == "" {
-		targetName = targetID
+	if snapshot, ok := c.Get("operation_audit_target_names"); ok {
+		if names, ok := snapshot.([]string); ok && len(names) > 0 {
+			targetName = operationAuditNames(names)
+		}
+	} else if len(requestNames) > 1 {
+		targetName = operationAuditNames(requestNames)
 	}
 	if knID == "" && rule.TargetType == "knowledge_network" && c.Writer.Status() < http.StatusBadRequest {
 		knID = observedTargetID
@@ -329,7 +346,7 @@ func operationAuditFacts(c *gin.Context, rule operationAuditRule, requestBody, r
 	}
 	return extractedOperationAuditFacts{
 		knowledgeNetworkID: knID,
-		targetID:           boundText(targetID, 1024), targetName: boundText(targetName, 1024),
+		targetID:           boundText(targetID, 1024), targetName: targetName,
 		outcome: outcome, failureCode: failureCode, failureMessage: failureMessage,
 		changeSummary: changedFields(requestJSON),
 	}
@@ -339,8 +356,8 @@ func operationAuditPathTarget(c *gin.Context, targetType string) string {
 	names := map[string][]string{
 		"knowledge_network": {"kn_id"}, "object_type": {"ot_id", "ot_ids"},
 		"relation_type": {"rt_id", "rt_ids"}, "action_type": {"at_id", "at_ids"},
-		"risk_type": {"rt_id", "rt_ids"},
-		"metric":    {"metric_ids"}, "concept_group": {"cg_id"}, "action_schedule": {"schedule_id", "schedule_ids"},
+		"risk_type": {"rt_id", "rt_ids"}, "value_type": {"vt_id"},
+		"metric": {"metric_id", "metric_ids"}, "concept_group": {"cg_id"}, "action_schedule": {"schedule_id", "schedule_ids"},
 		"kn_capability_binding": {"binding_ids"},
 	}
 	for _, name := range names[targetType] {
@@ -355,11 +372,17 @@ func decodeBoundedObject(body []byte) map[string]any {
 	if len(body) == 0 {
 		return map[string]any{}
 	}
-	var value map[string]any
+	var value any
 	if json.Unmarshal(body, &value) != nil {
 		return map[string]any{}
 	}
-	return value
+	switch value := value.(type) {
+	case map[string]any:
+		return value
+	case []any:
+		return map[string]any{"entries": value}
+	}
+	return map[string]any{}
 }
 
 func targetValues(value map[string]any) ([]string, []string) {
@@ -372,7 +395,11 @@ func targetValues(value map[string]any) ([]string, []string) {
 			names = append(names, name)
 		}
 	}
-	appendObject(value)
+	if definition, ok := value["definition"].(map[string]any); ok {
+		appendObject(definition)
+	} else {
+		appendObject(value)
+	}
 	if entries, ok := value["entries"].([]any); ok {
 		for _, item := range entries {
 			if object, ok := item.(map[string]any); ok {
@@ -388,6 +415,11 @@ func changedFields(value map[string]any) map[string]any {
 		"name": {}, "comment": {}, "tags": {}, "icon": {}, "color": {}, "branch": {},
 		"status": {}, "entries": {}, "object_type_ids": {},
 		"cron_expression": {}, "action_type_id": {},
+		"code": {}, "description": {}, "owner_object_type_id": {}, "metric_type": {},
+		"result_semantics": {}, "specification": {}, "query_capabilities": {}, "lifecycle": {},
+		"object_type_id": {}, "property_name": {}, "display_name": {}, "metric_ref": {}, "execution": {},
+		"no_data_policy": {}, "on_error": {},
+		"base_type": {}, "enum": {}, "range": {}, "length": {}, "pattern": {}, "unit": {},
 	}
 	fields := []string{}
 	for key := range value {
@@ -509,3 +541,6 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+// operationAuditNames keeps a readable bounded batch snapshot, never an ID.
+func operationAuditNames(names []string) string { return locale.AuditNames(names) }

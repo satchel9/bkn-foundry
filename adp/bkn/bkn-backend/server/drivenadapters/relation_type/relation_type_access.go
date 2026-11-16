@@ -23,9 +23,9 @@ import (
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -154,13 +154,9 @@ func (rta *relationTypeAccess) CreateRelationType(ctx context.Context, tx *sql.T
 		attr.Key("db_type").String(libdb.GetDBType()),
 	)
 
-	// Convert tags to a string.
-	tagsStr := libCommon.TagSlice2TagString(relationType.Tags)
-
-	// 2.0 Serialize the data source.
-	mappingRulesBytes, err := sonic.Marshal(relationType.MappingRules)
+	values, err := relationTypeInsertValues(relationType)
 	if err != nil {
-		logger.Errorf("Failed to marshal MappingRules, err: %v", common.SafeErrorSummary(err))
+		logger.Errorf("Failed to marshal relation type, err: %v", common.SafeErrorSummary(err))
 		return err
 	}
 
@@ -186,26 +182,9 @@ func (rta *relationTypeAccess) CreateRelationType(ctx context.Context, tx *sql.T
 			"f_updater_type",
 			"f_update_time",
 		).
-		Values(
-			relationType.RTID,
-			relationType.RTName,
-			tagsStr,
-			relationType.Comment,
-			relationType.Icon,
-			relationType.Color,
-			relationType.BKNRawContent,
-			relationType.KNID,
-			relationType.Branch,
-			relationType.SourceObjectTypeID,
-			relationType.TargetObjectTypeID,
-			relationType.Type,
-			mappingRulesBytes,
-			relationType.Creator.ID,
-			relationType.Creator.Type,
-			relationType.CreateTime,
-			relationType.Updater.ID,
-			relationType.Updater.Type,
-			relationType.UpdateTime).
+		Columns(declarationColumns...).
+		Columns("f_revision").
+		Values(values...).
 		ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of insert relation type, error", err)
@@ -242,7 +221,7 @@ func (rta *relationTypeAccess) CreateRelationTypes(ctx context.Context, tx *sql.
 			"f_kn_id", "f_branch", "f_source_object_type_id", "f_target_object_type_id", "f_type",
 			"f_mapping_rules", "f_creator", "f_creator_type", "f_create_time", "f_updater",
 			"f_updater_type", "f_update_time",
-		)
+		).Columns(declarationColumns...).Columns("f_revision")
 		for _, relationType := range relationTypes[start:end] {
 			values, err := relationTypeInsertValues(relationType)
 			if err != nil {
@@ -271,14 +250,18 @@ func relationTypeInsertValues(relationType *interfaces.RelationType) ([]any, err
 	if err != nil {
 		return nil, err
 	}
-	return []any{
+	declarations, err := declarationValues(relationType)
+	if err != nil {
+		return nil, err
+	}
+	return append([]any{
 		relationType.RTID, relationType.RTName, libCommon.TagSlice2TagString(relationType.Tags),
 		relationType.Comment, relationType.Icon, relationType.Color, relationType.BKNRawContent,
 		relationType.KNID, relationType.Branch, relationType.SourceObjectTypeID,
 		relationType.TargetObjectTypeID, relationType.Type, mappingRulesBytes, relationType.Creator.ID,
 		relationType.Creator.Type, relationType.CreateTime, relationType.Updater.ID,
 		relationType.Updater.Type, relationType.UpdateTime,
-	}, nil
+	}, append(declarations, interfaces.NewDefinitionRevision())...), nil
 }
 
 // Query current relation types on the main branch.
@@ -311,6 +294,7 @@ func (rta *relationTypeAccess) ListRelationTypes(ctx context.Context, query inte
 		"f_updater",
 		"f_updater_type",
 		"f_update_time").
+		Columns(declarationColumns...).
 		From(RT_TABLE_NAME)
 
 	builder := processQueryCondition(query, subBuilder)
@@ -353,6 +337,7 @@ func (rta *relationTypeAccess) ListRelationTypes(ctx context.Context, query inte
 		}
 		tagsStr := ""
 		var mappingRulesBytes []byte
+		var decl scannedDeclarations
 		err := rows.Scan(
 			&relationType.RTID,
 			&relationType.RTName,
@@ -373,6 +358,8 @@ func (rta *relationTypeAccess) ListRelationTypes(ctx context.Context, query inte
 			&relationType.Updater.ID,
 			&relationType.Updater.Type,
 			&relationType.UpdateTime,
+			&decl.reverseName, &decl.aliases, &decl.cardinality, &decl.constraints, &decl.lifecycleStatus,
+			&decl.deprecation, &decl.importance, &decl.fallbackFor, &decl.verification,
 		)
 		if err != nil {
 			common.LogSafeError(ctx, "Row scan error", err)
@@ -381,6 +368,7 @@ func (rta *relationTypeAccess) ListRelationTypes(ctx context.Context, query inte
 
 		// Convert a tag string to an array.
 		relationType.Tags = libCommon.TagString2TagSlice(tagsStr)
+		decl.apply(ctx, &relationType)
 
 		// 2.0 Deserialize mapping rules.
 		if relationType.Type == interfaces.RELATION_TYPE_DIRECT {
@@ -444,7 +432,7 @@ func (rta *relationTypeAccess) ListRelationTypeSummaries(ctx context.Context,
 		"f_updater",
 		"f_updater_type",
 		"f_update_time",
-	).From(RT_TABLE_NAME))
+	).Columns(declarationColumns...).From(RT_TABLE_NAME))
 	if query.Sort != "" {
 		orderBy, err := common.SafeOrderBy(query.Sort, query.Direction)
 		if err != nil {
@@ -473,6 +461,7 @@ func (rta *relationTypeAccess) ListRelationTypeSummaries(ctx context.Context,
 		item := &interfaces.RelationType{ModuleType: interfaces.MODULE_TYPE_RELATION_TYPE}
 		tags := ""
 		var mappingRulesBytes []byte
+		var decl scannedDeclarations
 		if err := rows.Scan(
 			&item.RTID,
 			&item.RTName,
@@ -492,10 +481,13 @@ func (rta *relationTypeAccess) ListRelationTypeSummaries(ctx context.Context,
 			&item.Updater.ID,
 			&item.Updater.Type,
 			&item.UpdateTime,
+			&decl.reverseName, &decl.aliases, &decl.cardinality, &decl.constraints, &decl.lifecycleStatus,
+			&decl.deprecation, &decl.importance, &decl.fallbackFor, &decl.verification,
 		); err != nil {
 			return nil, err
 		}
 		item.Tags = libCommon.TagString2TagSlice(tags)
+		decl.apply(ctx, item)
 		switch item.Type {
 		case interfaces.RELATION_TYPE_DIRECT:
 			var mappings []interfaces.Mapping
@@ -558,6 +550,11 @@ func (rta *relationTypeAccess) GetRelationTypesTotal(ctx context.Context, query 
 }
 
 func (rta *relationTypeAccess) GetRelationTypeByID(ctx context.Context, knID string, branch string, rtID string) (*interfaces.RelationType, error) {
+	return rta.GetRelationTypeByIDInTx(ctx, nil, knID, branch, rtID)
+}
+
+// GetRelationTypeByIDInTx sees relation definitions created in the same import transaction.
+func (rta *relationTypeAccess) GetRelationTypeByIDInTx(ctx context.Context, tx *sql.Tx, knID string, branch string, rtID string) (*interfaces.RelationType, error) {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "GetRelationTypeByID")
 	defer span.End()
 
@@ -586,7 +583,7 @@ func (rta *relationTypeAccess) GetRelationTypeByID(ctx context.Context, knID str
 		"f_updater",
 		"f_updater_type",
 		"f_update_time",
-	).From(RT_TABLE_NAME).
+	).Columns(declarationColumns...).From(RT_TABLE_NAME).
 		Where(sq.Eq{"f_kn_id": knID}).
 		Where(sq.Eq{"f_branch": branch}).
 		Where(sq.Eq{"f_id": rtID}).
@@ -604,8 +601,14 @@ func (rta *relationTypeAccess) GetRelationTypeByID(ctx context.Context, knID str
 	}
 	tagsStr := ""
 	var mappingRulesBytes []byte
+	var decl scannedDeclarations
 
-	row := rta.db.QueryRowContext(ctx, sqlStr, vals...)
+	var row *sql.Row
+	if tx != nil {
+		row = tx.QueryRowContext(ctx, sqlStr, vals...)
+	} else {
+		row = rta.db.QueryRowContext(ctx, sqlStr, vals...)
+	}
 	err = row.Scan(
 		&relationType.RTID,
 		&relationType.RTName,
@@ -626,6 +629,8 @@ func (rta *relationTypeAccess) GetRelationTypeByID(ctx context.Context, knID str
 		&relationType.Updater.ID,
 		&relationType.Updater.Type,
 		&relationType.UpdateTime,
+		&decl.reverseName, &decl.aliases, &decl.cardinality, &decl.constraints, &decl.lifecycleStatus,
+		&decl.deprecation, &decl.importance, &decl.fallbackFor, &decl.verification,
 	)
 	if err != nil {
 		common.LogSafeError(ctx, "Row scan error", err)
@@ -634,6 +639,7 @@ func (rta *relationTypeAccess) GetRelationTypeByID(ctx context.Context, knID str
 
 	// Convert a tag string to an array.
 	relationType.Tags = libCommon.TagString2TagSlice(tagsStr)
+	decl.apply(ctx, &relationType)
 
 	// 2.0 Deserialize mapping rules.
 	if relationType.Type == interfaces.RELATION_TYPE_DIRECT {
@@ -697,7 +703,7 @@ func (rta *relationTypeAccess) GetRelationTypesByIDs(ctx context.Context, knID s
 		"f_updater",
 		"f_updater_type",
 		"f_update_time",
-	).From(RT_TABLE_NAME).
+	).Columns(declarationColumns...).From(RT_TABLE_NAME).
 		Where(sq.Eq{"f_kn_id": knID}).
 		Where(sq.Eq{"f_branch": branch}).
 		Where(sq.Eq{"f_id": rtIDs}).
@@ -724,6 +730,7 @@ func (rta *relationTypeAccess) GetRelationTypesByIDs(ctx context.Context, knID s
 		}
 		tagsStr := ""
 		var mappingRulesBytes []byte
+		var decl scannedDeclarations
 
 		err := rows.Scan(
 			&relationType.RTID,
@@ -745,6 +752,8 @@ func (rta *relationTypeAccess) GetRelationTypesByIDs(ctx context.Context, knID s
 			&relationType.Updater.ID,
 			&relationType.Updater.Type,
 			&relationType.UpdateTime,
+			&decl.reverseName, &decl.aliases, &decl.cardinality, &decl.constraints, &decl.lifecycleStatus,
+			&decl.deprecation, &decl.importance, &decl.fallbackFor, &decl.verification,
 		)
 
 		if err != nil {
@@ -754,6 +763,7 @@ func (rta *relationTypeAccess) GetRelationTypesByIDs(ctx context.Context, knID s
 
 		// Convert a tag string to an array.
 		relationType.Tags = libCommon.TagString2TagSlice(tagsStr)
+		decl.apply(ctx, &relationType)
 
 		// 2.0 Deserialize mapping rules.
 		if relationType.Type == interfaces.RELATION_TYPE_DIRECT {
@@ -823,11 +833,21 @@ func (rta *relationTypeAccess) UpdateRelationType(ctx context.Context, tx *sql.T
 		"f_updater":               relationType.Updater.ID,
 		"f_updater_type":          relationType.Updater.Type,
 		"f_update_time":           relationType.UpdateTime,
+		"f_revision":              interfaces.NewDefinitionRevision(),
+	}
+	declarations, err := declarationValues(relationType)
+	if err != nil {
+		logger.Errorf("Failed to marshal relation declarations, err: %v", common.SafeErrorSummary(err))
+		return err
+	}
+	for i, column := range declarationColumns {
+		data[column] = declarations[i]
 	}
 	sqlStr, vals, err := sq.Update(RT_TABLE_NAME).
 		SetMap(data).
 		Where(sq.Eq{"f_id": relationType.RTID}).
 		Where(sq.Eq{"f_kn_id": relationType.KNID}).
+		Where(sq.Eq{"f_branch": relationType.Branch}).
 		ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of update relation type by relation type id, error", err)
@@ -842,18 +862,10 @@ func (rta *relationTypeAccess) UpdateRelationType(ctx context.Context, tx *sql.T
 		common.LogSafeError(ctx, "update relation type error", err)
 		return err
 	}
-
-	// Number of rows affected by the SQL statement.
-	RowsAffected, err := ret.RowsAffected()
-	if err != nil {
-		common.LogSafeError(ctx, "Get RowsAffected error", err)
+	key := sq.Eq{"f_id": relationType.RTID, "f_kn_id": relationType.KNID, "f_branch": relationType.Branch}
+	if err = common.EnsureRowUpdated(ctx, tx, ret, RT_TABLE_NAME, key); err != nil {
+		common.LogSafeError(ctx, "Update relation type found no row", err)
 		return err
-	}
-
-	if RowsAffected != 1 {
-		// Do not return an error when affected rows are not one because the update has occurred.
-		otellog.LogWarn(ctx, fmt.Sprintf("Update relation type affected unexpected row count: relation_type_id=%s, rows=%d",
-			relationType.RTID, RowsAffected))
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -884,6 +896,7 @@ func (rta *relationTypeAccess) UpdateRelationTypes(ctx context.Context, tx *sql.
 		"f_source_object_type_id", "f_target_object_type_id", "f_type", "f_mapping_rules",
 		"f_updater", "f_updater_type", "f_update_time",
 	}
+	columns = append(columns, declarationColumns...)
 	for start := 0; start < len(relationTypes); {
 		end := start
 		seenIDs := make(map[string]struct{}, min(relationTypeUpdateBatchSize, len(relationTypes)-start))
@@ -924,6 +937,7 @@ func (rta *relationTypeAccess) UpdateRelationTypes(ctx context.Context, tx *sql.
 			statement.WriteString(column)
 			statement.WriteString(" END")
 		}
+		statement.WriteString(", f_revision = REPLACE(UUID(), '-', '')")
 		statement.WriteString(" WHERE f_kn_id = ? AND f_branch = ? AND f_id IN (")
 		args = append(args, knID, branch)
 		for index, relationType := range batch {
@@ -951,12 +965,16 @@ func relationTypeUpdateValues(relationType *interfaces.RelationType) ([]any, err
 	if err != nil {
 		return nil, err
 	}
-	return []any{
+	declarations, err := declarationValues(relationType)
+	if err != nil {
+		return nil, err
+	}
+	return append([]any{
 		relationType.RTName, libCommon.TagSlice2TagString(relationType.Tags), relationType.Comment,
 		relationType.Icon, relationType.Color, relationType.BKNRawContent, relationType.SourceObjectTypeID,
 		relationType.TargetObjectTypeID, relationType.Type, mappingRulesBytes, relationType.Updater.ID,
 		relationType.Updater.Type, relationType.UpdateTime,
-	}, nil
+	}, declarations...), nil
 }
 
 func (rta *relationTypeAccess) DeleteRelationTypesByIDs(ctx context.Context, tx *sql.Tx, knID string, branch string, rtIDs []string) (int64, error) {
@@ -1176,6 +1194,7 @@ func (rta *relationTypeAccess) GetAllRelationTypesByKnID(ctx context.Context, kn
 		"f_updater",
 		"f_updater_type",
 		"f_update_time").
+		Columns(declarationColumns...).
 		From(RT_TABLE_NAME).
 		Where(sq.Eq{"f_kn_id": knID}).
 		Where(sq.Eq{"f_branch": branch}).
@@ -1203,6 +1222,7 @@ func (rta *relationTypeAccess) GetAllRelationTypesByKnID(ctx context.Context, kn
 		}
 		tagsStr := ""
 		var mappingRulesBytes []byte
+		var decl scannedDeclarations
 		err := rows.Scan(
 			&relationType.RTID,
 			&relationType.RTName,
@@ -1223,6 +1243,8 @@ func (rta *relationTypeAccess) GetAllRelationTypesByKnID(ctx context.Context, kn
 			&relationType.Updater.ID,
 			&relationType.Updater.Type,
 			&relationType.UpdateTime,
+			&decl.reverseName, &decl.aliases, &decl.cardinality, &decl.constraints, &decl.lifecycleStatus,
+			&decl.deprecation, &decl.importance, &decl.fallbackFor, &decl.verification,
 		)
 		if err != nil {
 			common.LogSafeError(ctx, "Row scan error", err)
@@ -1231,6 +1253,7 @@ func (rta *relationTypeAccess) GetAllRelationTypesByKnID(ctx context.Context, kn
 
 		// Convert a tag string to an array.
 		relationType.Tags = libCommon.TagString2TagSlice(tagsStr)
+		decl.apply(ctx, &relationType)
 
 		// 2.0 Deserialize mapping rules.
 		if relationType.Type == interfaces.RELATION_TYPE_DIRECT {
@@ -1266,4 +1289,37 @@ func (rta *relationTypeAccess) GetAllRelationTypesByKnID(ctx context.Context, kn
 
 	span.SetStatus(codes.Ok, "")
 	return relationTypes, nil
+}
+
+func (rta *relationTypeAccess) ListDeprecatedOrFallbackRelationTypeIDs(ctx context.Context, knID string, branch string) ([]string, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "ListDeprecatedOrFallbackRelationTypeIDs")
+	defer span.End()
+
+	sqlStr, vals, err := sq.Select("f_id").From(RT_TABLE_NAME).
+		Where(sq.Eq{"f_kn_id": knID}).
+		Where(sq.Eq{"f_branch": branch}).
+		Where(sq.Or{
+			sq.Eq{"f_lifecycle_status": interfaces.LIFECYCLE_DEPRECATED},
+			sq.NotEq{"f_fallback_for": nil},
+		}).
+		ToSql()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := rta.db.Query(sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "Query deprecated or fallback relation types failed", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var result []string
+	for rows.Next() {
+		var rtID string
+		if err = rows.Scan(&rtID); err != nil {
+			return nil, err
+		}
+		result = append(result, rtID)
+	}
+	span.SetStatus(codes.Ok, "")
+	return result, rows.Err()
 }

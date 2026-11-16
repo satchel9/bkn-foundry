@@ -13,15 +13,17 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"bkn-backend/common/visitor"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/visitor"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // CypherQueryRequest is the request body of a Cypher query. Paging is written
@@ -33,10 +35,19 @@ type CypherQueryRequest struct {
 	// a parameter changes which rows come back, never which resource or
 	// column is read.
 	Parameters map[string]any `json:"parameters"`
+	// ObjectProperties names, per node variable, the properties a returned
+	// node carries besides its identity.
+	ObjectProperties map[string][]string `json:"object_properties,omitempty"`
+	// Explain returns the query's plan instead of its rows; see
+	// interfaces.CypherQuery.
+	Explain bool `json:"explain,omitempty"`
+	// TimeoutSec bounds how long the statement may run, in seconds; see
+	// interfaces.CypherQuery.
+	TimeoutSec int `json:"timeout_sec,omitempty"`
 }
 
 func (r *restHandler) RunCypherQueryByEx(c *gin.Context) {
-	vis, err := r.verifyOAuth(rest.GetLanguageCtx(c), c)
+	vis, err := r.verifyOAuth(i18n.GetLanguageCtx(c), c)
 	if err != nil {
 		return
 	}
@@ -56,7 +67,11 @@ func (r *restHandler) RunCypherQuery(c *gin.Context, vis hydra.Visitor, includeT
 	oteltrace.AddHttpAttrs4API(span, oteltrace.GetAttrsByGinCtx(c))
 
 	knID := c.Param("kn_id")
-	branch := c.DefaultQuery("branch", interfaces.MAIN_BRANCH)
+	resolved, branchOK := r.resolveBranch(&ctx, c, knID, false)
+	if !branchOK {
+		return
+	}
+	branch := resolved.Branch
 	span.SetAttributes(attr.Key("kn_id").String(knID), attr.Key("branch").String(branch))
 
 	var body CypherQueryRequest
@@ -66,7 +81,7 @@ func (r *restHandler) RunCypherQuery(c *gin.Context, vis hydra.Visitor, includeT
 	decoder := json.NewDecoder(c.Request.Body)
 	decoder.UseNumber()
 	if err := decoder.Decode(&body); err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_InvalidParameter_RequestBody)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_InvalidParameter_RequestBody)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
@@ -78,17 +93,21 @@ func (r *restHandler) RunCypherQuery(c *gin.Context, vis hydra.Visitor, includeT
 		return
 	}
 	if !exist {
-		httpErr := rest.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_KnowledgeNetwork_NotFound)
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusNotFound, berrors.BknBackend_KnowledgeNetwork_NotFound)
 		oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 		rest.ReplyError(c, httpErr)
 		return
 	}
 
 	result, err := r.cqs.Query(ctx, interfaces.CypherQuery{
-		KNID:       knID,
-		Branch:     branch,
-		Query:      body.Query,
-		Parameters: body.Parameters,
+		KNID:             knID,
+		Branch:           branch,
+		RunningVersion:   resolved.Running,
+		Query:            body.Query,
+		Parameters:       body.Parameters,
+		ObjectProperties: body.ObjectProperties,
+		Explain:          body.Explain,
+		TimeoutSec:       body.TimeoutSec,
 	})
 	if err != nil {
 		replyHandlerError(c, span, ctx, err)
@@ -98,24 +117,29 @@ func (r *restHandler) RunCypherQuery(c *gin.Context, vis hydra.Visitor, includeT
 	oteltrace.AddHttpAttrs4Ok(span, http.StatusOK)
 	if includeTraceDescriptor {
 		rest.ReplyOK(c, http.StatusOK, struct {
-			Columns           []interfaces.RawQueryColumn         `json:"columns"`
-			Entries           []map[string]any                    `json:"entries"`
-			Trace             json.RawMessage                     `json:"_trace,omitempty"`
-			PermissionImpacts []interfaces.CypherPermissionImpact `json:"permission_impacts,omitempty"`
-		}{Columns: result.Columns, Entries: result.Entries, Trace: result.TraceDescriptor,
-			PermissionImpacts: result.PermissionImpacts})
+			Columns           []interfaces.RawQueryColumn            `json:"columns"`
+			Entries           []map[string]any                       `json:"entries"`
+			ValueTypes        map[string]*interfaces.CypherValueType `json:"value_types,omitempty"`
+			Execution         *interfaces.CypherExecution            `json:"execution,omitempty"`
+			Trace             json.RawMessage                        `json:"_trace,omitempty"`
+			PermissionImpacts []interfaces.CypherPermissionImpact    `json:"permission_impacts,omitempty"`
+			Plan              *interfaces.CypherPlan                 `json:"plan,omitempty"`
+			Limited           bool                                   `json:"limited,omitempty"`
+		}{Columns: result.Columns, Entries: result.Entries, ValueTypes: result.ValueTypes,
+			Execution: result.Execution, Trace: result.TraceDescriptor, PermissionImpacts: result.PermissionImpacts,
+			Plan: result.Plan, Limited: result.Limited})
 		return
 	}
 	rest.ReplyOK(c, http.StatusOK, result)
 }
 
-// replyHandlerError keeps an error that is not an *rest.HTTPError from
+// replyHandlerError keeps an error that is not an *httperrors.HTTPError from
 // becoming a panic in the handler, which is what a bare type assertion would
 // do the first time a dependency returns a plain error.
 func replyHandlerError(c *gin.Context, span trace.Span, ctx context.Context, err error) {
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		httpErr = rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		httpErr = httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
 	}
 	oteltrace.AddHttpAttrs4HttpError(span, httpErr)
 	rest.ReplyError(c, httpErr)

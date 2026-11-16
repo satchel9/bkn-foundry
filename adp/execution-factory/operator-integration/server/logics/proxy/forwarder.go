@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -14,13 +15,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/pkg/errors"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/config"
 	myErr "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/utils"
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
-	"github.com/pkg/errors"
 )
 
 // Forwarder HTTP request forwarder interface.
@@ -162,9 +164,18 @@ func (f *forwarder) Forward(ctx context.Context, req *interfaces.HTTPRequest) (*
 	// Send request.
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		status := http.StatusInternalServerError
+		message := err.Error()
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			// Say the proxy gave up waiting, so callers can tell "cut off" from "failed".
+			status = http.StatusGatewayTimeout
+			message = fmt.Sprintf("proxy timed out waiting for the upstream after %.0fs: %s",
+				time.Since(startTime).Seconds(), err.Error())
+		}
 		return &interfaces.HTTPResponse{
-			StatusCode: http.StatusInternalServerError,
-			Error:      err.Error(),
+			StatusCode: status,
+			Error:      message,
 			Duration:   time.Since(startTime).Milliseconds(),
 		}, nil
 	}
@@ -180,7 +191,7 @@ func (f *forwarder) Forward(ctx context.Context, req *interfaces.HTTPRequest) (*
 func (f *forwarder) buildRequest(ctx context.Context, req *interfaces.HTTPRequest) (*http.Request, error) {
 	// Handle URL and path parameters.
 	requestURL := substitutePathParams(req.URL, req.PathParams)
-	// If the path template still has unreplaced placeholders, it will be directly rejected to avoid sending invalid URLs such as "/market/{operator_id}" to downstream users.
+	// If the path template still has unreplaced placeholders, it will be directly rejected to avoid sending invalid URLs such as "/market/{box_id}" to downstream users.
 	if unresolved := unresolvedPathPlaceholders(requestURL); len(unresolved) > 0 {
 		missing := strings.Join(unresolved, ", ")
 		return nil, myErr.NewHTTPError(ctx, http.StatusBadRequest, myErr.ErrExtProxyPathParamMissing,
@@ -336,7 +347,7 @@ func (f *forwarder) buildRequest(ctx context.Context, req *interfaces.HTTPReques
 	}
 	// Internal requests carry the resolved, single-value locale rather than the
 	// caller's original Accept-Language preference list.
-	httpReq.Header.Set(sharedrest.AcceptLanguageHeader, sharedrest.GetLanguageByCtx(ctx))
+	httpReq.Header.Set(i18n.AcceptLanguageHeader, string(i18n.GetLanguageByCtx(ctx)))
 
 	// If Content-Type is not set in the request header but we have a definite type, set it.
 	if contentType != "" && (forceContentType || httpReq.Header.Get("Content-Type") == "") {
@@ -503,7 +514,7 @@ func (f *forwarder) processResponse(resp *http.Response, startTime time.Time) (*
 	var responseBody interface{}
 	contentType := resp.Header.Get("Content-Type")
 	if strings.Contains(contentType, "application/json") {
-		if err := json.Unmarshal(body, &responseBody); err != nil {
+		if err := utils.UnmarshalPreciseJSON(body, &responseBody); err != nil {
 			// If parsing fails, use the original response body.
 			responseBody = string(body)
 		}

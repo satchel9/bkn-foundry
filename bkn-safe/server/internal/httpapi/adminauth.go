@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension/authzresource"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/authz"
 )
 
@@ -77,6 +78,23 @@ func RequireActiveAccount(db *gorm.DB) gin.HandlerFunc {
 		}
 		if !active {
 			abortGate(c, http.StatusForbidden, gateInactive)
+			return
+		}
+		c.Next()
+	}
+}
+
+// Read sessions must reject disabled subjects even on a warm introspection
+// cache. A 401 lets browser clients discard their session and sign in again.
+func requireActiveSession(db *gorm.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		active, err := activeAccount(c, db, c.GetString(ctxAccessorID))
+		if err != nil {
+			abortPublicError(c, http.StatusServiceUnavailable)
+			return
+		}
+		if !active {
+			abortGate(c, http.StatusUnauthorized, gateInactive)
 			return
 		}
 		c.Next()
@@ -218,11 +236,10 @@ const (
 //
 // "Concrete" is the whole point, and it is why this reads ListObjectGrants
 // rather than asking the enforcer. A Check/EffectivePermissions answer folds in
-// type-wide role grants, and the seeded network_builder role carries `authorize`
-// on catalog, connector_type, operator, skill and stream_data_pipeline — so
-// every member of that role would pass without owning anything at all, turning
-// "the person who built this may look up a colleague" into "this role may read
-// the directory". ListObjectGrants skips type-wide rows (see its rid == "*"
+// type-wide role grants, and a role carrying type-wide `authorize` (for example
+// on connector_type or skill) would let every member pass without owning
+// anything at all, turning "the person who built this may look up a colleague"
+// into "this role may read the directory". ListObjectGrants skips type-wide rows (see its rid == "*"
 // filter), leaving exactly the grants a domain service wrote to a creator.
 //
 // Fail-closed throughout: a lookup error is a refusal, never a pass.
@@ -258,6 +275,10 @@ func RequireAdminOrResourceOwner(v TokenVerifier, e *authz.Enforcer) gin.Handler
 		}
 		owner := false
 		for _, grant := range grants {
+			if !authzresource.Entitled(grant.ResourceType) {
+				// Owning a paid resource below its edition owns nothing (#2512).
+				continue
+			}
 			for _, op := range grant.Operations {
 				if op == opAuthorize {
 					owner = true

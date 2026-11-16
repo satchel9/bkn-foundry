@@ -12,7 +12,8 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
 	attr "go.opentelemetry.io/otel/attribute"
 
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 // Per-instance results live in their own index, one document per result, so that an
@@ -212,7 +213,7 @@ func decodeStoredResult(source map[string]any) (interfaces.ObjectExecutionResult
 		return interfaces.ObjectExecutionResult{}, err
 	}
 	var stored storedExecutionResult
-	if err := sonic.Unmarshal(data, &stored); err != nil {
+	if err := common.UnmarshalPreciseJSON(data, &stored); err != nil {
 		return interfaces.ObjectExecutionResult{}, err
 	}
 	return stored.ObjectExecutionResult, nil

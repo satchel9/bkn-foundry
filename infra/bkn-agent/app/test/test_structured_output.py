@@ -164,6 +164,172 @@ def test_fallback_all_invalid_raises():
         asyncio.run(structured_extract(m, [], SCHEMA))
 
 
+class _JsonMode:
+    """A provider with json_object but no json_schema, as DeepSeek: the native
+    call is refused, the fallback goes through bind(response_format=...)."""
+
+    def __init__(self, replies, refuse_json_object=False):
+        self.replies = list(replies)
+        self.refuse_json_object = refuse_json_object
+        self.bound = []
+        self.plain = 0
+        self.seen = []
+
+    def with_structured_output(self, schema):
+        raise RuntimeError(
+            "Error code: 400 - This response_format type is unavailable now"
+        )
+
+    def _reply(self, messages):
+        self.seen.append(list(messages))
+        text, finish = self.replies.pop(0)
+        return AIMessage(content=text, response_metadata={"finish_reason": finish})
+
+    def bind(self, **kwargs):
+        outer = self
+
+        class _Bound:
+            async def ainvoke(self, messages):
+                outer.bound.append(kwargs)
+                if outer.refuse_json_object:
+                    raise RuntimeError("400 - response_format json_object is not supported")
+                return outer._reply(messages)
+
+        return _Bound()
+
+    async def ainvoke(self, messages):
+        self.plain += 1
+        return self._reply(messages)
+
+
+def test_fallback_asks_for_json_object():
+    m = _JsonMode([('{"greeting": "hi"}', "stop")])
+    out, path = asyncio.run(structured_extract_with_path(m, [], SCHEMA))
+    assert (out, path) == ({"greeting": "hi"}, "fallback")
+    assert m.bound == [{"response_format": {"type": "json_object"}}]
+    assert m.plain == 0
+
+
+def test_fallback_without_json_object_asks_plainly():
+    m = _JsonMode([('{"greeting": "hi"}', "stop")], refuse_json_object=True)
+    out = asyncio.run(structured_extract(m, [], SCHEMA))
+    assert out == {"greeting": "hi"}
+    assert m.plain == 1
+
+
+def test_fallback_without_json_object_in_other_words_asks_plainly():
+    """A thinking-mode qwen refuses json_object without naming response_format."""
+
+    class _Refused(Exception):
+        status_code = 400
+
+    m = _JsonMode([('{"greeting": "hi"}', "stop")])
+
+    def bind(**kwargs):
+        class _Bound:
+            async def ainvoke(self, messages):
+                raise _Refused("Json mode response is not supported when enable_thinking is true")
+
+        return _Bound()
+
+    m.bind = bind
+    out = asyncio.run(structured_extract(m, [], SCHEMA))
+    assert out == {"greeting": "hi"}
+    assert m.plain == 1
+
+
+def test_fallback_network_failure_is_not_hidden():
+    class _Down(Exception):
+        pass
+
+    m = _JsonMode([('{"greeting": "hi"}', "stop")])
+
+    def bind(**kwargs):
+        class _Bound:
+            async def ainvoke(self, messages):
+                raise _Down("connection reset")
+
+        return _Bound()
+
+    m.bind = bind
+    with pytest.raises(_Down):
+        asyncio.run(structured_extract(m, [], SCHEMA))
+
+
+def _length_error(reasoning_tokens):
+    from openai import LengthFinishReasonError
+    from openai.types.chat import ChatCompletion
+
+    completion = ChatCompletion.model_validate({
+        "id": "c", "object": "chat.completion", "created": 0, "model": "m",
+        "choices": [{"index": 0, "finish_reason": "length",
+                     "message": {"role": "assistant", "content": ""}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 16384, "total_tokens": 16385,
+                  "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}},
+    })
+    return LengthFinishReasonError(completion=completion)
+
+
+def test_reply_parsed_and_cut_off_is_retried_shorter(caplog):
+    """langchain-openai parses a response_format reply through the SDK, which
+    raises at the output cap; that is a truncated reply, asked again shorter."""
+    m = _JsonMode([('{"greeting": "short"}', "stop")])
+    calls = {"n": 0}
+
+    def bind(**kwargs):
+        class _Bound:
+            async def ainvoke(self, messages):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise _length_error(16384)
+                return m._reply(messages)
+
+        return _Bound()
+
+    m.bind = bind
+    out = asyncio.run(structured_extract(m, [], SCHEMA))
+    assert out == {"greeting": "short"}
+    assert "cut off" in str(m.seen[0][-1])
+    assert "reasoning_tokens=16384" in caplog.text
+
+
+def test_reply_cut_off_twice_names_truncation():
+    m = _JsonMode([])
+
+    def bind(**kwargs):
+        class _Bound:
+            async def ainvoke(self, messages):
+                raise _length_error(15000)
+
+        return _Bound()
+
+    m.bind = bind
+    with pytest.raises(structured.StructuredOutputError, match=structured.TRUNCATED):
+        asyncio.run(structured_extract(m, [], SCHEMA))
+
+
+def test_fallback_accepts_raw_newline_in_string():
+    m = _JsonMode([('{"greeting": "a' + chr(10) + 'b"}', "stop")])
+    out = asyncio.run(structured_extract(m, [], SCHEMA))
+    assert out == {"greeting": "a" + chr(10) + "b"}
+
+
+def test_truncated_reply_asks_for_a_shorter_one():
+    m = _JsonMode([('{"greeting": "cut', "length"), ('{"greeting": "short"}', "stop")])
+    out = asyncio.run(structured_extract(m, [], SCHEMA))
+    assert out == {"greeting": "short"}
+    retry = m.seen[1]
+    # The cut-off text is not sent back; the retry asks for less.
+    assert all('"cut' not in str(part) for part in retry)
+    assert "cut off" in str(retry[-1])
+
+
+def test_truncated_twice_says_so():
+    m = _JsonMode([('{"greeting": "cut', "length"), ('{"greeting": "cut again', "length")])
+    with pytest.raises(structured.StructuredOutputError, match=structured.TRUNCATED):
+        asyncio.run(structured_extract(m, [], SCHEMA))
+
+
 # ---------- run_agent_once 集成 ----------
 
 class _FakeGraph:
@@ -247,8 +413,82 @@ def test_run_without_response_format_text_path(monkeypatch):
     assert out == "loop done"
 
 
+def _single_call_agent(enabled=True):
+    from app.models import AgentLimits
+    agent = _agent()
+    agent.limits = AgentLimits(max_turns=1, max_tool_calls=0, single_structured_call=enabled)
+    return agent
+
+
+def _wire_single(monkeypatch, captured, tools=None):
+    _wire(monkeypatch, captured)
+
+    def graph(*a, **k):
+        captured["graph_built"] = True
+        return _FakeGraph()
+
+    monkeypatch.setattr(runner, "create_agent", graph)
+    if tools is not None:
+        async def fake_tools(agent_tools, account_id, account_type, **kwargs):
+            return tools
+
+        monkeypatch.setattr(tools_mod, "load_tools", fake_tools)
+
+    async def fake_extract(model, messages, schema, system_prompt=None):
+        captured["messages"] = messages
+        captured["extract_system_prompt"] = system_prompt
+        return {"greeting": "pong"}, "fallback"
+
+    monkeypatch.setattr(runner, "structured_extract_with_path", fake_extract)
+
+
+def test_single_structured_call_skips_free_form_call(monkeypatch):
+    captured: dict = {}
+    _wire_single(monkeypatch, captured)
+    out = asyncio.run(runner.run_agent_once(
+        _single_call_agent(), "the file", {}, [], None, "acc", "user", depth=1, response_format=SCHEMA,
+    ))
+    assert json.loads(out) == {"greeting": "pong"}
+    assert "graph_built" not in captured
+    # The structured call reads the task message itself, with the full system prompt.
+    assert [type(m) for m in captured["messages"]] == [HumanMessage]
+    assert captured["messages"][0].content == "the file"
+    assert captured["extract_system_prompt"] == "sys\n[技能] demo"
+    assert captured["streaming"] == [True, False]
+
+
+def test_single_structured_call_off_keeps_two_calls(monkeypatch):
+    captured: dict = {}
+    _wire_single(monkeypatch, captured)
+    asyncio.run(runner.run_agent_once(
+        _single_call_agent(enabled=None), "the file", {}, [], None, "acc", "user", depth=1, response_format=SCHEMA,
+    ))
+    assert captured["graph_built"] is True
+    assert captured["messages"][-1].content == "loop done"
+
+
+def test_single_structured_call_ignored_with_tools(monkeypatch):
+    captured: dict = {}
+    _wire_single(monkeypatch, captured, tools=[object()])
+    asyncio.run(runner.run_agent_once(
+        _single_call_agent(), "the file", {}, [], None, "acc", "user", depth=1, response_format=SCHEMA,
+    ))
+    assert captured["graph_built"] is True
+
+
+def test_single_structured_call_ignored_without_response_format(monkeypatch):
+    captured: dict = {}
+    _wire_single(monkeypatch, captured)
+    out = asyncio.run(runner.run_agent_once(
+        _single_call_agent(), "the file", {}, [], None, "acc", "user", depth=1,
+    ))
+    assert out == "loop done"
+    assert captured["graph_built"] is True
+
+
 def test_normalize_response_format():
     from app.core.llm import normalize_response_format
     assert normalize_response_format({"type": "object", "properties": {}})["title"] == "StructuredResponse"
     assert normalize_response_format({"title": "X", "type": "object"}) == {"title": "X", "type": "object"}
     assert normalize_response_format(None) is None
+

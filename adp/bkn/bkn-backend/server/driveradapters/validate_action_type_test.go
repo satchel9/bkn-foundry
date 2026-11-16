@@ -8,15 +8,35 @@ package driveradapters
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	. "github.com/smartystreets/goconvey/convey"
 
-	cond "bkn-backend/common/condition"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
+
+func TestValidateActionTypeNormalizesAndChecksConstants(t *testing.T) {
+	action := &interfaces.ActionType{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
+		ATID: "notify", ATName: "Notify", ActionType: interfaces.ACTION_TYPE_ADD,
+		OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
+		Parameters:      []interfaces.Parameter{{Name: "code", Type: "string", ValueFrom: "const", Value: json.Number("123")}},
+	}}
+	if err := ValidateActionType(context.Background(), action, true); err != nil {
+		t.Fatal(err)
+	}
+	if action.Parameters[0].Value != "123" {
+		t.Fatalf("string constant was not normalized: %v", action.Parameters[0].Value)
+	}
+	action.Parameters[0] = interfaces.Parameter{Name: "enabled", Type: "boolean", ValueFrom: "const", Value: json.Number("1")}
+	if err := ValidateActionType(context.Background(), action, true); err == nil {
+		t.Fatal("invalid boolean constant was accepted")
+	}
+}
 
 func Test_ValidateActionType(t *testing.T) {
 	Convey("Test ValidateActionType\n", t, func() {
@@ -28,14 +48,14 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldBeNil)
 		})
 
-		Convey("Success with strictMode false: empty ObjectTypeID and invalid condition not validated\n", func() {
+		Convey("Rejects strictMode false: empty ObjectTypeID and invalid condition not validated\n", func() {
 			at := &interfaces.ActionType{
 				ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 					ATID:         "at-relaxed",
@@ -45,11 +65,11 @@ func Test_ValidateActionType(t *testing.T) {
 					Condition: &interfaces.ActionCondCfg{
 						Field: "field1",
 						// Operation omitted — invalid under strict validation
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, false)
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
 		})
 
 		Convey("Failed with invalid ID\n", func() {
@@ -58,7 +78,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "_invalid_id",
 					ATName:       "action1",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -71,13 +91,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_NullParameter_Name)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_NullParameter_Name)
 		})
 
 		Convey("Failed with invalid action source type\n", func() {
@@ -89,7 +109,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ObjectTypeID: "ot1",
 					ActionSource: interfaces.ActionSource{
 						Type: "invalid_type",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -106,7 +126,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionSource: interfaces.ActionSource{
 						Type:  interfaces.ACTION_SOURCE_TYPE_TOOL,
 						McpID: "mcp1",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -123,7 +143,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionSource: interfaces.ActionSource{
 						Type:     interfaces.ACTION_SOURCE_TYPE_TOOL,
 						ToolName: "tool1",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -139,7 +159,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType:   interfaces.ACTION_TYPE_ADD,
 					ActionSource: interfaces.ActionSource{
 						Type: interfaces.ACTION_SOURCE_TYPE_TOOL,
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -155,7 +175,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType:   interfaces.ACTION_TYPE_ADD,
 					ActionSource: interfaces.ActionSource{
 						Type: interfaces.ACTION_SOURCE_TYPE_MCP,
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -173,7 +193,7 @@ func Test_ValidateActionType(t *testing.T) {
 						{
 							Name: "",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -189,7 +209,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionSource: interfaces.ActionSource{
 						Type:  interfaces.ACTION_SOURCE_TYPE_MCP,
 						BoxID: "box1",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -206,7 +226,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionSource: interfaces.ActionSource{
 						Type:   interfaces.ACTION_SOURCE_TYPE_MCP,
 						ToolID: "tool1",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -226,7 +246,7 @@ func Test_ValidateActionType(t *testing.T) {
 						ToolID:   "",
 						McpID:    "",
 						ToolName: "",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			So(ValidateActionType(ctx, atTool, false), ShouldBeNil)
@@ -248,7 +268,7 @@ func Test_ValidateActionType(t *testing.T) {
 						ToolName: "",
 						BoxID:    "",
 						ToolID:   "",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			So(ValidateActionType(ctx, atMcp, false), ShouldBeNil)
@@ -265,15 +285,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationEq,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -288,9 +306,7 @@ func Test_ValidateActionType(t *testing.T) {
 		// 			Condition: &interfaces.ActionCondCfg{
 		// 				Field:     "field1",
 		// 				Operation: cond.OperationEq,
-		// 				ValueOptCfg: cond.ValueOptCfg{
-		// 					Value: "value1",
-		// 				},
+		// 				Value: "value1",
 		// 			},
 		// 		},
 		// 	}
@@ -304,14 +320,12 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -324,15 +338,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    "invalid_op",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -345,7 +357,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationAnd,
@@ -354,12 +366,10 @@ func Test_ValidateActionType(t *testing.T) {
 								ObjectTypeID: "ot1",
 								Field:        "field1",
 								Operation:    cond.OperationEq,
-								ValueOptCfg: cond.ValueOptCfg{
-									Value: "value1",
-								},
+								Value:        "value1",
 							},
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -372,18 +382,18 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationAnd,
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
-			So(httpErr.BaseError.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
+			So(httpErr.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions")
 		})
 
 		Convey("Failed with empty or condition in strict mode\n", func() {
@@ -392,18 +402,18 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationOr,
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
-			So(httpErr.BaseError.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
+			So(httpErr.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions")
 		})
 
 		Convey("Success with empty and condition when strictMode false\n", func() {
@@ -412,11 +422,11 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationAnd,
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, false)
@@ -429,7 +439,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationAnd,
@@ -438,23 +448,21 @@ func Test_ValidateActionType(t *testing.T) {
 								ObjectTypeID: "ot1",
 								Field:        "field1",
 								Operation:    cond.OperationEq,
-								ValueOptCfg: cond.ValueOptCfg{
-									Value: "value1",
-								},
+								Value:        "value1",
 							},
 							{
 								ObjectTypeID: "ot1",
 								Operation:    cond.OperationOr,
 							},
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
-			So(httpErr.BaseError.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions[1].sub_conditions")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
+			So(httpErr.ErrorDetails, ShouldContainSubstring, "condition.sub_conditions[1].sub_conditions")
 		})
 
 		Convey("Failed with eq operation having array value\n", func() {
@@ -463,15 +471,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    "eq",
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: []any{"value1", "value2"},
-						},
-					},
+						Value:        []any{"value1", "value2"},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -484,15 +490,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationIn,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -505,15 +509,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationIn,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: []any{},
-						},
-					},
+						Value:        []any{},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -526,15 +528,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationRange,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -547,15 +547,13 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationRange,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: []any{"value1"},
-						},
-					},
+						Value:        []any{"value1"},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -568,7 +566,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ObjectTypeID: "ot1",
-					ActionType:   interfaces.ACTION_TYPE_ADD,
+					ActionType:   interfaces.ACTION_TYPE_MODIFY,
 					Condition: &interfaces.ActionCondCfg{
 						ObjectTypeID: "ot1",
 						Operation:    cond.OperationAnd,
@@ -577,20 +575,16 @@ func Test_ValidateActionType(t *testing.T) {
 								ObjectTypeID: "ot1",
 								Field:        "field1",
 								Operation:    cond.OperationEq,
-								ValueOptCfg: cond.ValueOptCfg{
-									Value: "value1",
-								},
+								Value:        "value1",
 							},
 							{
 								ObjectTypeID: "ot1",
 								Field:        "field2",
 								Operation:    cond.OperationIn,
-								ValueOptCfg: cond.ValueOptCfg{
-									Value: []any{"value2", "value3"},
-								},
+								Value:        []any{"value2", "value3"},
 							},
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -603,7 +597,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
-					ObjectTypeID: "",
+					ObjectTypeID: "", OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -621,19 +615,17 @@ func Test_ValidateActionType(t *testing.T) {
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationEq,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
 		})
 
-		Convey("Success with empty ObjectTypeID and condition when strictMode false\n", func() {
+		Convey("Rejects empty ObjectTypeID and condition when strictMode false\n", func() {
 			at := &interfaces.ActionType{
 				ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 					ATID:         "at1",
@@ -644,14 +636,12 @@ func Test_ValidateActionType(t *testing.T) {
 						ObjectTypeID: "ot1",
 						Field:        "field1",
 						Operation:    cond.OperationEq,
-						ValueOptCfg: cond.ValueOptCfg{
-							Value: "value1",
-						},
-					},
+						Value:        "value1",
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, false)
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
 		})
 
 		Convey("Failed with empty ObjectTypeID but parameter using property (strict)\n", func() {
@@ -667,16 +657,16 @@ func Test_ValidateActionType(t *testing.T) {
 							ValueFrom: interfaces.VALUE_FROM_PROPERTY,
 							Value:     "prop1",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionType_InvalidParameter)
 		})
 
-		Convey("Success with empty ObjectTypeID and parameter using property when strictMode false\n", func() {
+		Convey("Rejects empty ObjectTypeID and parameter using property when strictMode false\n", func() {
 			at := &interfaces.ActionType{
 				ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
 					ATID:         "at1",
@@ -689,11 +679,11 @@ func Test_ValidateActionType(t *testing.T) {
 							ValueFrom: interfaces.VALUE_FROM_PROPERTY,
 							Value:     "prop1",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, false)
-			So(err, ShouldBeNil)
+			So(err, ShouldNotBeNil)
 		})
 
 		Convey("Success with empty ObjectTypeID and parameter using const\n", func() {
@@ -709,7 +699,7 @@ func Test_ValidateActionType(t *testing.T) {
 							ValueFrom: interfaces.VALUE_FROM_CONST,
 							Value:     "const_value",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -728,7 +718,7 @@ func Test_ValidateActionType(t *testing.T) {
 							Name:      "param1",
 							ValueFrom: interfaces.VALUE_FROM_INPUT,
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -748,7 +738,7 @@ func Test_ValidateActionType(t *testing.T) {
 							ValueFrom: interfaces.VALUE_FROM_PROPERTY,
 							Value:     "prop1",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -768,7 +758,7 @@ func Test_ValidateActionType(t *testing.T) {
 							ValueFrom: interfaces.VALUE_FROM_CONST,
 							Value:     "const_value",
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -787,7 +777,7 @@ func Test_ValidateActionType(t *testing.T) {
 							Name:      "param1",
 							ValueFrom: interfaces.VALUE_FROM_INPUT,
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -800,7 +790,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldBeNil)
@@ -813,7 +803,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:         "at1",
 					ATName:       "action1",
 					ActionIntent: interfaces.ACTION_TYPE_DELETE,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldBeNil)
@@ -828,7 +818,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATName:       "action1",
 					ActionType:   interfaces.ACTION_TYPE_ADD,
 					ActionIntent: interfaces.ACTION_TYPE_MODIFY,
-					ObjectTypeID: "ot1",
+					ObjectTypeID: "ot1", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -842,7 +832,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType: interfaces.ACTION_TYPE_ADD,
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ExpectedOperation: interfaces.ExpectedOperationModify},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -856,7 +846,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType: interfaces.ACTION_TYPE_ADD,
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ObjectTypeID: "otx"},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -870,7 +860,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType: interfaces.ACTION_TYPE_ADD,
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ObjectTypeID: "otx", ExpectedOperation: interfaces.ExpectedOperationModify, AffectedFields: []string{"a", "  "}},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -884,7 +874,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType: interfaces.ACTION_TYPE_ADD,
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ObjectTypeID: "ot1", ExpectedOperation: interfaces.ExpectedOperationModify, AffectedFields: []string{"f1"}},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldBeNil)
@@ -898,7 +888,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ActionType: interfaces.ACTION_TYPE_ADD,
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ObjectTypeID: "ot1", ExpectedOperation: "update"},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -914,7 +904,7 @@ func Test_ValidateActionType(t *testing.T) {
 						ObjectTypeID:   "ot_a",
 						Comment:        "note",
 						AffectedFields: []string{"s"},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldBeNil)
@@ -934,7 +924,7 @@ func Test_ValidateActionType(t *testing.T) {
 					ATID:       "at1",
 					ATName:     "action1",
 					ActionType: interfaces.ACTION_TYPE_ADD,
-					Affect:     &interfaces.ActionAffect{},
+					Affect:     &interfaces.ActionAffect{}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -951,7 +941,7 @@ func Test_ValidateActionType(t *testing.T) {
 					},
 					Affect: &interfaces.ActionAffect{
 						ObjectTypeID: "ot_other",
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -969,7 +959,7 @@ func Test_ValidateActionType(t *testing.T) {
 					},
 					ImpactContracts: []interfaces.ImpactContractItem{
 						{ObjectTypeID: "ot_a", ExpectedOperation: interfaces.ExpectedOperationModify, AffectedFields: []string{"s"}},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "tool"},
 				},
 			}
 			So(ValidateActionType(ctx, at, true), ShouldNotBeNil)
@@ -997,7 +987,7 @@ func Test_ValidateActionType(t *testing.T) {
 							Name:      "param3",
 							ValueFrom: interfaces.VALUE_FROM_INPUT,
 						},
-					},
+					}, OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				},
 			}
 			err := ValidateActionType(ctx, at, true)
@@ -1009,32 +999,52 @@ func Test_ValidateActionType(t *testing.T) {
 func TestActionTypeValidationDetailsRespectLanguage(t *testing.T) {
 	testCases := []struct {
 		name     string
-		language string
+		language i18n.Language
 		want     string
 	}{
-		{"English", rest.AmericanEnglish, "The action type must be one of [add, modify, delete]; got unsupported."},
-		{"SimplifiedChinese", rest.SimplifiedChinese, "行动类型必须为 [add, modify, delete] 之一，当前为 unsupported。"},
+		{"English", i18n.AmericanEnglish, "The action type must be one of [add, modify, delete]; got unsupported."},
+		{"SimplifiedChinese", i18n.SimplifiedChinese, "行动类型必须为 [add, modify, delete] 之一，当前为 unsupported。"},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := ValidateActionType(
-				rest.WithLanguage(context.Background(), testCase.language),
+				i18n.WithLanguage(context.Background(), testCase.language),
 				&interfaces.ActionType{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
-					ATID: "at1", ATName: "action1", ObjectTypeID: "ot1", ActionType: "unsupported",
+					ATID: "at1", ATName: "action1", ObjectTypeID: "ot1", ActionType: "unsupported", OperationConfig: &interfaces.ActionOperationConfig{Type: "object"},
 				}},
 				true,
 			)
 			if err == nil {
 				t.Fatal("ValidateActionType() error = nil, want invalid action type error")
 			}
-			httpErr, ok := err.(*rest.HTTPError)
+			httpErr, ok := err.(*httperrors.HTTPError)
 			if !ok {
-				t.Fatalf("error type = %T, want *rest.HTTPError", err)
+				t.Fatalf("error type = %T, want *httperrors.HTTPError", err)
 			}
-			if got, ok := httpErr.BaseError.ErrorDetails.(string); !ok || got != testCase.want {
-				t.Fatalf("error_details = %#v, want %q", httpErr.BaseError.ErrorDetails, testCase.want)
+			if got, ok := httpErr.ErrorDetails.(string); !ok || got != testCase.want {
+				t.Fatalf("error_details = %#v, want %q", httpErr.ErrorDetails, testCase.want)
 			}
 		})
+	}
+}
+
+func TestActionLikePatternValidation(t *testing.T) {
+	for _, operation := range []string{cond.OperationLike, cond.OperationNotLike} {
+		for _, pattern := range []string{"apple", "%apple%", `a\%_`} {
+			cfg := &interfaces.ActionCondCfg{Field: "name", Operation: operation, ValueFrom: "const", Value: pattern}
+			if err := validateActionCondition(context.Background(), cfg, "object"); err != nil {
+				t.Errorf("%s %q: %v", operation, pattern, err)
+			}
+		}
+		cfg := &interfaces.ActionCondCfg{Field: "name", Operation: operation, ValueFrom: "const", Value: `apple\`}
+		if err := validateActionCondition(context.Background(), cfg, "object"); err == nil {
+			t.Errorf("%s accepted an incomplete LIKE escape", operation)
+		}
+		// Dynamic references name a parameter, not a pattern available at save time.
+		cfg.ValueFrom, cfg.Value = "input", `parameter\`
+		if err := validateActionCondition(context.Background(), cfg, "object"); err != nil {
+			t.Errorf("%s rejected a dynamic parameter name: %v", operation, err)
+		}
 	}
 }

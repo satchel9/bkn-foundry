@@ -8,16 +8,18 @@ package interfaces
 import (
 	"context"
 
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/licverify"
 )
 
 //go:generate mockgen -source ../interfaces/connector_factory.go -destination ../interfaces/mock/mock_connector_factory.go
 
-// ConnectorAvailability describes whether a connector can currently be used
-// and the edition declared by its local implementation. RequiredEdition is
-// empty for remote connectors and implementations not bundled in this binary.
+// ConnectorAvailability reports implementation/edition availability separately
+// from the registered connector's enabled state. RequiredEdition is empty for
+// remote connectors and implementations not bundled in this binary.
 type ConnectorAvailability struct {
 	Available       bool
+	Disabled        bool
 	RequiredEdition licverify.Edition
 }
 
@@ -65,7 +67,24 @@ type ConnectorFactory interface {
 	// connector type.
 	GetConnectorFieldConfig(ctx context.Context, ct *ConnectorType) (map[string]ConnectorFieldConfig, error)
 
-	// GetSensitiveFields returns the sensitive fields declared by a connector
-	// type that is available under the current entitlement.
-	GetSensitiveFields(tp string) []string
+	// SupportDiscover returns the assembled connector's static discovery support.
+	// It does not create an instance or depend on execution entitlement or enabled state.
+	SupportDiscover(tp string) (bool, error)
+
+	// GetSensitiveFields returns unqualified sensitive field names for an assembled connector,
+	// independently of execution entitlement. cfg is passed directly to the assembled builder without source I/O.
+	// An empty list is valid; an unknown type or invalid configuration metadata returns an error.
+	GetSensitiveFields(tp string, cfg ConnectorConfig) ([]string, error)
+
+	// ValidateBuildSchema delegates source-specific build validation to the registered connector without creating an instance or opening a source connection.
+	ValidateBuildSchema(tp string, resource *Resource) error
+
+	// ValidateFilterability 委托连接器校验显式开启的字段能力，不解析源元数据、创建实例或访问源端。
+	ValidateFilterability(tp string, resource *Resource) error
+
+	// ValidateFilterCondition 从 Resource 取得原生 Schema 和列元数据，委托连接器转换完整条件树，不创建实例或访问源端。
+	ValidateFilterCondition(tp string, condition FilterCondition, resource *Resource) error
+
+	// ConvertSQLFilterCondition 在注册连接器的读锁内转换完整 Table 过滤树，保留参数节点，不创建连接。
+	ConvertSQLFilterCondition(tp string, condition FilterCondition, resource *Resource) (sqlbuilder.SqlNode, error)
 }

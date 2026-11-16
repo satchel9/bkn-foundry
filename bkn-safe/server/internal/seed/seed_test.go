@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -220,7 +219,7 @@ func TestApplyRemovesWithdrawnResourceTypes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := map[string]string{"stream_data_pipeline": "view_detail"}
+	legacy := map[string]string{"stream_data_pipeline": "view_detail", "operator": "execute"}
 	for resourceType, operation := range legacy {
 		if err := db.Create(&model.ResourceType{ID: resourceType, Name: resourceType}).Error; err != nil {
 			t.Fatal(err)
@@ -527,82 +526,6 @@ func TestSeedsAdminUser(t *testing.T) {
 	}
 	if after.PasswordHash != "changed-hash" || after.MustChangePassword {
 		t.Errorf("re-seed overwrote changed admin: hash=%q must_change=%v", after.PasswordHash, after.MustChangePassword)
-	}
-}
-
-func TestApplySeedsBusinessProvenanceAppPrincipal(t *testing.T) {
-	db := newDB(t)
-	e, err := authz.New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Apply(db, e); err != nil {
-		t.Fatalf("apply: %v", err)
-	}
-
-	var principal model.User
-	if err := db.First(&principal, "id = ?", "bdd59f76-19c3-58b0-bf5f-082c4c3cbddb").Error; err != nil {
-		t.Fatalf("business provenance app principal not seeded: %v", err)
-	}
-	if principal.Account != "openbkn-business-provenance" {
-		t.Errorf("account = %q", principal.Account)
-	}
-	if principal.Name != "OpenBKN Business Provenance Service" {
-		t.Errorf("name = %q", principal.Name)
-	}
-	if principal.AccountType != model.AccountTypeApp {
-		t.Errorf("account type = %q, want app", principal.AccountType)
-	}
-	if !principal.Enabled {
-		t.Error("principal must be enabled")
-	}
-	if principal.PasswordHash != "" {
-		t.Error("app principal must not have a login password")
-	}
-}
-
-func TestApplyRejectsConflictingBusinessProvenancePrincipal(t *testing.T) {
-	db := newDB(t)
-	e, err := authz.New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Create(&model.User{
-		ID:          "bdd59f76-19c3-58b0-bf5f-082c4c3cbddb",
-		Account:     "customer-owned-account",
-		Name:        "Customer Account",
-		Enabled:     true,
-		Source:      model.SourceLocal,
-		AccountType: model.AccountTypeOther,
-	}).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	if err := Apply(db, e); err == nil {
-		t.Fatal("expected conflicting fixed principal to fail seed")
-	}
-}
-
-func TestApplyReportsBusinessProvenanceAccountCollision(t *testing.T) {
-	db := newDB(t)
-	e, err := authz.New(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Create(&model.User{
-		ID:          "customer-created-id",
-		Account:     BusinessProvenanceOwnerAccount,
-		Name:        "Customer Account",
-		Enabled:     true,
-		Source:      model.SourceLocal,
-		AccountType: model.AccountTypeApp,
-	}).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	err = Apply(db, e)
-	if err == nil || !strings.Contains(err.Error(), "conflicts with the deployment contract") {
-		t.Fatalf("expected actionable fixed principal conflict, got %v", err)
 	}
 }
 
@@ -936,6 +859,8 @@ func TestNetworkBuilderPermissionMatrixMatchesBusinessBuilderRole(t *testing.T) 
 	want := map[string][]string{
 		"catalog:*":           {"create"},
 		"knowledge_network:*": {"create"},
+		"knowledge_base:*":    {"create"},
+		"workshop_app:*":      {"create"},
 		"large_model:*":       {"create", "display", "modify", "delete", "execute"},
 		"small_model:*":       {"create", "display", "modify", "delete", "execute"},
 		"tool_box:*":          {"create"},
@@ -965,7 +890,7 @@ func TestApplyRemovesFormerNetworkBuilderExecutionFactoryGrants(t *testing.T) {
 	if err := e.AssignRole(user, roleID); err != nil {
 		t.Fatal(err)
 	}
-	for _, resourceType := range []string{"operator", "skill", "mcp", "function", "tool_box"} {
+	for _, resourceType := range []string{"skill", "mcp", "function", "tool_box"} {
 		if err := e.GrantRolePermission(roleID, resourceType, "*", "publish"); err != nil {
 			t.Fatal(err)
 		}
@@ -974,12 +899,12 @@ func TestApplyRemovesFormerNetworkBuilderExecutionFactoryGrants(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, resourceType := range []string{"operator", "skill", "mcp", "function", "tool_box"} {
+	for _, resourceType := range []string{"skill", "mcp", "function", "tool_box"} {
 		for _, tc := range []struct {
 			operation string
 			want      bool
 		}{
-			{"create", resourceType != "operator"},
+			{"create", true},
 			{"publish", false},
 		} {
 			got, err := e.Check(user, resourceType, "other-owner-resource", tc.operation)

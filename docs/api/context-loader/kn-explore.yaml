@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: 知识网络浏览
+  title: 上下文加载 · 知识网络浏览 API
   description: |
     Context Loader（服务名 `agent-retrieval`）的知识网络浏览接口：从「有哪些知识网络」
     到「这张网里有哪些对象类 / 关系类」，再按需下钻取完整定义。
@@ -91,11 +91,19 @@ paths:
 
         | 级别 | 保留 | 剥掉 |
         |---|---|---|
+        | `brief` | 网络的 `name` / `comment`、概念组、`mounted_capabilities`，以及 `object_type_count` / `relation_type_count` / `action_type_count` | 三个概念数组（回 `null`）；也不做逐对象类的属性授权读取，几 KB |
         | `summary`（默认） | 骨架 + 每个属性的 `name` / `type` | 属性的 `display_name` / `comment` / `mapped_field` / `condition_operations`，逻辑属性的 `data_source` / `parameters`，关系类的 `mapping_rules` 与起终点对象类详情 |
         | `full` | 全部 | —— |
 
         两种级别都会**去掉 `concept_groups` 里嵌套的对象类 / 关系类 / 行动类副本**：
         这些是顶层数组的重复拷贝，概念组只保留 `object_type_ids` 作为分组边界。
+
+        两种级别都**不带 BKN 3.0 声明**，这些只由 `search_schema` 给出：对象类、关系类、
+        行动类的 `aliases`；对象类属性和间接关系 `mapping_rules.properties` 中关系属性的
+        `aliases` / `semantic` / `required` / `constraints`；关系类的 `reverse_name` /
+        `cardinality` / `constraints` / `verification`。关系类的 `lifecycle`、`importance`、
+        `fallback_for` 保留：它们说明弃用的关系由谁替代、哪条是替代路径，缺了调用方可能把
+        主关系和替代路径的结果相加。
 
         被剥掉的细节按需用 `get_object_types` / `get_relation_types` 取回。
         对象类条目带 `related_metric_count`（该对象类下已建模指标数），`>0` 才值得
@@ -119,8 +127,26 @@ paths:
         选出 1-3 个相关分组，用 [schema-search.yaml](schema-search.yaml) 的 `search_schema`
         配合 `search_scope.concept_groups` 收敛，再用 `get_object_types` 按 ID 取细节。
 
+        非 `main` 分支暂不支持通过 `search_schema` 召回概念。此时用相同 `branch`
+        调 `get_object_types`，不传 `ids` 按页列举对象类索引，再带选中的 `ids`
+        读取完整定义和关联指标。
+
         收窄发生在逐对象类的属性授权读取之前：那一步每个对象类一次下游调用，为一份
         不会返回的列表付这个代价没有意义。
+
+        **返回体积另有上限：约 30000 字符**，按调用方实际读到的格式（JSON 或 TOON）计数，
+        `summary` 与 `full` 都受限。个数在上限以内的网络，summary 仍可能有二十多万字符，
+        宿主会把它转存成文件、截断或直接丢弃，调用方在不知情的情况下丢掉部分模型。超过时
+        逐级收窄，并在 `notice` 里说明：
+
+        1. **大纲**：三个概念数组都在，对象类去掉 `data_properties` / `logic_properties` /
+           `effective_permissions` 与说明文字，改给 `data_property_count` /
+           `logic_property_count`；关系类保留起终点，去掉映射规则。要属性用
+           `get_object_types` 按 ID 取。
+        2. **导航壳**：大纲仍超过上限时，返回与 `brief` 相同的导航壳；壳本身仍超过上限时，
+           再去掉各概念组的 `object_type_ids`。
+
+        体积收窄发生在属性授权读取之后、证据快照之前，证据记录的就是调用方拿到的内容。
       parameters:
         - $ref: '#/components/parameters/ResponseFormat'
         - $ref: '#/components/parameters/XKnID'
@@ -174,13 +200,14 @@ paths:
             - '{cl_ot_id}'
       description: |
         取 `get_kn_detail` 在 summary 级别剥掉的对象类细节：属性的 `mapped_field`
-        （写 `run_sql` 要的物理列名）、`condition_operations`（该属性可用的查询算子）、
-        逻辑属性的 `data_source` 与 `parameters`。
+        （物理列名）、`condition_operations`（该属性可用的查询算子）、
+        逻辑属性的 `data_source` 与 `parameters`。与 `get_kn_detail` 相同，不带对象类与属性的
+        BKN 3.0 声明（`aliases` / `semantic` / `required` / `constraints`），用 `search_schema` 取。
 
-        同时返回 `related_metrics`——挂在该对象类下的指标，**包括没绑到逻辑属性、
-        因而在 `logic_properties` 里根本看不见的那些**。这是 Agent 选指标的权威清单，
-        选定后走 [logic-property.yaml](logic-property.yaml) 的
-        `logic-property-resolver`（实例 + 已绑逻辑属性）或 `query_metric`（其余）。
+        同时返回 `related_metrics`——挂在该对象类下的已发布实例集合指标。这是 Agent
+        选指标的权威清单，选定后统一走 `query_metric`。`logic_properties` 只包含工具型
+        逻辑属性，通过 [logic-property.yaml](logic-property.yaml) 的
+        `logic-property-resolver` 按对象实例求值；二者不建立绑定关系。
 
         `ids` 里既可以传对象类 ID，也可以传对象类名（ID 优先，名称仅作兜底）；
         匹配不到的 ID 原样回填在 `missing` 里，不报错。属性的 `display_name`
@@ -188,9 +215,10 @@ paths:
 
         **不传 `ids` 就是列举对象类索引**：按名称升序返回一页，每条只有
         `id` / `name` / `comment` / `tags` / `data_source`，**没有 `data_properties`、
-        `logic_properties` 与 `related_metrics`**。`limit` 默认 50、上限 200，响应带
+        `logic_properties` 与 `related_metrics`**，`comment` 只保留前 120 个字符。`limit` 默认 50、上限 200，响应带
         `total_count`（当前账号可见总数）与 `next_offset`（走完最后一页即不再出现，
-        别自己用 `offset + len` 推）。
+        别自己用 `offset + len` 推）。单页内容超过约 30000 字符时提前截断，`next_offset`
+        指向截断处，`notice` 说明原因。
 
         这是给拿不到 ID 的调用方准备的——`get_kn_detail` 对超过上限的网络只回导航壳，
         那条路给不出 ID。挑好之后把 ID 传回本接口取完整定义。传了 `ids` 则
@@ -249,7 +277,7 @@ paths:
     post:
       tags:
         - KnExplore
-      summary: 按 ID 批量取关系类完整定义
+      summary: 按 ID 批量取关系类完整定义，或列举关系类索引
       operationId: getRelationTypes
       x-contract-probe:
         readonly: true
@@ -261,6 +289,24 @@ paths:
       description: |
         `get_object_types` 的关系类版本：取回 summary 级别剥掉的 `mapping_rules`
         与起终点对象类详情。同样支持按名称兜底匹配，未命中的 ID 落 `missing`。
+
+        **不传 `ids` 时按 `offset` / `limit` 列举关系类索引**，与 `get_object_types` 的
+        列举模式相同：默认 50 条、上限 200，按名称排序，带 `total_count` 与 `next_offset`。
+        索引条目只有 `id` / `name` / `comment` / `tags` / `source_object_type_id` /
+        `target_object_type_id` / `type`，不含 `mapping_rules` 与起终点对象类详情；
+        `comment` 只保留前 120 个字符，超出部分以「…」结尾，完整说明按 ID 取。
+        单页内容超过约 30000 字符时提前截断，`next_offset` 指向截断处，`notice` 说明原因。
+        传 `object_type_ids` 时只列起点或终点是其中之一的关系类。已经选好对象类、
+        要找它们之间有哪些关系时优先用它，通常一页就能列完。
+
+        需要列举的情形：`get_kn_detail` 只返回导航壳时 `relation_types` 为 `null`；
+        在非 `main` 分支上 `search_schema` 不能召回概念。`branch` 对两种模式都有效。
+
+        与 `get_kn_detail` 相同，不带 BKN 3.0 声明：关系类的 `aliases` / `reverse_name` /
+        `cardinality` / `constraints` / `verification`，以及间接关系 `mapping_rules.properties`
+        中关系属性的 `aliases` / `semantic` / `required` / `constraints`，用 `search_schema` 取。
+        关系属性的 `name` / `display_name` / `type` / `comment` / `mapped_field` 照常返回；
+        `lifecycle`、`importance`、`fallback_for` 保留。
       parameters:
         - $ref: '#/components/parameters/ResponseFormat'
         - $ref: '#/components/parameters/XKnID'
@@ -269,16 +315,23 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/DrillRequest'
+              $ref: '#/components/schemas/RelationTypesRequest'
             examples:
               下钻一条关系:
                 value:
                   kn_id: kn_medical
                   ids:
                     - rt_produced_by
+              列举两个对象类之间的关系:
+                value:
+                  kn_id: kn_medical
+                  object_type_ids:
+                    - ot_patient
+                    - ot_visit
+                  limit: 50
       responses:
         '200':
-          description: 关系类完整定义
+          description: 关系类完整定义，或一页关系类索引
           content:
             application/json:
               schema:
@@ -287,7 +340,7 @@ paths:
               schema:
                 type: string
         '400':
-          description: 缺少 `kn_id` 或 `ids` 为空
+          description: 缺少 `kn_id`
           content:
             application/json:
               schema:
@@ -402,31 +455,18 @@ components:
         kn_id:
           type: string
           description: 知识网络 ID。与 `x-kn-id` 头二选一，本字段优先。
+        branch:
+          type: string
+          default: main
+          description: 知识网络分支；省略时使用 main。
         detail_level:
           type: string
           enum:
+            - brief
             - summary
             - full
           default: summary
           description: 详情级别，见端点说明。
-
-    DrillRequest:
-      type: object
-      required:
-        - ids
-      properties:
-        bkn_context:
-          $ref: '../_shared/common.yaml#/components/schemas/BKNContext'
-        kn_id:
-          type: string
-          description: 知识网络 ID。与 `x-kn-id` 头二选一，本字段优先。
-        ids:
-          type: array
-          items:
-            type: string
-          description: |
-            要下钻的概念 ID 列表（取自 `get_kn_detail`）。也接受概念名称作为兜底匹配。
-            为空时返回 400。
 
     ObjectTypesRequest:
       type: object
@@ -440,6 +480,10 @@ components:
         kn_id:
           type: string
           description: 知识网络 ID。与 `x-kn-id` 头二选一，本字段优先。
+        branch:
+          type: string
+          default: main
+          description: 对象类与关联指标所属的知识网络分支；省略时使用 main。
         ids:
           type: array
           items:
@@ -461,7 +505,53 @@ components:
             列举的单页条数，默认 50、上限 200。仅在不传 `ids` 时有效。索引条目只有
             几百字节，所以比按 ID 取定义时能装得多。超过上限不报错，按上限返回，
             并在响应的 `notice` 里说明——一页比你要的短却什么都不说，会被读成
-            「这张网就这么大」。
+            「这张网就这么大」。单页内容超过约 30000 字符时也会提前截断，同样在 `notice` 里说明。
+
+    RelationTypesRequest:
+      type: object
+      description: |
+        `get_relation_types` 的入参。`ids` 可选：传了就是按 ID 取完整定义，不传就是列举
+        关系类索引，可用 `object_type_ids` 收窄。两种模式的条目形状不同——索引条目不含
+        `mapping_rules` 与起终点对象类详情；列举还会额外带 `total_count` 与 `next_offset`。
+      properties:
+        bkn_context:
+          $ref: '../_shared/common.yaml#/components/schemas/BKNContext'
+        kn_id:
+          type: string
+          description: 知识网络 ID。与 `x-kn-id` 头二选一，本字段优先。
+        branch:
+          type: string
+          default: main
+          description: 关系类所属的知识网络分支；省略时使用 main。
+        ids:
+          type: array
+          items:
+            type: string
+          description: |
+            要下钻的关系类 ID 列表（取自 `get_kn_detail`、`search_schema` 或本接口的列举
+            模式）。也接受名称作为兜底匹配。**留空即切换到列举模式**，不再返回 400；传了
+            `ids` 时 `object_type_ids` / `offset` / `limit` 无效。
+        object_type_ids:
+          type: array
+          items:
+            type: string
+          description: |
+            列举时只返回起点或终点是这些对象类之一的关系类。仅在不传 `ids` 时有效。
+            已经选好对象类时优先用它，通常一页就能列完。
+        offset:
+          type: integer
+          minimum: 0
+          default: 0
+          description: 列举的起始位置。仅在不传 `ids` 时有效；续页请用响应里的 `next_offset`。
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 50
+          description: |
+            列举的单页条数，默认 50、上限 200。仅在不传 `ids` 时有效。超过上限不报错，
+            按上限返回，并在响应的 `notice` 里说明；单页内容超过约 30000 字符时也会提前
+            截断，同样在 `notice` 里说明。
 
     KnowledgeNetworkDetail:
       type: object
@@ -479,14 +569,17 @@ components:
             $ref: '#/components/schemas/ConceptGroup'
         object_types:
           type: array
+          nullable: true
           items:
             $ref: '#/components/schemas/ObjectType'
         relation_types:
           type: array
+          nullable: true
           items:
             $ref: '#/components/schemas/RelationType'
         action_types:
           type: array
+          nullable: true
           items:
             $ref: '#/components/schemas/ActionType'
         mounted_capabilities:
@@ -494,8 +587,9 @@ components:
         object_type_count:
           type: integer
           description: |
-            该网络的对象类总数。**仅在导航壳返回时出现**——其余情况下 `object_types`
-            数组本身就是数量，再给一个数只会多一个可能对不上的地方。
+            该网络的对象类总数。**仅在导航壳返回时出现**（`detail_level=brief`，或网络超过
+            单次返回上限）——其余情况下 `object_types` 数组本身就是数量，再给一个数只会多一个
+            可能对不上的地方。
         relation_type_count:
           type: integer
           description: 该网络的关系类总数。出现条件同 `object_type_count`。
@@ -505,9 +599,13 @@ components:
         notice:
           type: string
           description: |
-            本次返回被收窄的原因与下一步指引。**出现时 `object_types` /
-            `relation_types` / `action_types` 都回 `null`**，这不表示该网络没有这些概念：
-            数量见三个 `*_count` 字段。
+            本次返回比所请求的级别少了什么，以及下一步指引。两种情形：
+
+            - **导航壳**（`detail_level=brief`，或网络超过单次返回上限）：`object_types` /
+              `relation_types` / `action_types` 都回 `null`，这不表示该网络没有这些概念，
+              数量见三个 `*_count` 字段。
+            - **大纲**（返回超过约 30000 字符）：三个数组都在，对象类只给
+              `data_property_count` / `logic_property_count`，不带属性列表。
 
     MountedCapabilityCounts:
       type: object
@@ -549,8 +647,8 @@ components:
             $ref: '#/components/schemas/ObjectType'
           description: |
             传了 `ids` 时是完整定义；**列举模式下是索引条目**，只有 `id` / `name` /
-            `comment` / `tags` / `data_source`，`data_properties` / `logic_properties` /
-            `related_metrics` 一概不下发。要它们把 `id` 传回本接口。
+            `comment`（只保留前 120 个字符，被截断时以「…」结尾）/ `tags` / `data_source`，`data_properties` / `logic_properties` /
+            `related_metrics` 一概不下发。要它们或完整说明把 `id` 传回本接口。
         missing:
           type: array
           items:
@@ -571,8 +669,8 @@ components:
         notice:
           type: string
           description: |
-            本次请求没有被原样兑现时的说明。目前只有一种情形：`limit` 超过上限，
-            按上限返回了。它出现时这一页比请求的短，**但不代表列举到头了**——
+            本次请求没有被原样兑现时的说明。有两种情形：`limit` 超过上限，按上限返回了；
+            或者这一页超过约 30000 字符，只返回了前面一部分。它出现时这一页比请求的短，**但不代表列举到头了**——
             是否还有下一页只看 `next_offset`。
 
     RelationTypesResponse:
@@ -584,11 +682,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/RelationType'
+          description: |
+            传了 `ids` 时是完整定义；**列举模式下是索引条目**，不含 `mapping_rules` 与
+            起终点对象类详情，`comment` 只保留前 120 个字符。要完整内容把 `id` 传回本接口。
         missing:
           type: array
           items:
             type: string
           description: 请求里没匹配到任何关系类的 ID；全部命中时该字段不返回。
+        total_count:
+          type: integer
+          description: |
+            当前账号可见、且符合 `object_type_ids` 条件的关系类总数。**仅列举模式返回**。
+            授权过滤发生在分页之前，所以这个数是「你能看到多少」。
+        next_offset:
+          type: integer
+          description: |
+            续走本次列举的下一个 `offset`。**仅列举模式返回，且走完最后一页即不再出现**。
+            不要用 `offset + relation_types.length` 自行推算。
+        notice:
+          type: string
+          description: |
+            本次请求没有被原样兑现时的说明。有两种情形：`limit` 超过上限，按上限返回了；
+            或者这一页超过约 30000 字符，只返回了前面一部分。是否还有下一页只看 `next_offset`。
 
     ConceptGroup:
       type: object
@@ -649,6 +765,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/LogicProperty'
+        data_property_count:
+          type: integer
+          description: |
+            数据属性个数。仅当 `get_kn_detail` 的返回超过字符上限、改给大纲时出现，此时不带
+            `data_properties`。
+        logic_property_count:
+          type: integer
+          description: 逻辑属性个数。出现条件同 `data_property_count`。
         effective_permissions:
           type: object
           additionalProperties:
@@ -679,11 +803,10 @@ components:
         related_metrics:
           type: array
           description: |
-            挂在该对象类下的指标（`scope_type=object_type` 且 `scope_ref` 等于本对象类
-            ID），**含没绑到任何逻辑属性的指标**。仅 `get_object_types` 返回。
-            选定后怎么算：实例级且已绑逻辑属性走
-            [logic-property.yaml](logic-property.yaml) 的 `logic-property-resolver`，
-            其余把 `id` 传给同文件的 `query_metric`。
+            挂在该对象类下的已发布实例集合指标（`scope_type=object_type` 且
+            `scope_ref` 等于本对象类 ID）。仅 `get_object_types` 返回。选定后统一把
+            `id` 与固定版本传给 [logic-property.yaml](logic-property.yaml) 的
+            `query_metric`；对象指标不绑定为逻辑属性。
           items:
             $ref: '#/components/schemas/RelatedMetric'
         related_metric_count:
@@ -719,7 +842,7 @@ components:
           type: array
           items:
             type: string
-          description: 可用的分析维度名，`query_metric` 的 `analysis_dimensions` 只能从这里取值。
+          description: 可用的分析维度名；传给 `query_metric` 时使用 `query.group_by` 属性引用。
         time_dimension:
           type: string
           description: |
@@ -738,7 +861,7 @@ components:
           description: 显示名。summary 级别与 `get_object_types` 均不返回。
         type:
           type: string
-          description: 属性类型。除视图字段类型外，还有 metric / objective / event / trace / log / operator。
+          description: 属性类型。除视图字段类型外，还有 metric / objective / event / trace / log / tool。
         comment:
           type: string
           description: 备注。summary 级别不返回。
@@ -747,8 +870,7 @@ components:
           additionalProperties: true
           description: |
             映射到的物理字段信息。summary 级别不返回，用 `get_object_types` 取。
-            结构随数据源类型而变，表 / 视图类数据源下至少含 `name`——**这就是写
-            `run_sql` 要用的物理列名**。
+            结构随数据源类型而变，表 / 视图类数据源下至少含 `name`，即物理列名。
           properties:
             name:
               type: string
@@ -765,7 +887,7 @@ components:
 
     LogicProperty:
       type: object
-      description: 逻辑属性（指标或算子），值需要计算，不直接存在于数据源里。
+      description: 工具型逻辑属性，值需要计算，不直接存在于数据源里；对象指标列在 `related_metrics`。
       properties:
         name:
           type: string
@@ -775,9 +897,8 @@ components:
         type:
           type: string
           enum:
-            - metric
-            - operator
-          description: 逻辑属性类型。
+            - tool
+          description: 逻辑属性类型，目前只支持 `tool`。
         comment:
           type: string
           description: 备注。summary 级别不返回。

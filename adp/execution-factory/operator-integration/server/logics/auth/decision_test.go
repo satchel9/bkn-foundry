@@ -8,11 +8,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	. "github.com/smartystreets/goconvey/convey"
+	"go.uber.org/mock/gomock"
+
 	oerrors "github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/execution-factory/operator-integration/server/mocks"
-	. "github.com/smartystreets/goconvey/convey"
-	"go.uber.org/mock/gomock"
 )
 
 // TestOperationCheckAllSeparatesDenialFromDependencyFailure guards #1533.
@@ -36,7 +38,7 @@ func TestOperationCheckAllSeparatesDenialFromDependencyFailure(t *testing.T) {
 				Return(&interfaces.AuthOperationCheckResponse{Result: true}, nil)
 
 			allowed, err := service.OperationCheckAll(context.Background(), accessor, interfaces.ResourceIDAll,
-				interfaces.AuthResourceTypeOperator, interfaces.AuthOperationTypeExecute)
+				interfaces.AuthResourceTypeToolBox, interfaces.AuthOperationTypeExecute)
 
 			So(err, ShouldBeNil)
 			So(allowed, ShouldBeTrue)
@@ -47,7 +49,7 @@ func TestOperationCheckAllSeparatesDenialFromDependencyFailure(t *testing.T) {
 				Return(&interfaces.AuthOperationCheckResponse{Result: false}, nil)
 
 			allowed, err := service.OperationCheckAll(context.Background(), accessor, interfaces.ResourceIDAll,
-				interfaces.AuthResourceTypeOperator, interfaces.AuthOperationTypeExecute)
+				interfaces.AuthResourceTypeToolBox, interfaces.AuthOperationTypeExecute)
 
 			So(err, ShouldBeNil)
 			So(allowed, ShouldBeFalse)
@@ -61,13 +63,13 @@ func TestOperationCheckAllSeparatesDenialFromDependencyFailure(t *testing.T) {
 				Do(func(format string, args ...interface{}) { logged = fmt.Sprintf(format, args...) })
 
 			allowed, err := service.OperationCheckAll(context.Background(), accessor, interfaces.ResourceIDAll,
-				interfaces.AuthResourceTypeOperator, interfaces.AuthOperationTypeExecute)
+				interfaces.AuthResourceTypeToolBox, interfaces.AuthOperationTypeExecute)
 
 			So(allowed, ShouldBeFalse)
-			var httpErr *oerrors.HTTPError
+			var httpErr *httperrors.HTTPError
 			So(errors.As(err, &httpErr), ShouldBeTrue)
 			So(httpErr.HTTPCode, ShouldEqual, http.StatusServiceUnavailable)
-			So(strings.HasSuffix(httpErr.Code, "."+oerrors.ErrExtCommonAuthorizationUnavailable.String()), ShouldBeTrue)
+			So(strings.HasSuffix(httpErr.ErrorCode, "."+oerrors.ErrExtCommonAuthorizationUnavailable.String()), ShouldBeTrue)
 			So(httpErr.ErrorDetails, ShouldBeNil)
 			So(err.Error(), ShouldNotContainSubstring, "10.43.0.17")
 			So(err.Error(), ShouldNotContainSubstring, "/api/safe/v1/authz/checks")

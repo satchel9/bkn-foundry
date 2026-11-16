@@ -14,16 +14,16 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 func Test_BKNRestHandler_DiffKNs(t *testing.T) {
@@ -119,7 +119,7 @@ func Test_BKNRestHandler_DiffKNs(t *testing.T) {
 		// The service authorizes each network on its own. Its refusal must reach the caller as the
 		// refusal it is, not flattened into a server error.
 		Convey("A refusal from the service keeps its own status\n", func() {
-			forbidden := rest.NewHTTPError(context.Background(), http.StatusForbidden,
+			forbidden := httperrors.NewHTTPError(context.Background(), http.StatusForbidden,
 				berrors.BknBackend_KnowledgeNetwork_InvalidParameter)
 			bs.EXPECT().DiffNetworks(gomock.Any(), gomock.Any()).Return(nil, forbidden)
 
@@ -191,7 +191,7 @@ func Test_BKNRestHandler_ObjectDataStats(t *testing.T) {
 		})
 
 		Convey("A refusal from the service keeps its own status\n", func() {
-			notFound := rest.NewHTTPError(context.Background(), http.StatusNotFound,
+			notFound := httperrors.NewHTTPError(context.Background(), http.StatusNotFound,
 				berrors.BknBackend_KNDiff_ObjectTypeNotFound)
 			odss.EXPECT().ObjectDataStats(gomock.Any(), gomock.Any()).Return(nil, notFound)
 

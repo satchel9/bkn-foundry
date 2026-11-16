@@ -7,7 +7,7 @@
 package interfaces
 
 import (
-	cond "ontology-query/common/condition"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
 )
 
 const (
@@ -15,8 +15,7 @@ const (
 	DATA_SOURCE_TYPE_RESOURCE = "resource"
 
 	// Logical property types.
-	LOGIC_PROPERTY_TYPE_METRIC = "metric"
-	LOGIC_PROPERTY_TYPE_TOOL   = "tool"
+	LOGIC_PROPERTY_TYPE_TOOL = "tool"
 
 	// Logic-property parameter source types.
 	LOGIC_PARAMS_VALUE_FROM_PROP  = "property"
@@ -35,8 +34,10 @@ const (
 
 // Object search request body.
 type ObjectQueryBaseOnObjectType struct {
-	Condition  map[string]any `json:"condition,omitempty"`
-	Properties []string       `json:"properties,omitempty"`
+	// AggregateAllowApproximate is set by the metric executor for property aggregates.
+	AggregateAllowApproximate *bool          `json:"-"`
+	Condition                 map[string]any `json:"condition,omitempty"`
+	Properties                []string       `json:"properties,omitempty"`
 	PageQuery
 
 	KNID            string        `json:"-"`
@@ -60,6 +61,7 @@ type ObjectQueryInfo struct {
 }
 
 type Objects struct {
+	IsApproximate        bool                           `json:"-"` // Actual property-aggregate accuracy for metric executors.
 	ObjectType           *ObjectType                    `json:"object_type,omitempty"`
 	Datas                []map[string]any               `json:"datas"`
 	TotalCount           int64                          `json:"total_count,omitempty"`
@@ -76,6 +78,26 @@ type Objects struct {
 	// this query. It never exposes the predicate itself, so callers can explain
 	// a possibly incomplete result without learning the policy.
 	RowFilterApplied bool `json:"row_filter_applied,omitempty"`
+	// Incomplete reports that a scan could not read every matching object,
+	// because the object type cannot be paged past its first page.
+	Incomplete bool `json:"-"`
+}
+
+// ObjectAggregateQuery describes an internal aggregate over authorized object
+// rows. Property names stay in the object-type namespace; the object service
+// owns permission checks and physical-field mapping.
+type ObjectAggregateQuery struct {
+	MeasureProperty string
+	Operation       string
+	GroupBy         []string
+	Having          *ObjectAggregateHaving
+}
+
+// ObjectAggregateHaving filters grouped aggregate values by their internal
+// __value alias. Scalar result semantics remain the metric caller's concern.
+type ObjectAggregateHaving struct {
+	Operation string
+	Value     any
 }
 
 // ObjectPagingResponse is the public object-query pagination envelope.
@@ -101,15 +123,6 @@ type ObjectTypeSampleData struct {
 	EffectivePermissions map[string]PropertyAccessLevel `json:"effective_permissions,omitempty"`
 }
 
-// Calculation parameters for metric properties.
-type MetricProperty struct {
-	PropertyType         string         `json:"property_type"`
-	MappingSourceId      string         `json:"mapping_source_id"`
-	HasAnyUnfilledParams bool           `json:"has_any_unfilled_params"`
-	Parameters           MetricFilters  `json:"parameters"`
-	DynamicParams        map[string]any `json:"dynamic_params"`
-}
-
 // ToolProperty holds execution parameters for a ToolBox-backed logical property.
 type ToolProperty struct {
 	PropertyType         string         `json:"property_type"`
@@ -117,10 +130,6 @@ type ToolProperty struct {
 	HasAnyUnfilledParams bool           `json:"has_any_unfilled_params"`
 	Parameters           map[string]any `json:"parameters"`
 	DynamicParams        map[string]any `json:"dynamic_params"`
-}
-
-type MetricFilters struct {
-	Filters []Filter `json:"filters"`
 }
 
 type Filter struct {
@@ -202,19 +211,6 @@ type Parameter struct {
 	Comment   *string `json:"comment,omitempty" mapstructure:"comment"` // Parameter note used when assigning live metric inputs to object-type metric properties.
 	Required  bool    `json:"required,omitempty" mapstructure:"required,omitempty"`
 	Default   any     `json:"default,omitempty" mapstructure:"default,omitempty"`
-}
-
-// DynamicParams is the dynamic_params structure for metric properties.
-type MetricPropertyDynamicParams struct {
-	Start              *int64           `json:"start,omitempty"`
-	End                *int64           `json:"end,omitempty"`
-	Instant            *bool            `json:"instant,omitempty"`
-	Step               *string          `json:"step,omitempty"`
-	AnalysisDimensions []string         `json:"analysis_dimensions,omitempty"`
-	OrderByFields      []OrderField     `json:"order_by_fields,omitempty"`
-	HavingCondition    *HavingCondition `json:"having_condition,omitempty"`
-	Metrics            *Metrics         `json:"metrics,omitempty"`
-	// Additional dynamic parameters defined by the metric property are handled by mapstructure or custom UnmarshalJSON.
 }
 
 // Object property-value request body.

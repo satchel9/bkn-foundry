@@ -9,11 +9,11 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics/permission"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
 )
 
 // dropUnreadableReferenceRows removes, from the child rows that make a network navigable, relation
@@ -96,7 +96,7 @@ func (kns *knowledgeNetworkService) readReferenceDefinitions(ctx context.Context
 	if ids := idsByType[interfaces.RESOURCE_TYPE_RELATION_TYPE]; len(ids) > 0 {
 		defs.relationTypes, err = kns.rta.GetRelationTypesByIDs(ctx, knID, branch, ids)
 		if err != nil {
-			return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_KnowledgeNetwork_InternalError).WithErrorDetails(err.Error())
 		}
 	}

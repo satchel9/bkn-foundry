@@ -34,20 +34,20 @@ func (c *LtCond) RequiredValueLen() int      { return -1 }
 func (c *LtCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	fieldsMap map[string]*interfaces.Property) (interfaces.FilterCondition, error) {
 
-	if cfg.Name == "" {
+	if cfg.Field == "" {
 		return nil, fmt.Errorf("condition [lt] left field is empty")
 	}
-	field, ok := fieldsMap[cfg.Name]
+	field, ok := fieldsMap[cfg.Field]
 	if !ok {
-		// If the field is not defined in the Schema, create a temporary Property object
-		field = &interfaces.Property{
-			Name:         cfg.Name,
-			OriginalName: cfg.Name,
-		}
+		return nil, fmt.Errorf("condition [lt] left field '%s' not found in schema", cfg.Field)
 	}
 
 	if IsSlice(cfg.Value) {
 		return nil, fmt.Errorf("condition [lt] only supports single value")
+	}
+
+	if cfg.Value == nil {
+		return nil, fmt.Errorf("condition [lt] value must not be nil")
 	}
 
 	cond := &LtCond{

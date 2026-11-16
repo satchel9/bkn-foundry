@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"strings"
 
-	"bkn-backend/interfaces"
-	"bkn-backend/interfaces/data_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 // applyRowFilters resolves all object classes the compiled plan reads in one
@@ -26,9 +26,30 @@ import (
 // would disappear along with them instead of coming back with nothing attached.
 func (s *cypherQueryService) applyRowFilters(ctx context.Context, knID string,
 	plan *Plan, schema *Schema) ([]string, error) {
+	// A semi-join's earlier stage reads tables of its own, and the caller's
+	// row policy holds there exactly as it does here.
+	var subFiltered []string
+	for _, sub := range plan.subPlans() {
+		types, err := s.applyRowFilters(ctx, knID, sub, schema)
+		if err != nil {
+			return nil, err
+		}
+		subFiltered = append(subFiltered, types...)
+	}
+	if len(plan.Tables) == 0 {
+		// A plan made only of others, as an intersection of two lists is,
+		// is filtered in them.
+		return subFiltered, nil
+	}
 	refs := make([]string, 0, len(plan.Tables))
 	seen := make(map[string]struct{}, len(plan.Tables))
 	for _, table := range plan.Tables {
+		if table.Backing {
+			// A backing table is a resource, not an object: there is no row
+			// policy to ask for, and an object reference without an object
+			// type is not one the policy service accepts.
+			continue
+		}
 		ref := interfaces.KNChildResourceID(knID, table.ObjectTypeID)
 		if _, exists := seen[ref]; exists {
 			continue
@@ -65,6 +86,9 @@ func (s *cypherQueryService) applyRowFilters(ctx context.Context, knID string,
 		filters = append(filters, plan.Where)
 	}
 	for tableIndex, table := range plan.Tables {
+		if table.Backing {
+			continue
+		}
 		objectType := schema.objectTypesByID[table.ObjectTypeID]
 		if objectType == nil {
 			return nil, fmt.Errorf("compiled row-filter table has unknown object type %q", table.ObjectTypeID)
@@ -91,6 +115,12 @@ func (s *cypherQueryService) applyRowFilters(ctx context.Context, knID string,
 		filters = append(filters, compiled)
 	}
 	plan.Where = combineRowFilterAnd(filters)
+	for _, objectTypeID := range subFiltered {
+		if _, exists := filteredSeen[objectTypeID]; !exists {
+			filteredSeen[objectTypeID] = struct{}{}
+			filteredObjectTypes = append(filteredObjectTypes, objectTypeID)
+		}
+	}
 	return filteredObjectTypes, nil
 }
 

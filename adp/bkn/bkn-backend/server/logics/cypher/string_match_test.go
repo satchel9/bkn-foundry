@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // #1720: STARTS WITH, ENDS WITH and CONTAINS become LIKE with '!' as the
@@ -144,7 +144,7 @@ func TestGeneratePostgresStringMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	want := `SELECT t0."f_name" AS "n" FROM {{.res_customer}} t0 WHERE t0."f_name" LIKE '%a\b''c!%%' ESCAPE '!'`
+	want := `SELECT t0."f_name" AS "n" FROM {{res_customer}} t0 WHERE t0."f_name" LIKE '%a\b''c!%%' ESCAPE '!'`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}

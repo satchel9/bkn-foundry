@@ -22,7 +22,7 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -33,7 +33,7 @@ const (
 )
 
 const (
-	envProducerStreamID = "BKN_TRACE_PRODUCER_STREAM_ID"
+	envProducerStreamID = "BKN_TRACE_PRODUCER_STREAM_ID" //nolint:unused // Intentionally retained.
 )
 
 const (
@@ -112,8 +112,8 @@ type eventContext struct {
 }
 
 var (
-	safeErrorCodeRE = regexp.MustCompile(`^[0-9A-Za-z_.-]{1,128}$`)
-	safeErrorPathRE = regexp.MustCompile(`^\$(?:\.[0-9A-Za-z_.-]+|\[[0-9]+\])+$`)
+	safeErrorCodeRE = regexp.MustCompile(`^[0-9A-Za-z_.-]{1,128}$`)               //nolint:unused // Intentionally retained.
+	safeErrorPathRE = regexp.MustCompile(`^\$(?:\.[0-9A-Za-z_.-]+|\[[0-9]+\])+$`) //nolint:unused // Intentionally retained.
 )
 
 func EvidenceEnabled() bool {
@@ -406,39 +406,6 @@ func ActionTypeRefs(items []*interfaces.ActionType) []EvidenceRef {
 	return refs
 }
 
-func MetricRefs(items []*interfaces.MetricDefinition) []EvidenceRef {
-	refs := make([]EvidenceRef, 0, len(items))
-	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		knID := strings.TrimSpace(item.KnID)
-		if strings.TrimSpace(item.ID) == "" || knID == "" {
-			continue
-		}
-		refs = append(refs, EvidenceRef{
-			RefID:          "metric:" + knID + ":" + strings.TrimSpace(item.ID),
-			RefType:        RefTypeMetric,
-			PartialReasons: []string{"metric_ref_unversioned"},
-			Summary: map[string]any{
-				"kind":                     EntityKindMetric,
-				"id":                       strings.TrimSpace(item.ID),
-				"kn_id":                    strings.TrimSpace(item.KnID),
-				"branch":                   strings.TrimSpace(item.Branch),
-				"module_type":              strings.TrimSpace(item.ModuleType),
-				"metric_type":              strings.TrimSpace(item.MetricType),
-				"scope_type":               strings.TrimSpace(item.ScopeType),
-				"scope_ref":                strings.TrimSpace(item.ScopeRef),
-				"has_time_dimension":       item.TimeDimension != nil,
-				"has_calculation_formula":  item.CalculationFormula != nil,
-				"analysis_dimension_count": len(item.AnalysisDimensions),
-				"update_time":              item.UpdateTime,
-			},
-		})
-	}
-	return refs
-}
-
 func contextFromRequest(ctx context.Context, reqCtx RequestContext) (eventContext, bool) {
 	spanContext := trace.SpanContextFromContext(ctx)
 	if !spanContext.IsValid() {
@@ -525,7 +492,7 @@ func buildEvent(ec eventContext, eventType, operationName string, payload map[st
 }
 
 func stableEventID(traceID, operationID, eventType string, attempt uint32) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d", traceID, operationID, eventType, attempt)))
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s|%s|%s|%d", traceID, operationID, eventType, attempt))
 	return "evt_" + hex.EncodeToString(sum[:])
 }
 

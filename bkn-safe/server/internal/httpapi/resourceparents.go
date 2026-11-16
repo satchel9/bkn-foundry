@@ -67,7 +67,7 @@ func registerResourceParents(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB)
 		if !bind(c, &req) {
 			return
 		}
-		if err := checkDeclaredHierarchy(c.Request.Context(), db, req.ResourceType, req.ParentType); err != nil {
+		if err := checkDeclaredHierarchy(c.Request.Context(), e.Registry(), req.ResourceType, req.ParentType); err != nil {
 			replyPublicError(c, http.StatusBadRequest)
 			return
 		}
@@ -236,9 +236,8 @@ func registerResourceParents(g *gin.RouterGroup, e *authz.Enforcer, db *gorm.DB)
 // internal_resource) that reach nobody but the super-admin wildcard, so
 // inheritance would buy them nothing. A synchroniser must therefore SKIP the
 // types it finds undeclared instead of treating the 400 as an outage.
-func checkDeclaredHierarchy(ctx context.Context, db *gorm.DB, resourceType, parentType string) error {
-	var rt model.ResourceType
-	err := db.WithContext(ctx).First(&rt, "id = ?", resourceType).Error
+func checkDeclaredHierarchy(ctx context.Context, registry *authz.Registry, resourceType, parentType string) error {
+	rt, err := registry.ResourceType(ctx, resourceType)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return errors.New("resource_type is not a registered resource type: " + resourceType)
 	}
@@ -252,18 +251,4 @@ func checkDeclaredHierarchy(ctx context.Context, db *gorm.DB, resourceType, pare
 		return errors.New("resource type " + resourceType + " hangs under " + rt.ParentTypeID + ", not " + parentType)
 	}
 	return nil
-}
-
-// dropResourceParent removes the hierarchy row for one instance. Called on the
-// resource-delete path alongside the policy teardown, so a deleted resource does
-// not leave a row that would later make a recycled id inherit from a stale
-// parent. Best-effort by design: the caller is deleting policies, and a failure
-// to tidy the hierarchy must not fail that.
-func dropResourceParent(ctx context.Context, db *gorm.DB, resourceType, resourceID string) error {
-	if db == nil || resourceType == "" || resourceID == "" {
-		return nil
-	}
-	return db.WithContext(ctx).
-		Where("resource_type_id = ? AND resource_id = ?", resourceType, resourceID).
-		Delete(&model.ResourceParent{}).Error
 }

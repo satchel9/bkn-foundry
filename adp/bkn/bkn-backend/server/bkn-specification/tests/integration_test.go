@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"bkn-backend/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
 )
 
 // allExampleDirs returns all example directories that contain a network.bkn file.
@@ -44,6 +44,20 @@ func allExampleDirs(t *testing.T) []string {
 		t.Skip("no example directories with network.bkn found")
 	}
 	return dirs
+}
+
+// TestExampleChecksumsMatchTheirFiles keeps each example's CHECKSUM in step with
+// its files: an edited example with a stale CHECKSUM fails here, not on import.
+func TestExampleChecksumsMatchTheirFiles(t *testing.T) {
+	for _, dir := range allExampleDirs(t) {
+		if _, err := os.Stat(filepath.Join(dir, "CHECKSUM")); err != nil {
+			continue
+		}
+		t.Run(filepath.Base(dir), func(t *testing.T) {
+			ok, problems := bkn.VerifyChecksumFile(dir)
+			assert.True(t, ok, "regenerate %s/CHECKSUM: %v", dir, problems)
+		})
+	}
 }
 
 // tempDir creates a temporary directory that is removed when the test ends.
@@ -122,6 +136,7 @@ func compareDirs(t *testing.T, srcDir, dstDir string) {
 		"object_types",
 		"relation_types",
 		"risk_types",
+		"object_metrics",
 	}
 
 	for _, target := range targets {
@@ -162,7 +177,7 @@ func TestLoadFromFile(t *testing.T) {
 			assert.NotEmpty(t, doc.Name, "network name must not be empty")
 
 			total := len(doc.ObjectTypes) + len(doc.RelationTypes) + len(doc.ActionTypes) +
-				len(doc.RiskTypes) + len(doc.ConceptGroups) + len(doc.Metrics)
+				len(doc.RiskTypes) + len(doc.ConceptGroups) + len(doc.ObjectMetrics)
 			assert.Greater(t, total, 0, "expected at least one entity")
 		})
 	}
@@ -186,7 +201,7 @@ func TestLoadFromTar(t *testing.T) {
 			assert.Equal(t, len(fileDoc.ActionTypes), len(tarDoc.ActionTypes), "action count mismatch")
 			assert.Equal(t, len(fileDoc.RiskTypes), len(tarDoc.RiskTypes), "risk type count mismatch")
 			assert.Equal(t, len(fileDoc.ConceptGroups), len(tarDoc.ConceptGroups), "concept group count mismatch")
-			assert.Equal(t, len(fileDoc.Metrics), len(tarDoc.Metrics), "metric count mismatch")
+			assert.Equal(t, len(fileDoc.ObjectMetrics), len(tarDoc.ObjectMetrics), "object metric count mismatch")
 		})
 	}
 }
@@ -249,7 +264,7 @@ version: "1.0"
 	assert.Empty(t, doc.ActionTypes)
 	assert.Empty(t, doc.RiskTypes)
 	assert.Empty(t, doc.ConceptGroups)
-	assert.Empty(t, doc.Metrics)
+	assert.Empty(t, doc.ObjectMetrics)
 }
 
 // TestCircularInclude covers circular-include detection.

@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	libCommon "github.com/openbkn-ai/bkn-foundry/comm-go/common"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/middleware"
@@ -23,19 +24,19 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"ontology-query/common"
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
-	"ontology-query/logics"
-	"ontology-query/logics/action_logs"
-	"ontology-query/logics/action_scheduler"
-	"ontology-query/logics/action_type"
-	"ontology-query/logics/auth"
-	"ontology-query/logics/knowledge_network"
-	"ontology-query/logics/metric"
-	"ontology-query/logics/object_type"
-	queryauthorization "ontology-query/logics/query_authorization"
-	"ontology-query/version"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/action_logs"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/action_scheduler"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/action_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/auth"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/knowledge_network"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/permission"
+	queryauthorization "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics/query_authorization"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/version"
 )
 
 type RestHandler interface {
@@ -43,30 +44,31 @@ type RestHandler interface {
 }
 
 type restHandler struct {
-	appSetting *common.AppSetting
-	as         interfaces.AuthService
-	als        interfaces.ActionLogsService
-	ass        interfaces.ActionSchedulerService
-	ats        interfaces.ActionTypeService
-	kns        interfaces.KnowledgeNetworkService
-	ms         interfaces.MetricQueryService
-	ots        interfaces.ObjectTypeService
-	qas        interfaces.QueryAuthorizationService
-	oma        interfaces.OntologyManagerAccess
+	appSetting            *common.AppSetting
+	as                    interfaces.AuthService
+	als                   interfaces.ActionLogsService
+	ass                   interfaces.ActionSchedulerService
+	ats                   interfaces.ActionTypeService
+	kns                   interfaces.KnowledgeNetworkService
+	oms                   interfaces.ObjectMetricQueryServiceV1
+	ots                   interfaces.ObjectTypeService
+	qas                   interfaces.QueryAuthorizationService
+	actionReadPermissions interfaces.ActionExecutionPermissionService
+	oma                   interfaces.OntologyManagerAccess
 }
 
 func NewRestHandler(appSetting *common.AppSetting) RestHandler {
 	r := &restHandler{
-		appSetting: appSetting,
-		als:        action_logs.NewActionLogsService(appSetting),
-		as:         auth.NewAuthService(appSetting),
-		ass:        action_scheduler.NewActionSchedulerService(appSetting),
-		ats:        action_type.NewActionTypeService(appSetting),
-		kns:        knowledge_network.NewKnowledgeNetworkService(appSetting),
-		ms:         metric.NewMetricQueryService(appSetting),
-		ots:        object_type.NewObjectTypeService(appSetting),
-		qas:        queryauthorization.NewQueryAuthorizationService(appSetting),
-		oma:        logics.OMA,
+		appSetting:            appSetting,
+		als:                   action_logs.NewActionLogsService(appSetting),
+		as:                    auth.NewAuthService(appSetting),
+		ass:                   action_scheduler.NewActionSchedulerService(appSetting),
+		ats:                   action_type.NewActionTypeService(appSetting),
+		kns:                   knowledge_network.NewKnowledgeNetworkService(appSetting),
+		ots:                   object_type.NewObjectTypeService(appSetting),
+		qas:                   queryauthorization.NewQueryAuthorizationService(appSetting),
+		actionReadPermissions: permission.NewPermissionService(appSetting),
+		oma:                   logics.OMA,
 	}
 	return r
 }
@@ -76,6 +78,7 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 	c.Use(r.AccessLog())
 	c.Use(r.TraceContextMiddleware())
 	c.Use(r.LanguageMiddleware())
+	c.Use(r.KNVersionMiddleware())
 
 	c.GET("/api/ontology-query/v1/health", r.HealthCheck)
 
@@ -100,8 +103,6 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 		apiV1.GET("/knowledge-networks/:kn_id/action-logs/:log_id/results", r.QueryActionLogResultsByEx)
 		apiV1.POST("/knowledge-networks/:kn_id/action-logs/:log_id/cancel", r.CancelActionLogByEx)
 
-		apiV1.POST("/knowledge-networks/:kn_id/metrics/dry-run", r.verifyJsonContentType(), r.PostMetricDryRunByEx)
-		apiV1.POST("/knowledge-networks/:kn_id/metrics/:metric_id/data", r.verifyJsonContentType(), r.PostMetricDataByEx)
 	}
 
 	apiInV1 := c.Group("/api/ontology-query/in/v1")
@@ -129,8 +130,6 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 		apiInV1.GET("/knowledge-networks/:kn_id/action-logs/:log_id/results", r.QueryActionLogResultsByIn)
 		apiInV1.POST("/knowledge-networks/:kn_id/action-logs/:log_id/cancel", r.CancelActionLogByIn)
 
-		apiInV1.POST("/knowledge-networks/:kn_id/metrics/dry-run", r.verifyJsonContentType(), r.PostMetricDryRunByIn)
-		apiInV1.POST("/knowledge-networks/:kn_id/metrics/:metric_id/data", r.verifyJsonContentType(), r.PostMetricDataByIn)
 	}
 
 	logger.Info("RestHandler RegisterPublic")
@@ -153,7 +152,7 @@ func (r *restHandler) verifyJsonContentType() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Reject requests whose Content-Type is not application/json.
 		if c.ContentType() != interfaces.CONTENT_TYPE_JSON {
-			httpErr := rest.NewHTTPError(c, http.StatusNotAcceptable, oerrors.OntologyQuery_InvalidRequestHeader_ContentType).
+			httpErr := httperrors.NewHTTPError(c, http.StatusNotAcceptable, oerrors.OntologyQuery_InvalidRequestHeader_ContentType).
 				WithErrorDetails(fmt.Sprintf("Content-Type header [%s] is not supported, expected is [application/json].", c.ContentType()))
 			rest.ReplyError(c, httpErr)
 
@@ -234,7 +233,7 @@ func operationSpanAttributes(method, route string, status int) []attribute.KeyVa
 func (r *restHandler) verifyOAuth(ctx context.Context, c *gin.Context) (hydra.Visitor, error) {
 	visitor, err := r.as.VerifyToken(ctx, c)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusUnauthorized, rest.PublicError_Unauthorized).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusUnauthorized, httperrors.PublicError_Unauthorized).
 			WithErrorDetails(err.Error())
 		rest.ReplyError(c, httpErr)
 		return visitor, err

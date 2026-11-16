@@ -23,6 +23,9 @@ const (
 	// Default branch.
 	MAIN_BRANCH = "main"
 
+	// Draft of a versioned knowledge network; only trial runs may read it.
+	DRAFT_BRANCH = "draft"
+
 	// Whether metric data queries include model information.
 	DEFAULT_INCLUDE_TYPE_INFO    = "false"
 	DEFAULT_INCLUDE_LOGIC_PARAMS = "false"
@@ -30,9 +33,6 @@ const (
 	// Parameter sources.
 	VALUE_FROM_INPUT    = "input"
 	VALUE_FROM_PROPERTY = "property"
-
-	// Property types.
-	PROPERTY_TYPE_METRIC = "metric"
 
 	// Sort directions.
 	DESC_DIRECTION = "desc"
@@ -58,9 +58,6 @@ const (
 
 	// Default instance count per node object type in subgraph queries.
 	DEFAULT_LIMIT = 1000
-
-	// Operator execution_mode values.
-	OPERATOR_EXECUTION_MODE_SYNC = "sync"
 
 	// Edge directions.
 	DIRECTION_FORWARD       = "forward"

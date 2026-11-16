@@ -13,7 +13,7 @@ import (
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	dtype "bkn-backend/interfaces/data_type"
+	dtype "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/data_type"
 )
 
 const MaxSubCondition = 100
@@ -174,6 +174,8 @@ func ConvertCondCfgToFilterCondition(ctx context.Context, cfg *CondCfg, fieldsMa
 		return convertKnnCondToDatasetFilterCondition(ctx, cfg, fieldsMap, vectorizer)
 	case OperationMultiMatch:
 		return convertMultiMatchCondToDatasetFilterCondition(cfg, fieldsMap)
+	case OperationNotExist:
+		return convertNotExistCondToDatasetFilterCondition(cfg)
 	case OperationAnd:
 		return convertAndCondToDatasetFilterCondition(ctx, cfg, fieldsMap, vectorizer)
 	case OperationOr:

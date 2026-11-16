@@ -17,8 +17,6 @@ type NotLikeCond struct {
 	Cfg    *interfaces.FilterCondCfg
 	Lfield *interfaces.Property
 	Value  string
-	// LegacyWildcards has the same meaning as in LikeCond.
-	LegacyWildcards bool
 }
 
 func (c *NotLikeCond) GetOperation() string { return OperationNotLike }
@@ -34,15 +32,15 @@ func (c *NotLikeCond) RequiredValueLen() int      { return -1 }
 func (c *NotLikeCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	fieldsMap map[string]*interfaces.Property) (interfaces.FilterCondition, error) {
 
-	if cfg.Name == "" {
+	if cfg.Field == "" {
 		return nil, fmt.Errorf("condition [not_like] left field is empty")
 	}
-	field, ok := fieldsMap[cfg.Name]
+	field, ok := fieldsMap[cfg.Field]
 	if !ok {
-		return nil, fmt.Errorf("condition [not_like] left field '%s' not found", cfg.Name)
+		return nil, fmt.Errorf("condition [not_like] left field '%s' not found", cfg.Field)
 	}
-	if interfaces.DataType_IsNumber(field.Type) {
-		return nil, fmt.Errorf("condition [not_like] left field is not a string/text field: %s:%s", cfg.Name, field.Type)
+	if !interfaces.DataType_IsString(field.Type) {
+		return nil, fmt.Errorf("condition [not_like] left field is not a string/text field: %s:%s", cfg.Field, field.Type)
 	}
 
 	if cfg.ValueFrom != interfaces.ValueFrom_Const {
@@ -52,17 +50,13 @@ func (c *NotLikeCond) New(ctx context.Context, cfg *interfaces.FilterCondCfg,
 	if !ok {
 		return nil, fmt.Errorf("condition [not_like] right value is not a string value: %v", cfg.Value)
 	}
-	if cfg.LegacyLikeWildcards {
-		return &NotLikeCond{Cfg: cfg, Lfield: field, Value: val, LegacyWildcards: true}, nil
-	}
-	literal, err := ParseLikeValue(OperationNotLike, val)
-	if err != nil {
+	if err := ValidateLikePattern(OperationNotLike, val); err != nil {
 		return nil, err
 	}
 
 	return &NotLikeCond{
 		Cfg:    cfg,
 		Lfield: field,
-		Value:  literal,
+		Value:  val,
 	}, nil
 }

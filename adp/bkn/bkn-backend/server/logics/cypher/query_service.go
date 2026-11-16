@@ -10,26 +10,28 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/otel/oteltrace"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/knowledge_network"
-	"bkn-backend/logics/object_type"
-	"bkn-backend/logics/permission"
-	"bkn-backend/logics/relation_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/knowledge_network"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/permission"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/relation_type"
 )
 
 // MaxQueryLength bounds the submitted text. Parsing is linear, but an
@@ -45,6 +47,15 @@ type cypherQueryService struct {
 	// from the compiled plan.
 	proxies interfaces.KNProxyBindingResolver
 	vba     interfaces.VegaBackendAccess
+	// bindJoinTimeout bounds one bind-join execution; zero means its share of
+	// the request's time.
+	bindJoinTimeout time.Duration
+	// now reads the clock a request's time is measured on; nil is the wall
+	// clock.
+	now func() time.Time
+	// resourceSources remembers, per resource id, the category and catalog
+	// vega-backend gave it; see outsideSQL.
+	resourceSources sync.Map
 }
 
 var (
@@ -75,8 +86,14 @@ func NewCypherQueryService(appSetting *common.AppSetting) interfaces.CypherQuery
 // was bound against, which holds the caller's property levels, and the
 // semantic descriptor the internal face returns for tracing.
 type compiledQuery struct {
-	statement         string
-	rowLimit          int
+	statement string
+	rowLimit  int
+	// parts are the parts of a UNION, each compiled as the query it would be
+	// on its own; the union itself has no statement.
+	parts []*compiledQuery
+	// graph is how a query that returns graph values reads its rows; such
+	// a query has no statement of its own.
+	graph             *graphRead
 	plan              *Plan
 	schema            *Schema
 	traceDescriptor   json.RawMessage
@@ -125,6 +142,14 @@ func (s *cypherQueryService) Query(ctx context.Context, query interfaces.CypherQ
 	if err := validateQueryText(ctx, query.Query); err != nil {
 		return nil, err
 	}
+	if err := s.validateTimeout(ctx, query.TimeoutSec); err != nil {
+		return nil, err
+	}
+	// Every statement the query runs -- a UNION's parts one after another, or
+	// a bind-join and the SQL it falls back to -- shares this one deadline,
+	// so the request as a whole stays within its timeout.
+	ctx = context.WithValue(ctx, queryDeadlineKey{},
+		s.clock().Add(time.Duration(s.requestTimeoutSec(query))*time.Second))
 	compiled, err := s.compile(ctx, query)
 	if err != nil {
 		return nil, err
@@ -132,28 +157,160 @@ func (s *cypherQueryService) Query(ctx context.Context, query interfaces.CypherQ
 	if err := s.authorizeProperties(ctx, query.KNID, compiled); err != nil {
 		return nil, err
 	}
+	if query.Explain {
+		// Everything that decides whether the query may run has run; only
+		// the read is left out.
+		plan, err := explain(compiled)
+		if err != nil {
+			common.LogSafeError(ctx, "Cypher explain failed", err)
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		}
+		span.SetAttributes(attribute.Bool(spanAttrExplain, true))
+		return &interfaces.CypherQueryResult{
+			Columns: []interfaces.RawQueryColumn{}, Entries: []map[string]any{}, Plan: plan,
+		}, nil
+	}
+	result, err := s.run(ctx, query, compiled)
+	if err != nil {
+		return nil, err
+	}
+	// A query that wrote no LIMIT and filled the default may have more rows;
+	// saying so keeps a caller from taking the page for the whole answer.
+	if compiled.plan.Limit == nil && len(result.Entries) >= interfaces.CYPHER_DEFAULT_LIMIT {
+		result.Limited = true
+	}
+	if err := decimalColumnsAsNumbers(result.Columns, result.Entries); err != nil {
+		return nil, executionError(ctx, err)
+	}
+	return result, nil
+}
 
+// run sends a compiled query down the path that answers it.
+func (s *cypherQueryService) run(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery) (*interfaces.CypherQueryResult, error) {
+	span := trace.SpanFromContext(ctx)
+	if compiled.parts != nil {
+		return s.queryUnion(ctx, query, compiled)
+	}
+	if s.outsideSQL(ctx, compiled.plan) {
+		return s.queryOutsideSQL(ctx, query, compiled)
+	}
+	if compiled.graph != nil {
+		span.SetAttributes(attribute.String(spanAttrExecutor, common.CypherExecutorSQL), attribute.Bool(spanAttrGraph, true))
+		return s.queryGraph(ctx, query, compiled)
+	}
+	// The bind-join executor takes no new capabilities; what only the SQL
+	// path answers, such as totals over groups or CASE, goes there.
+	if s.executor() == common.CypherExecutorBindJoin && !compiled.plan.SQLOnly {
+		return s.queryBindJoin(ctx, query, compiled)
+	}
+	span.SetAttributes(attribute.String(spanAttrExecutor, common.CypherExecutorSQL))
+	return s.querySQL(ctx, query, compiled, false)
+}
+
+// querySQL runs the compiled MySQL statement through vega-backend's raw query
+// route.
+//
+// afterBindJoin says the bind-join executor already ran the query and gave up
+// on its read budget or its time. Resources SQL cannot read then have nothing
+// left to fall back to: running the same bind-join again would only double the
+// wait and the reads.
+func (s *cypherQueryService) querySQL(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery, afterBindJoin bool) (*interfaces.CypherQueryResult, error) {
 	// The paging limit repeats the statement's own LIMIT rather than leaving
 	// it unset. vega-backend wraps the statement and applies a page of its
 	// own, defaulting to 20 rows, so a query asking for more would come back
 	// cut down with nothing to say it had been.
+	timeoutSec, err := s.statementTimeoutSec(ctx, query)
+	if err != nil {
+		return nil, err
+	}
 	response, err := s.execute(ctx, query, compiled.plan, interfaces.RawQueryRequest{
-		Query:        compiled.statement,
-		QueryFormat:  interfaces.VEGA_QUERY_FORMAT_SQL,
-		InputDialect: interfaces.VEGA_DIALECT_MYSQL,
+		Query:       compiled.statement,
+		QueryFormat: interfaces.VEGA_QUERY_FORMAT_SQL,
 		Paging: interfaces.ResourceDataPagingRequest{
 			Mode:  interfaces.VEGA_PAGING_MODE_SINGLE,
 			Limit: compiled.rowLimit,
 		},
-		QueryTimeoutSec: interfaces.CYPHER_DEFAULT_TIMEOUT_SEC,
+		QueryTimeoutSec: timeoutSec,
 	})
+	if unsupportedSource(err) && afterBindJoin {
+		return nil, outsideSQLTooLarge(ctx)
+	}
+	if unsupportedSource(err) {
+		return s.queryOutsideSQL(ctx, query, compiled)
+	}
 	if err != nil {
 		return nil, executionError(ctx, err)
 	}
 
+	conditionsAsBooleans(compiled.plan, response.Columns, response.Entries)
 	return &interfaces.CypherQueryResult{
 		Columns:           response.Columns,
 		Entries:           response.Entries,
+		TraceDescriptor:   compiled.traceDescriptor,
+		PermissionImpacts: compiled.permissionImpacts,
+	}, nil
+}
+
+// queryGraph runs a query that returns graph values. Its one statement runs
+// on the SQL path whatever the configured executor, which takes no new
+// capabilities; the rows it returns are only assembled into values here. A
+// read reaching the row cap is refused rather than answered with part of its
+// evidence.
+func (s *cypherQueryService) queryGraph(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery) (*interfaces.CypherQueryResult, error) {
+	read := compiled.graph
+	timeoutSec, err := s.statementTimeoutSec(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	response, err := s.execute(ctx, query, compiled.plan, interfaces.RawQueryRequest{
+		Query:       read.statement,
+		QueryFormat: interfaces.VEGA_QUERY_FORMAT_SQL,
+		Paging: interfaces.ResourceDataPagingRequest{
+			Mode:  interfaces.VEGA_PAGING_MODE_SINGLE,
+			Limit: read.rowLimit,
+		},
+		QueryTimeoutSec: timeoutSec,
+	})
+	if unsupportedSource(err) {
+		return s.queryOutsideSQL(ctx, query, compiled)
+	}
+	if err != nil {
+		return nil, executionError(ctx, err)
+	}
+	if read.evidence && len(response.Entries) >= graphRowCap {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_ReadBudgetExceeded).
+			WithErrorDetails(fmt.Sprintf("the evidence of this query reaches %d rows; narrow it with conditions "+
+				"or a smaller LIMIT, so no conclusion is returned with part of its evidence", graphRowCap))
+	}
+
+	conditionsAsBooleans(compiled.plan, response.Columns, response.Entries)
+	return s.graphResult(ctx, compiled, response.Entries)
+}
+
+// graphResult builds the graph values of a query from the flat rows its graph
+// read returned, whichever executor read them.
+func (s *cypherQueryService) graphResult(ctx context.Context, compiled *compiledQuery,
+	rows []map[string]any) (*interfaces.CypherQueryResult, error) {
+	entries, limited, err := assembleGraphRows(compiled.plan, compiled.graph, rows)
+	var missingKey *missingKeyError
+	if errors.As(err, &missingKey) {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+			WithErrorDetails(missingKey.Error())
+	}
+	if err != nil {
+		common.LogSafeError(ctx, "Cypher graph value assembly failed", err)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+	}
+	return &interfaces.CypherQueryResult{
+		Columns:    bindJoinColumns(compiled.plan, compiled.schema, entries),
+		Entries:    entries,
+		ValueTypes: graphValueTypes(compiled.plan, compiled.schema),
+		Execution: &interfaces.CypherExecution{
+			MatchRows: len(rows), MatchComplete: true, ConclusionsLimited: limited,
+		},
 		TraceDescriptor:   compiled.traceDescriptor,
 		PermissionImpacts: compiled.permissionImpacts,
 	}, nil
@@ -168,23 +325,39 @@ func (s *cypherQueryService) compile(ctx context.Context, query interfaces.Cyphe
 	if err != nil {
 		var syntaxErrors SyntaxErrors
 		if errors.As(err, &syntaxErrors) {
-			return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_SyntaxError).
+			return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_SyntaxError).
 				WithErrorDetails(syntaxErrors.Error())
 		}
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_SyntaxError).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_SyntaxError).
 			WithErrorDetails(err.Error())
 	}
 
 	analyzed, err := Analyze(tree)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_Unsupported).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_Unsupported).
 			WithErrorDetails(err.Error())
 	}
-	if analyzed.Limit != nil && *analyzed.Limit > interfaces.CYPHER_MAX_LIMIT {
+	// SKIP $name and LIMIT $name take their values here, so a bound LIMIT
+	// meets the ceiling below exactly as a written one does.
+	if err := bindRowCounts(analyzed, query.Parameters); err != nil {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+			WithErrorDetails(err.Error())
+	}
+	// $name IS NULL is decided here too, so the read every later step sizes
+	// is the one the data source will run.
+	if err := bindNullChecks(analyzed, query.Parameters); err != nil {
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+			WithErrorDetails(err.Error())
+	}
+	if limitExceeded(analyzed) {
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.LimitExceeded", map[string]any{"max": interfaces.CYPHER_MAX_LIMIT})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
 		// Refused rather than clamped: a caller who asked for more rows than
 		// they will get should be told, not handed a short answer.
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_LimitExceeded).
-			WithErrorDetails(detail(ctx, "LimitExceeded", map[string]any{"max": interfaces.CYPHER_MAX_LIMIT}))
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_LimitExceeded).
+			WithErrorDetails(localizedText)
 	}
 
 	schema, err := LoadSchema(ctx, s.schema, &permissionVisibility{ps: s.ps}, query.KNID, query.Branch)
@@ -195,7 +368,7 @@ func (s *cypherQueryService) compile(ctx context.Context, query interfaces.Cyphe
 		// The network holds concepts and this caller may read none of them.
 		// Saying so is better than reporting every label as unknown, and
 		// reveals nothing: they already knew which network they asked about.
-		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
 	}
 	// Levels are loaded before names are bound, so a property the caller may
 	// not know exists is already absent while the query is resolved, and no
@@ -204,10 +377,20 @@ func (s *cypherQueryService) compile(ctx context.Context, query interfaces.Cyphe
 		return nil, err
 	}
 
-	plan, err := Compile(analyzed, schema, CompileOptions{Parameters: query.Parameters})
+	plan, err := Compile(analyzed, schema, CompileOptions{
+		Parameters: query.Parameters, ObjectProperties: query.ObjectProperties,
+	})
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
 			WithErrorDetails(err.Error())
+	}
+	if crossProduct(plan) {
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.CartesianProduct", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_Unsupported).
+			WithErrorDetails(localizedText)
 	}
 	// The semantic descriptor records the caller's query, not policy internals.
 	// In particular, a filter-only policy property may be invisible to the
@@ -215,25 +398,69 @@ func (s *cypherQueryService) compile(ctx context.Context, query interfaces.Cyphe
 	// constrains execution below.
 	descriptor, err := BuildSemanticQueryDescriptor(plan, query.Query)
 	if errors.Is(err, ErrSemanticDescriptorTooLarge) {
-		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
 			WithErrorDetails("the query is too large to record; split a long IN list across several queries")
 	}
 	if err != nil {
 		common.LogSafeError(ctx, "Cypher semantic descriptor generation failed", err)
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
 	}
 	descriptorJSON, err := json.Marshal(descriptor)
 	if err != nil {
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
 	}
 	rowFilteredObjectTypes, err := s.applyRowFilters(ctx, query.KNID, plan, schema)
 	if err != nil {
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		if errors.As(err, &httpErr) {
 			return nil, err
 		}
 		common.LogSafeError(ctx, "Cypher row-filter compilation failed", err)
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+	}
+
+	if plan.Union != nil {
+		parts := make([]*compiledQuery, 0, len(plan.Union.Parts))
+		for _, part := range plan.Union.Parts {
+			compiledPart, err := compileStatement(ctx, part, schema)
+			if err != nil {
+				return nil, err
+			}
+			compiledPart.traceDescriptor = descriptorJSON
+			compiledPart.permissionImpacts = rowFilterPermissionImpacts(rowFilteredObjectTypes)
+			parts = append(parts, compiledPart)
+		}
+		return &compiledQuery{
+			parts: parts, rowLimit: pageSize(plan.Limit), plan: plan, schema: schema,
+			traceDescriptor:   descriptorJSON,
+			permissionImpacts: rowFilterPermissionImpacts(rowFilteredObjectTypes),
+		}, nil
+	}
+
+	compiled, err := compileStatement(ctx, plan, schema)
+	if err != nil {
+		return nil, err
+	}
+	compiled.traceDescriptor = descriptorJSON
+	compiled.permissionImpacts = rowFilterPermissionImpacts(rowFilteredObjectTypes)
+	return compiled, nil
+}
+
+// compileStatement writes what a plan runs as: a graph read when it returns
+// graph values, a statement otherwise.
+func compileStatement(ctx context.Context, plan *Plan, schema *Schema) (*compiledQuery, error) {
+	if plan.HasGraphValues() {
+		read, err := planGraphRead(plan, DialectMySQL, interfaces.CYPHER_DEFAULT_LIMIT)
+		var planErr *PlanError
+		if errors.As(err, &planErr) {
+			return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+				WithErrorDetails(err.Error())
+		}
+		if err != nil {
+			common.LogSafeError(ctx, "Cypher SQL generation failed", err)
+			return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		}
+		return &compiledQuery{graph: read, plan: plan, schema: schema}, nil
 	}
 
 	sql, err := Generate(plan, GenerateOptions{
@@ -242,21 +469,23 @@ func (s *cypherQueryService) compile(ctx context.Context, query interfaces.Cyphe
 	})
 	if err != nil {
 		common.LogSafeError(ctx, "Cypher SQL generation failed", err)
-		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+		return nil, httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
 	}
 
-	return &compiledQuery{
-		statement: sql, rowLimit: pageSize(plan.Limit), plan: plan, schema: schema,
-		traceDescriptor:   descriptorJSON,
-		permissionImpacts: rowFilterPermissionImpacts(rowFilteredObjectTypes),
-	}, nil
+	return &compiledQuery{statement: sql, rowLimit: pageSize(plan.Limit), plan: plan, schema: schema}, nil
 }
 
 // loadPropertyLevels records the caller's property levels for every object
-// type the query's pattern names. A label that does not resolve is left for
-// the compiler to report.
+// type the query's pattern names, a semi-join's earlier stage included: a
+// property the caller may not see must read as unknown wherever it is named.
+// A label that does not resolve is left for the compiler to report.
 func (s *cypherQueryService) loadPropertyLevels(ctx context.Context, knID string, schema *Schema,
 	query *Query) error {
+	for _, stage := range query.stages() {
+		if err := s.loadPropertyLevels(ctx, knID, schema, stage); err != nil {
+			return err
+		}
+	}
 	for _, node := range query.Pattern.Nodes {
 		objectType, err := schema.ResolveLabel(node.Label)
 		if err != nil {
@@ -327,7 +556,7 @@ func (s *cypherQueryService) authorizeProperties(ctx context.Context, knID strin
 		objectType := compiled.schema.objectTypesByID[objectTypeID]
 		if objectType == nil {
 			// The plan only names object types it resolved from this schema.
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
+			return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_InternalError)
 		}
 		levels, err := s.objectTypeLevels(ctx, knID, compiled.schema, objectType)
 		if err != nil {
@@ -342,7 +571,7 @@ func (s *cypherQueryService) authorizeProperties(ctx context.Context, knID strin
 			case interfaces.PROPERTY_ACCESS_NONE:
 				// Binding reports this as unknown before a plan exists; should
 				// that ever change, the answer must still be the unknown one.
-				return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
+				return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidQuery).
 					WithErrorDetails(compiled.schema.unknownProperty(objectType, property).Error())
 			default:
 				// Masked, schema, or a property bkn-safe gave no level for.
@@ -369,9 +598,13 @@ func (s *cypherQueryService) authorizeProperties(ctx context.Context, knID strin
 	for _, objectTypeID := range impactObjectTypeIDs {
 		impacts = append(impacts, impactByObjectType[objectTypeID])
 	}
-	return rest.NewHTTPError(ctx, http.StatusForbidden, berrors.BknBackend_Cypher_PropertyForbidden).
-		WithErrorDetails(i18n.Translate(rest.GetLanguageByCtx(ctx), "BknBackend.Cypher.PropertyForbidden.Detail.NotFull",
-			map[string]any{"properties": strings.Join(denied, ", ")})).
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.PropertyForbidden.Detail.NotFull",
+		map[string]any{"properties": strings.Join(denied, ", ")})
+	if renderErr != nil {
+		logger.Errorf("localized service message failed: %v", renderErr)
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusForbidden, berrors.BknBackend_Cypher_PropertyForbidden).
+		WithErrorDetails(localizedText).
 		WithMetadata(map[string]any{"permission_impacts": impacts})
 }
 
@@ -391,6 +624,10 @@ func rowFilterPermissionImpacts(objectTypeIDs []string) []interfaces.CypherPermi
 const (
 	spanAttrExecutionPath  = "cypher.execution_path"
 	spanAttrFallbackReason = "cypher.fallback_reason"
+	spanAttrExecutor       = "cypher.executor"
+	spanAttrFallback       = "cypher.fallback"
+	spanAttrGraph          = "cypher.graph_values"
+	spanAttrExplain        = "cypher.explain"
 
 	executionPathProxy  = "proxy"
 	executionPathCaller = "caller"
@@ -399,6 +636,16 @@ const (
 	fallbackNonMainBranch       = "non_main_branch"
 	fallbackBindingNotPublished = "binding_not_published"
 	fallbackProxyUnavailable    = "proxy_unavailable"
+
+	// fallbackSQLReadBudget records a bind-join query that ran as SQL because
+	// it would have read past the executor's budget.
+	fallbackSQLReadBudget = "sql_read_budget"
+	// fallbackSQLTimeout records one that ran as SQL because the executor did
+	// not finish within its own timeout.
+	fallbackSQLTimeout = "sql_timeout"
+	// fallbackNonSQLSource records a query that ran on the bind-join
+	// executor because its resources are not in one SQL data source.
+	fallbackNonSQLSource = "non_sql_source"
 )
 
 // proxyTargetResource is the target type of a binding to a vega resource.
@@ -426,9 +673,11 @@ func (s *cypherQueryService) execute(ctx context.Context, query interfaces.Cyphe
 	request interfaces.RawQueryRequest) (*interfaces.RawQueryResponse, error) {
 	span := trace.SpanFromContext(ctx)
 	callerRequest := request
+	started := time.Now()
 	response, err := s.vba.RawQuery(ctx, &callerRequest)
 	if err == nil || !vegaRefused(err) {
 		span.SetAttributes(attribute.String(spanAttrExecutionPath, executionPathCaller))
+		logExecutionFailure(query.KNID, plan, request, time.Since(started), err)
 		return response, err
 	}
 
@@ -446,13 +695,252 @@ func (s *cypherQueryService) execute(ctx context.Context, query interfaces.Cyphe
 		query.KNID, caller.ID, proxy.account.ID, strings.Join(proxy.resourceIDs, ","))
 	span.SetAttributes(attribute.String(spanAttrExecutionPath, executionPathProxy))
 	proxyRequest := request
-	return s.vba.RawQueryAs(ctx, proxy.account, &proxyRequest)
+	started = time.Now()
+	response, err = s.vba.RawQueryAs(ctx, proxy.account, &proxyRequest)
+	logExecutionFailure(query.KNID, plan, request, time.Since(started), err)
+	return response, err
 }
+
+// executor is the configured way to run a compiled query.
+func (s *cypherQueryService) executor() string {
+	if s.appSetting != nil && s.appSetting.ServerSetting.CypherExecutor == common.CypherExecutorBindJoin {
+		return common.CypherExecutorBindJoin
+	}
+	return common.CypherExecutorSQL
+}
+
+// queryBindJoin runs a compiled query through the bind-join executor, which
+// reads each table through vega-backend's resource data API. Identity follows
+// the same rule as the SQL path: the caller first, and the knowledge network's
+// proxy account only when vega-backend refused the caller and the proxy can
+// serve every binding the plan reads through. A refusal partway through
+// restarts the whole query under the proxy, so no result mixes identities.
+//
+// What the executor cannot answer -- a query past its read budget, or one it
+// cannot finish within its own timeout -- falls back to the compiled MySQL
+// statement, so the switch never takes away a query the SQL path answers.
+// Nothing else falls back: a refusal is the same under either path, a caller
+// that went away is not served by starting over, and any other failure is
+// reported rather than masked by a second attempt somewhere else.
+func (s *cypherQueryService) queryBindJoin(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery) (*interfaces.CypherQueryResult, error) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String(spanAttrExecutor, common.CypherExecutorBindJoin))
+
+	columns, entries, err := s.runBindJoin(ctx, query, compiled, compiled.plan, true)
+	if errors.Is(err, errQueryOutOfTime) {
+		return nil, queryTimeoutError(ctx)
+	}
+	var budget *ReadBudgetError
+	if errors.As(err, &budget) {
+		span.SetAttributes(attribute.String(spanAttrFallback, fallbackSQLReadBudget))
+		logger.Infof("Cypher query on knowledge network %s falls back to SQL: %s", query.KNID, budget.Error())
+		return s.querySQL(ctx, query, compiled, true)
+	}
+	if errors.Is(err, errBindJoinTimeout) {
+		span.SetAttributes(attribute.String(spanAttrFallback, fallbackSQLTimeout))
+		logger.Infof("Cypher query on knowledge network %s falls back to SQL: %v", query.KNID, err)
+		return s.querySQL(ctx, query, compiled, true)
+	}
+	if err != nil {
+		if !vegaRefused(err) {
+			common.LogSafeError(ctx, "Cypher bind-join execution failed", err)
+		}
+		return nil, executionError(ctx, err)
+	}
+
+	return &interfaces.CypherQueryResult{
+		Columns:           columns,
+		Entries:           entries,
+		TraceDescriptor:   compiled.traceDescriptor,
+		PermissionImpacts: compiled.permissionImpacts,
+	}, nil
+}
+
+// runBindJoin executes under the caller and, after a refusal the proxy can
+// answer, again under the proxy. The whole execution shares one timeout; see
+// bindJoinTimeoutFor.
+func (s *cypherQueryService) runBindJoin(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery, plan *Plan, fallsBack bool) ([]interfaces.RawQueryColumn, []map[string]any, error) {
+	span := trace.SpanFromContext(ctx)
+	timeout := s.bindJoinTimeoutFor(ctx, query, fallsBack)
+	if timeout <= 0 {
+		return nil, nil, errQueryOutOfTime
+	}
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	// Its own deadline, while the caller still waits, is the executor running
+	// out of time rather than the request ending. A read cut off partway may
+	// report it as a transport failure, so the deadline is read off the
+	// context rather than off the error.
+	timedOut := func(err error) error {
+		if err != nil && ctx.Err() == context.DeadlineExceeded && parent.Err() == nil {
+			return fmt.Errorf("%w after %s", errBindJoinTimeout, timeout)
+		}
+		return err
+	}
+	readAs := func(account interfaces.AccountInfo) dataReader {
+		return func(ctx context.Context, resourceID string,
+			params *interfaces.ResourceDataQueryParams) (*interfaces.DatasetQueryResponse, error) {
+			return s.vba.QueryResourceDataAs(ctx, account, resourceID, params)
+		}
+	}
+
+	caller, _ := ctx.Value(interfaces.ACCOUNT_INFO_KEY).(interfaces.AccountInfo)
+	columns, entries, err := runBindJoin(ctx, plan, compiled.schema, readAs(caller),
+		defaultBindJoinLimits, interfaces.CYPHER_DEFAULT_LIMIT)
+	if err == nil || !vegaRefused(err) {
+		span.SetAttributes(attribute.String(spanAttrExecutionPath, executionPathCaller))
+		return columns, entries, timedOut(err)
+	}
+
+	proxy, reason := s.resolveProxy(ctx, query, compiled.plan)
+	if proxy == nil {
+		span.SetAttributes(
+			attribute.String(spanAttrExecutionPath, executionPathCaller),
+			attribute.String(spanAttrFallbackReason, reason),
+		)
+		return nil, nil, err
+	}
+	logger.Infof("Cypher query on knowledge network %s runs under the knowledge network proxy: "+
+		"caller %s, proxy account %s, resources %s",
+		query.KNID, caller.ID, proxy.account.ID, strings.Join(proxy.resourceIDs, ","))
+	span.SetAttributes(attribute.String(spanAttrExecutionPath, executionPathProxy))
+	columns, entries, err = runBindJoin(ctx, plan, compiled.schema, readAs(proxy.account),
+		defaultBindJoinLimits, interfaces.CYPHER_DEFAULT_LIMIT)
+	return columns, entries, timedOut(err)
+}
+
+// errBindJoinTimeout is the bind-join executor running out of its own time
+// while the caller still waits.
+var errBindJoinTimeout = errors.New("the bind-join executor ran out of time")
+
+// errQueryOutOfTime is the query's own time already spent before a statement
+// could start, as the later parts of a UNION may find it.
+var errQueryOutOfTime = errors.New("the query ran out of time")
 
 // vegaRefused reports vega-backend refusing a resource the statement reads.
 func vegaRefused(err error) bool {
 	var dependencyErr *interfaces.DependencyError
 	return errors.As(err, &dependencyErr) && dependencyErr.HTTPStatus == http.StatusForbidden
+}
+
+// configuredTimeoutSec is how long one statement may run unless a request asks
+// for less, held to what vega-backend accepts.
+func (s *cypherQueryService) configuredTimeoutSec() int {
+	seconds := 0
+	if s.appSetting != nil {
+		seconds = s.appSetting.ServerSetting.CypherQueryTimeoutSec
+	}
+	if seconds <= 0 {
+		return interfaces.CYPHER_DEFAULT_TIMEOUT_SEC
+	}
+	return min(seconds, interfaces.CYPHER_MAX_TIMEOUT_SEC)
+}
+
+// requestTimeoutSec is how long one query may take as a whole: what it asked
+// for, or the configured timeout. validateTimeout has already held what it
+// asked for to the configured one.
+func (s *cypherQueryService) requestTimeoutSec(query interfaces.CypherQuery) int {
+	if query.TimeoutSec > 0 {
+		return query.TimeoutSec
+	}
+	return s.configuredTimeoutSec()
+}
+
+// queryDeadlineKey carries, on the context, when the query's time runs out.
+type queryDeadlineKey struct{}
+
+func (s *cypherQueryService) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// remaining is how much of the query's time is left. A context Query did not
+// set a deadline on has the whole of it.
+func (s *cypherQueryService) remaining(ctx context.Context, query interfaces.CypherQuery) time.Duration {
+	if deadline, ok := ctx.Value(queryDeadlineKey{}).(time.Time); ok {
+		return deadline.Sub(s.clock())
+	}
+	return time.Duration(s.requestTimeoutSec(query)) * time.Second
+}
+
+// statementTimeoutSec is the query_timeout_sec one statement is sent with:
+// what is left of the query's time, rounded up to vega-backend's whole
+// seconds. With nothing left the query has timed out, and nothing is sent.
+func (s *cypherQueryService) statementTimeoutSec(ctx context.Context, query interfaces.CypherQuery) (int, error) {
+	left := s.remaining(ctx, query)
+	if left <= 0 {
+		return 0, queryTimeoutError(ctx)
+	}
+	return int((left + time.Second - 1) / time.Second), nil
+}
+
+// bindJoinTimeoutFor is how long the bind-join executor may run. When a
+// timeout sends the query on to SQL, the executor takes half of what is left
+// so that the SQL statement still has time to answer within the request's
+// timeout; when nothing follows it, it may take all of it.
+func (s *cypherQueryService) bindJoinTimeoutFor(ctx context.Context, query interfaces.CypherQuery,
+	fallsBack bool) time.Duration {
+	if s.bindJoinTimeout > 0 {
+		return s.bindJoinTimeout
+	}
+	left := s.remaining(ctx, query)
+	if fallsBack {
+		return left / 2
+	}
+	return left
+}
+
+func queryTimeoutError(ctx context.Context) error {
+	return httperrors.NewHTTPError(ctx, http.StatusGatewayTimeout, berrors.BknBackend_Cypher_QueryTimeout)
+}
+
+// validateTimeout refuses a timeout the service would not honor rather than
+// clamping it, so a caller asking for more time is told it will not get it.
+func (s *cypherQueryService) validateTimeout(ctx context.Context, seconds int) error {
+	maxSeconds := s.configuredTimeoutSec()
+	if seconds >= 0 && seconds <= maxSeconds {
+		return nil
+	}
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.TimeoutOutOfRange",
+		map[string]any{"max": maxSeconds})
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidParameter).
+		WithErrorDetails(localizedText)
+}
+
+// dependencyTimedOut reports a statement the data source did not finish in
+// time: vega-backend stopping it at the statement's timeout, or the request to
+// vega-backend itself running out of time.
+func dependencyTimedOut(err error) bool {
+	var dependencyErr *interfaces.DependencyError
+	return errors.As(err, &dependencyErr) && dependencyErr.Kind == interfaces.DependencyTimeout
+}
+
+// logExecutionFailure records a statement the data source failed to run, with
+// what is needed to tell a slow source from a broken one: the resources it
+// reads, how long it ran and how it failed. The statement itself is left out
+// since it names physical tables and columns. A refusal is not logged here; it
+// is recorded on the span with the proxy decision.
+func logExecutionFailure(knID string, plan *Plan, request interfaces.RawQueryRequest,
+	elapsed time.Duration, err error) {
+	if err == nil || vegaRefused(err) || unsupportedSource(err) {
+		return
+	}
+	kind, status := interfaces.DependencyErrorKind("unknown"), 0
+	var dependencyErr *interfaces.DependencyError
+	if errors.As(err, &dependencyErr) {
+		kind, status = dependencyErr.Kind, dependencyErr.HTTPStatus
+	}
+	logger.Warnf("Cypher query on knowledge network %s failed after %s: kind=%s status=%d timeout_sec=%d resources=%s",
+		knID, elapsed.Round(time.Millisecond), kind, status, request.QueryTimeoutSec,
+		strings.Join(planResourceIDs(plan), ","))
 }
 
 // resolveProxy returns what a refused statement may run under through the
@@ -462,9 +950,10 @@ func (s *cypherQueryService) resolveProxy(ctx context.Context, query interfaces.
 	if s.proxies == nil {
 		return nil, fallbackNoResolver
 	}
-	// The proxy holds what the published main model binds. Another branch may
-	// bind its concepts differently, so its reads stay on the caller.
-	if query.Branch != interfaces.MAIN_BRANCH {
+	// The proxy holds what the published main model binds, which the running
+	// version of a versioned network mirrors. Another branch may bind its
+	// concepts differently, so its reads stay on the caller.
+	if query.Branch != interfaces.MAIN_BRANCH && !query.RunningVersion {
 		return nil, fallbackNonMainBranch
 	}
 	caller, ok := ctx.Value(interfaces.ACCOUNT_INFO_KEY).(interfaces.AccountInfo)
@@ -504,9 +993,10 @@ func (s *cypherQueryService) resolveProxy(ctx context.Context, query interfaces.
 
 // proxyBindings lists the published bindings a statement reads through: each
 // object type the pattern matches, bound to its resource, and each relation
-// type it joins over, bound to the resources at both of its ends. That is how
-// the published model grants the proxy account query_data, so every resource
-// the statement references is covered by one of them.
+// type it joins over, bound to the resources at both of its ends and, for an
+// indirect relation, to its backing resource. That is how the published model
+// grants the proxy account query_data, so every resource the statement
+// references is covered by one of them.
 func proxyBindings(plan *Plan) []interfaces.KNProxyBinding {
 	seen := map[interfaces.KNProxyBinding]bool{}
 	bindings := make([]interfaces.KNProxyBinding, 0, len(plan.Tables)+2*len(plan.Joins))
@@ -524,11 +1014,23 @@ func proxyBindings(plan *Plan) []interfaces.KNProxyBinding {
 		}
 	}
 	for _, table := range plan.Tables {
+		if table.Backing {
+			// Read through the relation it backs, below.
+			continue
+		}
 		add(interfaces.MODULE_TYPE_OBJECT_TYPE, table.ObjectTypeID, table.ResourceID)
 	}
 	for _, join := range plan.Joins {
 		add(interfaces.MODULE_TYPE_RELATION_TYPE, join.RelationTypeID, plan.Tables[join.Left].ResourceID)
 		add(interfaces.MODULE_TYPE_RELATION_TYPE, join.RelationTypeID, plan.Tables[join.Right].ResourceID)
+		if join.Backing != nil {
+			add(interfaces.MODULE_TYPE_RELATION_TYPE, join.RelationTypeID, plan.Tables[join.Backing.Table].ResourceID)
+		}
+	}
+	for _, sub := range plan.subPlans() {
+		for _, binding := range proxyBindings(sub) {
+			add(binding.ChildType, binding.ChildID, binding.TargetID)
+		}
 	}
 	return bindings
 }
@@ -542,6 +1044,14 @@ func planResourceIDs(plan *Plan) []string {
 		if !seen[table.ResourceID] {
 			seen[table.ResourceID] = true
 			resourceIDs = append(resourceIDs, table.ResourceID)
+		}
+	}
+	for _, sub := range plan.subPlans() {
+		for _, resourceID := range planResourceIDs(sub) {
+			if !seen[resourceID] {
+				seen[resourceID] = true
+				resourceIDs = append(resourceIDs, resourceID)
+			}
 		}
 	}
 	return resourceIDs
@@ -577,9 +1087,9 @@ func usableProxy(mapping *interfaces.KNProxyAccount, knID string) bool {
 }
 
 func proxyErrorCode(err error) string {
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if errors.As(err, &httpErr) {
-		return httpErr.BaseError.ErrorCode
+		return httpErr.ErrorCode
 	}
 	return "proxy resolution failed"
 }
@@ -589,11 +1099,146 @@ func proxyErrorCode(err error) string {
 // so only a code travels back: forbidden when vega-backend refused a resource
 // the statement reads, so a missing grant reads as one, and a query failure
 // for anything else.
+// resourceSource is where one resource lives: its category and its catalog.
+type resourceSource struct {
+	category string
+	catalog  string
+}
+
+// nonSQLCategories are the resource categories vega-backend cannot read as
+// SQL; a table or a logical view is read through a SQL connector.
+var nonSQLCategories = map[string]bool{
+	"dataset": true, "index": true, "file": true, "fileset": true, "api": true, "metric": true, "topic": true,
+}
+
+// outsideSQL reports a plan whose resources are known not to be readable as
+// one SQL statement: one of them is not in a SQL data source, or they are in
+// more than one. Where a resource lives is read from vega-backend once and
+// remembered; it only chooses the path, and the read itself is authorized as
+// any other. A resource the caller may not look up stays unknown, and the
+// statement is tried as SQL, which refuses it the same way.
+func (s *cypherQueryService) outsideSQL(ctx context.Context, plan *Plan) bool {
+	ids := planResourceIDs(plan)
+	var missing []string
+	for _, id := range ids {
+		if _, known := s.resourceSources.Load(id); !known {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		resources, err := s.vba.GetResourcesByIDs(ctx, missing)
+		if err != nil {
+			logger.Infof("Cypher could not look up where %d resources live; trying SQL: %s",
+				len(missing), common.SafeErrorSummary(err))
+		}
+		for _, resource := range resources {
+			if resource != nil {
+				s.resourceSources.Store(resource.ID, resourceSource{category: resource.Category, catalog: resource.CatalogID})
+			}
+		}
+	}
+	catalogs := map[string]bool{}
+	for _, id := range ids {
+		value, known := s.resourceSources.Load(id)
+		if !known {
+			continue
+		}
+		source := value.(resourceSource)
+		if nonSQLCategories[source.category] {
+			return true
+		}
+		catalogs[source.catalog] = true
+	}
+	return len(catalogs) > 1
+}
+
+// outsideSQLTooLarge refuses a query the data API path could not finish in
+// its read budget or its time. It is the read budget's code, so a caller can
+// tell "narrow the query" from "rewrite it".
+func outsideSQLTooLarge(ctx context.Context) error {
+	localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.NonSQLSourceTooLarge", nil)
+	if renderErr != nil {
+		logger.Errorf("localized message rendering failed: %v", renderErr)
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_ReadBudgetExceeded).
+		WithErrorDetails(localizedText)
+}
+
+// unsupportedSource reports a statement vega-backend could not run as SQL
+// because of where its resources live: a dataset, an index, or more than one
+// data source.
+func unsupportedSource(err error) bool {
+	var dependencyErr *interfaces.DependencyError
+	return errors.As(err, &dependencyErr) && dependencyErr.Kind == interfaces.DependencyUnsupportedSource
+}
+
+// queryOutsideSQL answers a query whose resources vega-backend cannot read as
+// SQL through the resource data API the bind-join executor reads, which
+// serves datasets and indexes and joins across data sources. That executor
+// takes no new capabilities, so what only the SQL path answers -- CASE,
+// coalesce, scalar functions, totals over groups, comparing two lists, passing nodes on and
+// graph values -- is refused, saying why.
+func (s *cypherQueryService) queryOutsideSQL(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery) (*interfaces.CypherQueryResult, error) {
+	if compiled.plan.SQLOnly || !graphOutsideSQL(compiled.graph) {
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.NonSQLSource", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return nil, httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_Unsupported).
+			WithErrorDetails(localizedText)
+	}
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(spanAttrExecutor, common.CypherExecutorBindJoin),
+		attribute.String(spanAttrFallback, fallbackNonSQLSource),
+		attribute.Bool(spanAttrGraph, compiled.graph != nil))
+	plan := compiled.plan
+	if compiled.graph != nil {
+		// The statement a graph value is read through is a plan of plain
+		// columns; the values are built from them as the SQL path builds
+		// them, so the executor runs nothing it does not already run.
+		plan = compiled.graph.flat
+	}
+	columns, entries, err := s.runBindJoin(ctx, query, compiled, plan, false)
+	if errors.Is(err, errQueryOutOfTime) {
+		return nil, queryTimeoutError(ctx)
+	}
+	var budget *ReadBudgetError
+	if errors.As(err, &budget) || errors.Is(err, errBindJoinTimeout) {
+		return nil, outsideSQLTooLarge(ctx)
+	}
+	if err != nil {
+		if !vegaRefused(err) {
+			common.LogSafeError(ctx, "Cypher query outside SQL failed", err)
+		}
+		return nil, executionError(ctx, err)
+	}
+	if compiled.graph != nil {
+		return s.graphResult(ctx, compiled, entries)
+	}
+	return &interfaces.CypherQueryResult{
+		Columns:           columns,
+		Entries:           entries,
+		TraceDescriptor:   compiled.traceDescriptor,
+		PermissionImpacts: compiled.permissionImpacts,
+	}, nil
+}
+
+// graphOutsideSQL reports a graph read the bind-join executor can serve: none,
+// or one read as flat rows. One with collect selects its conclusions through a
+// derived table first, which only the SQL path has.
+func graphOutsideSQL(read *graphRead) bool {
+	return read == nil || (!read.evidence && read.flat != nil && !read.flat.SQLOnly)
+}
+
 func executionError(ctx context.Context, err error) error {
 	if vegaRefused(err) {
-		return rest.NewHTTPError(ctx, http.StatusForbidden, berrors.BknBackend_Cypher_Forbidden)
+		return httperrors.NewHTTPError(ctx, http.StatusForbidden, berrors.BknBackend_Cypher_Forbidden)
 	}
-	return rest.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_QueryFailed)
+	if dependencyTimedOut(err) {
+		return queryTimeoutError(ctx)
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, berrors.BknBackend_Cypher_QueryFailed)
 }
 
 // pageSize is how many rows to ask vega-backend for. The statement's own LIMIT
@@ -616,16 +1261,105 @@ func pageSize(limit *int64) int {
 
 func validateQueryText(ctx context.Context, query string) error {
 	if len(query) == 0 {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidParameter).
-			WithErrorDetails(detail(ctx, "QueryRequired", nil))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.QueryRequired", nil)
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidParameter).
+			WithErrorDetails(localizedText)
 	}
 	if len(query) > MaxQueryLength {
-		return rest.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidParameter).
-			WithErrorDetails(detail(ctx, "QueryTooLong", map[string]any{"max": MaxQueryLength}))
+		localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail.QueryTooLong", map[string]any{"max": MaxQueryLength})
+		if renderErr != nil {
+			logger.Errorf("localized message rendering failed: %v", renderErr)
+		}
+		return httperrors.NewHTTPError(ctx, http.StatusBadRequest, berrors.BknBackend_Cypher_InvalidParameter).
+			WithErrorDetails(localizedText)
 	}
 	return nil
 }
 
-func detail(ctx context.Context, name string, templateData map[string]any) string {
-	return i18n.Translate(rest.GetLanguageByCtx(ctx), "BknBackend.Cypher.InvalidParameter.Detail."+name, templateData)
+// conditionsAsBooleans turns the 1, 0 and NULL MySQL returns for a condition
+// column back into the true, false and null the executor returns, so the
+// answer reads the same whichever path produced it.
+func conditionsAsBooleans(plan *Plan, columns []interfaces.RawQueryColumn, entries []map[string]any) {
+	if plan.Union != nil {
+		// Every part returns the same columns; the first says which are
+		// conditions.
+		plan = plan.Union.Parts[0]
+	}
+	for _, column := range plan.Select {
+		if _, ok := column.Expression.(PlanConditionValue); !ok {
+			continue
+		}
+		for i := range columns {
+			if columns[i].Name == column.Alias {
+				columns[i].Type = "boolean"
+			}
+		}
+		for _, entry := range entries {
+			value, present := entry[column.Alias]
+			if !present || value == nil {
+				continue
+			}
+			if _, isBool := value.(bool); isBool {
+				continue
+			}
+			if n, ok := asNumber(value); ok {
+				entry[column.Alias] = n.float() != 0
+			}
+		}
+	}
+}
+
+// queryUnion runs each part of a UNION as the query it would be on its own,
+// wherever its data lives, and puts the rows together: all of them for UNION
+// ALL, each distinct row once for UNION.
+func (s *cypherQueryService) queryUnion(ctx context.Context, query interfaces.CypherQuery,
+	compiled *compiledQuery) (*interfaces.CypherQueryResult, error) {
+	result := &interfaces.CypherQueryResult{
+		Entries:           []map[string]any{},
+		TraceDescriptor:   compiled.traceDescriptor,
+		PermissionImpacts: compiled.permissionImpacts,
+	}
+	seen := map[string]bool{}
+	for i, part := range compiled.parts {
+		if len(result.Entries) >= interfaces.CYPHER_MAX_LIMIT {
+			// The parts together may hold more rows than one query returns;
+			// the rest are not read, and the caller is told.
+			result.Limited = true
+			break
+		}
+		got, err := s.run(ctx, query, part)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 {
+			result.Columns, result.ValueTypes = got.Columns, got.ValueTypes
+		}
+		// A part that wrote no LIMIT and filled the default may have more
+		// rows, as a query on its own would say.
+		if got.Limited || (part.plan.Limit == nil && len(got.Entries) >= interfaces.CYPHER_DEFAULT_LIMIT) {
+			result.Limited = true
+		}
+		for _, entry := range got.Entries {
+			if len(result.Entries) >= interfaces.CYPHER_MAX_LIMIT {
+				result.Limited = true
+				break
+			}
+			if !compiled.plan.Union.All {
+				values := make([]any, len(result.Columns))
+				for j, column := range result.Columns {
+					values[j] = entry[column.Name]
+				}
+				key := canonicalTuple(values)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+			}
+			result.Entries = append(result.Entries, entry)
+		}
+	}
+	return result, nil
 }

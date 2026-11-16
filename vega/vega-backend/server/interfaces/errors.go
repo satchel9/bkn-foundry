@@ -11,6 +11,35 @@ import (
 	"fmt"
 )
 
+// DecimalIndexError 表示托管索引无法按字段的小数定义安全编码，不包含原始业务值。
+type DecimalIndexError struct {
+	Field  string
+	Reason string
+}
+
+func NewDecimalIndexError(field, reason string) *DecimalIndexError {
+	return &DecimalIndexError{Field: field, Reason: reason}
+}
+
+func (e *DecimalIndexError) Error() string {
+	return fmt.Sprintf("decimal index field %q: %s", e.Field, e.Reason)
+}
+
+// QueryExecutionBudgetError 标识完整计算未能在执行预算内完成，不携带部分结果。
+type QueryExecutionBudgetError struct {
+	Budget string
+	Cause  error
+}
+
+func NewQueryExecutionBudgetError(budget string, cause error) *QueryExecutionBudgetError {
+	return &QueryExecutionBudgetError{Budget: budget, Cause: cause}
+}
+
+func (e *QueryExecutionBudgetError) Error() string {
+	return "query execution budget exceeded: " + e.Budget
+}
+func (e *QueryExecutionBudgetError) Unwrap() error { return e.Cause }
+
 // SourceReadForbiddenError reports that a source account cannot read a resource.
 // Connectors return this error so callers can choose the appropriate response.
 type SourceReadForbiddenError struct{ Cause error }
@@ -28,10 +57,24 @@ func (e *SourceReadForbiddenError) Error() string {
 }
 func (e *SourceReadForbiddenError) Unwrap() error { return e.Cause }
 
+// SourceMemoryLimitError 表示源数据库达到内存限制，原始错误仅通过错误链保留。
+type SourceMemoryLimitError struct{ Cause error }
+
+// NewSourceMemoryLimitError 将连接器识别到的源端内存限制转换为公共错误类型。
+func NewSourceMemoryLimitError(cause error) *SourceMemoryLimitError {
+	return &SourceMemoryLimitError{Cause: cause}
+}
+
+func (e *SourceMemoryLimitError) Error() string { return "source memory limit exceeded" }
+func (e *SourceMemoryLimitError) Unwrap() error { return e.Cause }
+
 // SourceQueryInvalidParameterReason identifies a client-safe source query failure category.
 type SourceQueryInvalidParameterReason string
 
-const SourceQueryInvalidParameterUnknownColumn SourceQueryInvalidParameterReason = "unknown_column"
+const (
+	SourceQueryInvalidParameterUnknownColumn SourceQueryInvalidParameterReason = "unknown_column"
+	SourceQueryInvalidParameterInvalidQuery  SourceQueryInvalidParameterReason = "invalid_query"
+)
 
 // SourceQueryInvalidParameterError reports a source query rejected for invalid input.
 // Connectors preserve the driver failure for diagnostics; callers decide the HTTP response.
@@ -53,44 +96,27 @@ func (e *SourceQueryInvalidParameterError) Error() string {
 }
 func (e *SourceQueryInvalidParameterError) Unwrap() error { return e.Cause }
 
-// UnsupportedOperationError reports an operator unsupported by a query channel.
+// UnsupportedOperationError reports an unsupported operator with a caller-safe explanation.
 type UnsupportedOperationError struct {
 	Operation string
-	Channel   string
 	Cause     error
 }
 
-// NewUnsupportedOperationError identifies an operator unsupported by the selected channel.
-func NewUnsupportedOperationError(operation, channel string) *UnsupportedOperationError {
-	return &UnsupportedOperationError{Operation: operation, Channel: channel}
+// NewUnsupportedOperationError preserves the caller's explanation and original error chain.
+// Cause must be safe for callers because Error includes its message.
+func NewUnsupportedOperationError(operation string, cause error) *UnsupportedOperationError {
+	return &UnsupportedOperationError{Operation: operation, Cause: cause}
 }
 
 func (e *UnsupportedOperationError) Error() string {
 	msg := fmt.Sprintf("operation %s is not supported", e.Operation)
-	if e.Channel != "" {
-		msg += fmt.Sprintf(" by the %s query channel", e.Channel)
-	}
-	if hint := e.hint(); hint != "" {
-		msg += "; " + hint
+	if e.Cause != nil {
+		msg += fmt.Sprintf(": %v", e.Cause)
 	}
 	return msg
 }
 
 func (e *UnsupportedOperationError) Unwrap() error { return e.Cause }
-
-func (e *UnsupportedOperationError) hint() string {
-	if e.Channel != "sql" {
-		return ""
-	}
-	switch e.Operation {
-	case "match", "match_phrase", "multi_match":
-		return "full-text operations need a local index on the resource: build one, " +
-			"or use like/not_like/contain/prefix/regex on this channel"
-	case "knn_vector":
-		return "vector search needs a local index with a vector feature on the field: build one first"
-	}
-	return ""
-}
 
 // ConditionBuildError identifies a caller-supplied condition that the query channel cannot represent.
 type ConditionBuildError struct {
@@ -105,6 +131,48 @@ func NewConditionBuildError(format string, args ...any) *ConditionBuildError {
 
 func (e *ConditionBuildError) Error() string { return e.Reason }
 func (e *ConditionBuildError) Unwrap() error { return e.Cause }
+
+// TemporalRangeError 表示相对时间条件生成了当前索引字段无法表示的边界。
+type TemporalRangeError struct {
+	Field     string
+	FieldType string
+	Interval  int64
+	Unit      string
+	*ConditionBuildError
+}
+
+func NewTemporalRangeError(field, fieldType string, interval int64, unit string) *TemporalRangeError {
+	return &TemporalRangeError{
+		Field:               field,
+		FieldType:           fieldType,
+		Interval:            interval,
+		Unit:                unit,
+		ConditionBuildError: NewConditionBuildError("relative time interval for field %s exceeds the supported %s time range", field, fieldType)}
+}
+
+func (e *TemporalRangeError) Error() string { return e.ConditionBuildError.Error() }
+
+func (e *TemporalRangeError) Unwrap() error { return e.ConditionBuildError }
+
+// KeywordLimitError 表示精确查询值超过字段的 keyword 索引长度上限。
+// 字段与上限独立保存，调用方无需解析错误文案。
+type KeywordLimitError struct {
+	Field string
+	Limit int
+	*ConditionBuildError
+}
+
+func NewKeywordLimitError(field string, limit int) *KeywordLimitError {
+	return &KeywordLimitError{
+		Field:               field,
+		Limit:               limit,
+		ConditionBuildError: NewConditionBuildError("value for field %s exceeds keyword ignore_above %d and cannot be compared exactly", field, limit),
+	}
+}
+
+func (e *KeywordLimitError) Error() string { return e.ConditionBuildError.Error() }
+
+func (e *KeywordLimitError) Unwrap() error { return e.ConditionBuildError }
 
 // StoredConditionBuildError identifies a saved view condition that can no
 // longer be compiled against the current source schema or index configuration.
@@ -123,11 +191,46 @@ func (e *StoredConditionBuildError) Error() string {
 }
 func (e *StoredConditionBuildError) Unwrap() error { return e.Cause }
 
+// OutputFieldErrorReason identifies a projection rejected before execution.
+type OutputFieldErrorReason string
+
+const (
+	OutputFieldUnknown       OutputFieldErrorReason = "unknown_output_field"
+	OutputFieldUnsupported   OutputFieldErrorReason = "unsupported_output_field"
+	OutputFieldNoneQueryable OutputFieldErrorReason = "no_queryable_fields"
+)
+
+// OutputFieldError contains only public field names, never source SQL or driver errors.
+type OutputFieldError struct {
+	Reason OutputFieldErrorReason
+	Field  string
+}
+
+// NewOutputFieldError identifies a field or channel capability rejected before execution.
+func NewOutputFieldError(reason OutputFieldErrorReason, field string) *OutputFieldError {
+	return &OutputFieldError{Reason: reason, Field: field}
+}
+
+func (e *OutputFieldError) Error() string {
+	switch e.Reason {
+	case OutputFieldUnknown:
+		return fmt.Sprintf("unknown output field %q", e.Field)
+	case OutputFieldUnsupported:
+		return fmt.Sprintf("output field %q is not supported by this query channel", e.Field)
+	default:
+		return "resource schema has no queryable fields"
+	}
+}
+
 // RequestSideQueryError returns the client-safe reason for an invalid query shape.
 func RequestSideQueryError(err error) (string, bool) {
 	var stored *StoredConditionBuildError
 	if errors.As(err, &stored) {
 		return "", false
+	}
+	var output *OutputFieldError
+	if errors.As(err, &output) {
+		return output.Error(), true
 	}
 	var invalidParameter *SourceQueryInvalidParameterError
 	if errors.As(err, &invalidParameter) {
@@ -176,3 +279,18 @@ func (e *RawAggregationValidationError) Error() string {
 	return fmt.Sprintf("invalid OpenSearch aggregation at %s: %s", e.Path, e.Reason)
 }
 func (e *RawAggregationValidationError) Unwrap() error { return e.Cause }
+
+// ServerTimeZoneError 表示服务器时区配置错误，不属于调用方输入错误。
+type ServerTimeZoneError struct{}
+
+// NewServerTimeZoneError 创建不泄漏配置细节的服务时区错误。
+func NewServerTimeZoneError() *ServerTimeZoneError { return &ServerTimeZoneError{} }
+func (*ServerTimeZoneError) Error() string         { return "invalid server time zone configuration" }
+
+// DeleteByQueryIncompleteError 保留部分删除已经完成的实际进度。
+type DeleteByQueryIncompleteError struct{ Result *DeleteByQueryResult }
+
+func NewDeleteByQueryIncompleteError(result *DeleteByQueryResult) *DeleteByQueryIncompleteError {
+	return &DeleteByQueryIncompleteError{Result: result}
+}
+func (*DeleteByQueryIncompleteError) Error() string { return "delete-by-query did not complete" }

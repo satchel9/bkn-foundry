@@ -41,6 +41,21 @@ func (m *MockDatasetService) EXPECT() *MockDatasetServiceMockRecorder {
 	return m.recorder
 }
 
+// BulkReplaceDocuments mocks base method.
+func (m *MockDatasetService) BulkReplaceDocuments(ctx context.Context, res *interfaces.Resource, documents []map[string]any) ([]interfaces.DocumentWriteResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "BulkReplaceDocuments", ctx, res, documents)
+	ret0, _ := ret[0].([]interfaces.DocumentWriteResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// BulkReplaceDocuments indicates an expected call of BulkReplaceDocuments.
+func (mr *MockDatasetServiceMockRecorder) BulkReplaceDocuments(ctx, res, documents any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BulkReplaceDocuments", reflect.TypeOf((*MockDatasetService)(nil).BulkReplaceDocuments), ctx, res, documents)
+}
+
 // CountDocuments mocks base method.
 func (m *MockDatasetService) CountDocuments(ctx context.Context, res *interfaces.Resource) (int64, error) {
 	m.ctrl.T.Helper()
@@ -114,11 +129,12 @@ func (mr *MockDatasetServiceMockRecorder) DeleteDocuments(ctx, res, docIDs, igno
 }
 
 // DeleteDocumentsByQuery mocks base method.
-func (m *MockDatasetService) DeleteDocumentsByQuery(ctx context.Context, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) error {
+func (m *MockDatasetService) DeleteDocumentsByQuery(ctx context.Context, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.DeleteByQueryResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "DeleteDocumentsByQuery", ctx, res, params)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret0, _ := ret[0].(*interfaces.DeleteByQueryResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // DeleteDocumentsByQuery indicates an expected call of DeleteDocumentsByQuery.
@@ -143,13 +159,12 @@ func (mr *MockDatasetServiceMockRecorder) GetDocuments(ctx, res, docIDs, ignoreM
 }
 
 // ListDocuments mocks base method.
-func (m *MockDatasetService) ListDocuments(ctx context.Context, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) ([]map[string]any, int64, error) {
+func (m *MockDatasetService) ListDocuments(ctx context.Context, res *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ListDocuments", ctx, res, params)
-	ret0, _ := ret[0].([]map[string]any)
-	ret1, _ := ret[1].(int64)
-	ret2, _ := ret[2].(error)
-	return ret0, ret1, ret2
+	ret0, _ := ret[0].(*interfaces.ResourceDataQueryResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // ListDocuments indicates an expected call of ListDocuments.

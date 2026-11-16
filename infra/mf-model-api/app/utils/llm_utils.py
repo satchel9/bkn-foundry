@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 import hashlib
 import json
 import re
@@ -1254,6 +1255,7 @@ class OtherClient:
         self.thinking_mode = thinking_mode if thinking_mode in {"enabled", "disabled"} else ""
 
     async def chat_completion(self, messages, user_id, func_module):
+        start_time = time.perf_counter()
         retry_time = 3
         while retry_time > 0:
             retry_time -= 1
@@ -1263,7 +1265,6 @@ class OtherClient:
                         _platform_stream_error(
                             "ModelFactory.Stream.InvalidMessageRole", "invalid_request_error"),
                         400)
-                start_time = time.perf_counter()
                 params = {
                     "messages": messages,
                     "model": self.api_model,
@@ -1295,11 +1296,6 @@ class OtherClient:
                         res = await resp.text()
                         result = json.loads(res)
                         if resp.status == 200:
-                            log_info = logics.AddModelUsedAudit(
-                                model_id=self.model_id, user_id=user_id, input_tokens=result["usage"]["prompt_tokens"],
-                                output_tokens=result["usage"]["completion_tokens"],
-                                total_time=time.perf_counter() - start_time, status="success")
-                            await add_llm_model_call_log(log_info)
                             if self.model_type == "rlm" and not result["choices"][0]["message"].get("reasoning_content",
                                                                                                     None):
                                 # Extract the thinking tag.
@@ -1342,6 +1338,11 @@ class OtherClient:
                                     f'{{"model_name":{self.api_model},"resourece_type":"LLM","user_id":{user_id},'
                                     f'"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},'
                                     f'"total_tokens":{total_tokens},"func_module":{func_module},"status":"success"}}')
+                            log_info = logics.AddModelUsedAudit(
+                                model_id=self.model_id, user_id=user_id, input_tokens=result["usage"]["prompt_tokens"],
+                                output_tokens=result["usage"]["completion_tokens"],
+                                total_time=time.perf_counter() - start_time, status="success")
+                            await add_llm_model_call_log(log_info)
                             return result
                         else:
                             if get_logger():
@@ -1349,11 +1350,17 @@ class OtherClient:
                                     f'{{"model_name":{self.api_model},"resourece_type":"LLM","user_id":{user_id},'
                                     f'"prompt_tokens":0,"completion_tokens":0,'
                                     f'"total_tokens":0,"func_module":{func_module},"status":"failed"}}')
-                            return openai_error.with_http_status(
+                            error_result = openai_error.with_http_status(
                                 openai_error.from_upstream(result, resp.status),
                                 resp.status,
                                 openai_error.retry_after_seconds(
                                     resp.status, resp.headers))
+                            log_info = logics.AddModelUsedAudit(
+                                model_id=self.model_id, user_id=user_id, input_tokens=0,
+                                output_tokens=0, total_time=time.perf_counter() - start_time,
+                                status="failed")
+                            await add_llm_model_call_log(log_info)
+                            return error_result
             except Exception as e:
                 StandLogger.error(e.args)
                 if get_logger():
@@ -1362,6 +1369,12 @@ class OtherClient:
                         f'"prompt_tokens":0,"completion_tokens":0,'
                         f'"total_tokens":0,"func_module":{func_module},"status":"failed"}}')
                 if retry_time <= 0:
+                    # Count the final outcome once, after all provider attempts.
+                    log_info = logics.AddModelUsedAudit(
+                        model_id=self.model_id, user_id=user_id, input_tokens=0,
+                        output_tokens=0, total_time=time.perf_counter() - start_time,
+                        status="failed")
+                    await add_llm_model_call_log(log_info)
                     raise e
                 else:
                     await asyncio.sleep(0.5)
@@ -1371,6 +1384,7 @@ class OtherClient:
         while retry_time > 0:
             retry_time -= 1
             start_time = time.perf_counter()
+            stream_started = False
             try:
                 chunk_id = ""
                 if messages[len(messages) - 1]["role"] != "user" and self.api_model.find("qianxun") != -1:
@@ -1410,6 +1424,9 @@ class OtherClient:
                 }
                 prompt_tokens = 0
                 completion_tokens = 0
+                total_tokens = 0
+                usage_fields = set()
+                stream_done = False
                 first_token_time = None
                 async with aiohttp.ClientSession(timeout=base_config.aiohttp_timeout) as session:
                     async with session.post(self.api_url, json=params, headers=headers, ssl=False) as response:
@@ -1443,21 +1460,50 @@ class OtherClient:
                         async for chunk in response.content:
                             if not first_token_time:
                                 first_token_time = time.perf_counter()
-                            chunk = chunk.decode(encoding='utf-8')
-                            if chunk.endswith('\n'):
-                                chunk = chunk[:-1]
-                            elif chunk.endswith('\r\n'):
-                                chunk = chunk[:-2]
-                            if len(chunk) >= 6 and chunk[0:6] != "data: ":
+                            chunk = chunk.decode(encoding='utf-8').rstrip('\r\n')
+                            if chunk == "data: [DONE]":
+                                stream_done = True
+                                break
+                            if not chunk.startswith("data: "):
                                 continue
-                            if chunk != "data: [DONE]" and chunk != "":
+                            try:
+                                datas = json.loads(chunk[6:])
+                            except json.JSONDecodeError:
+                                continue
+                            stream_started = True
+                            if "error" in datas:
+                                log_info = logics.AddModelUsedAudit(
+                                    model_id=self.model_id, user_id=user_id, status="failed")
+                                await add_llm_model_call_log(log_info)
+                                yield openai_error.error_frame(openai_error.from_upstream(datas, 502))
+                                return
+                            usage = datas.get("usage")
+                            if isinstance(usage, dict):
+                                # Missing counts remain unknown; zero is the legacy
+                                # integer metering placeholder, not an estimate.
+                                for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                                    value = usage.get(key)
+                                    if value is not None and (type(value) is not int or value < 0):
+                                        raise ValueError("Invalid upstream token usage")
+                                usage_fields.update(key for key in ("prompt_tokens", "completion_tokens")
+                                                    if usage.get(key) is not None)
+                                if usage.get("prompt_tokens") is not None:
+                                    prompt_tokens = usage["prompt_tokens"]
+                                if usage.get("completion_tokens") is not None:
+                                    completion_tokens = usage["completion_tokens"]
+                                total_tokens = usage.get("total_tokens")
+                                if total_tokens is None:
+                                    total_tokens = prompt_tokens + completion_tokens
+                                if usage.get("prompt_tokens") is not None:
+                                    details = usage.get("prompt_tokens_details")
+                                    if details is None:
+                                        details = {"cache_type": "implicit", "cached_tokens": 0}
+                                        usage["prompt_tokens_details"] = details
+                                    if isinstance(details, dict):
+                                        cached = details.get("cached_tokens") or 0
+                                        details["uncached_tokens"] = prompt_tokens - cached
+                            if datas:
                                 if self.model_type == "rlm":
-                                    if chunk[0:6] == "data: ":
-                                        chunk = chunk[6:]
-                                    try:
-                                        datas = json.loads(chunk)
-                                    except Exception:
-                                        continue
                                     try:
                                         if chunk_id == "":
                                             chunk_id = datas.get("id", "")
@@ -1474,50 +1520,17 @@ class OtherClient:
                                         if "error" in datas.keys():
                                             yield json.dumps(datas, ensure_ascii=False)
                                             return
+                                    if not datas.get("choices"):
+                                        yield json.dumps(datas, ensure_ascii=False)
+                                        continue
                                     if rlm_type == "":
                                         if "reasoning_content" in datas["choices"][0]["delta"]:
                                             rlm_type = "saas"
                                         elif datas["choices"][0]["delta"].get("content", "") not in ["", None]:
                                             rlm_type = "inner"
                                     if rlm_type == "saas":
-                                        if "usage" in datas.keys() and completion_tokens == 0:
-                                            try:
-                                                prompt_tokens = datas["usage"]["prompt_tokens"]
-                                                completion_tokens = datas["usage"]["completion_tokens"]
-                                                total_tokens = datas["usage"]["total_tokens"]
-                                                # Add uncached_tokens to usage metadata.
-                                                if "prompt_tokens_details" not in datas["usage"]:
-                                                    datas["usage"]["prompt_tokens_details"] = {
-                                                        "cache_type": "implicit",
-                                                        "cached_tokens": 0
-                                                    }
-                                                prompt_tokens_details = datas["usage"]["prompt_tokens_details"]
-                                                cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
-                                                uncached_tokens = prompt_tokens - cached_tokens
-                                                datas["usage"]["prompt_tokens_details"][
-                                                    "uncached_tokens"] = uncached_tokens
-                                            except Exception:
-                                                pass
                                         yield json.dumps(datas, ensure_ascii=False)
                                     elif rlm_type == "inner":
-                                        if "usage" in datas.keys() and completion_tokens == 0:
-                                            try:
-                                                prompt_tokens = datas["usage"]["prompt_tokens"]
-                                                completion_tokens = datas["usage"]["completion_tokens"]
-                                                total_tokens = datas["usage"]["total_tokens"]
-                                                # Add uncached_tokens to usage metadata.
-                                                if "prompt_tokens_details" not in datas["usage"]:
-                                                    datas["usage"]["prompt_tokens_details"] = {
-                                                        "cache_type": "implicit",
-                                                        "cached_tokens": 0
-                                                    }
-                                                prompt_tokens_details = datas["usage"]["prompt_tokens_details"]
-                                                cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
-                                                uncached_tokens = prompt_tokens - cached_tokens
-                                                datas["usage"]["prompt_tokens_details"][
-                                                    "uncached_tokens"] = uncached_tokens
-                                            except Exception:
-                                                pass
                                         if think_done is False:
                                             if think_start is False:
                                                 start_pattern = r"<think>(.*?)"
@@ -1571,66 +1584,37 @@ class OtherClient:
                                                 datas["choices"][0]["delta"]["reasoning_content"] = None
                                             yield json.dumps(datas, ensure_ascii=False)
                                 else:
-                                    if chunk[0:6] == "data: ":
-                                        chunk = chunk[6:]
-                                    try:
-                                        datas = json.loads(chunk)
-                                    except Exception as e:
-                                        continue
-                                    # try:
-                                    #     delta = datas["choices"][0]["delta"]
-                                    #     if "content" in delta:
-                                    #         token = delta["content"]
-                                    #         if token is not None:
-                                    #             token_len += 1
-                                    #             ans += token
-                                    # except Exception as e:
-                                    #     if "error" in datas.keys():
-                                    #         yield json.dumps(datas, ensure_ascii=False)
-                                    #         return
-                                    if "usage" in datas.keys() and completion_tokens == 0:
-                                        try:
-                                            prompt_tokens = datas["usage"]["prompt_tokens"]
-                                            completion_tokens = datas["usage"]["completion_tokens"]
-                                            total_tokens = datas["usage"]["total_tokens"]
-                                            # Add uncached_tokens to usage metadata.
-                                            if "prompt_tokens_details" not in datas["usage"]:
-                                                datas["usage"]["prompt_tokens_details"] = {
-                                                    "cache_type": "implicit",
-                                                    "cached_tokens": 0
-                                                }
-                                            prompt_tokens_details = datas["usage"]["prompt_tokens_details"]
-                                            cached_tokens = prompt_tokens_details.get("cached_tokens", 0)
-                                            uncached_tokens = prompt_tokens - cached_tokens
-                                            datas["usage"]["prompt_tokens_details"]["uncached_tokens"] = uncached_tokens
-                                        except Exception:
-                                            pass
                                     yield json.dumps(datas, ensure_ascii=False)
-
-                            else:
-
-                                if chunk == "data: [DONE]":
-                                    yield "[DONE]"
-                        end_time = time.perf_counter()
-                        first_time = first_token_time - start_time
-                        total_time = end_time - start_time
-                        log_info = logics.AddModelUsedAudit(
-                            model_id=self.model_id, user_id=user_id, input_tokens=prompt_tokens,
-                            output_tokens=completion_tokens, first_time=first_time, total_time=total_time,
-                            status="success")
-                        await add_llm_model_call_log(log_info)
-                        if get_logger():
-                            get_logger().info(
-                                f'{{"model_name":{self.api_model},"resourece_type":"LLM","user_id":{user_id},'
-                                f'"prompt_tokens":{prompt_tokens},"completion_tokens":{completion_tokens},'
-                                f'"total_tokens":{total_tokens},"func_module":{func_module},"status":"success"}}')
-                        return
+                        if not stream_done:
+                            raise ValueError("Upstream stream ended without DONE")
+                end_time = time.perf_counter()
+                first_time = first_token_time - start_time if first_token_time is not None else 0.0
+                total_time = end_time - start_time
+                log_info = logics.AddModelUsedAudit(
+                    model_id=self.model_id, user_id=user_id, input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens, first_time=first_time, total_time=total_time,
+                    status="success")
+                await add_llm_model_call_log(log_info)
+                try:
+                    logger = get_logger()
+                    if logger:
+                        logger.info(json.dumps({
+                            "model_name": self.api_model, "resourece_type": "LLM", "user_id": user_id,
+                            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+                            "total_tokens": total_tokens, "usage_known": len(usage_fields) == 2,
+                            "func_module": func_module, "status": "success",
+                        }))
+                except Exception:
+                    # A diagnostic sink failure cannot change the model outcome.
+                    StandLogger.warn("Could not write model stream success log")
+                yield "[DONE]"
+                return
             except aiohttp.ClientError as e:
                 StandLogger.error(
                     f"call llmModelError {self.api_model} error "
                     f"request={log_redact.request_digest(params)},"
                     f"headers={log_redact.safe_headers(headers)},error={e}")
-                if retry_time <= 0:
+                if stream_started or retry_time <= 0:
                     log_info = logics.AddModelUsedAudit(
                         model_id=self.model_id, user_id=user_id, input_tokens=0,
                         output_tokens=0, first_time=0.0, total_time=0.0,
@@ -1849,57 +1833,54 @@ class ClaudeClient:
         elif tool_choice is not None:
             self.tool_choice = {"type": "tool", "name": self.tool_choice["function"]["name"]}
 
-    async def chat_completion(self, messages, user_id, func_module, cache=False):
-        system = None
-        for i in range(0, len(messages)):
+    def _prepare_messages(self, messages):
+        """Adapt OpenAI messages without mutating the caller's conversation.
 
-            if messages[i]["role"] == "system":
+        Keep explicit Claude system blocks first, then append system messages
+        in conversation order. Retain the legacy system-only user fallback.
+        """
+        system = deepcopy(self.system) if self.system else []
+        converted = []
+        for original in messages:
+            message = deepcopy(original)
+            role = message["role"]
+            if role == "system":
                 if len(messages) > 1:
-                    if system is None:
-                        system = messages[i]["content"]
-                    messages.pop(i)
-                else:
-                    messages[i]["role"] = "user"
-            elif messages[i]["role"] == "tool":
-
-                tmp_message = {
+                    content = message["content"]
+                    if isinstance(content, str):
+                        if content:
+                            system.append({"type": "text", "text": content})
+                    else:
+                        system.extend(content)
+                    continue
+                message["role"] = "user"
+            elif role == "tool":
+                message = {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": messages[i]["tool_call_id"],
-                            "content": messages[i]["content"]
-                        }
-                    ]
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": message["tool_call_id"],
+                        "content": message["content"],
+                    }],
                 }
-                messages[i] = tmp_message
-            elif messages[i]["role"] == "assistant":
-                if "tool_calls" in messages[i].keys() and messages[i]["tool_calls"] is not None and len(
-                        messages[i]["tool_calls"]) > 0:
-                    tmp_message = {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": messages[i].get("content", "")
-                            }
-                        ]
-                    }
-                    if messages[i].get("content", "") == "":
-                        tmp_message["content"] = []
-                    for j in range(0, len(messages[i]["tool_calls"])):
-                        tmp_message["content"].append(
-                            {
-                                "type": "tool_use",
-                                "id": messages[i]["tool_calls"][j]["id"],
-                                "name": messages[i]["tool_calls"][j]["function"]["name"],
-                                "input": json.loads(messages[i]["tool_calls"][j]["function"]["arguments"])
-                            })
-                    messages[i] = tmp_message
-            if "tool_calls" in messages[i].keys():
-                messages[i].pop("tool_calls")
-            if "tool_call_id" in messages[i].keys():
-                messages[i].pop("tool_call_id")
+            elif role == "assistant" and message.get("tool_calls"):
+                content = message.get("content") or ""
+                blocks = [{"type": "text", "text": content}] if content else []
+                for tool_call in message["tool_calls"]:
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tool_call["id"],
+                        "name": tool_call["function"]["name"],
+                        "input": json.loads(tool_call["function"]["arguments"]),
+                    })
+                message = {"role": "assistant", "content": blocks}
+            message.pop("tool_calls", None)
+            message.pop("tool_call_id", None)
+            converted.append(message)
+        return converted, system
+
+    async def chat_completion(self, messages, user_id, func_module, cache=False):
+        messages, system = self._prepare_messages(messages)
 
         params = {
             "messages": messages,
@@ -1910,8 +1891,8 @@ class ClaudeClient:
             "max_tokens": self.max_tokens,
             "top_k": self.top_k
         }
-        if self.system:
-            params["system"] = self.system
+        if system:
+            params["system"] = system
         if self.tools:
             params["tools"] = self.tools
         if self.tool_choice:
@@ -2008,56 +1989,7 @@ class ClaudeClient:
                         openai_error.retry_after_seconds(resp.status, resp.headers))
 
     async def chat_completion_stream_openai(self, messages, user_id, func_module, cache=False):
-        system = None
-        for i in range(0, len(messages)):
-
-            if messages[i]["role"] == "system":
-                if len(messages) > 1:
-                    if system is None:
-                        system = messages[i]["content"]
-                    messages.pop(i)
-                else:
-                    messages[i]["role"] = "user"
-            elif messages[i]["role"] == "tool":
-
-                tmp_message = {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": messages[i]["tool_call_id"],
-                            "content": messages[i]["content"]
-                        }
-                    ]
-                }
-                messages[i] = tmp_message
-            elif messages[i]["role"] == "assistant":
-                if "tool_calls" in messages[i].keys() and messages[i]["tool_calls"] is not None and len(
-                        messages[i]["tool_calls"]) > 0:
-                    tmp_message = {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": messages[i].get("content", "")
-                            }
-                        ]
-                    }
-                    if messages[i].get("content", "") == "":
-                        tmp_message["content"] = []
-                    for j in range(0, len(messages[i]["tool_calls"])):
-                        tmp_message["content"].append(
-                            {
-                                "type": "tool_use",
-                                "id": messages[i]["tool_calls"][j]["id"],
-                                "name": messages[i]["tool_calls"][j]["function"]["name"],
-                                "input": json.loads(messages[i]["tool_calls"][j]["function"]["arguments"])
-                            })
-                    messages[i] = tmp_message
-            if "tool_calls" in messages[i].keys():
-                messages[i].pop("tool_calls")
-            if "tool_call_id" in messages[i].keys():
-                messages[i].pop("tool_call_id")
+        messages, system = self._prepare_messages(messages)
 
         params = {
             "messages": messages,
@@ -2068,8 +2000,8 @@ class ClaudeClient:
             "max_tokens": self.max_tokens,
             "top_k": self.top_k
         }
-        if self.system:
-            params["system"] = self.system
+        if system:
+            params["system"] = system
         if self.tools:
             params["tools"] = self.tools
         if self.tool_choice:

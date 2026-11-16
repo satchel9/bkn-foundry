@@ -21,7 +21,13 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/port/driven/isessionstore"
 )
 
+const functionResultIntegrityContract = sessionvo.FunctionResultContract
+
+// Fixed inspection limits cannot recover by retrying an unchanged generation.
+var errRecordIntegrityInspectionBudget = errors.New("record integrity inspection budget exceeded")
+
 type recordIntegrityBudgetKey struct{}
+type historicalIntegrityRecheckKey struct{}
 type recordIntegrityReadBudget struct {
 	reads int
 	bytes int64
@@ -179,7 +185,7 @@ func evaluateRecordIntegrity(snapshot sessionvo.EvidenceSnapshot, owner sessionv
 		if f.Status != sessionvo.AttemptCompleted || !slices.Contains(profile.RequiredTraceFields, "result_completeness") {
 			continue
 		}
-		if profile.EvidenceContract == "managed_function_execution/v1" {
+		if profile.EvidenceContract == sessionvo.ManagedFunctionExecutionContract {
 			continue
 		}
 		// A trusted policy stop may omit this call's new result ledger only when
@@ -196,6 +202,8 @@ func evaluateRecordIntegrity(snapshot sessionvo.EvidenceSnapshot, owner sessionv
 			return nil, fmt.Errorf("record integrity contract unsupported: %s", profile.EvidenceContract)
 		}
 		found := false
+		functionResult := profile.EvidenceContract == functionResultIntegrityContract
+		resultSnapshots := 0
 		for _, e := range events {
 			if e.EventType != eventType || !e.Owner.Equal(owner) || e.ConversationID != interaction.ConversationID || e.InteractionID != interaction.ID || e.OperationID != f.OperationID || e.Attempt != f.Attempt || e.RequestID != f.RequestID || e.TraceID != f.TraceID {
 				continue
@@ -206,6 +214,18 @@ func evaluateRecordIntegrity(snapshot sessionvo.EvidenceSnapshot, owner sessionv
 			if err := json.Unmarshal(e.Envelope, &envelope); err != nil {
 				return nil, err
 			}
+			if functionResult {
+				// Only the accepted, receipt-bound capture event can record
+				// a captured Function result. A missing/false/malformed snapshot
+				// is a recorded gap, not an unsupported inspection contract.
+				var contract string
+				if f.SourceModule != sessionvo.FunctionResultSourceModule || e.ProducerID != sessionvo.FunctionResultProducerID || !slices.Contains(r.ObservedEvidenceRefs, e.EventID) || json.Unmarshal(envelope.Payload["result_contract"], &contract) != nil || contract != functionResultIntegrityContract {
+					continue
+				}
+				resultSnapshots++
+				found = string(envelope.Payload["complete"]) == "true"
+				continue
+			}
 			field := "truncated"
 			if eventType == "ontology.schema.snapshot" || eventType == "metric.query.completed" {
 				field = "complete"
@@ -213,6 +233,9 @@ func evaluateRecordIntegrity(snapshot sessionvo.EvidenceSnapshot, owner sessionv
 			if v, ok := envelope.Payload[field]; ok && (string(v) == "true" || string(v) == "false") {
 				found = true
 			}
+		}
+		if functionResult && resultSnapshots != 1 {
+			found = false
 		}
 		if !found {
 			add(f, "record_content_missing", "evidence.result_completeness")
@@ -265,7 +288,7 @@ func evaluateRecordIntegrity(snapshot sessionvo.EvidenceSnapshot, owner sessionv
 			last--
 		}
 		if last > 10000 {
-			return nil, errors.New("integrity attempt budget exceeded")
+			return nil, errRecordIntegrityInspectionBudget
 		}
 		for attempt := uint32(1); attempt <= last; attempt++ {
 			if _, found := facts[key{op.ID, attempt}]; !found {
@@ -314,6 +337,8 @@ func payloadOmitted(payload *sessionvo.PayloadEnvelope) bool {
 
 func integrityEventType(contract string) string {
 	switch contract {
+	case functionResultIntegrityContract:
+		return "logic.execution.observed"
 	case "ontology_schema_snapshot/v1":
 		return "ontology.schema.snapshot"
 	case "ontology_metric_result/v1":
@@ -465,12 +490,41 @@ func (s *Service) inspectAuthorizedLiveRecordIntegrity(ctx context.Context, id, 
 			// These fields only consume non-nil presence in evaluateRecordIntegrity.
 			return json.RawMessage("null"), nil
 		}
+
+		if recheck, _ := ctx.Value(historicalIntegrityRecheckKey{}).(bool); recheck && (field == "output" || field == "artifact") {
+			reader, ok := s.artifactStore.(iartifactstore.IntegrityReader)
+			if !ok {
+				return nil, errors.New("bounded integrity verifier unavailable")
+			}
+			if len(verified) >= 512 {
+				return nil, errRecordIntegrityInspectionBudget
+			}
+			result, err := reader.VerifyArtifactForIntegrity(ctx, id, scope)
+			if err != nil {
+				return nil, err
+			}
+			if !result.Found {
+				if result.Exists {
+					return nil, errors.New("referenced artifact inaccessible; integrity recheck incomplete")
+				}
+				return nil, nil
+			}
+			if err := checkSource(id, result.Artifact, f, field); err != nil {
+				return nil, err
+			}
+			metadata := verifiedArtifact{source: evidencevo.EvidenceArtifact{ArtifactID: result.Artifact.ArtifactID, ArtifactType: result.Artifact.ArtifactType, InteractionID: result.Artifact.InteractionID, OperationID: result.Artifact.OperationID, RequestID: result.Artifact.RequestID, TraceID: result.Artifact.TraceID}, canonicalLength: result.CanonicalLength, htmlEscapedLength: result.HTMLEscapedLength}
+			if err := checkLength(p, metadata); err != nil {
+				return nil, err
+			}
+			verified[id] = metadata
+			return json.RawMessage("null"), nil
+		}
 		reader, ok := s.artifactStore.(iartifactstore.CaptureReader)
 		if !ok {
 			return nil, errors.New("authoritative bounded artifact source unavailable")
 		}
 		if budget.reads >= 128 || budget.bytes >= 32<<20 {
-			return nil, errors.New("integrity artifact read budget exceeded")
+			return nil, errRecordIntegrityInspectionBudget
 		}
 		budget.reads++
 		result, err := reader.ReadArtifactForCapture(ctx, id, scope, min(8<<20, (32<<20)-budget.bytes))
@@ -495,6 +549,9 @@ func (s *Service) inspectAuthorizedLiveRecordIntegrity(ctx context.Context, id, 
 			return nil, errors.New("external artifact content is not available to integrity verifier")
 		}
 		content := evidencevo.CaptureArtifactContent(artifact, 8<<20)
+		if content.State == evidencevo.ArtifactContentOverBudget {
+			return nil, errRecordIntegrityInspectionBudget
+		}
 		if content.State != evidencevo.ArtifactContentCaptured {
 			return nil, fmt.Errorf("call artifact content verification failed: %s", content.Reason)
 		}
@@ -668,19 +725,20 @@ func integrityBusinessTargetRecorded(f sessionvo.OperationCallFact, r sessionvo.
 	toolbox, _ := args["toolbox_id"].(string)
 	ot, _ := args["ot_id"].(string)
 	metric, _ := args["metric_id"].(string)
+	metricVersionNumber, _ := args["version"].(float64)
+	metricVersion := int(metricVersionNumber)
 	// Header-resolved network may not be repeated in the raw input. A known
 	// object/metric still requires its canonical target; absence of kn_id is not
 	// evidence that the request was rejected.
-	for _, target := range []struct{ tool, prefix, id string }{{"query_object_instance", "object", ot}, {"query_metric", "metric", metric}} {
+	for _, target := range []struct {
+		tool, prefix, id string
+		version          int
+	}{{"query_object_instance", "object", ot, 0}, {"query_metric", "metric", metric, metricVersion}} {
 		if f.ToolName != target.tool || target.id == "" {
 			continue
 		}
-		if kn != "" {
-			return refs[target.prefix+":"+kn+":"+target.id], nil
-		}
 		for ref := range refs {
-			parts := strings.Split(ref, ":")
-			if len(parts) == 3 && parts[0] == target.prefix && parts[1] != "" && parts[2] == target.id {
+			if matchesRequestedBusinessTarget(ref, target.prefix, kn, target.id, target.version) {
 				return true, nil
 			}
 		}
@@ -710,7 +768,7 @@ func integrityBusinessTargetRecorded(f sessionvo.OperationCallFact, r sessionvo.
 			return false, nil
 		}
 	}
-	if f.CapabilityProfile != nil && f.CapabilityProfile.EvidenceContract == "managed_function_execution/v1" {
+	if f.CapabilityProfile != nil && (f.CapabilityProfile.EvidenceContract == sessionvo.ManagedFunctionExecutionContract || f.CapabilityProfile.EvidenceContract == functionResultIntegrityContract) {
 		for ref := range refs {
 			if matchesFunctionBusinessRef(ref, kn, toolbox, f.ToolName) {
 				return true, nil
@@ -734,6 +792,23 @@ func integrityBusinessTargetRecorded(f sessionvo.OperationCallFact, r sessionvo.
 	}
 
 	return len(refs) > 0, nil
+}
+
+func matchesRequestedBusinessTarget(ref, prefix, kn, id string, version int) bool {
+	parts := strings.Split(ref, ":")
+	if prefix == "metric" {
+		if !sessionvo.BusinessRefMetric.MatchesCanonicalRefID(ref) {
+			return false
+		}
+		// Historical three-segment metric refs remain readable. New versioned
+		// refs must identify the exact immutable version requested by the call.
+		if version > 0 && len(parts) == 4 && parts[3] != fmt.Sprintf("v%d", version) {
+			return false
+		}
+	} else if len(parts) != 3 {
+		return false
+	}
+	return parts[0] == prefix && parts[1] != "" && parts[2] == id && (kn == "" || parts[1] == kn)
 }
 
 // matchesFunctionBusinessRef accepts the current three-segment contract and

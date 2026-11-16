@@ -7,10 +7,10 @@ package httperrors
 
 import (
 	"net/http"
-	"sync"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/locale"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 const (
@@ -34,13 +34,15 @@ const (
 	AdminWriteImmutable                       = "BknSafe.AdminWrite.Immutable"
 	AdminWriteNoUpdatableFields               = "BknSafe.AdminWrite.NoUpdatableFields"
 	AdminWriteWildcardGrantForbidden          = "BknSafe.AdminWrite.WildcardGrantForbidden"
+	AdminWriteSubResourceWildcardForbidden    = "BknSafe.AdminWrite.SubResourceWildcardForbidden"
 	AdminWriteAdminConsolePermissionForbidden = "BknSafe.AdminWrite.AdminConsolePermissionForbidden"
 	ResourceExisted                           = "RESOURCE_EXISTED"
+	DepartmentCycle                           = "BknSafe.Department.Cycle"
+	DepartmentParentNotFound                  = "BknSafe.Department.ParentNotFound"
 )
 
 var (
-	registerOnce sync.Once
-	errorCodes   = []string{
+	errorCodes = []string{
 		InvalidRequest,
 		Unauthorized,
 		Forbidden,
@@ -56,18 +58,19 @@ var (
 		AdminWriteImmutable,
 		AdminWriteNoUpdatableFields,
 		AdminWriteWildcardGrantForbidden,
+		AdminWriteSubResourceWildcardForbidden,
 		AdminWriteAdminConsolePermissionForbidden,
 		ResourceExisted,
+		DepartmentCycle,
+		DepartmentParentNotFound,
 	}
 )
 
-// Register loads BKN Safe resources before making its error codes available.
-// It is idempotent because HTTP router tests create several engines in one process.
-func Register() {
-	registerOnce.Do(func() {
-		locale.Register()
-		rest.Register(errorCodes)
-	})
+// init prepares messages before registering the service error codes.
+func init() {
+	locale.Register()
+
+	httperrors.Register(errorCodes)
 }
 
 // ForStatus maps an HTTP status to the stable BKN Safe error code exposed to

@@ -17,18 +17,18 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
+	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	"bkn-backend/locale"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 // spanRecorder keeps the attributes set on any span started while it is the
@@ -44,7 +44,7 @@ type recordingSpan struct {
 
 func (s recordingSpan) SetAttributes(attributes ...attribute.KeyValue) {
 	for _, kv := range attributes {
-		s.recorder.attrs[string(kv.Key)] = kv.Value.Emit()
+		s.recorder.attrs[string(kv.Key)] = kv.Value.String()
 	}
 }
 
@@ -75,15 +75,6 @@ func recordSpans(t *testing.T) *spanRecorder {
 	return recorder
 }
 
-var registerLocaleOnce sync.Once
-
-// withLocale loads the message catalog, so a refusal's details read as they
-// would in production rather than as a bare message id.
-func withLocale(t *testing.T) {
-	t.Helper()
-	registerLocaleOnce.Do(locale.Register)
-}
-
 // recordingVega records which of the two ways a statement was sent to the raw
 // query route: under the caller's own identity (request) or under an account
 // the service named (proxyRequest, proxyAccount).
@@ -107,6 +98,12 @@ func (v *recordingVega) RawQuery(_ context.Context, req *interfaces.RawQueryRequ
 		return v.response, nil
 	}
 	return &interfaces.RawQueryResponse{}, nil
+}
+
+// GetResourcesByIDs answers nothing, so where a resource lives stays unknown
+// and the statement runs as SQL.
+func (v *recordingVega) GetResourcesByIDs(context.Context, []string) ([]*interfaces.VegaResource, error) {
+	return nil, nil
 }
 
 func (v *recordingVega) RawQueryAs(_ context.Context, account interfaces.AccountInfo,
@@ -265,9 +262,9 @@ func testService(t *testing.T, vega *recordingVega, permission *stubPermission) 
 
 func statusOf(t *testing.T, err error) int {
 	t.Helper()
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		t.Fatalf("error = %T (%v), want *rest.HTTPError", err, err)
+		t.Fatalf("error = %T (%v), want *httperrors.HTTPError", err, err)
 	}
 	return httpErr.HTTPCode
 }
@@ -295,11 +292,8 @@ func TestQueryRunsCompiledStatement(t *testing.T) {
 		t.Fatalf("trace descriptor = %s", result.TraceDescriptor)
 	}
 
-	if want := "SELECT t0.`f_id` AS `id` FROM {{.res_order}} t0 LIMIT 5"; vega.request.Query != want {
+	if want := "SELECT t0.`f_id` AS `id` FROM {{res_order}} t0 LIMIT 5"; vega.request.Query != want {
 		t.Fatalf("statement = %s, want %s", vega.request.Query, want)
-	}
-	if vega.request.InputDialect != interfaces.VEGA_DIALECT_MYSQL {
-		t.Fatalf("dialect = %s", vega.request.InputDialect)
 	}
 	// vega-backend pages the statement it is handed, defaulting to 20 rows, so
 	// the page has to be asked for explicitly or the result comes back cut
@@ -365,7 +359,7 @@ func TestQueryAppliesRowFiltersToEveryMatchedNode(t *testing.T) {
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("permission impacts = %+v, want %+v", got, want)
 	}
-	want := "SELECT COUNT(*) AS `total` FROM {{.res_order}} t0 JOIN {{.res_customer}} t1 ON t0.`f_id` = t1.`f_id` " +
+	want := "SELECT COUNT(*) AS `total` FROM {{res_order}} t0 JOIN {{res_customer}} t1 ON t0.`f_id` = t1.`f_id` " +
 		"WHERE t0.`f_amount` > 10 AND t0.`f_region` IN ('east') AND t1.`f_region` IN ('cn') LIMIT 1000"
 	if got := vega.request.Query; got != want {
 		t.Fatalf("statement = %s\nwant      = %s", got, want)
@@ -385,7 +379,7 @@ func TestQueryRowFilterFalseIsPushedIntoSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	if got, want := vega.request.Query, "SELECT COUNT(*) AS `total` FROM {{.res_order}} t0 WHERE 1 = 0 LIMIT 1000"; got != want {
+	if got, want := vega.request.Query, "SELECT COUNT(*) AS `total` FROM {{res_order}} t0 WHERE 1 = 0 LIMIT 1000"; got != want {
 		t.Fatalf("statement = %s, want %s", got, want)
 	}
 }
@@ -524,6 +518,7 @@ func TestQueryRejections(t *testing.T) {
 		{name: "not in the model", query: "MATCH (i:Invoice) RETURN i.id", status: http.StatusBadRequest},
 		{name: "writing", query: "CREATE (o:Order) RETURN o.id", status: http.StatusBadRequest},
 		{name: "limit above the ceiling", query: "MATCH (o:Order) RETURN o.id LIMIT 20000", status: http.StatusBadRequest},
+		{name: "limit above the ceiling in a UNION part", query: "MATCH (o:Order) RETURN o.id AS id LIMIT 20000 UNION MATCH (o:Order) RETURN o.id AS id", status: http.StatusBadRequest},
 		{name: "too long", query: "MATCH (o:Order) RETURN o.id //" + strings.Repeat("x", MaxQueryLength), status: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -560,20 +555,20 @@ func TestQueryHidesDependencyErrorDetail(t *testing.T) {
 
 func errorCodeOf(t *testing.T, err error) string {
 	t.Helper()
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		t.Fatalf("error = %T (%v), want *rest.HTTPError", err, err)
+		t.Fatalf("error = %T (%v), want *httperrors.HTTPError", err, err)
 	}
-	return httpErr.BaseError.ErrorCode
+	return httpErr.ErrorCode
 }
 
 func errorDetailsOf(t *testing.T, err error) string {
 	t.Helper()
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		t.Fatalf("error = %T (%v), want *rest.HTTPError", err, err)
+		t.Fatalf("error = %T (%v), want *httperrors.HTTPError", err, err)
 	}
-	details, _ := httpErr.BaseError.ErrorDetails.(string)
+	details, _ := httpErr.ErrorDetails.(string)
 	return details
 }
 
@@ -627,6 +622,10 @@ var queriesNamingAmount = []struct {
 	{name: "sorted", query: "MATCH (o:Order) RETURN o.id ORDER BY o.amount"},
 	{name: "aggregated", query: "MATCH (o:Order) RETURN sum(o.amount) AS total"},
 	{name: "across a relation", query: "MATCH (c:Customer)<-[:PLACED_BY]-(o:Order) RETURN c.name, o.amount"},
+	{name: "in a semi-join's first stage", query: "MATCH (o:Order) WHERE o.amount > 1 WITH DISTINCT o.customer_code AS code " +
+		"MATCH (c:Customer) WHERE c.code = code RETURN c.name"},
+	{name: "passed on by a semi-join", query: "MATCH (o:Order) WITH DISTINCT o.amount AS a " +
+		"MATCH (c:Customer) WHERE c.code = a RETURN c.name"},
 }
 
 // #1545: a compiled statement reads the column as it is, and nothing masks
@@ -634,7 +633,6 @@ var queriesNamingAmount = []struct {
 // schema -- is refused wherever the query names it, by its logical name, and
 // nothing reaches vega-backend.
 func TestQueryRefusesPropertyWithoutFullAccess(t *testing.T) {
-	withLocale(t)
 	for _, level := range []string{interfaces.PROPERTY_ACCESS_MASKED, interfaces.PROPERTY_ACCESS_SCHEMA} {
 		for _, tc := range queriesNamingAmount {
 			t.Run(level+" "+tc.name, func(t *testing.T) {
@@ -656,11 +654,11 @@ func TestQueryRefusesPropertyWithoutFullAccess(t *testing.T) {
 				if strings.Contains(err.Error(), "f_total") || strings.Contains(err.Error(), "orders") {
 					t.Fatalf("error leaked a physical name: %v", err)
 				}
-				var httpErr *rest.HTTPError
+				var httpErr *httperrors.HTTPError
 				if !errors.As(err, &httpErr) {
-					t.Fatalf("error = %T, want *rest.HTTPError", err)
+					t.Fatalf("error = %T, want *httperrors.HTTPError", err)
 				}
-				encoded, marshalErr := json.Marshal(httpErr.BaseError.Metadata["permission_impacts"])
+				encoded, marshalErr := json.Marshal(httpErr.Metadata["permission_impacts"])
 				if marshalErr != nil {
 					t.Fatalf("marshal permission impacts: %v", marshalErr)
 				}
@@ -680,7 +678,6 @@ func TestQueryRefusesPropertyWithoutFullAccess(t *testing.T) {
 }
 
 func TestPropertyRefusalIncludesTheRowFilterThatWouldAlsoShapeTheQuery(t *testing.T) {
-	withLocale(t)
 	permission := amountAt(interfaces.PROPERTY_ACCESS_MASKED)
 	permission.rowFilters = map[string]interfaces.RowFilterPredicate{
 		"kn_1/ot_order": {Kind: "false"},
@@ -689,11 +686,11 @@ func TestPropertyRefusalIncludesTheRowFilterThatWouldAlsoShapeTheQuery(t *testin
 	_, err := service.Query(callerContext(), interfaces.CypherQuery{
 		KNID: "kn_1", Branch: interfaces.MAIN_BRANCH, Query: "MATCH (o:Order) RETURN o.amount",
 	})
-	var httpErr *rest.HTTPError
+	var httpErr *httperrors.HTTPError
 	if !errors.As(err, &httpErr) {
-		t.Fatalf("error = %T, want *rest.HTTPError", err)
+		t.Fatalf("error = %T, want *httperrors.HTTPError", err)
 	}
-	encoded, marshalErr := json.Marshal(httpErr.BaseError.Metadata["permission_impacts"])
+	encoded, marshalErr := json.Marshal(httpErr.Metadata["permission_impacts"])
 	if marshalErr != nil {
 		t.Fatal(marshalErr)
 	}
@@ -798,7 +795,7 @@ func TestQueryReadsPropertyLevelsOncePerObjectType(t *testing.T) {
 	}
 }
 
-// #1564: a public object type read hides a logic property computed from a
+// #1564: a public object type read hides a tool-backed logic property computed from a
 // property at none. Cypher cannot query a logic property either way, but its
 // refusal must not confirm one the object type read would not show: it reads
 // as unknown then, and names the logic property only when it is visible.
@@ -807,7 +804,7 @@ func TestQueryAgreesWithPublicReadsOnHiddenLogicProperties(t *testing.T) {
 		service := relationService(&recordingVega{}, permission, nil)
 		order := service.schema.(*fakeSchemaSource).objectTypes[0]
 		order.LogicProperties = []*interfaces.LogicProperty{{
-			Name: "score", Type: interfaces.LOGIC_PROPERTY_TYPE_METRIC,
+			Name: "score", Type: interfaces.LOGIC_PROPERTY_TYPE_TOOL,
 			Parameters: []interfaces.Parameter{{Name: "p", ValueFrom: interfaces.VALUE_FROM_PROPERTY, Value: "amount"}},
 		}}
 		return service
@@ -847,7 +844,7 @@ func TestQueryReadsFullProperty(t *testing.T) {
 // A property-level decision that cannot be made fails the query closed.
 func TestQueryFailsClosedWhenPropertyAccessIsUnavailable(t *testing.T) {
 	vega := &recordingVega{}
-	permission := &stubPermission{propertyErr: rest.NewHTTPError(context.Background(),
+	permission := &stubPermission{propertyErr: httperrors.NewHTTPError(context.Background(),
 		http.StatusInternalServerError, berrors.BknBackend_InternalError_CheckPermissionFailed)}
 	service := testService(t, vega, permission)
 
@@ -963,8 +960,8 @@ func TestQueryRetriesRefusedCallerUnderProxyAccount(t *testing.T) {
 	if proxies.knID != "kn_1" || !slices.Equal(proxies.bindings, wantBindings) {
 		t.Fatalf("resolved %s %+v, want %+v", proxies.knID, proxies.bindings, wantBindings)
 	}
-	if !strings.Contains(vega.proxyRequest.Query, "{{.res_order}}") ||
-		!strings.Contains(vega.proxyRequest.Query, "{{.res_customer}}") {
+	if !strings.Contains(vega.proxyRequest.Query, "{{res_order}}") ||
+		!strings.Contains(vega.proxyRequest.Query, "{{res_customer}}") {
 		t.Fatalf("statement = %s", vega.proxyRequest.Query)
 	}
 }
@@ -1007,15 +1004,15 @@ func TestQueryReportsRefusalWhenProxyUnavailable(t *testing.T) {
 	}{
 		{name: "no resolver", branch: interfaces.MAIN_BRANCH, reason: "no_resolver"},
 		{name: "mapping missing", branch: interfaces.MAIN_BRANCH, reason: "proxy_unavailable", proxies: &stubProxies{
-			err: rest.NewHTTPError(context.Background(), http.StatusNotFound,
+			err: httperrors.NewHTTPError(context.Background(), http.StatusNotFound,
 				berrors.BknBackend_KnowledgeNetwork_ProxyMappingNotFound),
 		}},
 		{name: "not synchronized", branch: interfaces.MAIN_BRANCH, reason: "proxy_unavailable", proxies: &stubProxies{
-			err: rest.NewHTTPError(context.Background(), http.StatusServiceUnavailable,
+			err: httperrors.NewHTTPError(context.Background(), http.StatusServiceUnavailable,
 				berrors.BknBackend_KnowledgeNetwork_ProxySyncPending),
 		}},
 		{name: "disabled", branch: interfaces.MAIN_BRANCH, reason: "proxy_unavailable", proxies: &stubProxies{
-			err: rest.NewHTTPError(context.Background(), http.StatusServiceUnavailable,
+			err: httperrors.NewHTTPError(context.Background(), http.StatusServiceUnavailable,
 				berrors.BknBackend_KnowledgeNetwork_ProxyDisabled),
 		}},
 		{name: "mapping returned out of sync", branch: interfaces.MAIN_BRANCH, reason: "proxy_unavailable",
@@ -1055,7 +1052,7 @@ func TestQueryReportsRefusalWhenProxyUnavailable(t *testing.T) {
 
 // #1545: vega-backend refusing a resource was reported as a 500 with nothing
 // to diagnose. It is a 403 with its own code now, and still carries nothing
-// from the statement.
+// from the statement. A timeout likewise has its own code (#2090).
 func TestQueryReportsVegaRefusalAsForbidden(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1082,6 +1079,21 @@ func TestQueryReportsVegaRefusalAsForbidden(t *testing.T) {
 			status: http.StatusInternalServerError,
 			code:   berrors.BknBackend_Cypher_QueryFailed,
 		},
+		// #2090: a statement the data source could not finish within its time
+		// limit read as a generic failure. It has its own code now, so a
+		// caller knows to narrow the query rather than retry.
+		{
+			name:   "statement stopped at its timeout by vega-backend",
+			err:    interfaces.NewDependencyError("vega", "raw_query", interfaces.DependencyTimeout, http.StatusInternalServerError),
+			status: http.StatusGatewayTimeout,
+			code:   berrors.BknBackend_Cypher_QueryTimeout,
+		},
+		{
+			name:   "request to vega-backend timed out",
+			err:    interfaces.NewDependencyError("vega", "raw_query", interfaces.DependencyTimeout, 0),
+			status: http.StatusGatewayTimeout,
+			code:   berrors.BknBackend_Cypher_QueryTimeout,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			vega := &recordingVega{err: tc.err}
@@ -1099,6 +1111,66 @@ func TestQueryReportsVegaRefusalAsForbidden(t *testing.T) {
 			if strings.Contains(err.Error(), "f_total") || strings.Contains(err.Error(), "orders") ||
 				strings.Contains(err.Error(), "SELECT") {
 				t.Fatalf("error leaked the statement: %v", err)
+			}
+		})
+	}
+}
+
+// #2090: the statement timeout was fixed at 30 seconds. It is the service's
+// configured value now, 55 seconds unless set, held to what vega-backend
+// accepts, and a request may ask for less but never for more.
+func TestQueryStatementTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		configured int
+		requested  int
+		want       int
+	}{
+		{name: "default", want: 55},
+		{name: "configured", configured: 40, want: 40},
+		{name: "configured past what vega-backend accepts", configured: 5000, want: 3600},
+		{name: "requested shorter", requested: 10, want: 10},
+		{name: "requested exactly the configured", configured: 40, requested: 40, want: 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			vega := &recordingVega{}
+			service := testService(t, vega, &stubPermission{})
+			service.appSetting = &common.AppSetting{ServerSetting: common.ServerSetting{CypherQueryTimeoutSec: tc.configured}}
+
+			_, err := service.Query(callerContext(), interfaces.CypherQuery{
+				KNID: "kn_1", Branch: interfaces.MAIN_BRANCH, Query: "MATCH (o:Order) RETURN o.amount",
+				TimeoutSec: tc.requested,
+			})
+			if err != nil {
+				t.Fatalf("Query: %v", err)
+			}
+			if got := vega.request.QueryTimeoutSec; got != tc.want {
+				t.Fatalf("query_timeout_sec = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// A timeout past the configured one is refused before anything runs, rather
+// than quietly cut down, so the caller knows they will not get it.
+func TestQueryRefusesTimeoutOutOfRange(t *testing.T) {
+	for _, requested := range []int{56, -1} {
+		t.Run(strconv.Itoa(requested), func(t *testing.T) {
+			vega := &recordingVega{}
+			service := testService(t, vega, &stubPermission{})
+
+			_, err := service.Query(callerContext(), interfaces.CypherQuery{
+				KNID: "kn_1", Branch: interfaces.MAIN_BRANCH, Query: "MATCH (o:Order) RETURN o.amount",
+				TimeoutSec: requested,
+			})
+			if got := statusOf(t, err); got != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", got, http.StatusBadRequest)
+			}
+			if got := errorCodeOf(t, err); got != berrors.BknBackend_Cypher_InvalidParameter {
+				t.Fatalf("code = %s, want %s", got, berrors.BknBackend_Cypher_InvalidParameter)
+			}
+			if vega.request != nil {
+				t.Fatal("a query with a refused timeout reached vega-backend")
 			}
 		})
 	}
@@ -1167,7 +1239,7 @@ func TestQueryRowFilterGroupsListParameterCondition(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Query: %v", err)
 	}
-	want := "SELECT t0.`f_id` AS `id` FROM {{.res_order}} t0 WHERE (t0.`f_id` IN ('a''1', 'b2') OR t0.`f_amount` > 10) AND t0.`f_region` IN ('east') LIMIT 1000"
+	want := "SELECT t0.`f_id` AS `id` FROM {{res_order}} t0 WHERE (t0.`f_id` IN ('a''1', 'b2') OR t0.`f_amount` > 10) AND t0.`f_region` IN ('east') LIMIT 1000"
 	if got := vega.request.Query; got != want {
 		t.Fatalf("statement = %s\nwant      = %s", got, want)
 	}
@@ -1176,3 +1248,104 @@ func TestQueryRowFilterGroupsListParameterCondition(t *testing.T) {
 // A row filter is ANDed onto the caller's condition, so a caller's OR must stay
 // grouped: without the parentheses the filter would bind to one branch only and
 // the other would read rows the filter hides.
+
+// clockedVega answers every raw query at once but moves the service's clock on
+// by a fixed step, recording the timeout each statement was sent with.
+type clockedVega struct {
+	*recordingVega
+	timeouts []int
+	advance  func()
+}
+
+func (v *clockedVega) RawQuery(_ context.Context, req *interfaces.RawQueryRequest) (*interfaces.RawQueryResponse, error) {
+	v.timeouts = append(v.timeouts, req.QueryTimeoutSec)
+	v.advance()
+	return &interfaces.RawQueryResponse{}, nil
+}
+
+// #2090 review: the parts of a UNION ran one after another, each with the
+// whole timeout, so the request could run well past it. They share one
+// deadline now: a later part gets what is left, and none once it is gone.
+func TestQueryUnionPartsShareTheTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		step     time.Duration
+		timeouts []int
+		timedOut bool
+	}{
+		{name: "time left for the second part", step: 4 * time.Second, timeouts: []int{10, 6}},
+		{name: "no time left for the second part", step: 11 * time.Second, timeouts: []int{10}, timedOut: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Unix(1_700_000_000, 0)
+			vega := &clockedVega{recordingVega: &recordingVega{}}
+			vega.advance = func() { now = now.Add(tc.step) }
+			service := testService(t, vega.recordingVega, &stubPermission{})
+			service.vba = vega
+			service.now = func() time.Time { return now }
+
+			_, err := service.Query(callerContext(), interfaces.CypherQuery{
+				KNID: "kn_1", Branch: interfaces.MAIN_BRANCH, TimeoutSec: 10,
+				Query: "MATCH (o:Order) RETURN o.id AS v UNION ALL MATCH (o:Order) RETURN o.amount AS v",
+			})
+			if !slices.Equal(vega.timeouts, tc.timeouts) {
+				t.Fatalf("statement timeouts = %v, want %v", vega.timeouts, tc.timeouts)
+			}
+			if !tc.timedOut {
+				if err != nil {
+					t.Fatalf("Query: %v", err)
+				}
+				return
+			}
+			if got := statusOf(t, err); got != http.StatusGatewayTimeout {
+				t.Fatalf("status = %d, want %d", got, http.StatusGatewayTimeout)
+			}
+			if got := errorCodeOf(t, err); got != berrors.BknBackend_Cypher_QueryTimeout {
+				t.Fatalf("code = %s, want %s", got, berrors.BknBackend_Cypher_QueryTimeout)
+			}
+		})
+	}
+}
+
+// #2090 review: the bind-join executor took the whole timeout and the SQL it
+// falls back to took another. When SQL follows, the executor gets half of
+// what is left, so the fallback still answers within the request's timeout.
+func TestBindJoinTimeoutLeavesTimeForTheFallback(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	service := &cypherQueryService{now: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), queryDeadlineKey{}, now.Add(50*time.Second))
+	query := interfaces.CypherQuery{}
+
+	if got := service.bindJoinTimeoutFor(ctx, query, true); got != 25*time.Second {
+		t.Fatalf("with a fallback = %s, want 25s", got)
+	}
+	if got := service.bindJoinTimeoutFor(ctx, query, false); got != 50*time.Second {
+		t.Fatalf("without a fallback = %s, want 50s", got)
+	}
+	now = now.Add(50 * time.Second)
+	if _, err := service.statementTimeoutSec(ctx, query); statusOf(t, err) != http.StatusGatewayTimeout {
+		t.Fatalf("a statement with no time left was not refused as a timeout: %v", err)
+	}
+}
+
+// The running version of a versioned network is what main mirrors and the proxy grants cover,
+// so a refused statement on it falls back to the proxy as on main.
+func TestQueryOnRunningVersionFallsBackToProxy(t *testing.T) {
+	vega := &recordingVega{
+		err: interfaces.NewDependencyError("vega", "raw_query", interfaces.DependencyForbidden, http.StatusForbidden),
+		response: &interfaces.RawQueryResponse{
+			Columns: []interfaces.RawQueryColumn{{Name: "id"}, {Name: "name"}},
+			Entries: []map[string]any{{"id": "o-1", "name": "c-1"}},
+		},
+	}
+	service := relationService(vega, &stubPermission{}, &stubProxies{mapping: readyProxy()})
+	if _, err := service.Query(callerContext(), interfaces.CypherQuery{
+		KNID: "kn_1", Branch: "v2", RunningVersion: true,
+		Query: "MATCH (o:Order)-[:PLACED_BY]->(c:Customer) RETURN o.id AS id, c.name AS name LIMIT 3",
+	}); err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if vega.proxyRequest == nil {
+		t.Fatal("want the statement run again under the proxy")
+	}
+}

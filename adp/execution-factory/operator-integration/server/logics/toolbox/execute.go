@@ -77,7 +77,7 @@ func (s *ToolServiceImpl) DebugTool(ctx context.Context, req *interfaces.Execute
 	go func() {
 		accountAuthContext, ok := common.GetAccountAuthContextFromCtx(ctx)
 		if !ok {
-			s.Logger.WithContext(ctx).Warnf("[ExecuteTool] GetAccountAuthContextFromCtx err :%v", err)
+			s.Logger.WithContext(ctx).Warnf("[ExecuteTool] account context is unavailable; audit entry skipped")
 			return
 		}
 		s.AuditLog.Logger(ctx, &metric.AuditLogBuilderParams{
@@ -273,7 +273,7 @@ func (s *ToolServiceImpl) ExecuteTool(ctx context.Context, req *interfaces.Execu
 	go func() {
 		accountAuthContext, ok := common.GetAccountAuthContextFromCtx(ctx)
 		if !ok {
-			s.Logger.WithContext(ctx).Warnf("[ExecuteTool] GetAccountAuthContextFromCtx err :%v", err)
+			s.Logger.WithContext(ctx).Warnf("[ExecuteTool] account context is unavailable; audit entry skipped")
 			return
 		}
 		s.AuditLog.Logger(ctx, &metric.AuditLogBuilderParams{
@@ -366,6 +366,9 @@ func (s *ToolServiceImpl) executeTool(ctx context.Context, req *interfaces.Execu
 			fmt.Sprintf("metadata type: %s id: %s not found", tool.SourceType, tool.SourceID))
 		return
 	}
+	if function, ok := metadata.(*model.FunctionMetadataDB); ok && tool.SourceType == model.SourceTypeFunction && function.IsCypher() {
+		return s.executeCypherFunction(ctx, req, function)
+	}
 	var url string
 	switch tool.SourceType {
 	case model.SourceTypeOpenAPI:
@@ -373,8 +376,6 @@ func (s *ToolServiceImpl) executeTool(ctx context.Context, req *interfaces.Execu
 			toolBoxURL = metadata.GetServerURL()
 		}
 		url = fmt.Sprintf("%s%s", toolBoxURL, metadata.GetPath())
-	case model.SourceTypeOperator:
-		url = fmt.Sprintf("%s%s", metadata.GetServerURL(), metadata.GetPath())
 	case model.SourceTypeFunction:
 		url = fmt.Sprintf("%s%s", metadata.GetServerURL(), metadata.GetPath())
 	}
@@ -388,7 +389,7 @@ func (s *ToolServiceImpl) executeTool(ctx context.Context, req *interfaces.Execu
 		Timeout:           time.Duration(req.Timeout) * time.Second,
 	}
 	if tool.SourceType == model.SourceTypeFunction && isPlatformFunctionTarget(url) {
-		proxyReq.ClientTimeoutGrace = 5 * time.Second
+		proxyReq.ClientTimeoutGrace = s.functionGrace()
 		// The HTTP client timeout alone does not control sandbox execution. The internal
 		// Function endpoint accepts milliseconds through its timeout query parameter.
 		// Do not allow an existing URL query or a user-supplied query.timeout to
@@ -433,6 +434,14 @@ func (s *ToolServiceImpl) executeTool(ctx context.Context, req *interfaces.Execu
 		return nil, err
 	}
 	resp, err = s.Proxy.HandlerRequest(ctx, proxyReq)
+	if err == nil && resp != nil {
+		// Provenance is not accepted from a function's result/body or from a
+		// third-party response. Only the local versioned runtime supplies it.
+		resp.FunctionExecution = nil
+		if tool.SourceType == model.SourceTypeFunction {
+			resp.FunctionExecution = platformFunctionExecution(req, proxyReq.URL, resp)
+		}
+	}
 	return
 }
 
@@ -502,18 +511,10 @@ func isPlatformFunctionTarget(rawURL string) bool {
 // other address is a third party, and the sanitizer above is what keeps
 // platform identity away from it.
 //
-// On a direct Toolbox call all three values must be present. A partial context
-// means the call did not come through a managed Interaction, and a credential
-// without the lifecycle guard it belongs to is exactly what must not reach a
-// pooled sandbox.
-//
-// A trusted proxy call from ontology-query is different: a logic property or
-// action backed by a Function is evaluated by a Studio trial or a plain property
-// query just as often as inside an Interaction, and without the caller's
-// credential the Function cannot read BKN at all. The execution itself is still
-// authorized as the knowledge network's proxy account; the credential only
-// decides what the Function can read, which is what the caller could read
-// anyway. The Interaction is forwarded when the caller was in one.
+// Debug, direct Toolbox calls and ontology-query proxies may all read BKN as
+// their authenticated caller without a managed Interaction. Capture policy
+// controls recording, not credential availability. A complete lifecycle pair
+// is forwarded when present; partial IDs are never forwarded.
 //
 // Server-captured values win over anything in the body: a Tool that could state
 // them would be stating whose credential it runs under.
@@ -533,9 +534,6 @@ func functionRuntimeHeaders(headers map[string]any, req *interfaces.ExecuteToolR
 		return forwarded
 	}
 	managed := req.BKNConversationID != "" && req.BKNInteractionID != ""
-	if !managed && !req.TrustedProxyCall {
-		return forwarded
-	}
 	forwarded["Authorization"] = req.RequestAuthorization
 	for _, key := range []interfaces.HeaderKey{
 		interfaces.HeaderBKNConversationID, interfaces.HeaderBKNInteractionID, interfaces.HeaderBKNParentOperationID,
@@ -570,4 +568,16 @@ func actionExecutionSpanAttrs(ctx context.Context, operation string, err error, 
 		}
 	}
 	return attrs
+}
+
+// defaultFunctionGrace is used when the service was built without a configured grace.
+const defaultFunctionGrace = 5 * time.Second
+
+// functionGrace is how long the proxy keeps waiting past a platform Function's own
+// timeout, so the sandbox can report that timeout with a reason.
+func (s *ToolServiceImpl) functionGrace() time.Duration {
+	if s.ProxyFunctionGrace > 0 {
+		return s.ProxyFunctionGrace
+	}
+	return defaultFunctionGrace
 }

@@ -142,6 +142,14 @@ func KNChildResourceParents(knID string, childIDs []string) []PermissionResource
 	return items
 }
 
+// KNChildPresence finds the children a network still defines. A child's policy is keyed by
+// network and child id only, so every branch shares it; it may go only when no branch of the
+// network (main, the draft or any version) defines the child any more.
+type KNChildPresence interface {
+	// PresentKNChildIDs returns the ids among childIDs that some branch of the network defines.
+	PresentKNChildIDs(ctx context.Context, resourceType, knID string, childIDs []string) ([]string, error)
+}
+
 // KNChildResourceIDs returns canonical Safe IDs for concrete KN children.
 func KNChildResourceIDs(knID string, childIDs []string) []string {
 	ids := make([]string, 0, len(childIDs))
@@ -155,6 +163,13 @@ func KNChildResourceIDs(knID string, childIDs []string) []string {
 // authorization resource ID. Empty IDs and wildcard/path separators are invalid.
 func IsValidAuthorizationID(id string) bool {
 	return id != "" && strings.TrimSpace(id) == id && !strings.ContainsAny(id, "/*")
+}
+
+// IsValidKNChildResourceID reports whether an ID is the canonical, unambiguous
+// Safe identity of one concrete child inside one knowledge network.
+func IsValidKNChildResourceID(id string) bool {
+	parts := strings.Split(id, "/")
+	return len(parts) == 2 && IsValidAuthorizationID(parts[0]) && IsValidAuthorizationID(parts[1])
 }
 
 // PermissionResourcesFilter is used for filtering and deletion.

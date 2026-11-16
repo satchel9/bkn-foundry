@@ -14,18 +14,19 @@ import (
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	. "github.com/smartystreets/goconvey/convey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	cond "bkn-backend/common/condition"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
-	"bkn-backend/logics/batchindex"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/batchindex"
 )
 
 func allowAllRelationPermissionResources(_ context.Context, _ string, ids, _ []string) (map[string]interfaces.PermissionResourceOps, error) {
@@ -87,14 +88,14 @@ func Test_relationTypeService_CheckRelationTypeExistByID(t *testing.T) {
 			branch := interfaces.MAIN_BRANCH
 			rtID := "rt1"
 
-			rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", false, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", false, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			name, exist, err := service.CheckRelationTypeExistByID(ctx, knID, branch, rtID)
 			So(err, ShouldNotBeNil)
 			So(exist, ShouldBeFalse)
 			So(name, ShouldEqual, "")
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError_CheckRelationTypeIfExistFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError_CheckRelationTypeIfExistFailed)
 		})
 	})
 }
@@ -140,13 +141,13 @@ func Test_relationTypeService_GetRelationTypeIDsByKnID(t *testing.T) {
 			knID := "kn1"
 			branch := interfaces.MAIN_BRANCH
 
-			rta.EXPECT().GetRelationTypeIDsByKnID(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().GetRelationTypeIDsByKnID(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			result, err := service.GetRelationTypeIDsByKnID(ctx, knID, branch)
 			So(err, ShouldNotBeNil)
 			So(result, ShouldBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError_GetRelationTypesByIDsFailed)
 		})
 	})
 }
@@ -222,8 +223,8 @@ func Test_relationTypeService_GetRelationTypesByIDs(t *testing.T) {
 			result, err := service.GetRelationTypesByIDs(ctx, knID, branch, rtIDs)
 			So(err, ShouldNotBeNil)
 			So(result, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_RelationTypeNotFound)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_RelationTypeNotFound)
 		})
 
 		Convey("Failed when GetRelationTypesByIDs returns error\n", func() {
@@ -231,7 +232,7 @@ func Test_relationTypeService_GetRelationTypesByIDs(t *testing.T) {
 			branch := interfaces.MAIN_BRANCH
 			rtIDs := []string{"rt1"}
 
-			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			result, err := service.GetRelationTypesByIDs(ctx, knID, branch, rtIDs)
 			So(err, ShouldNotBeNil)
@@ -254,7 +255,7 @@ func Test_relationTypeService_GetRelationTypesByIDs(t *testing.T) {
 			}
 
 			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(rtArr, nil)
-			ots.EXPECT().GetObjectTypesMapByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			ots.EXPECT().GetObjectTypesMapByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			result, err := service.GetRelationTypesByIDs(ctx, knID, branch, rtIDs)
 			So(err, ShouldNotBeNil)
@@ -490,7 +491,7 @@ func Test_relationTypeService_ListRelationTypes(t *testing.T) {
 				Branch: interfaces.MAIN_BRANCH,
 			}
 
-			rta.EXPECT().ListRelationTypes(gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().ListRelationTypes(gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			rts, total, err := service.ListRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -519,7 +520,7 @@ func Test_relationTypeService_ListRelationTypes(t *testing.T) {
 			}
 
 			rta.EXPECT().ListRelationTypes(gomock.Any(), gomock.Any()).Return(rtArr, nil)
-			ots.EXPECT().GetObjectTypesMapByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			ots.EXPECT().GetObjectTypesMapByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			rts, total, err := service.ListRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -549,7 +550,7 @@ func Test_relationTypeService_ListRelationTypes(t *testing.T) {
 
 			rta.EXPECT().ListRelationTypes(gomock.Any(), gomock.Any()).Return(rtArr, nil)
 			ots.EXPECT().GetObjectTypesMapByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(map[string]*interfaces.ObjectType{}, nil)
-			ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			rts, total, err := service.ListRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -756,8 +757,8 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 			result, err := service.CreateRelationTypes(ctx, nil, relationTypes, interfaces.ImportMode_Normal, true)
 			So(err, ShouldNotBeNil)
 			So(len(result), ShouldEqual, 0)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_RelationTypeIDExisted)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_RelationTypeIDExisted)
 		})
 
 		Convey("Success with ignore mode when relation type ID exists\n", func() {
@@ -824,6 +825,9 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 			rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("rt1", true, nil).Times(2)
 			ots.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Return(&interfaces.ObjectType{}, nil).AnyTimes()
+			// The overwrite preflight reads the stored relation type; it has no declarations to clear.
+			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, []string{"rt1"}).
+				Return([]*interfaces.RelationType{{RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "rt1"}}}, nil)
 			rta.EXPECT().UpdateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 			smock.ExpectCommit()
@@ -842,6 +846,8 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 			smock.ExpectBegin()
 			rta.EXPECT().GetRelationTypeIDsByIDs(gomock.Any(), "kn1", interfaces.MAIN_BRANCH,
 				[]string{"rt1", "rt2"}).Return([]string{"rt1", "rt2"}, nil)
+			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, []string{"rt1", "rt2"}).
+				Return(nil, nil)
 			rta.EXPECT().UpdateRelationTypes(gomock.Any(), gomock.Any(), relationTypes).Return(nil)
 			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
 			smock.ExpectCommit()
@@ -919,7 +925,7 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 					Branch: interfaces.MAIN_BRANCH,
 				},
 			}
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError)
 
 			smock.ExpectBegin()
@@ -946,7 +952,7 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 			smock.ExpectBegin()
 			ots.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.ObjectType{}, nil).AnyTimes()
 			rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", false, nil)
-			rta.EXPECT().CreateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().CreateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			result, err := service.CreateRelationTypes(ctx, nil, relationTypes, interfaces.ImportMode_Normal, true)
@@ -970,7 +976,7 @@ func Test_relationTypeService_CreateRelationTypes(t *testing.T) {
 			ots.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.ObjectType{}, nil).AnyTimes()
 			rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("", false, nil)
 			rta.EXPECT().CreateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
-			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			result, err := service.CreateRelationTypes(ctx, nil, relationTypes, interfaces.ImportMode_Normal, true)
@@ -993,6 +999,9 @@ func Test_relationTypeService_UpdateRelationType(t *testing.T) {
 		}
 		rta := bmock.NewMockRelationTypeAccess(mockCtrl)
 		rta.EXPECT().CheckRelationTypeExistByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return("rt1", true, nil).AnyTimes()
+		// An interactive update reads the stored relation type to keep the declarations it leaves out.
+		rta.EXPECT().GetRelationTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(&interfaces.RelationType{}, nil).AnyTimes()
 		ps := bmock.NewMockPermissionService(mockCtrl)
 		ps.EXPECT().FilterVisibleResourcesWithOperations(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			DoAndReturn(allowAllRelationPermissionResources).AnyTimes()
@@ -1046,7 +1055,7 @@ func Test_relationTypeService_UpdateRelationType(t *testing.T) {
 				Branch: interfaces.MAIN_BRANCH,
 			}
 
-			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 403, berrors.BknBackend_InternalError_CheckPermissionFailed))
+			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 403, berrors.BknBackend_InternalError_CheckPermissionFailed))
 
 			err := service.UpdateRelationType(ctx, nil, relationType, false)
 			So(err, ShouldNotBeNil)
@@ -1062,7 +1071,7 @@ func Test_relationTypeService_UpdateRelationType(t *testing.T) {
 				KNID:   "kn1",
 				Branch: interfaces.MAIN_BRANCH,
 			}
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError)
 
 			smock.ExpectBegin()
@@ -1088,11 +1097,33 @@ func Test_relationTypeService_UpdateRelationType(t *testing.T) {
 			smock.ExpectBegin()
 			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			ots.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.ObjectType{}, nil).AnyTimes()
-			rta.EXPECT().UpdateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().UpdateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			err := service.UpdateRelationType(ctx, nil, relationType, false)
 			So(err, ShouldNotBeNil)
+		})
+
+		Convey("Returns not found when the row is gone from the branch\n", func() {
+			relationType := &interfaces.RelationType{
+				RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{
+					RTID:   "rt1",
+					RTName: "relation_type1",
+				},
+				KNID:   "kn1",
+				Branch: "dev",
+			}
+
+			smock.ExpectBegin()
+			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			rta.EXPECT().UpdateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(common.ErrRowNotFound)
+			smock.ExpectRollback()
+
+			err := service.UpdateRelationType(ctx, nil, relationType, false)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusNotFound)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_RelationTypeNotFound)
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
 		})
 
 		Convey("Failed when InsertDatasetData returns error\n", func() {
@@ -1109,7 +1140,7 @@ func Test_relationTypeService_UpdateRelationType(t *testing.T) {
 			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			ots.EXPECT().GetObjectTypeByID(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(&interfaces.ObjectType{}, nil).AnyTimes()
 			rta.EXPECT().UpdateRelationType(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
-			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			err := service.UpdateRelationType(ctx, nil, relationType, false)
@@ -1163,12 +1194,34 @@ func Test_relationTypeService_DeleteRelationTypesByIDs(t *testing.T) {
 			So(err, ShouldBeNil)
 		})
 
+		Convey("Refused while a fallback path stands in for the relation type\n", func() {
+			service.nr = &logics.NetworkRelations{RTA: rta}
+			fallback := &interfaces.RelationType{
+				RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{RTID: "rt1_via_site"},
+				RelationDeclarations:     interfaces.RelationDeclarations{FallbackFor: "rt1"},
+			}
+			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+			rta.EXPECT().ListDeprecatedOrFallbackRelationTypeIDs(gomock.Any(), "kn1", interfaces.MAIN_BRANCH).Return([]string{"rt1_via_site"}, nil)
+			rta.EXPECT().GetRelationTypesByIDs(gomock.Any(), "kn1", interfaces.MAIN_BRANCH, []string{"rt1_via_site"}).
+				Return([]*interfaces.RelationType{fallback}, nil)
+
+			err := service.DeleteRelationTypesByIDs(ctx, nil, "kn1", interfaces.MAIN_BRANCH, []string{"rt1"})
+			So(err, ShouldNotBeNil)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.HTTPCode, ShouldEqual, http.StatusConflict)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_StillReferenced)
+			So(httpErr.ErrorDetails, ShouldResemble, map[string]any{
+				"references": []string{`relation type "rt1" is the fallback_for of relation type "rt1_via_site"`},
+			})
+			So(smock.ExpectationsWereMet(), ShouldBeNil)
+		})
+
 		Convey("Failed when permission check fails\n", func() {
 			knID := "kn1"
 			branch := interfaces.MAIN_BRANCH
 			rtIDs := []string{"rt1"}
 
-			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 403, berrors.BknBackend_InternalError_CheckPermissionFailed))
+			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 403, berrors.BknBackend_InternalError_CheckPermissionFailed))
 
 			err := service.DeleteRelationTypesByIDs(ctx, nil, knID, branch, rtIDs)
 			So(err, ShouldNotBeNil)
@@ -1181,7 +1234,7 @@ func Test_relationTypeService_DeleteRelationTypesByIDs(t *testing.T) {
 
 			smock.ExpectBegin()
 			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
-			rta.EXPECT().DeleteRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(int64(0), rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			rta.EXPECT().DeleteRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(int64(0), httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			err := service.DeleteRelationTypesByIDs(ctx, nil, knID, branch, rtIDs)
@@ -1196,7 +1249,7 @@ func Test_relationTypeService_DeleteRelationTypesByIDs(t *testing.T) {
 			smock.ExpectBegin()
 			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 			rta.EXPECT().DeleteRelationTypesByIDs(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(int64(1), nil)
-			vbs.EXPECT().DeleteDatasetDocumentByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().DeleteDatasetDocumentByID(gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			smock.ExpectRollback()
 
 			err := service.DeleteRelationTypesByIDs(ctx, nil, knID, branch, rtIDs)
@@ -1260,7 +1313,7 @@ func Test_relationTypeService_InsertDatasetData(t *testing.T) {
 				},
 			}
 
-			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().WriteDatasetDocument(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			err := service.InsertDatasetData(ctx, relationTypes)
 			So(err, ShouldNotBeNil)
@@ -1334,7 +1387,7 @@ func Test_relationTypeService_InsertDatasetData(t *testing.T) {
 				},
 			}
 
-			mfs.EXPECT().GetDefaultModel(gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			mfs.EXPECT().GetDefaultModel(gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			err := serviceWithVector.InsertDatasetData(ctx, relationTypes)
 			So(err, ShouldNotBeNil)
@@ -1365,7 +1418,7 @@ func Test_relationTypeService_InsertDatasetData(t *testing.T) {
 			}
 
 			mfs.EXPECT().GetDefaultModel(gomock.Any()).Return(&interfaces.SmallModel{ModelID: "model1"}, nil)
-			mfs.EXPECT().GetVector(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			mfs.EXPECT().GetVector(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			err := serviceWithVector.InsertDatasetData(ctx, relationTypes)
 			So(err, ShouldNotBeNil)
@@ -1439,7 +1492,7 @@ func Test_relationTypeService_GetTotal(t *testing.T) {
 		Convey("Failed when QueryResourceData fails\n", func() {
 			filterCondition := map[string]any{}
 
-			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			total, err := service.GetTotal(ctx, filterCondition)
 			So(err, ShouldNotBeNil)
@@ -1494,7 +1547,7 @@ func Test_relationTypeService_GetTotalWithLargeRTIDs(t *testing.T) {
 			filterCondition := map[string]any{}
 			rtIDs := []string{"rt1"}
 
-			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			total, err := service.GetTotalWithLargeRTIDs(ctx, filterCondition, rtIDs)
 			So(err, ShouldNotBeNil)
@@ -1539,7 +1592,7 @@ func Test_relationTypeService_GetTotalWithRTIDs(t *testing.T) {
 			filterCondition := map[string]any{}
 			rtIDs := []string{"rt1"}
 
-			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			total, err := service.GetTotalWithRTIDs(ctx, filterCondition, rtIDs)
 			So(err, ShouldNotBeNil)
@@ -1611,10 +1664,8 @@ func Test_relationTypeService_SearchRelationTypes(t *testing.T) {
 						{
 							Field:     "name",
 							Operation: cond.OperationEq,
-							ValueOptCfg: cond.ValueOptCfg{
-								ValueFrom: "const",
-								Value:     "rt1",
-							},
+							ValueFrom: "const",
+							Value:     "rt1",
 						},
 					},
 				},
@@ -1690,7 +1741,7 @@ func Test_relationTypeService_SearchRelationTypes(t *testing.T) {
 				ConceptGroups: []string{"cg1"},
 			}
 
-			cga.EXPECT().GetConceptGroupsTotal(gomock.Any(), gomock.Any()).Return(0, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			cga.EXPECT().GetConceptGroupsTotal(gomock.Any(), gomock.Any()).Return(0, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			result, err := service.SearchRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -1706,7 +1757,7 @@ func Test_relationTypeService_SearchRelationTypes(t *testing.T) {
 			}
 
 			cga.EXPECT().GetConceptGroupsTotal(gomock.Any(), gomock.Any()).Return(1, nil)
-			cga.EXPECT().GetRelationTypeIDsFromConceptGroupRelation(gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			cga.EXPECT().GetRelationTypeIDsFromConceptGroupRelation(gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 
 			result, err := service.SearchRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
@@ -1759,7 +1810,7 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 				KNID:   "kn1",
 				Branch: interfaces.MAIN_BRANCH,
 			}
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError)
 
 			smock.ExpectBegin()
@@ -1768,7 +1819,7 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 
 			err := service.validateDependency(ctx, nil, relationType, true, nil)
 			So(err, ShouldNotBeNil)
-			So(err.(*rest.HTTPError).BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
+			So(err.(*httperrors.HTTPError).ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
 		})
 
 		Convey("Failed when target object type not found\n", func() {
@@ -1781,7 +1832,7 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 				KNID:   "kn1",
 				Branch: interfaces.MAIN_BRANCH,
 			}
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError)
 
 			smock.ExpectBegin()
@@ -1790,7 +1841,7 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 
 			err := service.validateDependency(ctx, nil, relationType, true, nil)
 			So(err, ShouldNotBeNil)
-			So(err.(*rest.HTTPError).BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
+			So(err.(*httperrors.HTTPError).ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
 		})
 
 		Convey("Failed when source property not found in DIRECT type\n", func() {
@@ -1825,8 +1876,8 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 
 			err := service.validateDependency(ctx, nil, relationType, true, nil)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InvalidParameter)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InvalidParameter)
 		})
 
 		Convey("Success DIRECT when GetObjectTypeByID returns OTs with DataProperties only (no PropertyMap; regression)\n", func() {
@@ -1904,8 +1955,8 @@ func Test_relationTypeService_validateDependency(t *testing.T) {
 
 			err := service.validateDependency(ctx, nil, relationType, true, nil)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InvalidParameter)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InvalidParameter)
 		})
 
 		Convey("Success when source/target resolved from batch preflight index\n", func() {
@@ -2000,7 +2051,7 @@ func TestRelationTypeStrictBackingResourceDependencyErrorMapping(t *testing.T) {
 	}{
 		{name: "missing binding", kind: interfaces.DependencyNotFound, status: http.StatusBadRequest, code: berrors.BknBackend_RelationType_InvalidParameter},
 		{name: "invalid binding", kind: interfaces.DependencyInvalidBinding, status: http.StatusBadRequest, code: berrors.BknBackend_RelationType_InvalidParameter},
-		{name: "current editor forbidden", kind: interfaces.DependencyForbidden, status: http.StatusForbidden, code: rest.PublicError_Forbidden},
+		{name: "current editor forbidden", kind: interfaces.DependencyForbidden, status: http.StatusForbidden, code: httperrors.PublicError_Forbidden},
 		{name: "resolved delegator forbidden", kind: interfaces.DependencyForbidden, controlled: true, status: http.StatusBadGateway, code: berrors.BknBackend_RelationType_InternalError},
 		{name: "timeout", kind: interfaces.DependencyTimeout, status: http.StatusServiceUnavailable, code: berrors.BknBackend_RelationType_InternalError},
 		{name: "unavailable", kind: interfaces.DependencyUnavailable, status: http.StatusServiceUnavailable, code: berrors.BknBackend_RelationType_InternalError},
@@ -2037,10 +2088,10 @@ func TestRelationTypeStrictBackingResourceDependencyErrorMapping(t *testing.T) {
 
 			err := service.validateDependency(ctx, nil, relationType, true, nil)
 
-			var httpErr *rest.HTTPError
+			var httpErr *httperrors.HTTPError
 			require.ErrorAs(t, err, &httpErr)
 			assert.Equal(t, tc.status, httpErr.HTTPCode)
-			assert.Equal(t, tc.code, httpErr.BaseError.ErrorCode)
+			assert.Equal(t, tc.code, httpErr.ErrorCode)
 		})
 	}
 }
@@ -2126,7 +2177,7 @@ func Test_relationTypeService_ValidateRelationTypes(t *testing.T) {
 		})
 
 		Convey("strictMode true runs validateDependency and fails when source OT missing\n", func() {
-			httpErr := rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			httpErr := httperrors.NewHTTPError(ctx, http.StatusInternalServerError,
 				berrors.BknBackend_RelationType_InternalError)
 			expectRTImportOK()
 			smock.ExpectBegin()
@@ -2134,7 +2185,7 @@ func Test_relationTypeService_ValidateRelationTypes(t *testing.T) {
 			smock.ExpectRollback()
 			err := service.ValidateRelationTypes(ctx, "kn1", interfaces.MAIN_BRANCH, relationTypes, true, nil, interfaces.ImportMode_Normal)
 			So(err, ShouldNotBeNil)
-			So(err.(*rest.HTTPError).BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
+			So(err.(*httperrors.HTTPError).ErrorCode, ShouldEqual, berrors.BknBackend_RelationType_InternalError)
 		})
 	})
 }
@@ -2164,7 +2215,7 @@ func Test_relationTypeService_DeleteRelationTypesByKnID(t *testing.T) {
 		Convey("Failed when access layer returns error\n", func() {
 			tx := new(sql.Tx)
 			rta.EXPECT().DeleteRelationTypesByKnID(gomock.Any(), tx, "kn1", interfaces.MAIN_BRANCH).
-				Return(int64(0), rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+				Return(int64(0), httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			err := service.DeleteRelationTypesByKnID(ctx, tx, "kn1", interfaces.MAIN_BRANCH)
 			So(err, ShouldNotBeNil)
 		})
@@ -2214,7 +2265,7 @@ func Test_relationTypeService_SearchRelationTypes_extraCases(t *testing.T) {
 
 		Convey("Failed when QueryResourceData returns error\n", func() {
 			query := &interfaces.ConceptsQuery{KNID: "kn1", Branch: interfaces.MAIN_BRANCH, Limit: 10}
-			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, rest.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
+			vbs.EXPECT().QueryResourceData(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, httperrors.NewHTTPError(ctx, 500, berrors.BknBackend_RelationType_InternalError))
 			result, err := service.SearchRelationTypes(ctx, query)
 			So(err, ShouldNotBeNil)
 			So(len(result.Entries), ShouldEqual, 0)

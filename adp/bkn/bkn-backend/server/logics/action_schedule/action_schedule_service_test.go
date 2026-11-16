@@ -9,18 +9,20 @@ package action_schedule
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/robfig/cron/v3"
 	. "github.com/smartystreets/goconvey/convey"
 	"go.uber.org/mock/gomock"
 
-	"bkn-backend/common"
-	berrors "bkn-backend/errors"
-	"bkn-backend/interfaces"
-	bmock "bkn-backend/interfaces/mock"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	berrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	bmock "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces/mock"
 )
 
 // newTestService constructs an actionScheduleService with injected mocks.
@@ -102,14 +104,15 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 
 		Convey("Success with inactive status (default)\n", func() {
 			schedule := &interfaces.ActionSchedule{
-				KNID:           knID,
-				Branch:         branch,
-				ActionTypeID:   "at1",
-				CronExpression: "* * * * *",
-				Status:         interfaces.ScheduleStatusInactive,
+				KNID:               knID,
+				Branch:             branch,
+				ActionTypeID:       "at1",
+				CronExpression:     "* * * * *",
+				Status:             interfaces.ScheduleStatusInactive,
+				InstanceIdentities: []map[string]any{{"id": "target-1"}},
 			}
 			ata.EXPECT().GetActionTypesByIDs(gomock.Any(), knID, branch, []string{"at1"}).
-				Return([]*interfaces.ActionType{{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at1"}}}, nil)
+				Return([]*interfaces.ActionType{schedulableActionType("at1")}, nil)
 			asa.EXPECT().CreateSchedule(gomock.Any(), nil, gomock.Any()).Return(nil)
 
 			id, err := svc.CreateSchedule(ctx, schedule)
@@ -119,14 +122,15 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 
 		Convey("Success with active status (calculates next run time)\n", func() {
 			schedule := &interfaces.ActionSchedule{
-				KNID:           knID,
-				Branch:         branch,
-				ActionTypeID:   "at1",
-				CronExpression: "* * * * *",
-				Status:         interfaces.ScheduleStatusActive,
+				KNID:               knID,
+				Branch:             branch,
+				ActionTypeID:       "at1",
+				CronExpression:     "* * * * *",
+				Status:             interfaces.ScheduleStatusActive,
+				InstanceIdentities: []map[string]any{{"id": "target-1"}},
 			}
 			ata.EXPECT().GetActionTypesByIDs(gomock.Any(), knID, branch, []string{"at1"}).
-				Return([]*interfaces.ActionType{{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at1"}}}, nil)
+				Return([]*interfaces.ActionType{schedulableActionType("at1")}, nil)
 			asa.EXPECT().CreateSchedule(gomock.Any(), nil, gomock.Any()).Return(nil)
 
 			id, err := svc.CreateSchedule(ctx, schedule)
@@ -145,9 +149,9 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 
 			_, err := svc.CreateSchedule(ctx, schedule)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidCronExpression)
-			So(httpErr.BaseError.ErrorDetails, ShouldEqual, "Cron 表达式无效。")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidCronExpression)
+			So(httpErr.ErrorDetails, ShouldEqual, "Cron 表达式无效。")
 		})
 
 		Convey("Failed when GetActionTypesByIDs returns error\n", func() {
@@ -162,8 +166,8 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 
 			_, err := svc.CreateSchedule(ctx, schedule)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetActionTypeFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetActionTypeFailed)
 		})
 
 		Convey("Failed when action type not found\n", func() {
@@ -178,26 +182,27 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 
 			_, err := svc.CreateSchedule(ctx, schedule)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_ActionTypeNotFound)
-			So(httpErr.BaseError.ErrorDetails, ShouldEqual, "行动类 at_missing 不存在。")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_ActionTypeNotFound)
+			So(httpErr.ErrorDetails, ShouldEqual, "行动类 at_missing 不存在。")
 		})
 
 		Convey("Failed when asa.CreateSchedule returns error\n", func() {
 			schedule := &interfaces.ActionSchedule{
-				KNID:           knID,
-				Branch:         branch,
-				ActionTypeID:   "at1",
-				CronExpression: "* * * * *",
+				KNID:               knID,
+				Branch:             branch,
+				ActionTypeID:       "at1",
+				CronExpression:     "* * * * *",
+				InstanceIdentities: []map[string]any{{"id": "target-1"}},
 			}
 			ata.EXPECT().GetActionTypesByIDs(gomock.Any(), knID, branch, []string{"at1"}).
-				Return([]*interfaces.ActionType{{ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{ATID: "at1"}}}, nil)
+				Return([]*interfaces.ActionType{schedulableActionType("at1")}, nil)
 			asa.EXPECT().CreateSchedule(gomock.Any(), nil, gomock.Any()).Return(errors.New("db error"))
 
 			_, err := svc.CreateSchedule(ctx, schedule)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_CreateFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_CreateFailed)
 		})
 	})
 }
@@ -207,7 +212,7 @@ func Test_actionScheduleService_CreateSchedule(t *testing.T) {
 func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 	Convey("Test UpdateSchedule\n", t, func() {
 		ctx := context.Background()
-		svc, mockCtrl, asa, _ := newTestService(t)
+		svc, mockCtrl, asa, ata := newTestService(t)
 		defer mockCtrl.Finish()
 
 		scheduleID := "sched1"
@@ -227,11 +232,16 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 		Convey("Success with cron change on active schedule (recalculates next run)\n", func() {
 			activeExisting := &interfaces.ActionSchedule{
-				ID:             scheduleID,
-				CronExpression: "0 8 * * *",
-				Status:         interfaces.ScheduleStatusActive,
+				ID:                 scheduleID,
+				KNID:               "kn1",
+				ActionTypeID:       "at1",
+				InstanceIdentities: []map[string]any{{"id": "target-1"}},
+				CronExpression:     "0 8 * * *",
+				Status:             interfaces.ScheduleStatusActive,
 			}
 			asa.EXPECT().GetSchedule(gomock.Any(), scheduleID).Return(activeExisting, nil)
+			ata.EXPECT().GetActionTypesByIDs(gomock.Any(), "kn1", "", []string{"at1"}).
+				Return([]*interfaces.ActionType{schedulableActionType("at1")}, nil)
 			asa.EXPECT().UpdateSchedule(gomock.Any(), nil, gomock.Any()).Return(nil)
 
 			err := svc.UpdateSchedule(ctx, scheduleID, &interfaces.ActionScheduleUpdateRequest{CronExpression: "0 9 * * *"})
@@ -243,8 +253,8 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 			err := svc.UpdateSchedule(ctx, scheduleID, &interfaces.ActionScheduleUpdateRequest{Name: "x"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 
 		Convey("Failed when schedule not found\n", func() {
@@ -252,8 +262,8 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 			err := svc.UpdateSchedule(ctx, scheduleID, &interfaces.ActionScheduleUpdateRequest{Name: "x"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
 		})
 
 		Convey("Failed with invalid new cron expression\n", func() {
@@ -261,8 +271,8 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 			err := svc.UpdateSchedule(ctx, scheduleID, &interfaces.ActionScheduleUpdateRequest{CronExpression: "invalid"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidCronExpression)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidCronExpression)
 		})
 
 		Convey("Failed when asa.UpdateSchedule returns error\n", func() {
@@ -271,8 +281,8 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 			err := svc.UpdateSchedule(ctx, scheduleID, &interfaces.ActionScheduleUpdateRequest{Name: "x"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_UpdateFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_UpdateFailed)
 		})
 	})
 }
@@ -281,19 +291,24 @@ func Test_actionScheduleService_UpdateSchedule(t *testing.T) {
 
 func Test_actionScheduleService_UpdateScheduleStatus(t *testing.T) {
 	Convey("Test UpdateScheduleStatus\n", t, func() {
-		ctx := rest.WithLanguage(context.Background(), rest.AmericanEnglish)
-		svc, mockCtrl, asa, _ := newTestService(t)
+		ctx := i18n.WithLanguage(context.Background(), i18n.AmericanEnglish)
+		svc, mockCtrl, asa, ata := newTestService(t)
 		defer mockCtrl.Finish()
 
 		scheduleID := "sched1"
 		existing := &interfaces.ActionSchedule{
-			ID:             scheduleID,
-			CronExpression: "* * * * *",
-			Status:         interfaces.ScheduleStatusInactive,
+			ID:                 scheduleID,
+			KNID:               "kn1",
+			ActionTypeID:       "at1",
+			InstanceIdentities: []map[string]any{{"id": "target-1"}},
+			CronExpression:     "* * * * *",
+			Status:             interfaces.ScheduleStatusInactive,
 		}
 
 		Convey("Success activating schedule\n", func() {
 			asa.EXPECT().GetSchedule(gomock.Any(), scheduleID).Return(existing, nil)
+			ata.EXPECT().GetActionTypesByIDs(gomock.Any(), "kn1", "", []string{"at1"}).
+				Return([]*interfaces.ActionType{schedulableActionType("at1")}, nil)
 			asa.EXPECT().UpdateSchedule(gomock.Any(), nil, gomock.Any()).Return(nil)
 
 			err := svc.UpdateScheduleStatus(ctx, scheduleID, interfaces.ScheduleStatusActive)
@@ -311,9 +326,9 @@ func Test_actionScheduleService_UpdateScheduleStatus(t *testing.T) {
 		Convey("Failed with invalid status\n", func() {
 			err := svc.UpdateScheduleStatus(ctx, scheduleID, "unknown")
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidStatus)
-			So(httpErr.BaseError.ErrorDetails, ShouldEqual, "status must be active or inactive; received unknown.")
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidStatus)
+			So(httpErr.ErrorDetails, ShouldEqual, "status must be active or inactive; received unknown.")
 		})
 
 		Convey("Failed when GetSchedule returns error\n", func() {
@@ -321,8 +336,8 @@ func Test_actionScheduleService_UpdateScheduleStatus(t *testing.T) {
 
 			err := svc.UpdateScheduleStatus(ctx, scheduleID, interfaces.ScheduleStatusActive)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 
 		Convey("Failed when schedule not found\n", func() {
@@ -330,8 +345,8 @@ func Test_actionScheduleService_UpdateScheduleStatus(t *testing.T) {
 
 			err := svc.UpdateScheduleStatus(ctx, scheduleID, interfaces.ScheduleStatusActive)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
 		})
 
 		Convey("Failed when UpdateScheduleStatus access returns error\n", func() {
@@ -340,8 +355,8 @@ func Test_actionScheduleService_UpdateScheduleStatus(t *testing.T) {
 
 			err := svc.UpdateScheduleStatus(ctx, scheduleID, interfaces.ScheduleStatusInactive)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_UpdateFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_UpdateFailed)
 		})
 	})
 }
@@ -358,10 +373,15 @@ func Test_actionScheduleService_DeleteSchedules(t *testing.T) {
 		branch := interfaces.MAIN_BRANCH
 
 		Convey("Success deleting schedules\n", func() {
+			ps := bmock.NewMockPermissionService(mockCtrl)
+			svc.ps = ps
 			asa.EXPECT().GetSchedules(gomock.Any(), []string{"s1", "s2"}).Return(map[string]*interfaces.ActionSchedule{
 				"s1": {ID: "s1", KNID: knID, Branch: branch},
 				"s2": {ID: "s2", KNID: knID, Branch: branch},
 			}, nil)
+			ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{
+				Type: interfaces.RESOURCE_TYPE_KN, ID: knID,
+			}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(nil)
 			asa.EXPECT().DeleteSchedules(gomock.Any(), nil, []string{"s1", "s2"}).Return(nil)
 
 			err := svc.DeleteSchedules(ctx, knID, branch, []string{"s1", "s2"})
@@ -373,13 +393,41 @@ func Test_actionScheduleService_DeleteSchedules(t *testing.T) {
 			So(err, ShouldBeNil)
 		})
 
+		for _, targetBranch := range []string{interfaces.MAIN_BRANCH, "draft"} {
+			Convey("Permission denial prevents deletion on "+targetBranch+"\n", func() {
+				ps := bmock.NewMockPermissionService(mockCtrl)
+				svc.ps = ps
+				asa.EXPECT().GetSchedules(gomock.Any(), []string{"s1", "s2"}).Return(map[string]*interfaces.ActionSchedule{
+					"s1": {ID: "s1", KNID: knID, Branch: targetBranch},
+					"s2": {ID: "s2", KNID: knID, Branch: targetBranch},
+				}, nil)
+				denied := httperrors.NewHTTPError(ctx, http.StatusForbidden, httperrors.PublicError_Forbidden)
+				ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{
+					Type: interfaces.RESOURCE_TYPE_KN, ID: knID,
+				}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(denied)
+				err := svc.DeleteSchedules(ctx, knID, targetBranch, []string{"s1", "s2"})
+				So(err, ShouldEqual, denied)
+			})
+		}
+
+		Convey("Permission service failure prevents deletion\n", func() {
+			ps := bmock.NewMockPermissionService(mockCtrl)
+			svc.ps = ps
+			asa.EXPECT().GetSchedules(gomock.Any(), []string{"s1"}).Return(map[string]*interfaces.ActionSchedule{
+				"s1": {ID: "s1", KNID: knID, Branch: branch},
+			}, nil)
+			checkErr := errors.New("safe unavailable")
+			ps.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(checkErr)
+			So(svc.DeleteSchedules(ctx, knID, branch, []string{"s1"}), ShouldEqual, checkErr)
+		})
+
 		Convey("Failed when GetSchedules returns error\n", func() {
 			asa.EXPECT().GetSchedules(gomock.Any(), gomock.Any()).Return(nil, errors.New("db error"))
 
 			err := svc.DeleteSchedules(ctx, knID, branch, []string{"s1"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 
 		Convey("Failed when schedule not found in result\n", func() {
@@ -387,8 +435,8 @@ func Test_actionScheduleService_DeleteSchedules(t *testing.T) {
 
 			err := svc.DeleteSchedules(ctx, knID, branch, []string{"s_missing"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
 		})
 
 		Convey("Failed when schedule belongs to different kn\n", func() {
@@ -398,20 +446,25 @@ func Test_actionScheduleService_DeleteSchedules(t *testing.T) {
 
 			err := svc.DeleteSchedules(ctx, knID, branch, []string{"s1"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidParameter)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_InvalidParameter)
 		})
 
 		Convey("Failed when DeleteSchedules access returns error\n", func() {
+			ps := bmock.NewMockPermissionService(mockCtrl)
+			svc.ps = ps
 			asa.EXPECT().GetSchedules(gomock.Any(), gomock.Any()).Return(map[string]*interfaces.ActionSchedule{
 				"s1": {ID: "s1", KNID: knID, Branch: branch},
 			}, nil)
+			ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{
+				Type: interfaces.RESOURCE_TYPE_KN, ID: knID,
+			}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(nil)
 			asa.EXPECT().DeleteSchedules(gomock.Any(), nil, gomock.Any()).Return(errors.New("db error"))
 
 			err := svc.DeleteSchedules(ctx, knID, branch, []string{"s1"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_DeleteFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_DeleteFailed)
 		})
 	})
 }
@@ -440,8 +493,8 @@ func Test_actionScheduleService_GetSchedule(t *testing.T) {
 
 			_, err := svc.GetSchedule(ctx, scheduleID)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 
 		Convey("Failed when schedule not found (nil)\n", func() {
@@ -449,8 +502,8 @@ func Test_actionScheduleService_GetSchedule(t *testing.T) {
 
 			_, err := svc.GetSchedule(ctx, scheduleID)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_NotFound)
 		})
 	})
 }
@@ -480,8 +533,8 @@ func Test_actionScheduleService_GetSchedules(t *testing.T) {
 
 			_, err := svc.GetSchedules(ctx, []string{"s1"})
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 	})
 }
@@ -511,8 +564,8 @@ func Test_actionScheduleService_ListSchedules(t *testing.T) {
 
 			_, _, err := svc.ListSchedules(ctx, params)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 
 		Convey("Failed when GetSchedulesTotal access returns error\n", func() {
@@ -521,8 +574,8 @@ func Test_actionScheduleService_ListSchedules(t *testing.T) {
 
 			_, _, err := svc.ListSchedules(ctx, params)
 			So(err, ShouldNotBeNil)
-			httpErr := err.(*rest.HTTPError)
-			So(httpErr.BaseError.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
+			httpErr := err.(*httperrors.HTTPError)
+			So(httpErr.ErrorCode, ShouldEqual, berrors.BknBackend_ActionSchedule_GetFailed)
 		})
 	})
 }

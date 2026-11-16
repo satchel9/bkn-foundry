@@ -26,6 +26,11 @@ const (
 	// same line with its type=mcp arm. Folding the two together would leave execute_tool unable
 	// to tell which transport a binding meant.
 	CAPABILITY_TYPE_MCP_TOOL = "mcp_tool"
+	// CAPABILITY_TYPE_KNOWLEDGE_BASE is an Enterprise knowledge base served by kb-api, addressed
+	// by ("knowledge_base", "", kb_id). Mounting one lets the network's proxy read it through
+	// kb-api's read API (#2576); the mount grants the whole knowledge base, which is how kb-api
+	// authorizes, so there is no owner slot.
+	CAPABILITY_TYPE_KNOWLEDGE_BASE = "knowledge_base"
 	// CAPABILITY_TYPE_API is not a stored type. It is a counting bucket: function bindings whose
 	// tool box is an openapi box. The rows still say "function"; only the statistics separate
 	// them, because that is the split Studio shows.
@@ -42,7 +47,12 @@ type CapabilityBinding struct {
 	ID             string `json:"id" mapstructure:"id"`
 	KNID           string `json:"kn_id" mapstructure:"kn_id"`
 	Branch         string `json:"branch" mapstructure:"branch"`
+	Revision       string `json:"revision,omitempty" mapstructure:"-"`
 	CapabilityType string `json:"capability_type" mapstructure:"capability_type"`
+
+	// CreatedByAttach is a transient mutation fact, never serialized or persisted.
+	CreatedByAttach bool `json:"-" mapstructure:"-"`
+
 	// OwnerID is the container the capability belongs to: the tool box for a function, the MCP
 	// Server for an mcp_tool, empty for a skill. The wire name is box_id, matching what the
 	// execution factory, Context Loader and Studio all call it; the column stays type-neutral,
@@ -89,7 +99,7 @@ type CapabilityBinding struct {
 // (mcp_server, for one) cannot silently skip its own write checks.
 func IsValidCapabilityType(capabilityType string) bool {
 	switch capabilityType {
-	case CAPABILITY_TYPE_SKILL, CAPABILITY_TYPE_FUNCTION, CAPABILITY_TYPE_MCP_TOOL:
+	case CAPABILITY_TYPE_SKILL, CAPABILITY_TYPE_FUNCTION, CAPABILITY_TYPE_MCP_TOOL, CAPABILITY_TYPE_KNOWLEDGE_BASE:
 		return true
 	default:
 		return false
@@ -114,6 +124,9 @@ type CapabilityBindingsQueryParams struct {
 	// paginate over rows the filter then discards, and a page whose rows all belong to the other
 	// kind would read as "none bound".
 	MetadataType string
+	// MountedOnly returns stored bindings without scanning object or action type references.
+	// The default list retains model provenance for callers that inspect dependencies.
+	MountedOnly bool
 	// OwnerIDs restricts to a set of owners. A non-nil empty slice selects nothing; nil means no
 	// restriction. It is set by the service, not parsed from the query string.
 	OwnerIDs *[]string
@@ -180,11 +193,12 @@ type CapabilityBindingsList struct {
 	TotalCount int                  `json:"total_count"`
 	// Boxes summarises the tool boxes behind the whole-box mounts on this page.
 	Boxes []*CapabilityBoxSummary `json:"boxes"`
-	// MetadataAvailable is false when the execution factory could not be reached. The bindings
+	// MetadataAvailable is false when a metadata service is unconfigured or could not be reached. The bindings
 	// are still returned in full — the names are missing, not the memberships — and the flag
 	// says so explicitly so an empty name is not read as a deleted capability.
 	MetadataAvailable bool `json:"metadata_available"`
-	// SourcesAvailable is false when the branch's object types or action types could not be read.
+	// SourcesAvailable is false when provenance was skipped or the branch's object types or
+	// action types could not be read.
 	// The mounted capabilities are still listed, but the ones only the model uses are missing and
 	// the sources on the rest are incomplete — an empty sources list would otherwise read as
 	// "nothing uses this", which is the opposite of unknown.
@@ -266,3 +280,9 @@ type CapabilityImportReport struct {
 	Bound   int               `json:"bound"`
 	Skipped []*CapabilitySkip `json:"skipped"`
 }
+
+func (d *CapabilityBinding) RevisionID() string { return d.ID }
+
+func (d *CapabilityBinding) SetRevision(revision string) { d.Revision = revision }
+
+func (d *CapabilityBinding) GetRevision() string { return d.Revision }

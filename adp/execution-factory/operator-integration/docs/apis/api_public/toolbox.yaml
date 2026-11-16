@@ -1134,7 +1134,7 @@ paths:
                 - properties:
                     timeout:
                       type: integer
-                      description: 指定超时时间，单位（秒）
+                      description: 指定超时时间，单位（秒）。不传时使用 proxy_module.default_timeout（默认 300），并以 proxy_module.max_timeout（默认 300）为上限；函数工具在此基础上再多等 proxy_module.platform_function_grace（默认 5）秒，以便沙箱先报告自身超时。代理等待上游超时后在响应 status_code 中返回 504 并说明原因。
       responses:
         "200":
           description: "API代理接口"
@@ -1211,7 +1211,7 @@ paths:
                 - properties:
                     timeout:
                       type: integer
-                      description: 指定超时时间，单位（秒）
+                      description: 指定超时时间，单位（秒）。不传时使用 proxy_module.default_timeout（默认 300），并以 proxy_module.max_timeout（默认 300）为上限；函数工具在此基础上再多等 proxy_module.platform_function_grace（默认 5）秒，以便沙箱先报告自身超时。代理等待上游超时后在响应 status_code 中返回 504 并说明原因。
       responses:
         "200":
           description: "API代理接口"
@@ -1239,40 +1239,6 @@ paths:
                 $ref: "#/components/schemas/Error"
         "500":
           description: "Internal Server Error"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-  # 算子转换成工具
-  /v1/operator/convert/tool:
-    post:
-      summary: "算子转换成工具"
-      description: "算子转换成工具"
-      tags:
-        - 工具
-      parameters:
-        - name: "Authorization"
-          in: "header"
-          required: true
-          description: "认证信息"
-          schema:
-            type: string
-            example: "Bearer token"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ConvertToolReq"
-      responses:
-        "200":
-          description: "算子转换成工具成功"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ConvertToolResp"
-        "400":
-          description: "Bad Request"
           content:
             application/json:
               schema:
@@ -1356,6 +1322,37 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "422":
+          description: "执行输入校验失败。代码超限按 Unicode 字符数计量；仅返回安全诊断，不回显源码、事件或下游原始响应。修正输入后重试。"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error_code: "Public.UnprocessableEntity"
+                description: "执行输入校验失败"
+                error_details:
+                  reason: "code_too_long"
+                  stage: "validation"
+                  actual: 102401
+                  max: 102400
+                  unit: "unicode_characters"
+                  session_id: "sess-1"
+        "504":
+          description: "函数执行超过配置时间。error_details 保留既有超时说明，metadata 提供安全分类、秒数及可用的执行/会话 ID。请减少执行工作量或调整超时配置后重试。"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error_code: "Public.GatewayTimeout"
+                error_details: "function execution timed out after 2 seconds"
+                metadata:
+                  reason: "execution_timeout"
+                  stage: "execution"
+                  timeout_seconds: 2
+                  session_id: "sess-1"
+                  execution_id: "exec-1"
         "500":
           description: "Internal Server Error"
           content:
@@ -1725,6 +1722,8 @@ components:
     APIProxyResponse:
       type: object
       properties:
+        function_execution:
+          $ref: '#/components/schemas/FunctionExecution'
         status_code:
           type: integer
           description: "HTTP状态码"
@@ -1742,6 +1741,21 @@ components:
           description: "错误信息"
       required:
         - status_code
+    FunctionExecution:
+      type: object
+      description: "仅本部署已执行 Function 的服务端来源信息。旧运行时或外部目标不提供；版本可编辑，code_sha256 对本次实际执行代码计算，不表示发布版本不可变。"
+      required: [toolbox_id, tool_id, function_version, code_sha256]
+      properties:
+        toolbox_id:
+          type: string
+        tool_id:
+          type: string
+        function_version:
+          type: string
+          format: uuid
+        code_sha256:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
     CreateToolBoxRequest:
       type: object
       description: "创建工具箱请求"
@@ -1847,7 +1861,7 @@ components:
       properties:
         metadata_type:
           type: string
-          description: "算子元数据类型"
+          description: "工具箱元数据类型"
           enum: ["openapi", "function"]
         box_id:
           type: string
@@ -1957,7 +1971,6 @@ components:
           description: "资源对象类型"
           enum:
             - "tool"
-            - "operator"
     APISpec:
       type: object
       description: "API Spec 信息"
@@ -2274,36 +2287,6 @@ components:
           items:
             type: string
             description: "工具ID"
-    ConvertToolReq:
-      type: object
-      description: "转换工具请求"
-      required:
-        - box_id
-        - operator_id
-        - operator_version
-      properties:
-        box_id:
-          type: string
-          description: "工具箱ID"
-        operator_id:
-          type: string
-          description: "算子ID"
-        operator_version:
-          type: string
-          description: "算子版本"
-        global_parameters:
-          $ref: "#/components/schemas/Parameters"
-          description: "全局参数"
-    ConvertToolResp:
-      type: object
-      description: "转换工具响应"
-      properties:
-        box_id:
-          type: string
-          description: "工具箱ID"
-        tool_id:
-          type: string
-          description: "工具ID"
     Parameters:
       type: object
       description: "参数"
@@ -2429,7 +2412,7 @@ components:
             properties:
               metadata_type:
                 type: string
-                description: "算子元数据类型"
+                description: "工具箱元数据类型"
                 enum: ["openapi", "function"]
               box_id:
                 type: string

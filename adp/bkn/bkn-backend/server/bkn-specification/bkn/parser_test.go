@@ -7,6 +7,8 @@
 package bkn
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,6 +16,76 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestParseActionTypeKeepsUnquotedStringConstants(t *testing.T) {
+	text := `---
+type: action_type
+id: create
+name: Create
+action_type: add
+---
+
+## ActionType: Create
+
+### Parameter Binding
+
+| Name | Type | Source | Operation | ValueFrom | Value | Description |
+|------|------|--------|-----------|-----------|-------|-------------|
+| code | string | Body | | const | 123 | |
+| enabled | string | Body | | const | true | |
+| missing | string | Body | | const | null | |
+| items | text | Body | | const | [1,2] | |
+| detail | keyword | Body | | const | {"a":1} | |
+| quoted | string | Body | | const | "123" | |
+| count | integer | Body | | const | 42 | |
+| nullable | boolean | Body | | const | null | |
+| untyped | | Body | | const | 17 | |
+` + "\n### Operation Config\n\n```yaml\noperation_config:\n  type: object\n```\n"
+	at, err := ParseActionTypeFile(text, "create.bkn")
+	require.NoError(t, err)
+	require.Len(t, at.Parameters, 9)
+	for index, want := range []string{"123", "true", "null", "[1,2]", `{"a":1}`, "123"} {
+		assert.Equal(t, want, at.Parameters[index].Value)
+	}
+	assert.Equal(t, json.Number("42"), at.Parameters[6].Value)
+	assert.Nil(t, at.Parameters[7].Value)
+	assert.Equal(t, json.Number("17"), at.Parameters[8].Value)
+}
+
+func TestParseActionTypeRejectsMismatchedTypedConstants(t *testing.T) {
+	for _, tc := range []struct {
+		name, declared, raw string
+	}{
+		{"boolean number", "boolean", "123"},
+		{"boolean string", "boolean", `"true"`},
+		{"integer boolean", "integer", "true"},
+		{"integer fraction", "integer", "1.5"},
+		{"number string", "number", `"1.5"`},
+		{"array object", "array", `{}`},
+		{"object array", "object", `[]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			text := fmt.Sprintf(`---
+type: action_type
+id: notify
+name: Notify
+action_type: add
+---
+
+## ActionType: Notify
+
+### Parameter Binding
+
+| Name | Type | Source | Operation | ValueFrom | Value | Description |
+|------|------|--------|-----------|-----------|-------|-------------|
+| payload | %s | Body | | const | %s | |
+`, tc.declared, tc.raw) + "\n### Operation Config\n\n```yaml\noperation_config:\n  type: tool\n```\n"
+			_, err := ParseActionTypeFile(text, "notify.bkn")
+			require.ErrorContains(t, err, `action parameter "payload"`)
+			require.ErrorContains(t, err, tc.declared)
+		})
+	}
+}
 
 // === Parse Frontmatter Tests ===
 
@@ -544,9 +616,9 @@ name: 产品
 
 **Source**
 
-| Source Type | Source ID | Source Name |
-|-------------|-----------|-------------|
-| tool | bom_tree_builder | bom_tree_builder |
+| Source Type | Source ID | Source Name | BoxID | ToolID | ResultPath |
+|-------------|-----------|-------------|-------|--------|------------|
+| tool | bom_tree_builder | | box_bom | tool_bom | $.result |
 
 **Parameters**
 
@@ -1100,19 +1172,6 @@ name: coupon
 	assert.Equal(t, src, reparsed.LogicProperties[0].DataSource)
 }
 
-func TestLogicPropertySource_NonToolKeepsNarrowTable(t *testing.T) {
-	ot := &BknObjectType{
-		BknObjectTypeFrontmatter: BknObjectTypeFrontmatter{Type: "object_type", ID: "ot1", Name: "OT1"},
-		LogicProperties: []*LogicProperty{
-			{Name: "lp1", Type: "metric", DataSource: &ResourceInfo{Type: "metric", ID: "m1", Name: "M1"}},
-		},
-	}
-
-	out := SerializeObjectType(ot)
-	assert.Contains(t, out, "| Source Type | Source ID | Source Name |\n")
-	assert.NotContains(t, out, "BoxID")
-}
-
 func TestLogicPropertySource_IncompleteToolStillGetsColumns(t *testing.T) {
 	ot := &BknObjectType{
 		BknObjectTypeFrontmatter: BknObjectTypeFrontmatter{Type: "object_type", ID: "ot1", Name: "OT1"},
@@ -1122,4 +1181,29 @@ func TestLogicPropertySource_IncompleteToolStillGetsColumns(t *testing.T) {
 	}
 
 	assert.Contains(t, SerializeObjectType(ot), "| Source Type | Source ID | Source Name | BoxID | ToolID | ResultPath |")
+}
+
+// Guards the current reading of a parameter table: every column keeps its literal meaning, even
+// when the table also carries the legacy Binding column.
+func TestParseParameterBinding_CurrentLayoutUnchanged(t *testing.T) {
+	text := `---
+type: action_type
+id: a
+name: a
+---
+
+## ActionType: a
+
+### Parameter Binding
+
+| Name | Type | Source | Operation | ValueFrom | Value | Binding | Description |
+|------|------|--------|-----------|-----------|-------|---------|-------------|
+| pod | string | Body | | property | pod_name | ignored | |
+`
+	at, err := ParseActionTypeFile(text, "a.bkn")
+	require.NoError(t, err)
+	require.Len(t, at.Parameters, 1)
+	assert.Equal(t, "Body", at.Parameters[0].Source)
+	assert.Equal(t, "property", at.Parameters[0].ValueFrom)
+	assert.Equal(t, "pod_name", at.Parameters[0].Value)
 }

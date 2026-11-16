@@ -13,18 +13,134 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 
+	cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/condition"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common/maskrule"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	omock "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces/mock"
 	"go.uber.org/mock/gomock"
-	cond "ontology-query/common/condition"
-	"ontology-query/common/maskrule"
-	"ontology-query/interfaces"
-	omock "ontology-query/interfaces/mock"
 )
 
 type propertyAccessStub struct {
 	levels map[string]interfaces.PropertyAccessLevel
 	calls  *int
+}
+
+func TestPropertyAccessPlanKeepsDeniedAndUnknownPropertiesIndistinguishable(t *testing.T) {
+	objectType := accessPlanObjectType()
+	access := propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+		"id": interfaces.PropertyAccessFull, "mobile": interfaces.PropertyAccessMasked,
+		"notes": interfaces.PropertyAccessSchema, "secret": interfaces.PropertyAccessNone,
+	}}
+	tests := []struct {
+		name    string
+		query   interfaces.ObjectQueryBaseOnObjectType
+		status  int
+		code    string
+		details string
+	}{
+		{
+			name: "explicit denied property", query: interfaces.ObjectQueryBaseOnObjectType{Properties: []string{"secret"}},
+			status: http.StatusBadRequest, code: "OntologyQuery.ObjectType.InvalidParameter",
+			details: "the request contains an unavailable property",
+		},
+		{
+			name: "non-full calculation input", query: interfaces.ObjectQueryBaseOnObjectType{
+				Properties: []string{"id", "mobile"}, CommonQueryParameters: interfaces.CommonQueryParameters{
+					RequiredFullProperties: []string{"mobile"},
+				},
+			},
+			status: http.StatusBadRequest, code: "OntologyQuery.ObjectType.InvalidParameter",
+			details: "the request contains a property unavailable for this operation",
+		},
+		{
+			name: "no returnable properties", query: interfaces.ObjectQueryBaseOnObjectType{Properties: []string{"notes"}},
+			status: http.StatusForbidden, code: httperrors.PublicError_Forbidden,
+			details: "the request has no returnable properties",
+		},
+		{
+			name: "unknown property", query: interfaces.ObjectQueryBaseOnObjectType{Properties: []string{"missing"}},
+			status: http.StatusBadRequest, code: "OntologyQuery.ObjectType.InvalidParameter",
+			details: "the request contains an unavailable property",
+		},
+		{
+			name: "unknown calculation input", query: interfaces.ObjectQueryBaseOnObjectType{
+				Properties: []string{"id"}, CommonQueryParameters: interfaces.CommonQueryParameters{
+					RequiredFullProperties: []string{"missing"},
+				},
+			},
+			status: http.StatusBadRequest, code: "OntologyQuery.ObjectType.InvalidParameter",
+			details: "the request contains a property unavailable for this operation",
+		},
+	}
+	bodies := make(map[string]string, len(tests))
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := buildPropertyAccessPlan(context.Background(), access, objectType, &test.query, true)
+			httpError, ok := err.(*httperrors.HTTPError)
+			if !ok || httpError.HTTPCode != test.status || httpError.ErrorCode != test.code ||
+				httpError.ErrorDetails != test.details {
+				t.Fatalf("error = %#v, want status=%d code=%s details=%s", err, test.status, test.code, test.details)
+			}
+			if reason := httpError.Metadata["reason"]; reason != "property_unavailable" {
+				t.Fatalf("property reason = %#v", reason)
+			}
+			bodies[test.name] = httpError.Error()
+		})
+	}
+	if bodies["explicit denied property"] != bodies["unknown property"] ||
+		bodies["non-full calculation input"] != bodies["unknown calculation input"] {
+		t.Fatal("denied and unknown properties returned distinguishable error bodies")
+	}
+}
+
+func TestPropertyAccessPlanRequiresFullAccessForMetricIdentityDisjunction(t *testing.T) {
+	objectType := accessPlanObjectType()
+	objectType.PrimaryKeys = []string{"id", "mobile"}
+	identity := func(id, mobile string) *cond.CondCfg {
+		return &cond.CondCfg{Operation: cond.OperationAnd, SubConds: []*cond.CondCfg{
+			{Name: "id", Operation: cond.OperationEq, Value: id},
+			{Name: "mobile", Operation: cond.OperationEq, Value: mobile},
+		}}
+	}
+	query := &interfaces.ObjectQueryBaseOnObjectType{
+		Properties: []string{"id", "mobile"},
+		ActualCondition: &cond.CondCfg{Operation: cond.OperationOr,
+			SubConds: []*cond.CondCfg{identity("customer-a", "phone-a"), identity("customer-b", "phone-b")}},
+		CommonQueryParameters: interfaces.CommonQueryParameters{
+			RequiredFullProperties: []string{"id", "mobile"},
+		},
+	}
+	for _, test := range []struct {
+		name        string
+		mobileLevel interfaces.PropertyAccessLevel
+		allowed     bool
+	}{
+		{name: "full key", mobileLevel: interfaces.PropertyAccessFull, allowed: true},
+		{name: "masked key", mobileLevel: interfaces.PropertyAccessMasked},
+		{name: "schema-only key", mobileLevel: interfaces.PropertyAccessSchema},
+		{name: "denied key", mobileLevel: interfaces.PropertyAccessNone},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			access := propertyAccessStub{levels: map[string]interfaces.PropertyAccessLevel{
+				"id": interfaces.PropertyAccessFull, "mobile": test.mobileLevel,
+				"notes": interfaces.PropertyAccessSchema, "secret": interfaces.PropertyAccessNone,
+			}}
+			_, err := buildPropertyAccessPlan(context.Background(), access, objectType, query, true)
+			if test.allowed {
+				if err != nil {
+					t.Fatalf("fully authorized identity rejected: %v", err)
+				}
+				return
+			}
+			httpError, ok := err.(*httperrors.HTTPError)
+			if !ok || httpError.HTTPCode != http.StatusBadRequest ||
+				httpError.Metadata["reason"] != "property_unavailable" {
+				t.Fatalf("non-full identity access was not rejected: %#v", err)
+			}
+		})
+	}
 }
 
 func TestObjectQueryRejectsEmptyReturnBeforeProxyOrVega(t *testing.T) {
@@ -47,7 +163,7 @@ func TestObjectQueryRejectsEmptyReturnBeforeProxyOrVega(t *testing.T) {
 		KNID: "kn-1", Branch: "main", ObjectTypeID: "customer", Properties: []string{"notes"},
 		PageQuery: interfaces.PageQuery{Sort: []*interfaces.SortParams{{Field: interfaces.SORT_FIELD_SCORE, Direction: "desc"}}},
 	})
-	httpError, ok := err.(*rest.HTTPError)
+	httpError, ok := err.(*httperrors.HTTPError)
 	if !ok || httpError.HTTPCode != http.StatusForbidden || len(proxy.bindings) != 0 {
 		t.Fatalf("result error = %#v, proxy bindings = %#v", err, proxy.bindings)
 	}
@@ -77,7 +193,7 @@ func TestVegaUsesPropertyProjection(t *testing.T) {
 	}}}
 	service := &objectTypeService{vba: vega}
 	var vegaResult interfaces.Objects
-	if err := service.getObjectsFromResource(context.Background(), query, objectType, &vegaResult, plan.fieldPropertyMap(), plan); err != nil {
+	if err := service.getObjectsFromResource(context.Background(), query, objectType, &vegaResult, plan.fieldPropertyMap(), plan, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(vegaResult.Datas) != 1 || vegaResult.Datas[0]["id"] != "customer-1" ||
@@ -421,10 +537,10 @@ func TestPropertyAccessPlanRejectsHiddenAndMissingPropertiesIndistinguishably(t 
 		"id": interfaces.PropertyAccessFull, "mobile": interfaces.PropertyAccessFull,
 		"notes": interfaces.PropertyAccessSchema, "secret": interfaces.PropertyAccessNone,
 	}}
-	errorFor := func(property string) *rest.HTTPError {
+	errorFor := func(property string) *httperrors.HTTPError {
 		query := &interfaces.ObjectQueryBaseOnObjectType{Properties: []string{property}}
 		_, err := buildPropertyAccessPlan(context.Background(), resolver, objectType, query, true)
-		httpError, ok := err.(*rest.HTTPError)
+		httpError, ok := err.(*httperrors.HTTPError)
 		if !ok {
 			t.Fatalf("property %q error = %#v", property, err)
 		}
@@ -432,8 +548,8 @@ func TestPropertyAccessPlanRejectsHiddenAndMissingPropertiesIndistinguishably(t 
 	}
 	hidden := errorFor("secret")
 	missing := errorFor("does_not_exist")
-	if hidden.HTTPCode != missing.HTTPCode || hidden.BaseError.ErrorCode != missing.BaseError.ErrorCode ||
-		hidden.BaseError.ErrorDetails != missing.BaseError.ErrorDetails {
+	if hidden.HTTPCode != missing.HTTPCode || hidden.ErrorCode != missing.ErrorCode ||
+		hidden.ErrorDetails != missing.ErrorDetails {
 		t.Fatalf("hidden and missing errors differ: %#v %#v", hidden, missing)
 	}
 }
@@ -449,14 +565,14 @@ func TestPropertyAccessPlanRejectsNonFullOperationAndEmptyReturnBeforeRead(t *te
 		PageQuery:  interfaces.PageQuery{Sort: []*interfaces.SortParams{{Field: "mobile", Direction: "asc"}}},
 	}
 	_, err := buildPropertyAccessPlan(context.Background(), resolver, objectType, query, true)
-	httpError, ok := err.(*rest.HTTPError)
+	httpError, ok := err.(*httperrors.HTTPError)
 	if !ok || httpError.HTTPCode != http.StatusBadRequest {
 		t.Fatalf("operation error = %#v", err)
 	}
 
 	query = &interfaces.ObjectQueryBaseOnObjectType{Properties: []string{"notes"}}
 	_, err = buildPropertyAccessPlan(context.Background(), resolver, objectType, query, true)
-	httpError, ok = err.(*rest.HTTPError)
+	httpError, ok = err.(*httperrors.HTTPError)
 	if !ok || httpError.HTTPCode != http.StatusForbidden {
 		t.Fatalf("empty return error = %#v", err)
 	}

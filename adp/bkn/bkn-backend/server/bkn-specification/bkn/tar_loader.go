@@ -10,8 +10,6 @@ import (
 	"archive/tar"
 	"fmt"
 	"io"
-	"path"
-	"strings"
 )
 
 const (
@@ -36,14 +34,8 @@ func LoadNetworkFromTar(tarReader io.Reader) (*BknNetwork, error) {
 // ExtractTarToMemory extracts a tar archive into the in-memory file system.
 // It returns the in-memory file system and root directory path.
 func ExtractTarToMemory(reader io.Reader) (*MemoryFileSystem, string, error) {
-	mfs := NewMemoryFileSystem()
 	tr := tar.NewReader(reader)
-
-	var (
-		rootDir    string
-		entryCount int
-		totalSize  int64
-	)
+	c := newArchiveCollector("tar")
 
 	for {
 		header, err := tr.Next()
@@ -53,9 +45,8 @@ func ExtractTarToMemory(reader io.Reader) (*MemoryFileSystem, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to read tar header: %w", err)
 		}
-		entryCount++
-		if entryCount > maxTarEntries {
-			return nil, "", fmt.Errorf("tar contains more than %d entries", maxTarEntries)
+		if err := c.countEntry(); err != nil {
+			return nil, "", err
 		}
 		// Global PAX headers describe archive metadata rather than filesystem entries.
 		if header.Typeflag == tar.TypeXGlobalHeader {
@@ -65,7 +56,7 @@ func ExtractTarToMemory(reader io.Reader) (*MemoryFileSystem, string, error) {
 			continue
 		}
 
-		safePath, err := normalizeTarEntryPath(header.Name)
+		safePath, err := c.normalize(header.Name)
 		if err != nil {
 			return nil, "", err
 		}
@@ -74,28 +65,21 @@ func ExtractTarToMemory(reader io.Reader) (*MemoryFileSystem, string, error) {
 		if header.Typeflag == tar.TypeDir {
 			continue
 		}
-		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+		// Typeflag zero is the legacy regular-file marker.
+		if header.Typeflag != tar.TypeReg && header.Typeflag != 0 {
 			return nil, "", fmt.Errorf("unsupported tar entry type for %q", header.Name)
 		}
 
-		base := path.Base(safePath)
-		// Skip macOS AppleDouble extended-attribute files (._*) to avoid parsing empty ObjectTypes.
-		if strings.HasPrefix(base, "._") {
+		keep, err := c.filter(safePath)
+		if err != nil {
+			return nil, "", err
+		}
+		if !keep {
 			continue
 		}
-
-		// Process only supported file types (.bkn and .md) and the CHECKSUM file.
-		ext := strings.ToLower(path.Ext(safePath))
-		if !SupportedExtensions[ext] && base != ChecksumFileName {
-			continue
+		if err := c.reserve(header.Name, safePath, header.Size); err != nil {
+			return nil, "", err
 		}
-		if header.Size < 0 || header.Size > maxTarFileSize {
-			return nil, "", fmt.Errorf("tar entry %q exceeds the %d-byte file limit", header.Name, maxTarFileSize)
-		}
-		if header.Size > maxTarTotalSize-totalSize {
-			return nil, "", fmt.Errorf("tar contents exceed the %d-byte total limit", maxTarTotalSize)
-		}
-		totalSize += header.Size
 
 		// Read file contents.
 		content := make([]byte, int(header.Size))
@@ -103,48 +87,13 @@ func ExtractTarToMemory(reader io.Reader) (*MemoryFileSystem, string, error) {
 			return nil, "", fmt.Errorf("failed to read file %s: %w", header.Name, err)
 		}
 
-		mfs.AddFile(safePath, content)
-
-		// Check whether this is a root-file candidate and record its directory.
-		if strings.EqualFold(base, RootFileName) {
-			rootDir = path.Dir(safePath)
-			if rootDir == "" {
-				rootDir = "."
-			}
-		}
+		c.add(safePath, content)
 	}
 
-	if rootDir == "" {
-		return nil, "", fmt.Errorf("no root network file found in tar")
-	}
-
-	return mfs, rootDir, nil
+	return c.finish()
 }
 
+//nolint:unused // Intentionally retained.
 func normalizeTarEntryPath(name string) (string, error) {
-	if name == "" || strings.ContainsRune(name, '\x00') {
-		return "", fmt.Errorf("invalid empty tar entry path")
-	}
-	if strings.ContainsRune(name, '\\') {
-		return "", fmt.Errorf("tar entry %q uses a non-portable path separator", name)
-	}
-	if path.IsAbs(name) || (len(name) >= 2 && name[1] == ':') {
-		return "", fmt.Errorf("tar entry %q uses an absolute path", name)
-	}
-
-	trimmed := name
-	for strings.HasPrefix(trimmed, "./") {
-		trimmed = strings.TrimPrefix(trimmed, "./")
-	}
-	cleaned := path.Clean(trimmed)
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("tar entry %q escapes the archive root", name)
-	}
-	for _, segment := range strings.Split(trimmed, "/") {
-		if segment == ".." {
-			return "", fmt.Errorf("tar entry %q contains parent traversal", name)
-		}
-	}
-
-	return cleaned, nil
+	return normalizeArchiveEntryPath("tar", name)
 }

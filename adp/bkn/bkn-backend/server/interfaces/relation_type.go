@@ -6,7 +6,7 @@
 
 package interfaces
 
-import cond "bkn-backend/common/condition"
+import cond "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common/condition"
 
 const (
 	RELATION_TYPE_DIRECT              = "direct"
@@ -37,6 +37,7 @@ type RelationType struct {
 	CommonInfo               `mapstructure:",squash"`
 	KNID                     string           `json:"kn_id" mapstructure:"kn_id"`
 	Branch                   string           `json:"branch,omitempty" mapstructure:"branch"`
+	Revision                 string           `json:"revision,omitempty" mapstructure:"-"`
 	SourceObjectType         SimpleObjectType `json:"source_object_type,omitempty" mapstructure:"source_object_type"` // Name returned when retrieving details
 	TargetObjectType         SimpleObjectType `json:"target_object_type,omitempty" mapstructure:"target_object_type"` // Name returned when retrieving details
 
@@ -47,6 +48,13 @@ type RelationType struct {
 
 	ModuleType string   `json:"module_type" mapstructure:"module_type"`
 	Operations []string `json:"operations,omitempty"`
+
+	// The relation declarations of BKN spec 3.0 (SPECIFICATION.md §4.3, §7.6). An interactive update
+	// that leaves one out keeps the stored value; the relation properties ride in the indirect
+	// mapping rules.
+	RelationDeclarations `mapstructure:",squash"`
+	// declared names the declaration fields the JSON carried, null included.
+	declared map[string]bool
 
 	IfNameModify bool `json:"-"`
 
@@ -66,6 +74,10 @@ type InDirectMapping struct {
 	BackingDataSource  *ResourceInfo `json:"backing_data_source" mapstructure:"backing_data_source"`
 	SourceMappingRules []Mapping     `json:"source_mapping_rules" mapstructure:"source_mapping_rules"`
 	TargetMappingRules []Mapping     `json:"target_mapping_rules" mapstructure:"target_mapping_rules"`
+	// Properties are the relation properties (BKN spec 3.0, §7.6): columns of the backing resource
+	// read on each edge. They are decoded from JSON, never by mapstructure, so their declarations
+	// keep the JSON reading.
+	Properties []*DataProperty `json:"properties,omitempty" mapstructure:"-"`
 }
 
 // FilteredCrossJoinMapping rules for relation type filtered_cross_join (per-side conditions, no key mapping).
@@ -97,3 +109,9 @@ type RelationTypes struct {
 	NextCursor *string         `json:"next_cursor,omitempty"`
 	OverallMs  int64           `json:"overall_ms"`
 }
+
+func (d *RelationType) RevisionID() string { return d.RTID }
+
+func (d *RelationType) SetRevision(revision string) { d.Revision = revision }
+
+func (d *RelationType) GetRevision() string { return d.Revision }

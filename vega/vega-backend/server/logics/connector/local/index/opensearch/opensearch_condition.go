@@ -8,6 +8,7 @@ package opensearch
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -17,8 +18,26 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
+// 日期查询显式指定纳秒格式，与源字段 mapping 的 format 解耦。
+const (
+	indexDateQueryFormat         = "strict_date_optional_time_nanos"
+	maxIndexTemporalRangeClauses = 1024
+	maxIndexTimeTerms            = 65536
+)
+
 // ConvertFilterCondition converts a FilterCondition to OpenSearch DSL.
 func (c *OpenSearchConnector) ConvertFilterCondition(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
+	query, err := c.convertFilterCondition(condition, schemaDefinition)
+	if err != nil {
+		return nil, err
+	}
+	if countIndexRangeClauses(query) > 0 && countIndexQueryClauses(query) > maxIndexTemporalRangeClauses {
+		return nil, interfaces.NewConditionBuildError("OpenSearch range filters require at most %d query clauses", maxIndexTemporalRangeClauses)
+	}
+	return query, nil
+}
+
+func (c *OpenSearchConnector) convertFilterCondition(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	switch condition.GetOperation() {
 	case filter_condition.OperationAnd:
@@ -106,9 +125,9 @@ func (c *OpenSearchConnector) ConvertFilterConditionWithOpr(condition interfaces
 	case filter_condition.OperationNotLike:
 		return c.ConvertFilterConditionNotLike(condition, schemaDefinition)
 	case filter_condition.OperationContain:
-		return c.ConvertFilterConditionContain(condition)
+		return c.ConvertFilterConditionContain(condition, schemaDefinition)
 	case filter_condition.OperationNotContain:
-		return c.ConvertFilterConditionNotContain(condition)
+		return c.ConvertFilterConditionNotContain(condition, schemaDefinition)
 	case filter_condition.OperationRange:
 		return c.ConvertFilterConditionRange(condition)
 	case filter_condition.OperationOutRange:
@@ -122,9 +141,9 @@ func (c *OpenSearchConnector) ConvertFilterConditionWithOpr(condition interfaces
 	case filter_condition.OperationNotEmpty:
 		return c.ConvertFilterConditionNotEmpty(condition)
 	case filter_condition.OperationPrefix:
-		return c.ConvertFilterConditionPrefix(condition)
+		return c.ConvertFilterConditionPrefix(condition, schemaDefinition)
 	case filter_condition.OperationNotPrefix:
-		return c.ConvertFilterConditionNotPrefix(condition)
+		return c.ConvertFilterConditionNotPrefix(condition, schemaDefinition)
 	case filter_condition.OperationBetween:
 		return c.ConvertFilterConditionBetween(condition)
 	case filter_condition.OperationExist:
@@ -132,7 +151,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionWithOpr(condition interfaces
 	case filter_condition.OperationNotExist:
 		return c.ConvertFilterConditionNotExist(condition)
 	case filter_condition.OperationRegex:
-		return c.ConvertFilterConditionRegex(condition)
+		return c.ConvertFilterConditionRegex(condition, schemaDefinition)
 	case filter_condition.OperationMatch:
 		return c.ConvertFilterConditionMatch(condition)
 	case filter_condition.OperationMatchPhrase:
@@ -150,7 +169,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionWithOpr(condition interfaces
 	case filter_condition.OperationKnnVector:
 		return c.ConvertFilterConditionKnnVector(condition, schemaDefinition)
 	default:
-		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), filter_condition.QueryChannelOpenSearch)
+		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), fmt.Errorf("the opensearch query channel does not support this operation"))
 	}
 }
 
@@ -202,9 +221,17 @@ func (c *OpenSearchConnector) ConvertFilterConditionMultiMatch(condition interfa
 	}
 
 	value := cond.Cfg.Value
+	if len(cond.Fields) == 0 {
+		return nil, interfaces.NewConditionBuildError("condition [multi_match] requires at least one bound field")
+	}
 	fields := make([]string, 0, len(cond.Fields))
 	for _, field := range cond.Fields {
-		fields = append(fields, fulltextFieldName(field))
+		name := fulltextFieldName(field)
+		// 字段已经绑定，不能再被 OpenSearch 当成通配或权重表达式解析；反斜杠不能转义这些语法。
+		if name == "" || strings.ContainsAny(name, "*^") {
+			return nil, interfaces.NewConditionBuildError("condition [multi_match] field %q cannot be queried as a literal field name", name)
+		}
+		fields = append(fields, name)
 	}
 
 	multiMatchQuery := map[string]any{
@@ -239,12 +266,23 @@ func (c *OpenSearchConnector) ConvertFilterConditionEqual(condition interfaces.F
 	}
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+		if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
 			return nil, err
+		}
+		if cond.Lfield.Type == interfaces.DataType_Time {
+			query, _, err := indexTemporalSetQuery(exactField, cond.Lfield.Type, []any{cond.Value})
+			return query, err
+		}
+		if _, temporal := cond.Value.(time.Time); temporal {
+			query := indexTemporalRangeQuery(exactField, cond.Lfield.Type, map[string]any{
+				"gte": cond.Value,
+				"lte": cond.Value,
+			})
+			return query, nil
 		}
 		return map[string]any{
 			"term": map[string]any{
-				exactField: cond.Value,
+				exactField: indexConditionValue(cond.Value),
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
@@ -253,7 +291,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionEqual(condition interfaces.F
 		if err != nil {
 			return nil, err
 		}
-		return fieldComparisonScript(exactField, "==", rightExactField), nil
+		return fieldComparisonScript(exactField, "==", rightExactField, cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
@@ -277,16 +315,36 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotEqual(condition interface
 	}
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+		if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
 			return nil, err
 		}
+		var query map[string]any
+		if cond.Lfield.Type == interfaces.DataType_Time {
+			query, _, err = indexTemporalSetQuery(exactField, cond.Lfield.Type, []any{cond.Value})
+			if err != nil {
+				return nil, err
+			}
+		} else if _, temporal := cond.Value.(time.Time); temporal {
+			query = indexTemporalRangeQuery(exactField, cond.Lfield.Type, map[string]any{
+				"gte": cond.Value,
+				"lte": cond.Value,
+			})
+		} else {
+			query = map[string]any{
+				"term": map[string]any{
+					exactField: indexConditionValue(cond.Value),
+				},
+			}
+		}
+		// 仅比较有精确索引值的记录；NULL、缺失及超过 keyword ignore_above 的值不参与比较。
 		return map[string]any{
 			"bool": map[string]any{
-				"must_not": map[string]any{
-					"term": map[string]any{
-						exactField: cond.Value,
+				"filter": map[string]any{
+					"exists": map[string]any{
+						"field": exactField,
 					},
 				},
+				"must_not": query,
 			},
 		}, nil
 	case interfaces.ValueFrom_Field:
@@ -295,7 +353,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotEqual(condition interface
 		if err != nil {
 			return nil, err
 		}
-		return fieldComparisonScript(exactField, "!=", rightExactField), nil
+		return fieldComparisonScript(exactField, "!=", rightExactField, cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
@@ -311,16 +369,12 @@ func (c *OpenSearchConnector) ConvertFilterConditionGt(condition interfaces.Filt
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		return map[string]any{
-			"range": map[string]any{
-				cond.Lfield.OriginalName: map[string]any{
-					"gt": cond.Value,
-				},
-			},
-		}, nil
+		return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+			"gt": cond.Value,
+		}), nil
 	case interfaces.ValueFrom_Field:
 		return fieldComparisonScript(
-			propertyPhysicalFieldName(cond.Lfield), ">", propertyPhysicalFieldName(cond.Rfield)), nil
+			propertyPhysicalFieldName(cond.Lfield), ">", propertyPhysicalFieldName(cond.Rfield), cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
@@ -336,16 +390,12 @@ func (c *OpenSearchConnector) ConvertFilterConditionGte(condition interfaces.Fil
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		return map[string]any{
-			"range": map[string]any{
-				cond.Lfield.OriginalName: map[string]any{
-					"gte": cond.Value,
-				},
-			},
-		}, nil
+		return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+			"gte": cond.Value,
+		}), nil
 	case interfaces.ValueFrom_Field:
 		return fieldComparisonScript(
-			propertyPhysicalFieldName(cond.Lfield), ">=", propertyPhysicalFieldName(cond.Rfield)), nil
+			propertyPhysicalFieldName(cond.Lfield), ">=", propertyPhysicalFieldName(cond.Rfield), cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
@@ -361,16 +411,12 @@ func (c *OpenSearchConnector) ConvertFilterConditionLt(condition interfaces.Filt
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		return map[string]any{
-			"range": map[string]any{
-				cond.Lfield.OriginalName: map[string]any{
-					"lt": cond.Value,
-				},
-			},
-		}, nil
+		return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+			"lt": cond.Value,
+		}), nil
 	case interfaces.ValueFrom_Field:
 		return fieldComparisonScript(
-			propertyPhysicalFieldName(cond.Lfield), "<", propertyPhysicalFieldName(cond.Rfield)), nil
+			propertyPhysicalFieldName(cond.Lfield), "<", propertyPhysicalFieldName(cond.Rfield), cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
@@ -386,31 +432,49 @@ func (c *OpenSearchConnector) ConvertFilterConditionLte(condition interfaces.Fil
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
-		return map[string]any{
-			"range": map[string]any{
-				cond.Lfield.OriginalName: map[string]any{
-					"lte": cond.Value,
-				},
-			},
-		}, nil
+		return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+			"lte": cond.Value,
+		}), nil
 	case interfaces.ValueFrom_Field:
 		return fieldComparisonScript(
-			propertyPhysicalFieldName(cond.Lfield), "<=", propertyPhysicalFieldName(cond.Rfield)), nil
+			propertyPhysicalFieldName(cond.Lfield), "<=", propertyPhysicalFieldName(cond.Rfield), cond.Lfield.Type, cond.Rfield.Type)
 	default:
 		return nil, interfaces.NewConditionBuildError("value_from %s is not supported", cond.Cfg.ValueFrom)
 	}
 }
 
-func fieldComparisonScript(leftField string, operator string, rightField string) map[string]any {
+func fieldComparisonScript(leftField string, operator string, rightField string, leftType string, rightType string) (map[string]any, error) {
+	leftDate := interfaces.DataType_HasDatePart(leftType)
+	rightDate := interfaces.DataType_HasDatePart(rightType)
+	if leftDate != rightDate {
+		return nil, interfaces.NewConditionBuildError("cannot compare a date field with a non-date field")
+	}
+
+	// 缺失映射或空值不参与比较，与 SQL WHERE 中 NULL 比较不命中的语义一致。
+	guard := "doc.containsKey(params.left) && doc.containsKey(params.right) && " +
+		"doc[params.left].size() > 0 && doc[params.right].size() > 0 && "
+	comparison := fmt.Sprintf("doc[params.left].value %s doc[params.right].value", operator)
+	if (leftType == interfaces.DataType_UnsignedInteger || rightType == interfaces.DataType_UnsignedInteger) &&
+		(leftType == interfaces.DataType_Integer || leftType == interfaces.DataType_UnsignedInteger) &&
+		(rightType == interfaces.DataType_Integer || rightType == interfaces.DataType_UnsignedInteger) {
+		// unsigned_long 的 doc value 是 BigInteger；通用运算符会窄化为 int/long。
+		// 两侧整数均转为 BigInteger，避免高位截断，并正确比较有符号和无符号边界。
+		comparison = fmt.Sprintf("new BigInteger(doc[params.left].value.toString()).compareTo(new BigInteger(doc[params.right].value.toString())) %s 0", operator)
+	} else if leftDate && rightDate {
+		// 日期 doc value 是 ZonedDateTime，按 Instant 比较以保留纳秒并按绝对时刻判等。
+		comparison = fmt.Sprintf("doc[params.left].value.toInstant().compareTo(doc[params.right].value.toInstant()) %s 0", operator)
+	}
 	return map[string]any{
 		"script": map[string]any{
-			"source": fmt.Sprintf("doc[params.left].value %s doc[params.right].value", operator),
-			"params": map[string]any{
-				"left":  leftField,
-				"right": rightField,
+			"script": map[string]any{
+				"source": guard + comparison,
+				"params": map[string]any{
+					"left":  leftField,
+					"right": rightField,
+				},
 			},
 		},
-	}
+	}, nil
 }
 
 // ConvertFilterConditionIn converts an InCond to OpenSearch DSL.
@@ -421,10 +485,6 @@ func (c *OpenSearchConnector) ConvertFilterConditionIn(condition interfaces.Filt
 		return nil, fmt.Errorf("condition is not *filter_condition.InCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
 	fieldName := cond.Lfield.OriginalName
 	if fieldName == "" {
 		fieldName = cond.Lfield.Name
@@ -433,13 +493,21 @@ func (c *OpenSearchConnector) ConvertFilterConditionIn(condition interfaces.Filt
 	if err != nil {
 		return nil, err
 	}
-	if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+	if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
 		return nil, err
+	}
+
+	query, temporal, err := indexTemporalSetQuery(exactField, cond.Lfield.Type, cond.Value)
+	if err != nil {
+		return nil, err
+	}
+	if temporal {
+		return query, nil
 	}
 
 	return map[string]any{
 		"terms": map[string]any{
-			exactField: cond.Value,
+			exactField: indexConditionValue(cond.Value),
 		},
 	}, nil
 }
@@ -452,10 +520,6 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotIn(condition interfaces.F
 		return nil, fmt.Errorf("condition is not *filter_condition.NotInCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
 	fieldName := cond.Lfield.OriginalName
 	if fieldName == "" {
 		fieldName = cond.Lfield.Name
@@ -464,110 +528,98 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotIn(condition interfaces.F
 	if err != nil {
 		return nil, err
 	}
-	if err := validateKeywordValues(fieldName, cond.Value, schemaDefinition); err != nil {
+	if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
 		return nil, err
 	}
 
-	return map[string]any{
-		"bool": map[string]any{
-			"must_not": map[string]any{
-				"terms": map[string]any{
-					exactField: cond.Value,
-				},
-			},
-		},
-	}, nil
-}
-
-// ConvertFilterConditionLike converts a LikeCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionLike(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
-
-	cond, ok := condition.(*filter_condition.LikeCond)
-	if !ok {
-		return nil, fmt.Errorf("condition is not *filter_condition.LikeCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [like] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	fieldName := cond.Lfield.OriginalName
-	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	query, temporal, err := indexTemporalSetQuery(exactField, cond.Lfield.Type, cond.Value)
 	if err != nil {
 		return nil, err
 	}
-
-	if cond.LegacyWildcards {
-		return map[string]any{
-			"regexp": map[string]any{
-				exactField: c.legacyLikeWildcardRegexp(cond.Value),
-			},
-		}, nil
-	}
-
-	return map[string]any{
-		"wildcard": map[string]any{
-			exactField: c.likeContainsPattern(cond.Value),
-		},
-	}, nil
-}
-
-// ConvertFilterConditionNotLike converts a NotLikeCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionNotLike(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
-
-	cond, ok := condition.(*filter_condition.NotLikeCond)
-	if !ok {
-		return nil, fmt.Errorf("condition is not *filter_condition.NotLikeCond")
-	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_like] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	fieldName := cond.Lfield.OriginalName
-	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
-	if err != nil {
-		return nil, err
-	}
-
-	inner := map[string]any{
-		"wildcard": map[string]any{
-			exactField: c.likeContainsPattern(cond.Value),
-		},
-	}
-	if cond.LegacyWildcards {
-		inner = map[string]any{
-			"regexp": map[string]any{
-				exactField: c.legacyLikeWildcardRegexp(cond.Value),
+	if !temporal {
+		query = map[string]any{
+			"terms": map[string]any{
+				exactField: indexConditionValue(cond.Value),
 			},
 		}
 	}
 
+	// 与 != 一致，仅比较有精确索引值的记录，保留相同的 keyword 长度限制。
 	return map[string]any{
 		"bool": map[string]any{
-			"must_not": inner,
+			"filter": map[string]any{
+				"exists": map[string]any{
+					"field": exactField,
+				},
+			},
+			"must_not": query,
+		},
+	}, nil
+}
+
+// ConvertFilterConditionLike 使用完整 SQL LIKE 模式，不自动补充前后通配符。
+func (c *OpenSearchConnector) ConvertFilterConditionLike(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
+	cond, ok := condition.(*filter_condition.LikeCond)
+	if !ok {
+		return nil, fmt.Errorf("condition is not *filter_condition.LikeCond")
+	}
+	pattern, err := filter_condition.SQLLikeToWildcard(filter_condition.OperationLike, cond.Value)
+	if err != nil {
+		return nil, err
+	}
+	exactField, err := c.exactMatchFieldName(propertyPhysicalFieldName(cond.Lfield), schemaDefinition)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"wildcard": map[string]any{exactField: pattern}}, nil
+}
+
+// ConvertFilterConditionNotLike 排除 NULL/缺失的精确字段，保持 SQL NOT LIKE 的三值语义。
+func (c *OpenSearchConnector) ConvertFilterConditionNotLike(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
+	cond, ok := condition.(*filter_condition.NotLikeCond)
+	if !ok {
+		return nil, fmt.Errorf("condition is not *filter_condition.NotLikeCond")
+	}
+	pattern, err := filter_condition.SQLLikeToWildcard(filter_condition.OperationNotLike, cond.Value)
+	if err != nil {
+		return nil, err
+	}
+	exactField, err := c.exactMatchFieldName(propertyPhysicalFieldName(cond.Lfield), schemaDefinition)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"bool": map[string]any{
+			"filter":   map[string]any{"exists": map[string]any{"field": exactField}},
+			"must_not": map[string]any{"wildcard": map[string]any{exactField: pattern}},
 		},
 	}, nil
 }
 
 // ConvertFilterConditionContain converts a ContainCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionContain(condition interfaces.FilterCondition) (map[string]any, error) {
+func (c *OpenSearchConnector) ConvertFilterConditionContain(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	cond, ok := condition.(*filter_condition.ContainCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.ContainCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [contain] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	if err != nil {
+		return nil, err
 	}
-	// The text contains queries that must use match /match_phrase
+	if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
+		return nil, err
+	}
+
+	// 索引集合语义保持任一精确项命中；TEXT 使用 keyword 子字段。
 	values := cond.Value
 	should := make([]map[string]any, len(values))
 	for i, v := range values {
 		should[i] = map[string]any{
 			"term": map[string]any{
-				cond.Lfield.OriginalName: v,
+				exactField: v,
 			},
 		}
 	}
@@ -581,15 +633,20 @@ func (c *OpenSearchConnector) ConvertFilterConditionContain(condition interfaces
 }
 
 // ConvertFilterConditionNotContain converts a NotContainCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionNotContain(condition interfaces.FilterCondition) (map[string]any, error) {
+func (c *OpenSearchConnector) ConvertFilterConditionNotContain(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	cond, ok := condition.(*filter_condition.NotContainCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotContainCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_contain] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateKeywordValues(fieldName, cond.Cfg.Field, cond.Value, schemaDefinition); err != nil {
+		return nil, err
 	}
 
 	values := cond.Value
@@ -597,7 +654,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotContain(condition interfa
 	for i, v := range values {
 		mustNot[i] = map[string]any{
 			"term": map[string]any{
-				cond.Lfield.OriginalName: v,
+				exactField: v,
 			},
 		}
 	}
@@ -617,23 +674,15 @@ func (c *OpenSearchConnector) ConvertFilterConditionRange(condition interfaces.F
 		return nil, fmt.Errorf("condition is not *filter_condition.RangeCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [range] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
 	values := cond.Value
 	if len(values) != 2 {
 		return nil, interfaces.NewConditionBuildError("range condition requires exactly 2 values")
 	}
 
-	return map[string]any{
-		"range": map[string]any{
-			cond.Lfield.OriginalName: map[string]any{
-				"gte": values[0],
-				"lte": values[1],
-			},
-		},
-	}, nil
+	return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+		"gte": values[0],
+		"lte": values[1],
+	}), nil
 }
 
 // ConvertFilterConditionOutRange converts an OutRangeCond to OpenSearch DSL.
@@ -644,10 +693,6 @@ func (c *OpenSearchConnector) ConvertFilterConditionOutRange(condition interface
 		return nil, fmt.Errorf("condition is not *filter_condition.OutRangeCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [out_range] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
 	values := cond.Value
 	if len(values) != 2 {
 		return nil, interfaces.NewConditionBuildError("out_range condition requires exactly 2 values")
@@ -656,20 +701,12 @@ func (c *OpenSearchConnector) ConvertFilterConditionOutRange(condition interface
 	return map[string]any{
 		"bool": map[string]any{
 			"should": []map[string]any{
-				{
-					"range": map[string]any{
-						cond.Lfield.OriginalName: map[string]any{
-							"lt": values[0],
-						},
-					},
-				},
-				{
-					"range": map[string]any{
-						cond.Lfield.OriginalName: map[string]any{
-							"gt": values[1],
-						},
-					},
-				},
+				indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+					"lt": values[0],
+				}),
+				indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+					"gt": values[1],
+				}),
 			},
 			"minimum_should_match": 1,
 		},
@@ -850,31 +887,39 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotEmpty(condition interface
 }
 
 // ConvertFilterConditionPrefix converts a PrefixCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionPrefix(condition interfaces.FilterCondition) (map[string]any, error) {
+func (c *OpenSearchConnector) ConvertFilterConditionPrefix(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	cond, ok := condition.(*filter_condition.PrefixCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.PrefixCond")
 	}
 
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	if err != nil {
+		return nil, err
+	}
+
 	vStr := cond.Value
 	return map[string]any{
 		"prefix": map[string]any{
-			cond.Lfield.OriginalName: vStr,
+			exactField: vStr,
 		},
 	}, nil
 }
 
 // ConvertFilterConditionNotPrefix converts a NotPrefixCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionNotPrefix(condition interfaces.FilterCondition) (map[string]any, error) {
+func (c *OpenSearchConnector) ConvertFilterConditionNotPrefix(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	cond, ok := condition.(*filter_condition.NotPrefixCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotPrefixCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_prefix] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	if err != nil {
+		return nil, err
 	}
 
 	vStr := cond.Value
@@ -882,7 +927,7 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotPrefix(condition interfac
 		"bool": map[string]any{
 			"must_not": map[string]any{
 				"prefix": map[string]any{
-					cond.Lfield.OriginalName: vStr,
+					exactField: vStr,
 				},
 			},
 		},
@@ -897,23 +942,15 @@ func (c *OpenSearchConnector) ConvertFilterConditionBetween(condition interfaces
 		return nil, fmt.Errorf("condition is not *filter_condition.BetweenCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [between] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
 	values := cond.Value
 	if len(values) != 2 {
 		return nil, interfaces.NewConditionBuildError("between condition requires exactly 2 values")
 	}
 
-	return map[string]any{
-		"range": map[string]any{
-			cond.Lfield.OriginalName: map[string]any{
-				"gte": values[0],
-				"lte": values[1],
-			},
-		},
-	}, nil
+	return indexTemporalRangeQuery(propertyPhysicalFieldName(cond.Lfield), cond.Lfield.Type, map[string]any{
+		"gte": values[0],
+		"lte": values[1],
+	}), nil
 }
 
 // ConvertFilterConditionExist converts an ExistCond to OpenSearch DSL.
@@ -951,20 +988,22 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotExist(condition interface
 }
 
 // ConvertFilterConditionRegex converts a RegexCond to OpenSearch DSL.
-func (c *OpenSearchConnector) ConvertFilterConditionRegex(condition interfaces.FilterCondition) (map[string]any, error) {
+func (c *OpenSearchConnector) ConvertFilterConditionRegex(condition interfaces.FilterCondition, schemaDefinition []*interfaces.Property) (map[string]any, error) {
 
 	cond, ok := condition.(*filter_condition.RegexCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.RegexCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [regex] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	exactField, err := c.exactMatchFieldName(fieldName, schemaDefinition)
+	if err != nil {
+		return nil, err
 	}
 
 	return map[string]any{
 		"regexp": map[string]any{
-			cond.Lfield.OriginalName: cond.Value,
+			exactField: cond.Value,
 		},
 	}, nil
 }
@@ -1012,41 +1051,107 @@ func (c *OpenSearchConnector) ConvertFilterConditionBefore(condition interfaces.
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.BeforeCond")
 	}
+	return indexBeforeQuery(cond, time.Now())
+}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [before] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	values := cond.Value
-	if len(values) != 2 {
+// indexBeforeQuery 显式接收查询时刻，使相对时间转换可用固定时钟验证。
+func indexBeforeQuery(cond *filter_condition.BeforeCond, now time.Time) (map[string]any, error) {
+	if len(cond.Value) != 2 {
 		return nil, interfaces.NewConditionBuildError("before condition requires exactly 2 values")
 	}
 
-	interval, ok := common.NumberAsFloat64(values[0])
+	unit, ok := cond.Value[1].(string)
 	if !ok {
-		return nil, fmt.Errorf("condition [before] interval value should be a number")
+		return nil, interfaces.NewConditionBuildError("before unit must be a string")
 	}
-	datetimeStr, ok := values[1].(string)
-	if !ok {
-		return nil, fmt.Errorf("condition [before] datetime value should be a string")
+	fieldName := propertyPhysicalFieldName(cond.Lfield)
+	interval, ok := common.NumberAsInt64(cond.Value[0])
+	// 保持既有索引 before 条件的间隔上限。
+	if !ok || interval <= 0 || interval > math.MaxInt32 {
+		return nil, interfaces.NewConditionBuildError("before interval must be a positive integer no greater than %d", math.MaxInt32)
 	}
-
-	// Parse the datetime string
-	datetime, err := time.Parse(time.RFC3339, datetimeStr)
+	normalizedUnit := strings.ToLower(strings.TrimSpace(unit))
+	switch normalizedUnit {
+	case "year", "month", "week", "day", "hour", "minute", "second":
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported before unit: %s", unit)
+	}
+	if cond.Lfield.Type != interfaces.DataType_Date && cond.Lfield.Type != interfaces.DataType_Datetime {
+		return nil, interfaces.NewConditionBuildError("index before requires a date or datetime field")
+	}
+	zone := common.ServerTimeZone()
+	location, err := time.LoadLocation(zone)
 	if err != nil {
-		return nil, fmt.Errorf("condition [before] failed to parse datetime: %w", err)
+		return nil, interfaces.NewServerTimeZoneError()
 	}
-
-	// Subtract the interval hours from the datetime
-	resultTime := datetime.Add(-time.Duration(interval) * time.Hour)
-
+	anchor := now.UTC()
+	if cond.Lfield.Type == interfaces.DataType_Date {
+		// date 按日历日期索引为 UTC 午夜；在相同墙钟坐标比较，避免服务时区换日偏移。
+		wall := now.In(location)
+		anchor = time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), wall.Second(), wall.Nanosecond(), time.UTC)
+		location = time.UTC
+	}
+	cutoff := indexBeforeCutoff(anchor, interval, normalizedUnit, location)
+	if err := validateIndexTimeBoundary(cond, cutoff, interval, normalizedUnit); err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"range": map[string]any{
-			cond.Lfield.OriginalName: map[string]any{
-				"lt": resultTime.Format(time.RFC3339),
+			fieldName: map[string]any{
+				"lt":     cutoff.UTC().Format(common.RFC3339FixedNanosLayout),
+				"format": indexDateQueryFormat,
 			},
 		},
 	}, nil
+}
+
+func validateIndexTimeBoundary(cond *filter_condition.BeforeCond, cutoff time.Time, interval int64, unit string) error {
+	fieldType := "date"
+	minTime, maxTime := time.UnixMilli(math.MinInt64), time.UnixMilli(math.MaxInt64)
+	if cond.Lfield.OriginalType == "date_nanos" {
+		fieldType = "date_nanos"
+		minTime, maxTime = time.Unix(0, 0), time.Unix(0, math.MaxInt64)
+	}
+	if cutoff.Before(minTime) || cutoff.After(maxTime) {
+		return interfaces.NewTemporalRangeError(cond.Lfield.Name, fieldType, interval, unit)
+	}
+	return nil
+}
+
+// indexBeforeCutoff 在服务时区计算截止时刻，供值域校验和查询共用。
+// 小时以下按经过时间计算，避免大间隔转换为 time.Duration 时溢出。
+// 年/月截断到目标月末；日/周使用标准库的日历运算。
+func indexBeforeCutoff(anchor time.Time, interval int64, unit string, location *time.Location) time.Time {
+	seconds := int64(0)
+	switch unit {
+	case "second":
+		seconds = interval
+	case "minute":
+		seconds = interval * 60
+	case "hour":
+		seconds = interval * 3600
+	}
+	if seconds != 0 {
+		return time.Unix(anchor.Unix()-seconds, int64(anchor.Nanosecond())).In(location)
+	}
+	local := anchor.In(location)
+	switch unit {
+	case "year", "month":
+		years, months := 0, 0
+		if unit == "year" {
+			years = -int(interval)
+		} else {
+			months = -int(interval)
+		}
+		month := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(years, months, 0)
+		day := min(local.Day(), month.AddDate(0, 1, -1).Day())
+		return time.Date(month.Year(), month.Month(), day, local.Hour(), local.Minute(), local.Second(), local.Nanosecond(), location)
+	case "week":
+		return local.AddDate(0, 0, -int(interval)*7)
+	case "day":
+		return local.AddDate(0, 0, -int(interval))
+	}
+	return local
 }
 
 // ConvertFilterConditionCurrent converts a CurrentCond to OpenSearch DSL.
@@ -1057,9 +1162,6 @@ func (c *OpenSearchConnector) ConvertFilterConditionCurrent(condition interfaces
 		return nil, fmt.Errorf("condition is not *filter_condition.CurrentCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [current] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
 	// Get current time
 	now := time.Now()
 	// Calculate the start and end of the current period
@@ -1153,68 +1255,6 @@ func (c *OpenSearchConnector) ConvertFilterConditionKnnVector(condition interfac
 	}, nil
 }
 
-// likeContainsPattern converts a literal like/not_like substring into an OpenSearch wildcard pattern.
-//
-// The like contract uses substring containment. ParseLikeValue has already handled % and _,
-// so the value is matched literally here; escape the wildcard metacharacters * ? \ and wrap it in *.
-func (c *OpenSearchConnector) likeContainsPattern(input string) string {
-	var escaped strings.Builder
-	for _, r := range input {
-		if r == '*' || r == '?' || r == '\\' {
-			escaped.WriteRune('\\')
-		}
-		escaped.WriteRune(r)
-	}
-	return "*" + escaped.String() + "*"
-}
-
-// legacyLikeWildcardRegexp reproduces how the index path handled a like value before this
-// change: % -> .*, _ -> ., backslash escapes preserved. It is used only for conditions marked
-// as legacy (see filter_condition.MarkLegacyLikeWildcards), so stored view definitions return
-// the same rows as before; new values go through likeContainsPattern's literal semantics.
-func (c *OpenSearchConnector) legacyLikeWildcardRegexp(input string) string {
-	if input == "" {
-		return input
-	}
-
-	var result strings.Builder
-	escaped := false
-	runes := []rune(input)
-
-	for i := 0; i < len(runes); i++ {
-		r := runes[i]
-
-		if escaped {
-			switch r {
-			case '%', '_', '\\':
-				result.WriteRune(r)
-			default:
-				result.WriteRune('\\')
-				result.WriteRune(r)
-			}
-			escaped = false
-		} else if r == '\\' {
-			if i == len(runes)-1 {
-				result.WriteRune(r)
-			} else {
-				escaped = true
-			}
-		} else if r == '%' {
-			result.WriteString(".*")
-		} else if r == '_' {
-			result.WriteString(".")
-		} else {
-			result.WriteRune(r)
-		}
-	}
-
-	if escaped {
-		result.WriteRune('\\')
-	}
-
-	return result.String()
-}
-
 // exactMatchProperty 为别名查找目标字段，复用目标的 keyword 配置和校验元数据。
 // 别名不能指向另一个别名；目标不在 schema 中时保留原字段，由调用方保守校验。
 func exactMatchProperty(fieldName string, schemaDefinition []*interfaces.Property) *interfaces.Property {
@@ -1239,7 +1279,7 @@ func exactMatchProperty(fieldName string, schemaDefinition []*interfaces.Propert
 func (c *OpenSearchConnector) exactMatchFieldName(fieldName string, schemaDefinition []*interfaces.Property) (string, error) {
 	prop := exactMatchProperty(fieldName, schemaDefinition)
 	if prop == nil {
-		return fieldName, nil
+		return "", interfaces.NewConditionBuildError("field %q not found in schema", fieldName)
 	}
 	physicalName := propertyPhysicalFieldName(prop)
 	if prop.Type != interfaces.DataType_Text {
@@ -1253,8 +1293,9 @@ func (c *OpenSearchConnector) exactMatchFieldName(fieldName string, schemaDefini
 	return "", interfaces.NewConditionBuildError("text field %s has no keyword feature; re-save the resource configuration and rebuild the local index, or use match", fieldName)
 }
 
-func validateKeywordValues(fieldName string, value any, schemaDefinition []*interfaces.Property) error {
-	prop := exactMatchProperty(fieldName, schemaDefinition)
+// validateKeywordValues 使用物理字段配置校验，超限错误保留调用方请求的字段名。
+func validateKeywordValues(physicalFieldName, requestFieldName string, value any, schemaDefinition []*interfaces.Property) error {
+	prop := exactMatchProperty(physicalFieldName, schemaDefinition)
 	if prop == nil || (prop.Type != interfaces.DataType_String && prop.Type != interfaces.DataType_Text) {
 		return nil
 	}
@@ -1275,8 +1316,7 @@ func validateKeywordValues(fieldName string, value any, schemaDefinition []*inte
 			// OpenSearch compares ignore_above with Java String.length(), whose
 			// unit is UTF-16 code units rather than Unicode code points.
 			if ok && len(utf16.Encode([]rune(text))) > limit {
-				return interfaces.NewConditionBuildError(
-					"value for %s field %s exceeds keyword ignore_above %d and cannot be compared exactly", prop.Type, fieldName, limit)
+				return interfaces.NewKeywordLimitError(requestFieldName, limit)
 			}
 		}
 		return nil
@@ -1291,4 +1331,152 @@ func positiveInt(value any) (int, bool) {
 		return 0, false
 	}
 	return converted, true
+}
+
+// indexConditionValue 将公共层的 datetime 时刻编码为明确的 UTC RFC3339 文本，
+// date/time 字符串保持日历语义，集合值逐项处理，不改写条件本身。
+func indexConditionValue(value any) any {
+	switch typed := value.(type) {
+	case time.Time:
+		return typed.UTC().Format(common.RFC3339FixedNanosLayout)
+	case []any:
+		values := make([]any, len(typed))
+		for i, item := range typed {
+			values[i] = indexConditionValue(item)
+		}
+		return values
+	default:
+		return value
+	}
+}
+
+func indexTemporalRangeQuery(field, fieldType string, bounds map[string]any) map[string]any {
+	encoded := make(map[string]any, len(bounds)+1)
+	for op, value := range bounds {
+		encoded[op] = indexConditionValue(value)
+		if fieldType == interfaces.DataType_Time {
+			// 对合法 HH:mm:ss[.fraction]，同一时刻的所有尾零形式位于这两个字典序边界之间。
+			if text, ok := value.(string); ok {
+				if clock, err := time.Parse(common.TimeLayout, text); err == nil {
+					layout := common.TimeLayout
+					if op == "gt" || op == "lte" {
+						layout = common.TimeFixedNanosLayout
+					}
+					encoded[op] = clock.Format(layout)
+				}
+			}
+		}
+		if _, temporal := value.(time.Time); temporal {
+			encoded["format"] = indexDateQueryFormat
+		}
+	}
+	return map[string]any{"range": map[string]any{field: encoded}}
+}
+
+// 日期 terms 在引擎内仍展开为布尔子句，且整数毫秒会扩大 date_nanos 的匹配范围。
+// datetime 使用固定纳秒精度的闭区间；time keyword 使用有限的等价尾零集合。
+func indexTemporalSetQuery(field, fieldType string, values []any) (map[string]any, bool, error) {
+	if len(values) == 0 {
+		return nil, false, nil
+	}
+	unique := make([]any, 0, len(values))
+	seen := make(map[any]struct{}, len(values))
+	for _, value := range values {
+		if fieldType == interfaces.DataType_Time {
+			parsed, err := filter_condition.ParseTemporalValue(fieldType, value, common.ServerTimeZone())
+			if err != nil {
+				return nil, true, err
+			}
+			value = parsed
+		} else if instant, temporal := value.(time.Time); temporal {
+			value = instant.UTC()
+		} else {
+			return nil, false, nil
+		}
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		unique = append(unique, value)
+	}
+	if fieldType == interfaces.DataType_Time {
+		// keyword terms 不会像日期 terms 一样展开布尔子句；枚举最多 10 种等价尾零形式。
+		if len(unique) > maxIndexTimeTerms {
+			return nil, true, interfaces.NewConditionBuildError("OpenSearch time sets support at most %d expanded terms", maxIndexTimeTerms)
+		}
+		terms := make([]any, 0, len(unique))
+		for _, value := range unique {
+			text := value.(string)
+			terms = append(terms, text)
+			if !strings.Contains(text, ".") {
+				text += "."
+			}
+			for len(text) < len(common.TimeFixedNanosLayout) {
+				text += "0"
+				terms = append(terms, text)
+			}
+			if len(terms) > maxIndexTimeTerms {
+				return nil, true, interfaces.NewConditionBuildError("OpenSearch time sets support at most %d expanded terms", maxIndexTimeTerms)
+			}
+		}
+		return map[string]any{"terms": map[string]any{field: terms}}, true, nil
+	}
+	if len(unique) > maxIndexTemporalRangeClauses {
+		return nil, true, interfaces.NewConditionBuildError("OpenSearch temporal sets support at most %d distinct values", maxIndexTemporalRangeClauses)
+	}
+	queries := make([]map[string]any, len(unique))
+	for i, value := range unique {
+		queries[i] = indexTemporalRangeQuery(field, fieldType, map[string]any{"gte": value, "lte": value})
+	}
+	return map[string]any{"bool": map[string]any{"should": queries, "minimum_should_match": 1}}, true, nil
+}
+
+// 按整个条件树计算 range 预算，覆盖 datetime/time 集合及混合条件。
+func countIndexRangeClauses(value any) int {
+	count := 0
+	switch typed := value.(type) {
+	case map[string]any:
+		if ranges, ok := typed["range"].(map[string]any); ok {
+			count += len(ranges)
+		}
+		for _, child := range typed {
+			count += countIndexRangeClauses(child)
+		}
+	case []map[string]any:
+		for _, child := range typed {
+			count += countIndexRangeClauses(child)
+		}
+	case []any:
+		for _, child := range typed {
+			count += countIndexRangeClauses(child)
+		}
+	}
+	return count
+}
+
+func countIndexQueryClauses(value any) int {
+	switch query := value.(type) {
+	case map[string]any:
+		if boolean, ok := query["bool"].(map[string]any); ok {
+			count := 0
+			for _, op := range []string{"must", "filter", "should", "must_not"} {
+				count += countIndexQueryClauses(boolean[op])
+			}
+			return count
+		}
+		return 1
+	case []map[string]any:
+		count := 0
+		for _, query := range query {
+			count += countIndexQueryClauses(query)
+		}
+		return count
+	case []any:
+		count := 0
+		for _, query := range query {
+			count += countIndexQueryClauses(query)
+		}
+		return count
+	}
+	return 0
 }

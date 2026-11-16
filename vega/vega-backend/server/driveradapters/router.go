@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	libCommon "github.com/openbkn-ai/bkn-foundry/comm-go/common"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/hydra"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/middleware"
@@ -28,6 +29,7 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/auth"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/build_schedule"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/build_task"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/catalog_health_check_schedule"
@@ -57,6 +59,7 @@ type restHandler struct {
 	proxyAuditRecorder proxyReadAuditRecorder
 	as                 interfaces.AuthService
 	bts                interfaces.BuildTaskService
+	bss                interfaces.BuildScheduleService
 	cs                 interfaces.CatalogService
 	cts                interfaces.ConnectorTypeService
 	ds                 interfaces.DatasetService
@@ -87,6 +90,7 @@ func NewRestHandler(appSetting *common.AppSetting, auditRecorder operationAuditR
 	rs := resource.NewResourceService(appSetting, ds)
 	pas := proxy_authorization.NewProxyAuthorizationService(logics.PAA)
 	bts := build_task.NewBuildTaskService(appSetting, rs)
+	bss := build_schedule.NewBuildScheduleService(appSetting, bts, rs)
 	suts := semantic_understanding_task.NewSemanticUnderstandingTaskService(appSetting)
 	ums := user_mgmt.NewUserMgmtService(appSetting)
 
@@ -96,6 +100,7 @@ func NewRestHandler(appSetting *common.AppSetting, auditRecorder operationAuditR
 		auditTelemetry: auditTelemetry,
 		as:             as,
 		bts:            bts,
+		bss:            bss,
 		cs:             cs,
 		cts:            cts,
 		ds:             ds,
@@ -174,6 +179,7 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 
 			resources.POST("/:id/data", r.verifyJsonContentType(), r.PostResourceDataByEx)
 			resources.PUT("/:id/data/:docid", r.verifyJsonContentType(), r.PutResourceDataDocByEx)
+			resources.PUT("/:id/data", r.verifyJsonContentType(), r.PutResourceDataByEx)
 			resources.GET("/:id/data/:docid", r.GetResourceDataDocByEx)
 			resources.DELETE("/:id/data/:docid", r.DeleteResourceDataByEx)
 		}
@@ -198,6 +204,18 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 			discoverSchedules.POST("/:id/disable", r.DisableDiscoverScheduleByEx)
 		}
 
+		// 构建计划采用顶层资源，与探查计划保持一致。
+		buildSchedules := apiV1.Group("/build-schedules")
+		{
+			buildSchedules.POST("", r.verifyJsonContentType(), r.CreateBuildScheduleByEx)
+			buildSchedules.GET("", r.ListBuildSchedulesByEx)
+			buildSchedules.GET("/:id", r.GetBuildScheduleByEx)
+			buildSchedules.PUT("/:id", r.verifyJsonContentType(), r.UpdateBuildScheduleByEx)
+			buildSchedules.DELETE("/:id", r.DeleteBuildScheduleByEx)
+			buildSchedules.POST("/:id/enable", r.EnableBuildScheduleByEx)
+			buildSchedules.POST("/:id/disable", r.DisableBuildScheduleByEx)
+		}
+
 		// BuildTask APIs - External
 		buildTasks := apiV1.Group("/build-tasks")
 		{
@@ -215,6 +233,7 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 			semanticUnderstandingTasks.POST("", r.verifyJsonContentType(), r.CreateSemanticUnderstandingTaskByEx)
 			semanticUnderstandingTasks.GET("", r.ListSemanticUnderstandingTasksByEx)
 			semanticUnderstandingTasks.GET("/:id", r.GetSemanticUnderstandingTaskByEx)
+			semanticUnderstandingTasks.POST("/:id/apply", r.verifyJsonContentType(), r.ApplySemanticUnderstandingTaskByEx)
 			semanticUnderstandingTasks.DELETE("/:ids", r.DeleteSemanticUnderstandingTasksByEx)
 		}
 
@@ -283,6 +302,7 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 
 			resources.POST("/:id/data", r.verifyJsonContentType(), r.PostResourceDataByIn)
 			resources.PUT("/:id/data/:docid", r.verifyJsonContentType(), r.PutResourceDataDocByIn)
+			resources.PUT("/:id/data", r.verifyJsonContentType(), r.PutResourceDataByIn)
 			resources.GET("/:id/data/:docid", r.GetResourceDataDocByIn)
 			resources.DELETE("/:id/data/:docid", r.DeleteResourceDataByIn)
 		}
@@ -307,6 +327,18 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 			discoverSchedules.POST("/:id/disable", r.DisableDiscoverScheduleByIn)
 		}
 
+		// 构建计划采用顶层资源，与探查计划保持一致。
+		buildSchedules := apiInV1.Group("/build-schedules")
+		{
+			buildSchedules.POST("", r.verifyJsonContentType(), r.CreateBuildScheduleByIn)
+			buildSchedules.GET("", r.ListBuildSchedulesByIn)
+			buildSchedules.GET("/:id", r.GetBuildScheduleByIn)
+			buildSchedules.PUT("/:id", r.verifyJsonContentType(), r.UpdateBuildScheduleByIn)
+			buildSchedules.DELETE("/:id", r.DeleteBuildScheduleByIn)
+			buildSchedules.POST("/:id/enable", r.EnableBuildScheduleByIn)
+			buildSchedules.POST("/:id/disable", r.DisableBuildScheduleByIn)
+		}
+
 		// BuildTask APIs - Internal
 		buildTasks := apiInV1.Group("/build-tasks")
 		{
@@ -324,6 +356,7 @@ func (r *restHandler) RegisterPublic(c *gin.Engine) {
 			semanticUnderstandingTasks.POST("", r.verifyJsonContentType(), r.CreateSemanticUnderstandingTaskByIn)
 			semanticUnderstandingTasks.GET("", r.ListSemanticUnderstandingTasksByIn)
 			semanticUnderstandingTasks.GET("/:id", r.GetSemanticUnderstandingTaskByIn)
+			semanticUnderstandingTasks.POST("/:id/apply", r.verifyJsonContentType(), r.ApplySemanticUnderstandingTaskByIn)
 			semanticUnderstandingTasks.DELETE("/:ids", r.DeleteSemanticUnderstandingTasksByIn)
 		}
 
@@ -365,7 +398,7 @@ func (r *restHandler) verifyJsonContentType() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		//Intercept the request and determine whether the ContentType is XXX
 		if c.ContentType() != interfaces.CONTENT_TYPE_JSON {
-			httpErr := rest.NewHTTPError(c, http.StatusNotAcceptable, verrors.VegaBackend_InvalidRequestHeader_ContentType).
+			httpErr := httperrors.NewHTTPError(c, http.StatusNotAcceptable, verrors.VegaBackend_InvalidRequestHeader_ContentType).
 				WithErrorDetails(fmt.Sprintf("Content-Type header [%s] is not supported, expected is [application/json].", c.ContentType()))
 			rest.ReplyError(c, httpErr)
 
@@ -415,7 +448,7 @@ func (r *restHandler) AccessLog() gin.HandlerFunc {
 func (r *restHandler) verifyOAuth(ctx context.Context, c *gin.Context) (hydra.Visitor, error) {
 	visitor, err := r.as.VerifyToken(ctx, c)
 	if err != nil {
-		httpErr := rest.NewHTTPError(ctx, http.StatusUnauthorized, rest.PublicError_Unauthorized).
+		httpErr := httperrors.NewHTTPError(ctx, http.StatusUnauthorized, httperrors.PublicError_Unauthorized).
 			WithErrorDetails(err.Error())
 		rest.ReplyError(c, httpErr)
 		return visitor, err
@@ -426,12 +459,12 @@ func (r *restHandler) verifyOAuth(ctx context.Context, c *gin.Context) (hydra.Vi
 }
 
 // HTTPErrorOrInternal 保留 Service 返回的 HTTP 错误；其他错误转换为调用方指定的内部错误码。
-func httpErrorOrInternal(ctx context.Context, err error, internalErrorCode string) *rest.HTTPError {
-	var httpErr *rest.HTTPError
-	if errors.As(err, &httpErr) {
+func httpErrorOrInternal(ctx context.Context, err error, internalErrorCode string) *httperrors.HTTPError {
+	var httpErr *httperrors.HTTPError
+	if errors.As(err, &httpErr) && httpErr != nil {
 		return httpErr
 	}
 
-	return rest.NewHTTPError(ctx, http.StatusInternalServerError, internalErrorCode).
-		WithErrorDetails(err.Error())
+	logger.Errorf("request failed with internal diagnostic: %v", err)
+	return httperrors.NewHTTPError(ctx, http.StatusInternalServerError, internalErrorCode)
 }

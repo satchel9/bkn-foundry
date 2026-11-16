@@ -37,7 +37,8 @@ type PTCToolkit struct {
 	Version string `json:"version"`
 	// Digest is a list of function signatures shown to the model and is used as a tool description for run_code.
 	Digest string `json:"digest"`
-	// A stub is a sandboxed Python implementation that is inlined into the script with each execution.
+	// Stub is the Python implementation retained for legacy toolkit clients.
+	// Server-side run_code imports the matching implementation preinstalled in the sandbox image.
 	Stub string `json:"stub"`
 	// SandboxMCPURL is the address the sandbox uses to call back into this service. The sandbox is inside the cluster
 	// and cannot use the browser-side gateway address; only the server knows the in-cluster address.
@@ -270,24 +271,67 @@ func ptcToleratedParams(raw json.RawMessage) []string {
 	return names
 }
 
-// ptcStubSignature is ptcSignature plus the tolerated plumbing parameters. Only the
-// executable stub carries them; the digest shown to the model stays without them, so it
-// keeps telling the model not to pass bkn_context.
+// ptcStubSignature is the executable stub's signature: ptcCallSignature plus the
+// tolerated plumbing parameters.
 func ptcStubSignature(tool MCPToolInfo) string {
+	return ptcCallSignature(tool, ptcToleratedParams(tool.InputSchema))
+}
+
+// ptcDigestSignature is the signature shown to the model. It puts every argument in the
+// same slot as the stub, by-name-only ones after the star, but leaves the plumbing
+// parameters out, so it keeps telling the model not to pass bkn_context.
+func ptcDigestSignature(tool MCPToolInfo) string {
+	return ptcCallSignature(tool, nil)
+}
+
+// ptcCallSignature is ptcSignature with the arguments that arrived after scripts already
+// used the optional ones positionally moved after a star, and with tolerated appended.
+func ptcCallSignature(tool MCPToolInfo, tolerated []string) string {
 	signature := ptcSignature(tool)
-	tolerated := ptcToleratedParams(tool.InputSchema)
-	if len(tolerated) == 0 {
+	// These tools gained branch after scripts had already used their optional
+	// arguments positionally. Keep every old positional slot stable in the
+	// executable stub; branch is available by name only.
+	branchKeywordOnly := tool.Name == toolKeyQueryMetric || tool.Name == toolKeyDrillThroughMetric ||
+		tool.Name == toolKeyGetKnDetail || tool.Name == toolKeyGetObjectTypes
+	if branchKeywordOnly {
+		signature = strings.Replace(signature, ", branch: str = 'main'", "", 1)
+	}
+	// kn_version and draft_revision arrived the same way: after scripts used the
+	// optional arguments positionally, so they are by-name only for every tool.
+	var keywordOnly []string
+	for _, kw := range []string{"draft_revision: int = None", "kn_version: str = None"} {
+		if strings.Contains(signature, ", "+kw) {
+			signature = strings.Replace(signature, ", "+kw, "", 1)
+			keywordOnly = append(keywordOnly, kw)
+		}
+	}
+	if len(tolerated) == 0 && !branchKeywordOnly && len(keywordOnly) == 0 {
 		return signature
 	}
 	parts := make([]string, 0, len(tolerated))
 	for _, name := range tolerated {
 		parts = append(parts, name+": dict = None")
 	}
-	separator := ", "
-	if strings.HasSuffix(signature, "()") {
-		separator = ""
+	signature = strings.TrimSuffix(signature, ")")
+	if len(parts) > 0 {
+		if !strings.HasSuffix(signature, "(") {
+			signature += ", "
+		}
+		signature += strings.Join(parts, ", ")
 	}
-	return strings.TrimSuffix(signature, ")") + separator + strings.Join(parts, ", ") + ")"
+	if branchKeywordOnly || len(keywordOnly) > 0 {
+		if !strings.HasSuffix(signature, "(") {
+			signature += ", "
+		}
+		signature += "*"
+		if branchKeywordOnly {
+			signature += ", branch: str = 'main'"
+		}
+		for i := len(keywordOnly) - 1; i >= 0; i-- {
+			signature += ", " + keywordOnly[i]
+		}
+	}
+	return signature + ")"
 }
 
 // ptcReturnKeys Render return value top-level keys. Key names are not uniform among tools (some list classes are called entries,
@@ -453,7 +497,7 @@ func renderPTCDigestForLocale(locale *mcpLocaleBundle, tools []MCPToolInfo, with
 			fmt.Fprintf(&b, "\n### %s\n\n```python\n", ptcGroupTitle(locale, tool))
 			group = next
 		}
-		fmt.Fprintf(&b, "%s -> %s\n", ptcSignature(tool), ptcReturnKeys(tool))
+		fmt.Fprintf(&b, "%s -> %s\n", ptcDigestSignature(tool), ptcReturnKeys(tool))
 		if tool.Title != "" {
 			fmt.Fprintf(&b, "    # %s\n", tool.Title)
 		}

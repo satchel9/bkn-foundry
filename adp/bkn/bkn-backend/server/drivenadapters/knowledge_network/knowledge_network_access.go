@@ -23,10 +23,10 @@ import (
 	attr "go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
-	"bkn-backend/common"
-	"bkn-backend/drivenadapters/object_type"
-	"bkn-backend/drivenadapters/relation_type"
-	"bkn-backend/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/drivenadapters/object_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/drivenadapters/relation_type"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 )
 
 const (
@@ -41,7 +41,7 @@ var knChildResourceTables = []struct {
 	{interfaces.RESOURCE_TYPE_OBJECT_TYPE, "t_object_type"},
 	{interfaces.RESOURCE_TYPE_RELATION_TYPE, "t_relation_type"},
 	{interfaces.RESOURCE_TYPE_ACTION_TYPE, "t_action_type"},
-	{interfaces.RESOURCE_TYPE_METRIC, "t_metric_definition"},
+	{interfaces.RESOURCE_TYPE_METRIC, "t_object_metric_definition"},
 	{interfaces.RESOURCE_TYPE_RISK_TYPE, "t_risk_type"},
 }
 
@@ -517,54 +517,60 @@ func (kna *knowledgeNetworkAccess) UpdateKN(ctx context.Context, tx *sql.Tx, kn 
 	// Convert tags to a string.
 	tagsStr := libCommon.TagSlice2TagString(kn.Tags)
 
-	data := map[string]any{
-		"f_name":            kn.KNName,
-		"f_tags":            tagsStr,
-		"f_comment":         kn.Comment,
-		"f_icon":            kn.Icon,
-		"f_color":           kn.Color,
-		"f_bkn_raw_content": kn.BKNRawContent,
-		"f_skill_content":   kn.SkillContent,
-		"f_updater":         kn.Updater.ID,
-		"f_updater_type":    kn.Updater.Type,
-		"f_update_time":     kn.UpdateTime,
-	}
-	sqlStr, vals, err := sq.Update(KN_TABLE_NAME).
-		SetMap(data).
-		Where(sq.Eq{"f_id": kn.KNID}).
-		ToSql()
-	if err != nil {
-		common.LogSafeError(ctx, "Failed to build the sql of update knowledge network by knowledge network_id, error", err)
+	// Basic info belongs to the network, so it goes to every branch.
+	info := sq.Update(KN_TABLE_NAME).
+		SetMap(map[string]any{
+			"f_name":         kn.KNName,
+			"f_tags":         tagsStr,
+			"f_comment":      kn.Comment,
+			"f_icon":         kn.Icon,
+			"f_color":        kn.Color,
+			"f_updater":      kn.Updater.ID,
+			"f_updater_type": kn.Updater.Type,
+			"f_update_time":  kn.UpdateTime,
+		}).
+		Where(sq.Eq{"f_id": kn.KNID})
+	if _, err := kna.execUpdate(ctx, tx, info); err != nil {
 		return err
 	}
 
-	// Record the processed SQL string.
-	otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
-
-	ret, err := tx.Exec(sqlStr, vals...)
+	// The content belongs to the branch the request names.
+	content := map[string]any{"f_bkn_raw_content": kn.BKNRawContent}
+	if !kn.KeepSkillContent {
+		content["f_skill_content"] = kn.SkillContent
+	}
+	branchRow := sq.Eq{"f_id": kn.KNID, "f_branch": kn.Branch}
+	ret, err := kna.execUpdate(ctx, tx, sq.Update(KN_TABLE_NAME).SetMap(content).Where(branchRow))
 	if err != nil {
-		common.LogSafeError(ctx, "Update data error", err)
 		return err
 	}
-
-	// Number of rows affected by the SQL statement.
-	RowsAffected, err := ret.RowsAffected()
-	if err != nil {
-		common.LogSafeError(ctx, "Get RowsAffected error", err)
+	if err := common.EnsureRowUpdated(ctx, tx, ret, KN_TABLE_NAME, branchRow); err != nil {
 		return err
-	}
-
-	if RowsAffected != 1 {
-		// Do not return an error when affected rows are not one because the update has occurred.
-		otellog.LogWarn(ctx, fmt.Sprintf("Update knowledge network affected unexpected row count: knowledge_network_id=%s, rows=%d",
-			kn.KNID, RowsAffected))
 	}
 
 	span.SetStatus(codes.Ok, "")
 	return nil
 }
 
-func (kna *knowledgeNetworkAccess) UpdateKNDetail(ctx context.Context,
+func (kna *knowledgeNetworkAccess) execUpdate(ctx context.Context, tx *sql.Tx, builder sq.UpdateBuilder) (sql.Result, error) {
+	sqlStr, vals, err := builder.ToSql()
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to build the sql of update knowledge network, error", err)
+		return nil, err
+	}
+	otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+
+	ret, err := tx.Exec(sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "Update data error", err)
+		return nil, err
+	}
+	return ret, nil
+}
+
+// UpdateKNDetail writes the serialized network of one branch. With tx it runs on that
+// transaction. A branch row that does not exist returns common.ErrRowNotFound.
+func (kna *knowledgeNetworkAccess) UpdateKNDetail(ctx context.Context, tx *sql.Tx,
 	knID string, branch string, detail string) error {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, fmt.Sprintf("Update knowledge network detail[%s]", knID))
 	defer span.End()
@@ -574,13 +580,10 @@ func (kna *knowledgeNetworkAccess) UpdateKNDetail(ctx context.Context,
 		attr.Key("db_type").String(libdb.GetDBType()),
 		attr.Key("kn_id").String(knID))
 
-	data := map[string]any{
-		"f_bkn_raw_content": detail,
-	}
+	branchRow := sq.Eq{"f_id": knID, "f_branch": branch}
 	sqlStr, vals, err := sq.Update(KN_TABLE_NAME).
-		SetMap(data).
-		Where(sq.Eq{"f_id": knID}).
-		Where(sq.Eq{"f_branch": branch}).
+		Set("f_bkn_raw_content", detail).
+		Where(branchRow).
 		ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of update knowledge network detail by knowledge network_id, error", err)
@@ -590,26 +593,57 @@ func (kna *knowledgeNetworkAccess) UpdateKNDetail(ctx context.Context,
 	// Record the processed SQL string.
 	otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
 
-	ret, err := kna.db.Exec(sqlStr, vals...)
+	var q interface {
+		ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+		QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	} = kna.db
+	if tx != nil {
+		q = tx
+	}
+	ret, err := q.ExecContext(ctx, sqlStr, vals...)
 	if err != nil {
 		common.LogSafeError(ctx, "Update data error", err)
 		return err
 	}
-
-	// Number of rows affected by the SQL statement.
-	RowsAffected, err := ret.RowsAffected()
-	if err != nil {
-		common.LogSafeError(ctx, "Get RowsAffected error", err)
+	if err := common.EnsureRowUpdated(ctx, q, ret, KN_TABLE_NAME, branchRow); err != nil {
 		return err
-	}
-
-	if RowsAffected != 1 {
-		otellog.LogWarn(ctx, fmt.Sprintf("Update knowledge network detail %s RowsAffected not equal 1, RowsAffected is %d",
-			knID, RowsAffected))
 	}
 
 	span.SetStatus(codes.Ok, "")
 	return nil
+}
+
+// ListKNBranches returns every branch the network has a row on, in name order.
+func (kna *knowledgeNetworkAccess) ListKNBranches(ctx context.Context, knID string) ([]string, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Select knowledge network branches")
+	defer span.End()
+	span.SetAttributes(attr.Key("kn_id").String(knID))
+
+	sqlStr, vals, err := sq.Select("f_branch").From(KN_TABLE_NAME).
+		Where(sq.Eq{"f_id": knID}).OrderBy("f_branch").ToSql()
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to build the sql of listing knowledge network branches", err)
+		return nil, err
+	}
+	otellog.LogInfo(ctx, common.SafeQuerySummary(sqlStr, len(vals)))
+
+	rows, err := kna.db.QueryContext(ctx, sqlStr, vals...)
+	if err != nil {
+		common.LogSafeError(ctx, "List knowledge network branches error", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	branches := []string{}
+	for rows.Next() {
+		var branch string
+		if err := rows.Scan(&branch); err != nil {
+			common.LogSafeError(ctx, "Scan knowledge network branch error", err)
+			return nil, err
+		}
+		branches = append(branches, branch)
+	}
+	return branches, rows.Err()
 }
 
 func (kna *knowledgeNetworkAccess) DeleteKN(ctx context.Context,
@@ -658,7 +692,15 @@ func (kna *knowledgeNetworkAccess) DeleteKN(ctx context.Context,
 }
 
 // Build SQL filter conditions.
+// oneRowPerNetwork keeps one row per network in a listing: its main row, or its first branch by
+// name when it has no main row. Its only argument is the main branch name.
+const oneRowPerNetwork = "f_branch = COALESCE(" +
+	"(SELECT m.f_branch FROM " + KN_TABLE_NAME + " m WHERE m.f_id = " + KN_TABLE_NAME + ".f_id AND m.f_branch = ?), " +
+	"(SELECT MIN(b.f_branch) FROM " + KN_TABLE_NAME + " b WHERE b.f_id = " + KN_TABLE_NAME + ".f_id))"
+
 func processQueryCondition(query interfaces.KNsQueryParams, subBuilder sq.SelectBuilder) sq.SelectBuilder {
+	subBuilder = subBuilder.Where(sq.Expr(oneRowPerNetwork, interfaces.MAIN_BRANCH))
+
 	if query.NamePattern != "" {
 		// Fuzzy-match name or ID; either match is sufficient.
 		subBuilder = subBuilder.Where(sq.Expr("(instr(f_name, ?) > 0 OR instr(f_id, ?) > 0)", query.NamePattern, query.NamePattern))
@@ -959,18 +1001,23 @@ func (kna *knowledgeNetworkAccess) GetNeighborPathsBatch(ctx context.Context, ot
 	return rtPathsMap, nil
 }
 
-// GetAllKNs queries knowledge networks across all branches for existing callers
-// such as concept synchronization.
-func (kna *knowledgeNetworkAccess) GetAllKNs(ctx context.Context) (map[string]*interfaces.KN, error) {
+// GetAllKNs returns every branch row of every knowledge network, for callers such as
+// concept synchronization that handle each branch on its own.
+func (kna *knowledgeNetworkAccess) GetAllKNs(ctx context.Context) ([]*interfaces.KN, error) {
 	return kna.getAllKNs(ctx, "")
 }
 
-// GetAllMainBranchKNs queries only published main-branch knowledge networks.
+// GetAllMainBranchKNs queries only published main-branch knowledge networks, keyed by id.
 func (kna *knowledgeNetworkAccess) GetAllMainBranchKNs(ctx context.Context) (map[string]*interfaces.KN, error) {
-	return kna.getAllKNs(ctx, interfaces.MAIN_BRANCH)
+	kns, err := kna.getAllKNs(ctx, interfaces.MAIN_BRANCH)
+	byID := make(map[string]*interfaces.KN, len(kns))
+	for _, kn := range kns {
+		byID[kn.KNID] = kn
+	}
+	return byID, err
 }
 
-func (kna *knowledgeNetworkAccess) getAllKNs(ctx context.Context, branch string) (map[string]*interfaces.KN, error) {
+func (kna *knowledgeNetworkAccess) getAllKNs(ctx context.Context, branch string) ([]*interfaces.KN, error) {
 	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Select knowledge networks")
 	defer span.End()
 
@@ -1001,7 +1048,7 @@ func (kna *knowledgeNetworkAccess) getAllKNs(ctx context.Context, branch string)
 	sqlStr, vals, err := query.ToSql()
 	if err != nil {
 		common.LogSafeError(ctx, "Failed to build the sql of select knowledge networks, error", err)
-		return map[string]*interfaces.KN{}, err
+		return []*interfaces.KN{}, err
 	}
 
 	// Record the processed SQL string.
@@ -1010,11 +1057,11 @@ func (kna *knowledgeNetworkAccess) getAllKNs(ctx context.Context, branch string)
 	rows, err := kna.db.Query(sqlStr, vals...)
 	if err != nil {
 		common.LogSafeError(ctx, "List data error", err)
-		return map[string]*interfaces.KN{}, err
+		return []*interfaces.KN{}, err
 	}
 	defer func() { _ = rows.Close() }()
 
-	KNs := make(map[string]*interfaces.KN)
+	KNs := make([]*interfaces.KN, 0)
 	for rows.Next() {
 		KN := interfaces.KN{
 			ModuleType: interfaces.MODULE_TYPE_KN,
@@ -1039,12 +1086,12 @@ func (kna *knowledgeNetworkAccess) getAllKNs(ctx context.Context, branch string)
 		)
 		if err != nil {
 			common.LogSafeError(ctx, "Row scan error", err)
-			return map[string]*interfaces.KN{}, err
+			return []*interfaces.KN{}, err
 		}
 
 		// Convert a tag string to an array.
 		KN.Tags = libCommon.TagString2TagSlice(tagsStr)
-		KNs[KN.KNID] = &KN
+		KNs = append(KNs, &KN)
 	}
 
 	span.SetStatus(codes.Ok, "")
@@ -1163,7 +1210,7 @@ func (kna *knowledgeNetworkAccess) ListKnSrcs(ctx context.Context,
 }
 
 // ListKNChildResourceCandidates returns the authorization identities of all
-// model children under the requested knowledge networks. The six child tables
+// model children under the requested knowledge networks. The child tables
 // are read in one round trip so list visibility does not degrade into N+1
 // queries as the number of networks grows.
 func (kna *knowledgeNetworkAccess) ListKNChildResourceCandidates(ctx context.Context,
@@ -1222,6 +1269,51 @@ func (kna *knowledgeNetworkAccess) ListKNChildResourceCandidates(ctx context.Con
 
 	span.SetStatus(codes.Ok, "")
 	return candidates, nil
+}
+
+// PresentKNChildIDs returns the ids among childIDs that some branch of the network defines as a
+// child of resourceType. It reads committed rows, so a cleanup calls it after its delete committed.
+func (kna *knowledgeNetworkAccess) PresentKNChildIDs(ctx context.Context, resourceType, knID string,
+	childIDs []string) ([]string, error) {
+	ctx, span := oteltrace.StartNamedClientSpan(ctx, "Select knowledge network children still defined")
+	defer span.End()
+
+	if len(childIDs) == 0 {
+		return nil, nil
+	}
+	tableName := ""
+	for _, childTable := range knChildResourceTables {
+		if childTable.resourceType == resourceType {
+			tableName = childTable.tableName
+		}
+	}
+	if tableName == "" {
+		return nil, fmt.Errorf("unknown knowledge network child resource type %q", resourceType)
+	}
+	query, args, err := sq.Select("f_id").Distinct().From(tableName).
+		Where(sq.Eq{"f_kn_id": knID}).Where(sq.Eq{"f_id": childIDs}).ToSql()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := kna.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		common.LogSafeError(ctx, "Failed to list knowledge network children still defined", err)
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	present := make([]string, 0, len(childIDs))
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		present = append(present, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	span.SetStatus(codes.Ok, "")
+	return present, nil
 }
 
 func processConceptGroupRelationsQueryCondition(query interfaces.ConceptGroupRelationsQueryParams, subBuilder sq.SelectBuilder, fieldPrefix string) sq.SelectBuilder {

@@ -8,17 +8,18 @@ package postgresql
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	sq "github.com/Masterminds/squirrel"
 	"github.com/lib/pq"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sb "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/connector/local/table"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
 // convertRawValue converts driver byte values to strings unless binary output is requested.
@@ -32,7 +33,7 @@ func convertRawValue(v any, preserveBinary bool) any {
 	return v
 }
 
-// convertValue converts time values with time zones to the current time zone and handles other types
+// convertValue converts zoned time values to the server time zone and preserves binary output when requested.
 func convertValue(v any, colName string, origTypeMap map[string]string, preserveBinary bool) any {
 	if v == nil {
 		return nil
@@ -66,101 +67,258 @@ func convertValue(v any, colName string, origTypeMap map[string]string, preserve
 	}
 }
 
-// BuildPagedSQL applies PostgreSQL paging syntax to a validated query.
-func (c *PostgresqlConnector) BuildPagedSQL(sql string, offset, limit int) string {
-	return fmt.Sprintf("SELECT * FROM (%s) AS _raw_query_page LIMIT %d OFFSET %d", sql, limit, offset)
-}
-
-// BuildCountSQL applies PostgreSQL total-count syntax to a validated query.
-func (c *PostgresqlConnector) BuildCountSQL(sql string) string {
-	return fmt.Sprintf("SELECT COUNT(*) AS _raw_query_total_count FROM (%s) AS _raw_query_total", sql)
-}
-
-// ExecuteRawSQL executes the original SQL query
-func (c *PostgresqlConnector) ExecuteRawSQL(ctx context.Context, sql string) (*interfaces.RawQueryResponse, error) {
-	if err := c.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("connect failed: %w", err)
-	}
-
-	rows, err := c.db.QueryContext(ctx, sql)
+// ExecuteQuery 为 PostgreSQL 使用公共 Builder，复用既有结果扫描和归一化。
+func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
+	query, err := c.buildSelectBuilder(resource, params)
 	if err != nil {
-		return nil, fmt.Errorf("execute query failed: %w", classifyQueryError(err))
-	}
-	defer func() { _ = rows.Close() }()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("get columns failed: %w", err)
-	}
-
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, fmt.Errorf("get column types failed: %w", err)
-	}
-
-	response := &interfaces.RawQueryResponse{
-		Columns: make([]interfaces.ColumnInfo, len(columns)),
-		Entries: make([]map[string]any, 0),
-	}
-
-	// Fill column information
-	for i, col := range columns {
-		response.Columns[i] = interfaces.ColumnInfo{
-			Name: col,
-			Type: c.MapType(columnTypes[i].DatabaseTypeName()),
-		}
-	}
-
-	// Read the result row
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, fmt.Errorf("scan row failed: %w", err)
-		}
-
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertRawValue(values[i], false)
-		}
-		response.Entries = append(response.Entries, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate rows failed: %w", classifyQueryError(err))
-	}
-
-	totalCount := int64(len(response.Entries))
-	response.TotalCount = &totalCount
-
-	return response, nil
-}
-
-// ExecuteQuery performs single-table queries.
-func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interfaces.Resource,
-	params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
-	if params.Paging.Offset < 0 || params.Paging.Limit < 0 {
-		return nil, fmt.Errorf("paging offset and limit must not be negative")
-	}
-
-	if err := c.Connect(ctx); err != nil {
 		return nil, err
 	}
-
-	fieldMap := map[string]*interfaces.Property{}
-	for _, prop := range resource.SchemaDefinition {
-		fieldMap[prop.Name] = prop
+	rows, _, err := c.OpenSQLBuilder(ctx, query)
+	if err != nil {
+		return nil, err
 	}
-	originalName := func(property string) string {
-		if field, ok := fieldMap[property]; ok && field.OriginalName != "" {
-			return field.OriginalName
+	defer func() { _ = rows.Close() }()
+	result, err := c.scanQueryRows(rows, resource, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan query rows: %w", err)
+	}
+	// COUNT 独立执行，先释放数据 Rows，兼容单连接池。
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close query rows: %w", postgresqlQueryError(err))
+	}
+	if params.NeedTotal {
+		unpaged := *query
+		unpaged.LimitPart = nil
+		unpaged.OffsetPart = 0
+		unpaged.OrderByPart = nil
+		count := sb.Select(&sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}).FromSelect(&unpaged, "_resource_total")
+		text, args, err := ToSql(count)
+		if err != nil {
+			return nil, err
 		}
-		return property
+		if err := c.db.QueryRowContext(ctx, text, args...).Scan(&result.TotalCount); err != nil {
+			return nil, fmt.Errorf("failed to scan total: %w", postgresqlQueryError(err))
+		}
 	}
+	table.NormalizeQueryResult(result, resource, params)
+	return result, nil
+}
 
+// buildSelectBuilder 将 DTO 的查询子句组装为公共 Builder，不创建连接或拼接 SQL 片段。
+func (c *PostgresqlConnector) buildSelectBuilder(resource *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*sb.SelectBuilder, error) {
+	if params.Paging.Offset < 0 || params.Paging.Limit < 0 {
+		return nil, interfaces.NewConditionBuildError("paging offset and limit must not be negative")
+	}
+	fields := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
+	for _, field := range resource.SchemaDefinition {
+		fields[field.Name] = field
+	}
+	sourceColumn := func(name string) sb.SqlNode {
+		if field := fields[name]; field != nil {
+			return sqlResourceColumn(field)
+		}
+		return sqlColumnName(name)
+	}
+	query := sb.Select().From(&sb.Table{ResourceID: resource.ID, SourceIdentifier: resource.SourceIdentifier})
+	groupExpressions := make(map[string]sb.SqlNode, len(params.GroupBy))
+	for _, group := range params.GroupBy {
+		expr := sourceColumn(group.Property)
+		if group.CalendarInterval != "" {
+			var err error
+			expr, err = sqlCalendarGroup(expr, group.CalendarInterval)
+			if err != nil {
+				return nil, err
+			}
+		}
+		query.Columns(&sb.Alias{Expr: expr, Name: group.Property}).GroupBy(expr)
+		groupExpressions[group.Property] = expr
+	}
+	var metric sb.SqlNode
+	metricAlias := ""
+	metricField := &interfaces.Property{Type: interfaces.DataType_Integer}
+	if aggregation := params.Aggregation; aggregation != nil {
+		name := strings.ToUpper(aggregation.Aggr)
+		distinct := name == "COUNT_DISTINCT"
+		if distinct {
+			name = "COUNT"
+		}
+		switch name {
+		case "COUNT", "SUM", "AVG", "MIN", "MAX":
+		default:
+			return nil, interfaces.NewConditionBuildError("unsupported aggregate function")
+		}
+		var arg sb.SqlNode = &sb.Star{}
+		if aggregation.Property != "*" {
+			arg = sourceColumn(aggregation.Property)
+		} else if name != "COUNT" || distinct {
+			return nil, interfaces.NewConditionBuildError("aggregate wildcard requires count")
+		}
+		metric = &sb.Function{Name: name, Args: []sb.SqlNode{arg}, Distinct: distinct}
+		metricAlias = aggregation.Alias
+		if metricAlias == "" {
+			metricAlias = "__value"
+		}
+		if name == "MIN" || name == "MAX" {
+			metricField = fields[aggregation.Property]
+		}
+	} else if params.Having != nil && params.Having.Field == "count(*)" {
+		metric = &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}
+		metricAlias = "__value"
+	}
+	if err := table.ValidateAggregateAlias(metricAlias, params.GroupBy); err != nil {
+		return nil, err
+	}
+	if metric != nil {
+		query.Columns(&sb.Alias{Expr: metric, Name: metricAlias})
+	}
+	if len(params.GroupBy) == 0 && params.Aggregation == nil && params.Having == nil {
+		names := params.OutputFields
+		if len(names) == 0 {
+			for _, field := range resource.SchemaDefinition {
+				names = append(names, field.Name)
+			}
+		}
+		for _, name := range names {
+			field := fields[name]
+			if field == nil {
+				return nil, interfaces.NewOutputFieldError(interfaces.OutputFieldUnknown, name)
+			}
+			expr := sourceColumn(name)
+			if field.Type == interfaces.DataType_Binary {
+				switch {
+				case params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeContent:
+				case params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeMetadata:
+					expr = &sb.Function{Name: "OCTET_LENGTH", Args: []sb.SqlNode{expr}}
+				default:
+					expr = &sb.Literal{Value: nil}
+				}
+			}
+			query.Columns(&sb.Alias{Expr: expr, Name: name})
+		}
+	}
+	if len(query.ColumnsPart) == 0 {
+		return nil, interfaces.NewOutputFieldError(interfaces.OutputFieldNoneQueryable, "")
+	}
+	if params.ActualFilterCond != nil {
+		columns, err := table.ColumnMetadata(resource)
+		if err != nil {
+			return nil, err
+		}
+		predicate, err := c.ConvertFilterCondition(params.ActualFilterCond, resource.SchemaDefinition, columns)
+		if err != nil {
+			return nil, err
+		}
+		query.Where(predicate)
+	}
+	if having := params.Having; having != nil && metric != nil {
+		expr := metric
+		field := metricField
+		if having.Field == "count(*)" {
+			expr = &sb.Function{Name: "COUNT", Args: []sb.SqlNode{&sb.Star{}}}
+			field = &interfaces.Property{Type: interfaces.DataType_Integer}
+		}
+		predicate, err := sqlHavingCondition(having, expr, field)
+		if err != nil {
+			return nil, err
+		}
+		query.Having(predicate)
+	}
+	for _, sort := range table.QuerySortFields(params, metricAlias) {
+		expr := sourceColumn(sort.Field)
+		if sort.Field == metricAlias && metricAlias != "" {
+			expr = sqlColumnName(metricAlias)
+		}
+		if grouped := groupExpressions[sort.Field]; grouped != nil && sort.Field != metricAlias {
+			expr = sqlColumnName(sort.Field)
+		}
+		nulls := sb.NullsLast
+		if len(params.GroupBy) > 0 {
+			// 分组查询与索引及 MySQL 保持一致；明细查询保留既有 NULL 排序。
+			if sort.Direction != interfaces.DESC_DIRECTION {
+				nulls = sb.NullsFirst
+			}
+		} else if sort.Direction == interfaces.DESC_DIRECTION {
+			nulls = sb.NullsFirst
+		}
+		query.OrderBy(sb.Order{Expr: expr, Descending: sort.Direction == interfaces.DESC_DIRECTION, Nulls: nulls})
+	}
+	if params.CursorEncoded == "" {
+		query.Offset(uint64(params.Paging.Offset))
+	}
+	query.Limit(uint64(params.Paging.Limit))
+	return query, nil
+}
+
+func sqlHavingCondition(having *interfaces.HavingClause, expr sb.SqlNode, field *interfaces.Property) (sb.SqlNode, error) {
+	if having.Field != "__value" && having.Field != "count(*)" {
+		return nil, interfaces.NewConditionBuildError("HAVING field must be '__value' or 'count(*)'")
+	}
+	if field != nil {
+		if err := filter_condition.ValidateTemporalPrecision(field.Type, having.Value); err != nil {
+			return nil, err
+		}
+	}
+	switch having.Operation {
+	case "=", "==", "!=", "<>", ">", ">=", "<", "<=":
+		if having.Value == nil {
+			return nil, interfaces.NewConditionBuildError("HAVING comparison requires a value")
+		}
+		value, err := sqlConditionValue(field, having.Value)
+		if err != nil {
+			return nil, err
+		}
+		return sqlComparisonNode(expr, value, having.Operation)
+	case "in", "not_in", "range", "out_range":
+		var values []any
+		switch value := having.Value.(type) {
+		case []any:
+			values = value
+		case []string:
+			for _, v := range value {
+				values = append(values, v)
+			}
+		default:
+			return nil, interfaces.NewConditionBuildError("HAVING operation requires an array")
+		}
+		if having.Operation == "in" || having.Operation == "not_in" {
+			return sqlSetCondition(expr, field, values, having.Operation == "not_in")
+		}
+		return sqlRangeCondition(expr, field, values, having.Operation == "out_range")
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported HAVING operation")
+	}
+}
+
+// sqlCalendarGroup 构造 PG 日历分桶，按源时间类型保留会话时区语义。
+func sqlCalendarGroup(expr sb.SqlNode, unit string) (sb.SqlNode, error) {
+	format := ""
+	switch unit {
+	case interfaces.CALENDAR_UNIT_MINUTE:
+		format = "YYYY-MM-DD HH24:MI"
+	case interfaces.CALENDAR_UNIT_HOUR:
+		format = "YYYY-MM-DD HH24"
+	case interfaces.CALENDAR_UNIT_DAY:
+		format = "YYYY-MM-DD"
+	case interfaces.CALENDAR_UNIT_WEEK:
+		format = "IYYY-IW"
+	case interfaces.CALENDAR_UNIT_MONTH:
+		format = "YYYY-MM"
+	case interfaces.CALENDAR_UNIT_QUARTER:
+		format = `YYYY-"Q"Q`
+	case interfaces.CALENDAR_UNIT_YEAR:
+		format = "YYYY"
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported calendar interval")
+	}
+	return &sb.Function{Name: "TO_CHAR", Args: []sb.SqlNode{&sb.Function{Name: "DATE_TRUNC", Args: []sb.SqlNode{&sb.Literal{Value: unit}, expr}}, &sb.Literal{Value: format}}}, nil
+}
+
+// scanQueryRows 复用原始字段类型和聚合别名信息，保留带时区值与二进制内容。
+func (c *PostgresqlConnector) scanQueryRows(rows *sql.Rows, resource *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
+	fieldMap := make(map[string]*interfaces.Property, len(resource.SchemaDefinition))
+	for _, field := range resource.SchemaDefinition {
+		fieldMap[field.Name] = field
+	}
 	// Results are always aliased to property names, so retain original types by
 	// the same logical names instead of re-reading source metadata.
 	origTypeMap := make(map[string]string, len(resource.SchemaDefinition))
@@ -170,313 +328,142 @@ func (c *PostgresqlConnector) ExecuteQuery(ctx context.Context, resource *interf
 		}
 	}
 
-	var condition sq.Sqlizer
-	var err error
-	if params.ActualFilterCond != nil {
-		condition, err = c.ConvertFilterCondition(params.ActualFilterCond)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	result := &interfaces.QueryResult{
-		Entries: make([]map[string]any, 0),
-	}
-
-	// Construct the SELECT clause
-	selectFields := []string{}
-
-	// Add the GROUP BY field (when aggregating queries)
-	for _, groupByItem := range params.GroupBy {
-		column := pgQuoteColumnName(originalName(groupByItem.Property))
-		if groupByItem.CalendarInterval != "" {
-			selectFields = append(selectFields,
-				c.buildDateFormat(column, groupByItem.CalendarInterval)+" AS "+pgQuoteColumnName(groupByItem.Property))
-		} else {
-			selectFields = append(selectFields, column+" AS "+pgQuoteColumnName(groupByItem.Property))
-		}
-	}
-
-	// Add aggregated fields (when performing aggregated queries)
-	var aggAlias string
+	metricAlias := ""
 	if params.Aggregation != nil {
-		aggField := pgQuoteColumnName(originalName(params.Aggregation.Property))
-
-		// Determine the aggregation function
-		aggFunc := params.Aggregation.Aggr
-		switch aggFunc {
-		case "count_distinct":
-			aggFunc = "COUNT(DISTINCT " + aggField + ")"
-		default:
-			aggFunc = strings.ToUpper(aggFunc) + "(" + aggField + ")"
+		metricAlias = params.Aggregation.Alias
+		if metricAlias == "" {
+			metricAlias = "__value"
 		}
-
-		// Determine the alias
-		if params.Aggregation.Alias != "" {
-			aggAlias = params.Aggregation.Alias
-		} else {
-			aggAlias = "__value"
-		}
-
-		selectFields = append(selectFields, aggFunc+" AS "+pgQuoteColumnName(aggAlias))
+	} else if params.Having != nil && params.Having.Field == "count(*)" {
+		metricAlias = "__value"
 	}
+	// 聚合列仅保留 MIN/MAX 实际源字段的时间类型，不继承同名字段的类型。
+	delete(origTypeMap, metricAlias)
 
-	// If it is not an aggregated query and GROUP BY is not specified, add all fields
-	selectField := func(name string) string {
-		column := pgQuoteColumnName(originalName(name))
-		if prop := fieldMap[name]; prop != nil && prop.Type == interfaces.DataType_Binary {
-			if params.BinaryMode == nil {
-				return "NULL AS " + pgQuoteColumnName(name)
-			}
-			switch *params.BinaryMode {
-			case interfaces.BinaryModeMetadata:
-				return "octet_length(" + column + ") AS " + pgQuoteColumnName(name)
-			case interfaces.BinaryModeContent:
-				return column + " AS " + pgQuoteColumnName(name)
-			default:
-				return "NULL AS " + pgQuoteColumnName(name)
-			}
-		}
-		return column + " AS " + pgQuoteColumnName(name)
-	}
-	if len(params.GroupBy) == 0 && params.Aggregation == nil {
-		if len(params.OutputFields) > 0 {
-			for _, field := range params.OutputFields {
-				selectFields = append(selectFields, selectField(field))
-			}
-		} else if len(selectFields) == 0 {
-			// If no output field is specified, all fields will be queried
-			for _, prop := range resource.SchemaDefinition {
-				selectFields = append(selectFields, selectField(prop.Name))
-			}
+	if agg := params.Aggregation; agg != nil && (agg.Aggr == "min" || agg.Aggr == "max") {
+		if field := fieldMap[agg.Property]; field != nil {
+			origTypeMap[metricAlias] = field.OriginalType
 		}
 	}
-
-	// Build query
-	builder := stmtBuilder.Select(selectFields...).
-		From(resource.SourceIdentifier)
-
-	// Add the WHERE condition
-	if condition != nil {
-		builder = builder.Where(condition)
-	}
-
-	// Add GROUP BY (when aggregating queries)
-	if len(params.GroupBy) > 0 {
-		groupByFields := []string{}
-		for _, groupByItem := range params.GroupBy {
-			column := pgQuoteColumnName(originalName(groupByItem.Property))
-			if groupByItem.CalendarInterval != "" {
-				groupByFields = append(groupByFields, c.buildDateFormat(column, groupByItem.CalendarInterval))
-			} else {
-				groupByFields = append(groupByFields, column)
-			}
-		}
-		builder = builder.GroupBy(groupByFields...)
-	}
-
-	// Add a HAVING condition (when aggregating queries)
-	if params.Having != nil && params.Aggregation != nil {
-		havingCond, havingErr := c.buildHavingCondition(params.Having, aggAlias)
-		if havingErr != nil {
-			return nil, fmt.Errorf("failed to build HAVING condition: %w", havingErr)
-		}
-		if havingCond != "" {
-			builder = builder.Where(havingCond)
-		}
-	}
-
-	// Add ORDER BY
-	if len(params.Sort) > 0 {
-		for _, sortItem := range params.Sort {
-			dir := "ASC"
-			if sortItem.Direction == interfaces.DESC_DIRECTION {
-				dir = "DESC"
-			}
-			sortField := pgQuoteColumnName(originalName(sortItem.Field))
-			if aggAlias != "" && sortItem.Field == aggAlias {
-				sortField = pgQuoteColumnName(aggAlias)
-			}
-			for _, groupByItem := range params.GroupBy {
-				if groupByItem.Property == sortItem.Field && groupByItem.CalendarInterval != "" {
-					sortField = c.buildDateFormat(pgQuoteColumnName(originalName(groupByItem.Property)), groupByItem.CalendarInterval)
-					break
-				}
-			}
-			builder = builder.OrderBy(sortField + " " + dir)
-		}
-	}
-
-	// Add LIMIT and OFFSET
-	if params.CursorEncoded == "" {
-		builder = builder.Offset(uint64(params.Paging.Offset))
-	}
-	builder = builder.Limit(uint64(params.Paging.Limit))
-
-	// Build SQL and execute it
-	query, args, err := builder.ToSql()
-	if err != nil {
-		return nil, fmt.Errorf("failed to build query: %w", err)
-	}
-
-	isAggregate := params.Aggregation != nil || len(params.GroupBy) > 0 || params.Having != nil
-	if isAggregate {
-		logger.Debugf("postgresql aggregate query: %s", table.SQLSummary(query, args))
-	} else {
-		logger.Debugf("postgresql query: %s", table.SQLSummary(query, args))
-	}
-
-	rows, err := c.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", classifyQueryError(err))
-	}
-	defer func() { _ = rows.Close() }()
 
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read result columns: %w", err)
 	}
-	result.Columns = columns
-
-	binaryContentColumns := map[string]bool{}
-	if params.BinaryMode != nil && *params.BinaryMode == interfaces.BinaryModeContent {
-		for _, prop := range resource.SchemaDefinition {
-			if prop != nil && prop.Type == interfaces.DataType_Binary {
-				binaryContentColumns[prop.Name] = true
-			}
-		}
+	result := &interfaces.ResourceDataQueryResult{
+		Columns: columns,
+		Entries: make([]map[string]any, 0),
 	}
+	binaryColumns := table.QueryBinaryContentColumns(resource, params)
 	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
+		values, destinations := make([]any, len(columns)), make([]any, len(columns))
 		for i := range values {
-			valuePtrs[i] = &values[i]
+			destinations[i] = &values[i]
 		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
+		if err := rows.Scan(destinations...); err != nil {
+			return nil, fmt.Errorf("failed to scan result row: %w", err)
 		}
-
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertValue(values[i], col, origTypeMap, binaryContentColumns[col])
+		entry := make(map[string]any, len(columns))
+		for i, column := range columns {
+			entry[column] = convertValue(values[i], column, origTypeMap, binaryColumns[column])
 		}
-		result.Entries = append(result.Entries, row)
+		result.Entries = append(result.Entries, entry)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, classifyQueryError(err)
+		return nil, fmt.Errorf("failed to iterate result rows: %w", postgresqlQueryError(err))
 	}
-
-	// Total number of processed items (for detailed inquiries only)
-	if params.NeedTotal && !isAggregate {
-		countBuilder := stmtBuilder.Select("COUNT(1)").
-			From(resource.SourceIdentifier)
-		if condition != nil {
-			countBuilder = countBuilder.Where(condition)
-		}
-		countQuery, countArgs, countErr := countBuilder.ToSql()
-		if countErr != nil {
-			return nil, fmt.Errorf("failed to build count query: %w", countErr)
-		}
-		logger.Debugf("postgresql count query: %s", table.SQLSummary(countQuery, countArgs))
-		var total int64
-		row := c.db.QueryRowContext(ctx, countQuery, countArgs...)
-		if err := row.Scan(&total); err != nil {
-			return nil, fmt.Errorf("failed to scan total: %w", classifyQueryError(err))
-		}
-		result.Total = total
-	}
-
 	return result, nil
 }
 
-func classifyQueryError(err error) error {
+// postgresqlQueryError classifies unknown-column errors and preserves the source error chain.
+func postgresqlQueryError(err error) error {
 	var driverErr *pq.Error
-	if errors.As(err, &driverErr) && string(driverErr.Code) == "42703" {
-		return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterUnknownColumn, err)
+	if errors.As(err, &driverErr) {
+		switch string(driverErr.Code) {
+		case "42703":
+			return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterUnknownColumn, err)
+		case "42601", "42701", "42702", "42803", "42804", "42846", "42883", "42P10", "42P18",
+			"22023", "2201B", "22P02", "22003", "22007", "22008", "22012", "22018", "22021":
+			return interfaces.NewSourceQueryInvalidParameterError(interfaces.SourceQueryInvalidParameterInvalidQuery, err)
+		}
 	}
 	return err
 }
 
-// buildDateFormat formats a date field for the requested calendar grouping.
-func (c *PostgresqlConnector) buildDateFormat(dateField, calendarInterval string) string {
-	switch calendarInterval {
-	case interfaces.CALENDAR_UNIT_MINUTE:
-		return fmt.Sprintf(`to_char(date_trunc('minute',%s),'YYYY-MM-DD HH24:MI')`, dateField)
-	case interfaces.CALENDAR_UNIT_HOUR:
-		return fmt.Sprintf(`to_char(date_trunc('hour',%s),'YYYY-MM-DD HH24')`, dateField)
-	case interfaces.CALENDAR_UNIT_DAY:
-		return fmt.Sprintf(`to_char(date_trunc('day',%s),'YYYY-MM-DD')`, dateField)
-	case interfaces.CALENDAR_UNIT_WEEK:
-		return fmt.Sprintf(`to_char(date_trunc('week',%s),'IYYY-IW')`, dateField)
-	case interfaces.CALENDAR_UNIT_MONTH:
-		return fmt.Sprintf(`to_char(date_trunc('month',%s),'YYYY-MM')`, dateField)
-	case interfaces.CALENDAR_UNIT_QUARTER:
-		return fmt.Sprintf(`to_char(date_trunc('quarter',%s),'YYYY-"Q"Q')`, dateField)
-	case interfaces.CALENDAR_UNIT_YEAR:
-		return fmt.Sprintf(`to_char(date_trunc('year',%s),'YYYY')`, dateField)
-	default:
-		return ""
+// OpenSQLBuilder 在执行时生成 PG SQL 和参数；Rows 成功后交由查询会话或调用方关闭。
+func (c *PostgresqlConnector) OpenSQLBuilder(ctx context.Context, query *sb.SelectBuilder) (*sql.Rows, []interfaces.ColumnInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
+	text, args, err := ToSql(query)
+	if err != nil {
+		failure := interfaces.NewConditionBuildError("SQL expression is not supported by PostgreSQL")
+		failure.Cause = err
+		return nil, nil, failure
+	}
+	if err := c.Connect(ctx); err != nil {
+		return nil, nil, fmt.Errorf("failed to connect for SQL builder query: %w", postgresqlQueryError(err))
+	}
+	rows, err := c.db.QueryContext(ctx, text, args...)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to execute SQL builder query: %w", postgresqlQueryError(err))
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			_ = rows.Close()
+		}
+	}()
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read result column types: %w", err)
+	}
+	columns := make([]interfaces.ColumnInfo, len(types))
+	names := make(map[string]bool, len(types))
+	for i, column := range types {
+		if names[column.Name()] {
+			return nil, nil, interfaces.NewConditionBuildError("query result contains duplicate column names; use explicit aliases")
+		}
+		names[column.Name()] = true
+		columns[i] = interfaces.ColumnInfo{Name: column.Name(), Type: c.MapType(column.DatabaseTypeName())}
+	}
+	transferred = true
+	return rows, columns, nil
 }
 
-// buildHavingCondition builds the HAVING condition
-func (c *PostgresqlConnector) buildHavingCondition(having *interfaces.HavingClause, aggAlias string) (string, error) {
-	if having.Field != "__value" {
-		return "", fmt.Errorf("HAVING field must be '__value'")
+// ExecuteSQLBuilder 消费一次 Builder 结果，保留 bytea 原始字节和 NUMERIC 文本精度。
+// TotalCount 为本次返回行数；独立 COUNT 和 API 分页由查询服务负责。
+func (c *PostgresqlConnector) ExecuteSQLBuilder(ctx context.Context, query *sb.SelectBuilder) (*interfaces.RawQueryResponse, error) {
+	rows, columns, err := c.OpenSQLBuilder(ctx, query)
+	if err != nil {
+		return nil, err
 	}
-
-	var op string
-	switch having.Operation {
-	case "==":
-		op = "="
-	case "!=":
-		op = "<>"
-	case ">":
-		op = ">"
-	case ">=":
-		op = ">="
-	case "<":
-		op = "<"
-	case "<=":
-		op = "<="
-	case "in":
-		return fmt.Sprintf("%s IN (%s)", aggAlias, formatInValues(having.Value)), nil
-	case "not_in":
-		return fmt.Sprintf("%s NOT IN (%s)", aggAlias, formatInValues(having.Value)), nil
-	case "range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			return fmt.Sprintf("%s BETWEEN ? AND ?", aggAlias), nil
+	defer func() { _ = rows.Close() }()
+	result := &interfaces.RawQueryResponse{Columns: columns, Entries: make([]map[string]any, 0)}
+	for rows.Next() {
+		values, destinations := make([]any, len(columns)), make([]any, len(columns))
+		for i := range values {
+			destinations[i] = &values[i]
 		}
-		return "", fmt.Errorf("range operation requires an array with 2 values")
-	case "out_range":
-		if values, ok := having.Value.([]any); ok && len(values) == 2 {
-			return fmt.Sprintf("%s NOT BETWEEN ? AND ?", aggAlias), nil
+		if err := rows.Scan(destinations...); err != nil {
+			return nil, fmt.Errorf("failed to scan SQL builder row: %w", err)
 		}
-		return "", fmt.Errorf("out_range operation requires an array with 2 values")
-	default:
-		return "", fmt.Errorf("unsupported HAVING operation: %s", having.Operation)
+		entry := make(map[string]any, len(columns))
+		for i, column := range columns {
+			entry[column.Name] = convertRawValue(values[i], column.Type == interfaces.DataType_Binary)
+		}
+		result.Entries = append(result.Entries, entry)
 	}
-
-	return fmt.Sprintf("%s %s ?", aggAlias, op), nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate SQL builder rows: %w", postgresqlQueryError(err))
+	}
+	total := int64(len(result.Entries))
+	result.TotalCount = &total
+	return result, nil
 }
 
-// Format IN Values: Format the list of values for the in operation
-func formatInValues(value any) string {
-	switch v := value.(type) {
-	case []any:
-		var values []string
-		for _, item := range v {
-			values = append(values, fmt.Sprintf("%v", item))
-		}
-		return strings.Join(values, ", ")
-	case []string:
-		var values []string
-		for _, item := range v {
-			values = append(values, fmt.Sprintf("'%s'", item))
-		}
-		return strings.Join(values, ", ")
-	default:
-		return fmt.Sprintf("%v", value)
-	}
+// ScanSQLBuilderRow reads one retained SQL row and classifies source errors.
+func (c *PostgresqlConnector) ScanSQLBuilderRow(rows *sql.Rows, columns []interfaces.ColumnInfo) (map[string]any, error) {
+	row, err := table.ScanSQLRow(rows, columns)
+	return row, postgresqlQueryError(err)
 }

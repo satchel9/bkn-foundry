@@ -16,16 +16,16 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
 	"github.com/opensearch-project/opensearch-go/v2"
 	. "github.com/smartystreets/goconvey/convey"
 
-	"ontology-query/common"
-	"ontology-query/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
 )
 
 var (
-	testCtx = rest.WithLanguage(context.Background(), rest.DefaultLanguage)
+	testCtx = i18n.WithLanguage(context.Background(), i18n.DefaultLanguage)
 )
 
 // mockTransport simulates OpenSearch HTTP responses.
@@ -922,6 +922,37 @@ func Test_openSearchAccess_Count(t *testing.T) {
 			result, err := osa3.Count(testCtx, "test-index", query)
 			So(result, ShouldBeNil)
 			So(err, ShouldNotBeNil)
+		})
+	})
+}
+
+func Test_openSearchAccess_PutMapping(t *testing.T) {
+	Convey("test PutMapping\n", t, func() {
+		appSetting := &common.AppSetting{}
+		body := map[string]any{"properties": map[string]any{"conversation_id": map[string]any{"type": "keyword"}}}
+
+		Convey("PutMapping sends PUT /<index>/_mapping with the body\n", func() {
+			var gotBody string
+			osa, _ := MockNewOpenSearchAccess(appSetting, &mockTransport{
+				roundTripFunc: func(req *http.Request) (*http.Response, error) {
+					So(req.Method, ShouldEqual, "PUT")
+					So(req.URL.Path, ShouldEqual, "/test-index/_mapping")
+					raw, _ := io.ReadAll(req.Body)
+					gotBody = string(raw)
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"acknowledged": true}`))}, nil
+				},
+			})
+			So(osa.PutMapping(testCtx, "test-index", body), ShouldBeNil)
+			So(gotBody, ShouldContainSubstring, `"conversation_id"`)
+		})
+
+		Convey("PutMapping reports a conflicting mapping\n", func() {
+			osa, _ := MockNewOpenSearchAccess(appSetting, &mockTransport{
+				roundTripFunc: func(req *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"error": "mapper_parsing_exception"}`))}, nil
+				},
+			})
+			So(osa.PutMapping(testCtx, "test-index", body), ShouldNotBeNil)
 		})
 	})
 }

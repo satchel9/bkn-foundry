@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -56,11 +56,11 @@ func TestCatalogHealthCheckScheduleServiceGetByCatalogID(t *testing.T) {
 
 		got, err := service.GetByCatalogID(context.Background(), "catalog-1")
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), sql.ErrNoRows.Error())
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), sql.ErrNoRows.Error())
 		assert.Nil(t, got)
 	})
 
@@ -73,11 +73,11 @@ func TestCatalogHealthCheckScheduleServiceGetByCatalogID(t *testing.T) {
 
 		got, err := service.GetByCatalogID(context.Background(), "catalog-1")
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), sensitiveError)
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), sensitiveError)
 		assert.Nil(t, got)
 	})
 }
@@ -94,6 +94,7 @@ func TestCatalogHealthCheckScheduleServiceCreate(t *testing.T) {
 
 		sa.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.AssignableToTypeOf(&interfaces.CatalogHealthCheckSchedule{})).DoAndReturn(func(_ context.Context, _ *sql.Tx, schedule *interfaces.CatalogHealthCheckSchedule) error {
 			assert.Equal(t, "catalog-1", schedule.CatalogID)
+			assert.Equal(t, interfaces.ScheduleStatusNever, schedule.LastStatus)
 			assert.Equal(t, interfaces.CatalogHealthCheckScheduleModeInherit, schedule.Mode)
 			assert.Empty(t, schedule.CronExpr)
 			assert.Greater(t, schedule.NextRun, beforeCreate)
@@ -130,10 +131,10 @@ func TestCatalogHealthCheckScheduleServiceCreate(t *testing.T) {
 			},
 		)
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InvalidParameter, httpErr.ErrorCode)
 		assert.Nil(t, got)
 	})
 
@@ -188,11 +189,11 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 			Mode: interfaces.CatalogHealthCheckScheduleModeInherit,
 		})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		ok := errors.As(err, &httpErr)
 		require.True(t, ok)
 		assert.Equal(t, http.StatusNotFound, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_NotFound, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_NotFound, httpErr.ErrorCode)
 		assert.Nil(t, got)
 	})
 
@@ -205,11 +206,11 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 
 		got, err := service.Update(context.Background(), "catalog-1", &interfaces.CatalogHealthCheckScheduleRequest{Mode: interfaces.CatalogHealthCheckScheduleModeInherit})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), catalogErr.Error())
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), catalogErr.Error())
 		assert.Nil(t, got)
 	})
 
@@ -274,11 +275,11 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 			CronExpr: "0 * * * *",
 		})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), sql.ErrNoRows.Error())
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), sql.ErrNoRows.Error())
 		assert.Nil(t, got)
 	})
 
@@ -360,11 +361,11 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 			Mode: interfaces.CatalogHealthCheckScheduleModeInherit,
 		})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), accessErr.Error())
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_GetFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), accessErr.Error())
 		assert.Nil(t, got)
 	})
 
@@ -387,11 +388,11 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 
 		got, err := service.Update(context.Background(), "catalog-1", &interfaces.CatalogHealthCheckScheduleRequest{Mode: interfaces.CatalogHealthCheckScheduleModeInherit})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_UpdateFailed, httpErr.BaseError.ErrorCode)
-		assert.NotContains(t, fmt.Sprint(httpErr.BaseError.ErrorDetails), updateErr.Error())
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_InternalError_UpdateFailed, httpErr.ErrorCode)
+		assert.NotContains(t, fmt.Sprint(httpErr.ErrorDetails), updateErr.Error())
 		assert.Nil(t, got)
 	})
 
@@ -422,10 +423,108 @@ func TestCatalogHealthCheckScheduleServiceUpdate(t *testing.T) {
 			ExpectedUpdateTime: expectedUpdateTime,
 		})
 
-		var httpErr *rest.HTTPError
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, err, &httpErr)
 		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_UpdateConflict, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, verrors.VegaBackend_CatalogHealthCheckSchedule_UpdateConflict, httpErr.ErrorCode)
+		assert.Nil(t, got)
+	})
+	t.Run("monotonic configuration version survives a nonadvancing clock", func(t *testing.T) {
+		for _, mode := range []string{interfaces.CatalogHealthCheckScheduleModeInherit, interfaces.CatalogHealthCheckScheduleModeEnabled, interfaces.CatalogHealthCheckScheduleModeDisabled} {
+			t.Run(mode, func(t *testing.T) {
+				ctrl := gomock.NewController(t)
+				ca := vmock.NewMockCatalogAccess(ctrl)
+				access := vmock.NewMockCatalogHealthCheckScheduleAccess(ctrl)
+				permissions := vmock.NewMockPermissionService(ctrl)
+				service := newCatalogHealthCheckScheduleServiceForTest(t)
+				service.ca = ca
+				service.sa = access
+				service.ps = permissions
+				version := time.Now().Add(24 * time.Hour).UnixMilli()
+				current := &interfaces.CatalogHealthCheckSchedule{CatalogID: "catalog", Mode: interfaces.CatalogHealthCheckScheduleModeEnabled, CronExpr: "0 * * * *", UpdateTime: version, LastStatus: interfaces.ScheduleStatusFailed, LastMessage: "previous"}
+				ca.EXPECT().GetByID(gomock.Any(), "catalog").Return(&interfaces.Catalog{ID: "catalog", Type: interfaces.CatalogTypePhysical}, nil)
+				permissions.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{Type: interfaces.AUTH_RESOURCE_TYPE_CATALOG, ID: "catalog"}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(nil)
+				access.EXPECT().GetByCatalogID(gomock.Any(), "catalog").Return(current, nil)
+				access.EXPECT().Update(gomock.Any(), current, version).DoAndReturn(func(_ context.Context, updated *interfaces.CatalogHealthCheckSchedule, expected int64) (int64, error) {
+					assert.Equal(t, version, expected)
+					assert.Equal(t, version+1, updated.UpdateTime)
+					assert.Equal(t, interfaces.ScheduleStatusFailed, updated.LastStatus)
+					assert.Equal(t, "previous", updated.LastMessage)
+					return 1, nil
+				})
+				request := &interfaces.CatalogHealthCheckScheduleRequest{Mode: mode, ExpectedUpdateTime: version}
+				if mode == interfaces.CatalogHealthCheckScheduleModeEnabled {
+					request.CronExpr = "0 * * * *"
+				}
+				_, err := service.Update(context.Background(), "catalog", request)
+				require.NoError(t, err)
+			})
+		}
+	})
+
+}
+
+func TestCatalogHealthCheckScheduleServiceAPICatalog(t *testing.T) {
+	for _, action := range []string{"create", "update"} {
+		t.Run(action, func(t *testing.T) {
+			for _, mode := range []string{interfaces.CatalogHealthCheckScheduleModeInherit, interfaces.CatalogHealthCheckScheduleModeEnabled, interfaces.CatalogHealthCheckScheduleModeDisabled} {
+				t.Run(mode, func(t *testing.T) {
+					ctrl := gomock.NewController(t)
+					service := newCatalogHealthCheckScheduleServiceForTest(t)
+					sa := vmock.NewMockCatalogHealthCheckScheduleAccess(ctrl)
+					service.sa = sa
+					catalog := &interfaces.Catalog{ID: "api", Type: interfaces.CatalogTypePhysical, ConnectorType: "http"}
+					req := &interfaces.CatalogHealthCheckScheduleRequest{Mode: mode, ExpectedUpdateTime: 10}
+					if mode == interfaces.CatalogHealthCheckScheduleModeEnabled {
+						req.CronExpr = "0 * * * *"
+					}
+					var got *interfaces.CatalogHealthCheckSchedule
+					var err error
+					if action == "create" {
+						sa.EXPECT().Create(gomock.Any(), nil, gomock.Any()).Return(nil)
+						if mode == interfaces.CatalogHealthCheckScheduleModeInherit {
+							req = nil
+						}
+						got, err = service.Create(context.Background(), nil, catalog, req)
+					} else {
+						ca := vmock.NewMockCatalogAccess(ctrl)
+						ps := vmock.NewMockPermissionService(ctrl)
+						service.ca = ca
+						service.ps = ps
+						current := &interfaces.CatalogHealthCheckSchedule{CatalogID: "api", Mode: interfaces.CatalogHealthCheckScheduleModeEnabled, NextRun: 456, LastRun: 123}
+						ca.EXPECT().GetByID(gomock.Any(), "api").Return(catalog, nil)
+						ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{Type: interfaces.AUTH_RESOURCE_TYPE_CATALOG, ID: "api"}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(nil)
+						sa.EXPECT().GetByCatalogID(gomock.Any(), "api").Return(current, nil)
+						sa.EXPECT().Update(gomock.Any(), current, int64(10)).Return(int64(1), nil)
+						got, err = service.Update(context.Background(), "api", req)
+					}
+					require.NoError(t, err)
+					require.NotNil(t, got)
+					assert.Equal(t, "api", got.CatalogID)
+					assert.Equal(t, mode, got.Mode)
+					if mode == interfaces.CatalogHealthCheckScheduleModeDisabled {
+						assert.Zero(t, got.NextRun)
+					} else {
+						assert.Positive(t, got.NextRun)
+					}
+					if mode == interfaces.CatalogHealthCheckScheduleModeEnabled {
+						assert.Equal(t, "0 * * * *", got.CronExpr)
+					}
+				})
+			}
+		})
+	}
+	t.Run("update requires modify permission before accessing schedule", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		ca := vmock.NewMockCatalogAccess(ctrl)
+		ps := vmock.NewMockPermissionService(ctrl)
+		sa := vmock.NewMockCatalogHealthCheckScheduleAccess(ctrl)
+		service := &catalogHealthCheckScheduleService{ca: ca, ps: ps, sa: sa}
+		permissionErr := httperrors.NewHTTPError(context.Background(), http.StatusForbidden, httperrors.PublicError_Forbidden)
+		ca.EXPECT().GetByID(gomock.Any(), "api").Return(&interfaces.Catalog{ID: "api", Type: interfaces.CatalogTypePhysical, ConnectorType: "http"}, nil)
+		ps.EXPECT().CheckPermission(gomock.Any(), interfaces.PermissionResource{Type: interfaces.AUTH_RESOURCE_TYPE_CATALOG, ID: "api"}, []string{interfaces.OPERATION_TYPE_MODIFY}).Return(permissionErr)
+		got, err := service.Update(context.Background(), "api", &interfaces.CatalogHealthCheckScheduleRequest{Mode: interfaces.CatalogHealthCheckScheduleModeInherit})
+		require.ErrorIs(t, err, permissionErr)
 		assert.Nil(t, got)
 	})
 }

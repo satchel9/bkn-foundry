@@ -28,6 +28,18 @@ func TestSourceReadForbiddenError(t *testing.T) {
 	}
 }
 
+func TestSourceMemoryLimitError(t *testing.T) {
+	cause := errors.New("private source diagnostics")
+	err := fmt.Errorf("execute query: %w", NewSourceMemoryLimitError(cause))
+	var limited *SourceMemoryLimitError
+	if !errors.As(err, &limited) || !errors.Is(err, cause) {
+		t.Fatalf("wrapped source memory error lost its type or cause: %v", err)
+	}
+	if strings.Contains(err.Error(), cause.Error()) {
+		t.Fatalf("source memory error exposes private source diagnostics: %v", err)
+	}
+}
+
 func TestSourceQueryInvalidParameterError(t *testing.T) {
 	cause := errors.New("unknown column in source query")
 	err := fmt.Errorf("execute query: %w", NewSourceQueryInvalidParameterError(SourceQueryInvalidParameterUnknownColumn, cause))
@@ -50,36 +62,36 @@ func TestIndexCapabilitiesUnavailableError(t *testing.T) {
 }
 
 func TestUnsupportedOperationErrorCause(t *testing.T) {
-	cause := errors.New("source operation rejected")
-	err := NewUnsupportedOperationError("regex", "sql")
-	err.Cause = cause
-	if !errors.Is(fmt.Errorf("build query: %w", err), cause) {
-		t.Fatal("unsupported operation error must preserve its optional cause")
+	cause := errors.New("full-text search requires a local index")
+	err := NewUnsupportedOperationError("match", cause)
+	wrapped := fmt.Errorf("build query: %w", err)
+	if !errors.Is(wrapped, cause) {
+		t.Fatal("unsupported operation error must preserve the supplied cause")
+	}
+	var unsupported *UnsupportedOperationError
+	if !errors.As(wrapped, &unsupported) || unsupported.Operation != "match" || !errors.Is(unsupported.Cause, cause) {
+		t.Fatalf("wrapped unsupported operation lost its type, operation, or cause: %v", wrapped)
+	}
+	if reason, ok := RequestSideQueryError(wrapped); !ok || !strings.Contains(reason, cause.Error()) {
+		t.Fatalf("caller explanation was not classified as a request-side error: %q, %t", reason, ok)
 	}
 }
 
 func TestUnsupportedOperationErrorMessage(t *testing.T) {
 	for _, tc := range []struct {
-		operation string
-		channel   string
-		want      string
+		cause error
+		want  string
 	}{
-		{operation: "match", channel: "sql", want: "local index"},
-		{operation: "knn_vector", channel: "sql", want: "vector feature"},
-		{operation: "match", channel: "opensearch", want: "opensearch query channel"},
+		{nil, "operation match is not supported"},
+		{errors.New("full-text search requires a local index"), "operation match is not supported: full-text search requires a local index"},
 	} {
-		msg := NewUnsupportedOperationError(tc.operation, tc.channel).Error()
-		if !strings.Contains(msg, tc.want) {
-			t.Errorf("error %q should contain %q", msg, tc.want)
+		err := NewUnsupportedOperationError("match", tc.cause)
+		if got := err.Error(); got != tc.want {
+			t.Errorf("got %q, want %q", got, tc.want)
 		}
-		if tc.channel != "sql" && strings.Contains(msg, "local index") {
-			t.Errorf("error %q should not suggest building an index", msg)
+		if !errors.Is(err.Unwrap(), tc.cause) {
+			t.Errorf("cause changed: %v", err.Unwrap())
 		}
-	}
-	wrapped := fmt.Errorf("execute query: %w", NewUnsupportedOperationError("match", "sql"))
-	var unsupported *UnsupportedOperationError
-	if !errors.As(wrapped, &unsupported) || unsupported.Operation != "match" {
-		t.Fatalf("wrapped unsupported operation lost its type or operation: %v", wrapped)
 	}
 }
 
@@ -89,6 +101,42 @@ func TestConditionBuildErrorCause(t *testing.T) {
 	err.Cause = cause
 	if !errors.Is(fmt.Errorf("build query: %w", err), cause) {
 		t.Fatal("condition build error must preserve its optional cause")
+	}
+}
+
+func TestTemporalRangeError(t *testing.T) {
+	if _, ok := any(TemporalRangeError{}).(error); ok {
+		t.Fatal("only *TemporalRangeError should implement error")
+	}
+	cause := NewTemporalRangeError("created", "date_nanos", 2147483647, "day")
+	err := fmt.Errorf("build query: %w", cause)
+	var temporal *TemporalRangeError
+	var condition *ConditionBuildError
+	if !errors.As(err, &temporal) || temporal != cause ||
+		!errors.As(err, &condition) || condition != cause.ConditionBuildError {
+		t.Fatalf("wrapped temporal range error lost its type or condition cause: %v", err)
+	}
+	if got := cause.Error(); got != cause.ConditionBuildError.Error() {
+		t.Fatalf("temporal range error lost its condition message: %q", got)
+	}
+}
+
+func TestKeywordLimitError(t *testing.T) {
+	if _, ok := any(KeywordLimitError{}).(error); ok {
+		t.Fatal("only *KeywordLimitError should implement error")
+	}
+	cause := NewKeywordLimitError("status", 256)
+	wrapped := fmt.Errorf("build query: %w", cause)
+	var limit *KeywordLimitError
+	if !errors.As(wrapped, &limit) || limit.Field != "status" || limit.Limit != 256 {
+		t.Fatalf("wrapped keyword limit error lost its type or parameters: %v", wrapped)
+	}
+	var build *ConditionBuildError
+	if !errors.As(wrapped, &build) || !errors.Is(wrapped, cause.ConditionBuildError) {
+		t.Fatalf("wrapped keyword limit error lost its condition build cause: %v", wrapped)
+	}
+	if cause.Error() != build.Error() {
+		t.Fatal("keyword limit error changed its condition build explanation")
 	}
 }
 
@@ -124,7 +172,7 @@ func TestRequestSideQueryError(t *testing.T) {
 	if reason, ok := RequestSideQueryError(build); !ok || reason != "text field body needs keyword" {
 		t.Errorf("wrapped condition build error was not classified: %q, %t", reason, ok)
 	}
-	if reason, ok := RequestSideQueryError(NewUnsupportedOperationError("regex", "sql")); !ok || !strings.Contains(reason, "regex") {
+	if reason, ok := RequestSideQueryError(NewUnsupportedOperationError("regex", errors.New("the sql query channel does not support this operation"))); !ok || !strings.Contains(reason, "regex") {
 		t.Errorf("unsupported operation was not classified: %q, %t", reason, ok)
 	}
 	if reason, ok := RequestSideQueryError(errors.New("opensearch unavailable")); ok || reason != "" {
@@ -141,5 +189,31 @@ func TestRawAggregationValidationError(t *testing.T) {
 	if !errors.As(err, &validation) || !errors.Is(err, cause) ||
 		validation.Path != "aggs.total" || validation.Reason != "unsupported aggregation" {
 		t.Fatalf("wrapped aggregation error lost its path or reason: %v", err)
+	}
+}
+
+func TestOutputFieldError(t *testing.T) {
+	for _, tc := range []struct {
+		reason  OutputFieldErrorReason
+		message string
+	}{
+		{OutputFieldUnknown, `unknown output field "value"`},
+		{OutputFieldUnsupported, `output field "value" is not supported by this query channel`},
+		{OutputFieldNoneQueryable, "resource schema has no queryable fields"},
+	} {
+		t.Run(string(tc.reason), func(t *testing.T) {
+			err := fmt.Errorf("prepare: %w", NewOutputFieldError(tc.reason, "value"))
+			var output *OutputFieldError
+			if !errors.As(err, &output) || output.Reason != tc.reason || output.Field != "value" {
+				t.Fatalf("lost projection error: %v", err)
+			}
+			reason, ok := RequestSideQueryError(err)
+			if !ok || reason != tc.message {
+				t.Fatalf("request-side projection reason = %q, %v", reason, ok)
+			}
+			if _, ok := RequestSideQueryError(NewStoredConditionBuildError(err)); ok {
+				t.Fatal("stored configuration failure became a request error")
+			}
+		})
 	}
 }

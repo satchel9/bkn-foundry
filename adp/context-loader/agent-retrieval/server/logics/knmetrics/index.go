@@ -6,12 +6,10 @@
 //
 //	Recall the object type → see the available metrics under the object type → get the number according to the metric's own semantics.
 //
-// Step 2 is AttachRelatedMetrics: put scope_type=object_type and scope_ref=<ot_id>.
-// The metric is attached to the object type. Indicators that are not bound to logical attributes are completely invisible on the object type, so the Agent can only degenerate into.
-// run_sql overrides the semantics itself.
-//
-// The third step is QueryMetric: After selecting the metric, it is handed over to ontology-query to calculate according to MetricDefinition.
-// The instance-level branch that has bound logical properties still uses get_logic_properties_values, which is not included in this package.
+// Step 2 is AttachRelatedMetrics: expose published versions owned by the
+// object type. Step 3 is QueryMetric: pass the selected immutable version to
+// ontology-query. Object metrics are always instance-set aggregations; object
+// type logical properties are a separate capability.
 package knmetrics
 
 import (
@@ -31,21 +29,94 @@ import (
 var (
 	ErrKnIDRequired     = errors.New("kn_id is required")
 	ErrMetricIDRequired = errors.New("metric_id is required (from get_object_types related_metrics)")
+	ErrVersionRequired  = errors.New("version must be a positive published object metric version (from get_object_types related_metrics)")
 )
 
-// Step whitelist, consistent with the granularity supported by MetricDefinition.
-var validSteps = map[string]struct{}{
-	"day": {}, "week": {}, "month": {}, "quarter": {}, "year": {},
+const defaultBranch = "main"
+
+func discoveryBranch(branch string) string {
+	if branch = strings.TrimSpace(branch); branch != "" {
+		return branch
+	}
+	return defaultBranch
+}
+
+func branchReader(bkn interfaces.BknBackendAccess, branch string) (interfaces.BranchBknBackendAccess, error) {
+	branched, ok := bkn.(interfaces.BranchBknBackendAccess)
+	if !ok {
+		return nil, fmt.Errorf("branch-aware metric discovery is unavailable for %q", branch)
+	}
+	return branched, nil
+}
+
+func NetworkDetailForBranch(ctx context.Context, bkn interfaces.BknBackendAccess, knID, branch string) (*interfaces.KnowledgeNetworkDetail, error) {
+	if branch = discoveryBranch(branch); branch == defaultBranch {
+		return bkn.GetKnowledgeNetworkDetail(ctx, knID)
+	}
+	reader, err := branchReader(bkn, branch)
+	if err != nil {
+		return nil, err
+	}
+	return reader.GetKnowledgeNetworkDetailBranch(ctx, knID, branch)
+}
+
+func ObjectTypesForBranch(ctx context.Context, bkn interfaces.BknBackendAccess, knID, branch string, offset, limit int) (*interfaces.ObjectTypePage, error) {
+	if branch = discoveryBranch(branch); branch == defaultBranch {
+		return bkn.ListObjectTypes(ctx, knID, offset, limit)
+	}
+	reader, err := branchReader(bkn, branch)
+	if err != nil {
+		return nil, err
+	}
+	return reader.ListObjectTypesBranch(ctx, knID, branch, offset, limit)
+}
+
+func ObjectTypeDetailForBranch(ctx context.Context, bkn interfaces.BknBackendAccess, knID, branch string, ids []string, includeDetail bool) ([]*interfaces.ObjectType, error) {
+	if branch = discoveryBranch(branch); branch == defaultBranch {
+		return bkn.GetObjectTypeDetail(ctx, knID, ids, includeDetail)
+	}
+	reader, err := branchReader(bkn, branch)
+	if err != nil {
+		return nil, err
+	}
+	return reader.GetObjectTypeDetailBranch(ctx, knID, branch, ids, includeDetail)
+}
+
+// RelationTypesForBranch reads one page of a network's relation types, keeping those that
+// start or end at objectTypeIDs when it is given. Unlike the object type index there is no
+// main-only reader to fall back on: listing relation types is new on every branch.
+func RelationTypesForBranch(ctx context.Context, bkn interfaces.BknBackendAccess, knID, branch string,
+	objectTypeIDs []string, offset, limit int) (*interfaces.RelationTypePage, error) {
+	reader, ok := bkn.(interfaces.RelationTypeReader)
+	if !ok {
+		return nil, fmt.Errorf("relation type listing is unavailable")
+	}
+	return reader.ListRelationTypesBranch(ctx, knID, discoveryBranch(branch), objectTypeIDs, offset, limit)
+}
+
+// RelationTypeDetailForBranch reads relation types by id. main keeps the reader it always
+// used; another branch needs one that names it.
+func RelationTypeDetailForBranch(ctx context.Context, bkn interfaces.BknBackendAccess, knID, branch string,
+	ids []string, includeDetail bool) ([]*interfaces.RelationType, error) {
+	if branch = discoveryBranch(branch); branch == defaultBranch {
+		return bkn.GetRelationTypeDetail(ctx, knID, ids, includeDetail)
+	}
+	reader, ok := bkn.(interfaces.RelationTypeReader)
+	if !ok {
+		return nil, fmt.Errorf("branch-aware relation type reads are unavailable for %q", branch)
+	}
+	return reader.GetRelationTypeDetailBranch(ctx, knID, branch, ids, includeDetail)
 }
 
 // KnMetricsService metric visibility and metric access.
 type KnMetricsService interface {
 	// AttachRelatedMetrics attaches the metrics under its scope to the object type.
-	AttachRelatedMetrics(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType) error
+	AttachRelatedMetrics(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType, branch ...string) error
 	// AttachRelatedMetricCounts Attach only counts, used for progressive drill-down of get_kn_detail.
-	AttachRelatedMetricCounts(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType) error
+	AttachRelatedMetricCounts(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType, branch ...string) error
 	// QueryMetric takes the number based on the metric's own semantics.
 	QueryMetric(ctx context.Context, req *interfaces.QueryMetricReq) (*interfaces.QueryMetricResp, error)
+	DrillThroughMetric(ctx context.Context, req *interfaces.MetricDrillThroughReq) (*interfaces.MetricDrillThroughResp, error)
 }
 
 type knMetricsService struct {
@@ -78,9 +149,9 @@ func NewKnMetricsServiceWith(logger interfaces.Logger, bkn interfaces.BknBackend
 	return &knMetricsService{logger: logger, bknBackend: bkn, ontologyQuery: oq}
 }
 
-// AttachRelatedMetrics distributes metrics to each object type according to scope_ref.
-func (s *knMetricsService) AttachRelatedMetrics(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType) error {
-	byScope, err := s.metricsByScope(ctx, knID, objectTypes)
+// AttachRelatedMetrics distributes published metrics by owner object type.
+func (s *knMetricsService) AttachRelatedMetrics(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType, branch ...string) error {
+	byScope, err := s.metricsByScope(ctx, knID, objectTypes, branch...)
 	if err != nil {
 		return err
 	}
@@ -95,8 +166,8 @@ func (s *knMetricsService) AttachRelatedMetrics(ctx context.Context, knID string
 }
 
 // AttachRelatedMetricCounts only writes counts, not details (used for get_kn_detail summary).
-func (s *knMetricsService) AttachRelatedMetricCounts(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType) error {
-	byScope, err := s.metricsByScope(ctx, knID, objectTypes)
+func (s *knMetricsService) AttachRelatedMetricCounts(ctx context.Context, knID string, objectTypes []*interfaces.ObjectType, branch ...string) error {
+	byScope, err := s.metricsByScope(ctx, knID, objectTypes, branch...)
 	if err != nil {
 		return err
 	}
@@ -109,9 +180,9 @@ func (s *knMetricsService) AttachRelatedMetricCounts(ctx context.Context, knID s
 	return nil
 }
 
-// metricsByScope retrieves the metrics under this batch of object types and groups them by scope_ref.
+// metricsByScope groups visible metrics by owner object type.
 func (s *knMetricsService) metricsByScope(ctx context.Context, knID string,
-	objectTypes []*interfaces.ObjectType) (map[string][]*interfaces.RelatedMetric, error) {
+	objectTypes []*interfaces.ObjectType, branch ...string) (map[string][]*interfaces.RelatedMetric, error) {
 	ids := make([]string, 0, len(objectTypes))
 	for _, ot := range objectTypes {
 		if ot != nil && strings.TrimSpace(ot.ID) != "" {
@@ -122,22 +193,36 @@ func (s *knMetricsService) metricsByScope(ctx context.Context, knID string,
 		return nil, nil
 	}
 
-	metrics, err := s.bknBackend.ListMetricsByObjectTypes(ctx, knID, ids)
+	selectedBranch := defaultBranch
+	if len(branch) > 0 && strings.TrimSpace(branch[0]) != "" {
+		selectedBranch = strings.TrimSpace(branch[0])
+	}
+	var metrics []*interfaces.RelatedMetric
+	var err error
+	if selectedBranch != defaultBranch {
+		branched, ok := s.bknBackend.(interfaces.BranchBknBackendAccess)
+		if !ok {
+			return nil, fmt.Errorf("branch-aware metric discovery is unavailable for %q", selectedBranch)
+		}
+		metrics, err = branched.ListMetricsByObjectTypesBranch(ctx, knID, selectedBranch, ids)
+	} else {
+		metrics, err = s.bknBackend.ListMetricsByObjectTypes(ctx, knID, ids)
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	byScope := make(map[string][]*interfaces.RelatedMetric, len(ids))
 	for _, m := range metrics {
-		if m == nil || m.ScopeRef == "" {
+		if m == nil || m.OwnerObjectTypeID == "" {
 			continue
 		}
-		byScope[m.ScopeRef] = append(byScope[m.ScopeRef], m)
+		byScope[m.OwnerObjectTypeID] = append(byScope[m.OwnerObjectTypeID], m)
 	}
 	return byScope, nil
 }
 
-// QueryMetric forwards ontology-query's metric fetching endpoint after verifying the input parameters.
+// QueryMetric forwards only V1 runtime choices to a published, version-pinned object metric.
 func (s *knMetricsService) QueryMetric(ctx context.Context, req *interfaces.QueryMetricReq) (*interfaces.QueryMetricResp, error) {
 	if req == nil {
 		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
@@ -145,6 +230,11 @@ func (s *knMetricsService) QueryMetric(ctx context.Context, req *interfaces.Quer
 	}
 	knID := strings.TrimSpace(req.KnID)
 	metricID := strings.TrimSpace(req.MetricID)
+	branch := strings.TrimSpace(req.Branch)
+	if branch == "" {
+		branch = defaultBranch
+	}
+	req.Branch = branch
 	if knID == "" {
 		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
 		return nil, ErrKnIDRequired
@@ -153,86 +243,93 @@ func (s *knMetricsService) QueryMetric(ctx context.Context, req *interfaces.Quer
 		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
 		return nil, ErrMetricIDRequired
 	}
-	if err := validateTimeWindow(req.Time, req.FillNull); err != nil {
+	if req.Version < 1 {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+		return nil, ErrVersionRequired
+	}
+	if err := validateMetricRuntimeQuery(req.Query, 0); err != nil {
 		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
 		return nil, err
 	}
-
-	downstream := &interfaces.MetricQueryDownstreamReq{
-		Time:               req.Time,
-		Cond:               req.Cond,
-		AnalysisDimensions: req.AnalysisDimensions,
-		OrderBy:            req.OrderBy,
-		Having:             req.Having,
-		Limit:              req.Limit,
+	if req.Query.Time != nil && req.Query.Time.Start > req.Query.Time.End {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+		return nil, errors.New("query.time.start must be <= query.time.end")
 	}
-	resp, err := s.ontologyQuery.QueryMetricData(ctx, knID, metricID, req.FillNull, downstream)
+	resp, err := s.ontologyQuery.QueryMetricData(ctx, knID, branch, metricID, req.Version, &req.Query)
 	if err != nil {
 		return nil, err
 	}
 
-	out := &interfaces.QueryMetricResp{KnID: knID, MetricID: metricID, Datas: []*interfaces.MetricDataSeries{}}
+	out := &interfaces.QueryMetricResp{KnID: knID, MetricID: metricID, Version: req.Version, Entries: []interfaces.ObjectMetricDataEntry{}}
 	if resp != nil {
-		if len(resp.Datas) > 0 {
-			out.Datas = resp.Datas
+		if len(resp.Entries) > 0 {
+			out.Entries = resp.Entries
 		}
+		out.Model = resp.Model
+		out.IsApproximate = resp.IsApproximate
+		out.Status = resp.Status
+		out.EmptyReason = resp.EmptyReason
+		out.TotalCount = resp.TotalCount
+		out.NextCursor = resp.NextCursor
+		out.Warnings = resp.Warnings
 		out.OverallMs = resp.OverallMs
+		out.EvaluatedAt = resp.EvaluatedAt
+		out.EffectiveWindow = resp.EffectiveWindow
 	}
 	return out, nil
 }
 
-// isTrendWindow mirrors ontology-query's metricQueryIsTrendTime: a window is a
-// trend (series) query unless instant is explicitly true. Omitting instant means
-// trend, not instant — getting this backwards is what makes the common
-// {"start":…,"end":…} shape pass here and fail downstream.
-func isTrendWindow(t *interfaces.MetricTimeWindow) bool {
-	return t != nil && (t.Instant == nil || !*t.Instant)
+// DrillThroughMetric pages authorized participants of a selected published result bucket.
+func (s *knMetricsService) DrillThroughMetric(ctx context.Context, req *interfaces.MetricDrillThroughReq) (*interfaces.MetricDrillThroughResp, error) {
+	if req == nil || strings.TrimSpace(req.KnID) == "" || strings.TrimSpace(req.MetricID) == "" || req.Version < 1 || strings.TrimSpace(req.BucketKey) == "" {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+		return nil, errors.New("kn_id, metric_id, version, and bucket_key are required")
+	}
+	if req.PageSize < 0 || req.PageSize > 100 {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+		return nil, errors.New("page_size must be between 0 and 100")
+	}
+	if err := validateMetricRuntimeQuery(req.Query, 0); err != nil {
+		bkntrace.RecordToolFailure(ctx, "invalid_arguments", "input_validation")
+		return nil, err
+	}
+	branch := strings.TrimSpace(req.Branch)
+	if branch == "" {
+		branch = defaultBranch
+	}
+	req.Branch = branch
+	resp, err := s.ontologyQuery.DrillThroughMetricData(ctx, strings.TrimSpace(req.KnID), branch,
+		strings.TrimSpace(req.MetricID), req.Version, req)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("metric drill-through returned no result")
+	}
+	if resp.Participants == nil {
+		resp.Participants = []interfaces.ObjectMetricParticipant{}
+	}
+	resp.KnID = strings.TrimSpace(req.KnID)
+	resp.MetricID = strings.TrimSpace(req.MetricID)
+	resp.Version = req.Version
+	return resp, nil
 }
 
-// validateTimeWindow rejects a malformed time window before it costs a round trip.
-//
-// Every rule here mirrors ontology-query's validateMetricQueryRequest exactly —
-// same conditions, same wording — because a local check that is stricter than the
-// downstream one turns a valid call into a false rejection, and a looser one just
-// delays the same error. The point is a faster, identical verdict, not a second
-// opinion.
-func validateTimeWindow(t *interfaces.MetricTimeWindow, fillNull bool) error {
-	if t == nil {
-		if fillNull {
-			return errors.New("fill_null requires a time range (time is required)")
-		}
-		return nil
+func validateMetricRuntimeQuery(query interfaces.ObjectMetricQuery, depth int) error {
+	if query.PageSize < 0 || query.PageSize > 1000 {
+		return errors.New("query.page_size must be between 0 and 1000")
 	}
-	if (t.Start != nil) != (t.End != nil) {
-		return errors.New("time.start and time.end must both be set when either is set")
+	if query.Cursor != "" && query.PageSize == 0 {
+		return errors.New("query.page_size is required with cursor")
 	}
-	if t.Start != nil && t.End != nil && *t.Start > *t.End {
-		return errors.New("time.start must be <= time.end")
+	if query.Filter != nil && strings.TrimSpace(query.Filter.NodeType) == "" {
+		return errors.New("query.filter.node_type is required")
 	}
-	if isTrendWindow(t) {
-		if t.Step == nil || strings.TrimSpace(*t.Step) == "" {
-			return errors.New("trend query requires time.step (calendar interval only). " +
-				"Omitting time.instant means a trend query; set time.instant=true for a single point")
+	if query.BucketSelection != nil {
+		if depth >= 8 {
+			return fmt.Errorf("metric drill depth exceeds 8")
 		}
-		if err := validateCalendarStep(*t.Step); err != nil {
-			return err
-		}
-	}
-	if fillNull {
-		if !isTrendWindow(t) {
-			return errors.New("fill_null is only valid for trend (range) queries: set time.instant to false or omit it")
-		}
-		if t.Start == nil || t.End == nil {
-			return errors.New("fill_null requires time.start and time.end")
-		}
-	}
-	return nil
-}
-
-// validateCalendarStep accepts the same steps as ontology-query, case-insensitively.
-func validateCalendarStep(raw string) error {
-	if _, ok := validSteps[strings.ToLower(strings.TrimSpace(raw))]; !ok {
-		return fmt.Errorf("step must be a calendar interval: day, week, month, quarter, year (got %q)", raw)
+		return validateMetricRuntimeQuery(query.BucketSelection.ParentQuery, depth+1)
 	}
 	return nil
 }

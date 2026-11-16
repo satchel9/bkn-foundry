@@ -8,6 +8,7 @@ package bkn
 
 import (
 	"archive/tar"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -23,7 +24,7 @@ import (
 // - action_types/*.bkn for each ActionType
 // - risk_types/*.bkn for each RiskType
 // - concept_groups/*.bkn for each ConceptGroup
-// - metrics/*.bkn for each Metric
+// - object_metrics/<id>@<version>.json for each Object Metrics V1 version
 // - SKILL.md (auto-generated)
 // - CHECKSUM (auto-generated)
 func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
@@ -33,8 +34,12 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 	now := time.Now()
 	mfs := NewMemoryFileSystem()
 
+	// Only a network that declares bkn_spec 3.0 is written under 3.0; every other network is written
+	// exactly as before.
+	opts := serializeOptions{v3: doc.BknSpec == BknSpecV3}
+
 	// Write network.bkn
-	rootContent := SerializeBknNetwork(doc)
+	rootContent := serializeBknNetwork(doc, opts)
 	mfs.AddFile("network.bkn", []byte(rootContent))
 	if err := writeTarEntry(tw, "network.bkn", []byte(rootContent), now); err != nil {
 		return err
@@ -42,7 +47,7 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 
 	// Write ObjectTypes
 	for _, ot := range doc.ObjectTypes {
-		content := SerializeObjectType(ot)
+		content := serializeObjectType(ot, opts)
 		path := "object_types/" + ot.ID + ".bkn"
 		mfs.AddFile(path, []byte(content))
 		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
@@ -52,7 +57,7 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 
 	// Write RelationTypes
 	for _, rt := range doc.RelationTypes {
-		content := SerializeRelationType(rt)
+		content := serializeRelationType(rt, opts)
 		path := "relation_types/" + rt.ID + ".bkn"
 		mfs.AddFile(path, []byte(content))
 		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
@@ -62,7 +67,7 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 
 	// Write ActionTypes
 	for _, at := range doc.ActionTypes {
-		content := SerializeActionType(at)
+		content := serializeActionType(at, opts)
 		path := "action_types/" + at.ID + ".bkn"
 		mfs.AddFile(path, []byte(content))
 		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
@@ -72,7 +77,7 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 
 	// Write RiskTypes
 	for _, rt := range doc.RiskTypes {
-		content := SerializeRiskType(rt)
+		content := serializeRiskType(rt, opts)
 		path := "risk_types/" + rt.ID + ".bkn"
 		mfs.AddFile(path, []byte(content))
 		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
@@ -88,7 +93,7 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 
 	// Write ConceptGroups
 	for _, cg := range doc.ConceptGroups {
-		content := SerializeConceptGroup(cg, otIndex)
+		content := serializeConceptGroup(cg, otIndex, opts)
 		path := "concept_groups/" + cg.ID + ".bkn"
 		mfs.AddFile(path, []byte(content))
 		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
@@ -96,12 +101,36 @@ func WriteNetworkToTar(doc *BknNetwork, w io.Writer) error {
 		}
 	}
 
-	// Write Metrics
-	for _, met := range doc.Metrics {
-		content := SerializeMetric(met)
-		path := "metrics/" + met.ID + ".bkn"
-		mfs.AddFile(path, []byte(content))
-		if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
+	// Write ValueTypes: a 3.0 package only; 2.x has no place for them.
+	if opts.v3 {
+		for _, vt := range doc.ValueTypes {
+			content := SerializeValueType(vt)
+			path := valueTypesDir + "/" + vt.ID + ".bkn"
+			mfs.AddFile(path, []byte(content))
+			if err := writeTarEntry(tw, path, []byte(content), now); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Preserve the complete versioned definition and metadata in each file.
+	writtenMetrics := make(map[string]struct{}, len(doc.ObjectMetrics))
+	for _, metric := range doc.ObjectMetrics {
+		id, version, err := objectMetricArchiveIdentity(metric)
+		if err != nil {
+			return err
+		}
+		content, err := json.MarshalIndent(metric, "", "  ")
+		if err != nil {
+			return err
+		}
+		path := "object_metrics/" + objectMetricArchiveFileName(id, version)
+		if _, duplicate := writtenMetrics[path]; duplicate {
+			return fmt.Errorf("duplicate object metric archive file %q", path)
+		}
+		writtenMetrics[path] = struct{}{}
+		mfs.AddFile(path, content)
+		if err := writeTarEntry(tw, path, content, now); err != nil {
 			return err
 		}
 	}
@@ -191,16 +220,15 @@ func generateSkillMd(doc *BknNetwork) string {
 		_, _ = fmt.Fprintf(&sb, "\n")
 	}
 
-	// Metrics table
-	if len(doc.Metrics) > 0 {
-		sb.WriteString("### 指标（Metrics）\n\n")
+	// Object metric table
+	if len(doc.ObjectMetrics) > 0 {
+		sb.WriteString("### Object Metrics V1\n\n")
 		sb.WriteString("| 指标 | 文件路径 | 说明 |\n")
 		sb.WriteString("|------|----------|------|\n")
-		mts := append([]*BknMetric(nil), doc.Metrics...)
-		sort.Slice(mts, func(i, j int) bool { return mts[i].ID < mts[j].ID })
-		for _, met := range mts {
-			path := "metrics/" + met.ID + ".bkn"
-			fmt.Fprintf(&sb, "| %s | `%s` | %s |\n", met.Name, path, met.Description)
+		for _, metric := range doc.ObjectMetrics {
+			id, version, name, description := objectMetricArchiveMetadata(metric)
+			path := "object_metrics/" + objectMetricArchiveFileName(id, version)
+			fmt.Fprintf(&sb, "| %s | `%s` | %s |\n", name, path, description)
 		}
 		sb.WriteString("\n")
 	}
@@ -227,8 +255,8 @@ func generateSkillMd(doc *BknNetwork) string {
 	if len(doc.RiskTypes) > 0 {
 		_, _ = fmt.Fprintf(&sb, "├── risk_types/\n")
 	}
-	if len(doc.Metrics) > 0 {
-		_, _ = fmt.Fprintf(&sb, "├── metrics/\n")
+	if len(doc.ObjectMetrics) > 0 {
+		_, _ = fmt.Fprintf(&sb, "├── object_metrics/\n")
 	}
 	_, _ = fmt.Fprintf(&sb, "```\n\n")
 
@@ -264,8 +292,8 @@ func generateSkillMd(doc *BknNetwork) string {
 	if len(doc.RiskTypes) > 0 {
 		_, _ = fmt.Fprintf(&sb, "- **风险定义**: `risk_types/`\n")
 	}
-	if len(doc.Metrics) > 0 {
-		_, _ = fmt.Fprintf(&sb, "- **指标定义**: `metrics/`\n")
+	if len(doc.ObjectMetrics) > 0 {
+		_, _ = fmt.Fprintf(&sb, "- **Object Metrics V1**: `object_metrics/`\n")
 	}
 	_, _ = fmt.Fprintf(&sb, "\n")
 

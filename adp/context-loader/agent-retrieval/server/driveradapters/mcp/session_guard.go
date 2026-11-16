@@ -407,11 +407,23 @@ type operationFailure struct {
 // said how often it happened, at which step, or with which code. The tool,
 // stage and code fields keep a fixed shape so a log query can group on them.
 func lifecycleUnavailable(ctx context.Context, toolName, stage string, err error) *mcpsdk.CallToolResult {
-	value := lifecycleAvailabilityError(err)
+	value := lifecycleStageAvailabilityError(stage, err)
+	if errors.Is(err, errInteractionFinishACK) {
+		value.Code = "interaction_finish_ack_invalid"
+	}
 	logger.DefaultLogger().WithContext(ctx).Warnf(
 		"[BKN Trace] lifecycle unavailable: tool=%s stage=%s code=%s: %v",
 		toolName, stage, value.Code, err,
 	)
+	if toolName == toolKeyFinishInteraction {
+		if value.Code != "evidence_capture_failed" && value.Code != "evidence_capture_denied" && retryableInteractionFinish(nil, err) {
+			return interactionFinishUnconfirmed(ctx, stage, value)
+		}
+		if value.Code == "feature_not_installed" {
+			value.RequiredAction = "contact_platform_operator"
+		}
+		return lifecycleToolError(value)
+	}
 	if bkntrace.IsTraceInfrastructureFailure(nil, err) {
 		if toolName == toolKeyStartInteraction {
 			return lifecycleToolError(value)
@@ -434,6 +446,12 @@ func lifecycleAPIResult(ctx context.Context, toolName, stage string, value bkntr
 	if bkntrace.IsCaptureDisabledError(&value) {
 		return lifecycleToolError(traceCoreError(value))
 	}
+	if toolName == toolKeyFinishInteraction {
+		if retryableInteractionFinish(&value, nil) {
+			return interactionFinishUnconfirmed(ctx, stage, traceCoreError(value))
+		}
+		return lifecycleToolError(traceCoreError(value))
+	}
 	if bkntrace.IsTraceInfrastructureFailure(&value, nil) {
 		if toolName == toolKeyStartInteraction {
 			startError := traceCoreError(value)
@@ -448,6 +466,26 @@ func lifecycleAPIResult(ctx context.Context, toolName, stage string, value bkntr
 		return lifecycleUnrecordedResult(ctx, toolName, stage, value.Code)
 	}
 	return lifecycleToolError(traceCoreError(value))
+}
+
+// Artifact transport failures do not imply that lifecycle SQL is unavailable.
+// Keep configuration and permission classifications from the shared mapper.
+func lifecycleStageAvailabilityError(stage string, err error) lifecycleError {
+	value := lifecycleAvailabilityError(err)
+	if (stage != "question_artifact" && stage != "answer_artifact") || value.Code != "trace_core_unavailable" {
+		return value
+	}
+	var coreErr *bkntrace.CoreHTTPError
+	if bkntrace.IsTraceInfrastructureFailure(nil, err) || errors.As(err, &coreErr) && coreErr.Retryable() {
+		value.Code = "evidence_store_unavailable"
+		value.Message = "BKN Trace evidence artifact capture is temporarily unavailable"
+	} else {
+		value.Code = "evidence_capture_failed"
+		value.Message = "BKN Trace evidence artifact could not be captured"
+		value.Retryable = false
+		value.RequiredAction = "contact_platform_operator"
+	}
+	return value
 }
 
 func lifecycleAvailabilityError(err error) lifecycleError {

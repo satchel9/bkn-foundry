@@ -8,22 +8,22 @@ package mcp
 
 import (
 	"context"
-	"github.com/bytedance/sonic"
-	validator "github.com/go-playground/validator/v10"
-	"github.com/mark3labs/mcp-go/mcp"
 	"log"
 	"strings"
 
+	"github.com/bytedance/sonic"
+	"github.com/go-playground/validator/v10"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/bkntrace"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
-	infraErr "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/errors"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/rest"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/kncypher"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knmetrics"
 	logicsKqs "github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knquerysubgraph"
-	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knresources"
-	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knrunsql"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/knsearch"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/objectpermission"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/logics/permissionguide"
@@ -495,33 +495,6 @@ func handleListKnowledgeNetworks(bkn interfaces.BknBackendAccess) func(ctx conte
 	}
 }
 
-// handleRunSQL handles run_sql tool calls.
-// Execute read-only SQL (mandatory SELECT-only) on the data resources mounted on the knowledge network, and use the shared knrunsql service at the bottom.
-func handleRunSQL(svc knrunsql.KnRunSQLService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		format, err := GetResponseFormatFromRequest(req)
-		if err != nil {
-			return inputValidationToolError(ctx, err.Error()), nil
-		}
-
-		sqlReq := &knrunsql.RunSQLReq{}
-		if err := bindArguments(req, sqlReq); err != nil {
-			return inputValidationToolError(ctx, err.Error()), nil
-		}
-
-		resp, err := svc.RunSQL(ctx, sqlReq)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		result, err := BuildMCPToolResult(resp, format)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return result, nil
-	}
-}
-
 // handleRunCypher handles run_cypher tool calls.
 // Read-only Cypher over the knowledge network's model: bkn-backend compiles the
 // query against the object and relation types and runs the SQL it produces.
@@ -542,6 +515,9 @@ func handleRunCypher(svc kncypher.KnCypherService,
 		if err := bindPreciseArguments(req, cypherReq); err != nil {
 			return inputValidationToolError(ctx, err.Error()), nil
 		}
+		// The tool's schema has no timeout; one an agent sends anyway is
+		// dropped so that the statement runs under the configured timeout.
+		cypherReq.TimeoutSec = 0
 
 		resp, err := svc.RunCypher(ctx, cypherReq)
 		if err != nil {
@@ -588,60 +564,6 @@ func permissionGuidancesForObjectImpacts(ctx context.Context, guide *permissiong
 	return guidance
 }
 
-// handleListResources handles list_resources tool calls.
-// Data layer "Resource Direct Inspection" entrance (separated from the ontology): List the data resources that the account has the right to view, with describe_resource + run_sql.
-func handleListResources(svc knresources.KnResourcesService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		format, err := GetResponseFormatFromRequest(req)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		listReq := &knresources.ListResourcesReq{}
-		if err := bindArguments(req, listReq); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		resp, err := svc.ListResources(ctx, listReq)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		result, err := BuildMCPToolResult(resp, format)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return result, nil
-	}
-}
-
-// handleDescribeResource handles describe_resource tool calls.
-// Get the physical schema (column name + connector type) of a single resource for writing run_sql.
-func handleDescribeResource(svc knresources.KnResourcesService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		format, err := GetResponseFormatFromRequest(req)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		resourceID := getStringArg(req, "resource_id", "")
-		if resourceID == "" {
-			return mcp.NewToolResultError("resource_id is required"), nil
-		}
-
-		resp, err := svc.DescribeResource(ctx, resourceID)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		result, err := BuildMCPToolResult(resp, format)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-		return result, nil
-	}
-}
-
 // handleGetKnDetail handles get_kn_detail tool calls.
 // Pack the knowledge network details (concept group/object type/relation type/action class) of bkn-backend and press.
 // detail_level does progressive cropping: summary (default) returns the skeleton + attribute name, full returns the full amount.
@@ -659,26 +581,30 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
 
-		resp, err := bkn.GetKnowledgeNetworkDetail(ctx, knID)
+		branch := getStringArg(req, "branch", "main")
+		detailLevel := getStringArg(req, "detail_level", interfaces.DetailLevelSummary)
+		resp, err := knmetrics.NetworkDetailForBranch(ctx, bkn, knID, branch)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
+		}
+		notice := func(reduction interfaces.KnDetailReduction) string {
+			return renderKnDetailNotice(ctx, resp, reduction, detailLevel, branch)
 		}
 		// A network too large to answer with its concept model narrows to its navigation
 		// shell, and does so here -- before the two steps below, which each cost a
 		// downstream call per object type of a list this answer will not carry (#1877).
-		if resp.NeedsNavigationShell() {
+		// brief asks for that shell outright.
+		if detailLevel == interfaces.DetailLevelBrief || resp.NeedsNavigationShell() {
 			resp.ReduceToNavigationShell()
-			resp.Notice = infraErr.LocalizedDetail(ctx, resp.NavigationShellNoticeKey(),
-				resp.ObjectTypeCount, resp.RelationTypeCount,
-				interfaces.MaxSummaryObjectTypes, interfaces.MaxSummaryRelationTypes)
+			resp.Notice = notice(interfaces.KnDetailReductionShell)
 		} else {
-			resp.ObjectTypes, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, resp.ObjectTypes)
+			resp.ObjectTypes, err = objectpermission.FilterObjectTypesBranch(ctx, schemaAccess, knID, branch, resp.ObjectTypes)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			// Counts only: which object types have metrics worth drilling into, without
 			// carrying the metric list itself at this level.
-			if err := metrics.AttachRelatedMetricCounts(ctx, knID, resp.ObjectTypes); err != nil {
+			if err := metrics.AttachRelatedMetricCounts(ctx, knID, resp.ObjectTypes, branch); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 		}
@@ -696,15 +622,24 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 		// means unknown either way, which is what it has to mean for an unreadable list too.
 		if err := knAuthz.AuthorizeRead(ctx, knID); err != nil {
 			log.Printf("WARN: get_kn_detail capability counts withheld for kn %s: %v", knID, err)
-		} else if refs, err := bkn.ListKNCapabilities(ctx, knID, "", ""); err == nil {
+		} else if refs, err := bkn.ListKNCapabilities(ctx, knID, branch, ""); err == nil {
 			resp.AttachMountedCapabilities(refs)
 		} else {
 			// Logged because an absent field and a silently dropped error look identical to
 			// whoever reads the answer, and only one of them is worth investigating.
 			log.Printf("WARN: get_kn_detail capability bindings unreadable for kn %s: %v", knID, err)
 		}
-		detailLevel := getStringArg(req, "detail_level", interfaces.DetailLevelSummary)
 		resp.Slim(detailLevel)
+		// Narrowed to what the caller can read in one result, measured as they will read
+		// it, and before the snapshot so the evidence is the answer they were given.
+		if _, err := resp.FitWithin(interfaces.MaxKnDetailChars, notice, func(d *interfaces.KnowledgeNetworkDetail) (int, error) {
+			if detailLevel != interfaces.DetailLevelFull {
+				d = objectpermission.WithUnrestrictedPermissionsOmitted(d)
+			}
+			return toolResultRunes(d, format)
+		}); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "network", knID, nil, resp, true)
 		// After the snapshot, which records permissions as they are: the evidence
 		// keeps every entry, only the answer drops the ones that say nothing.
@@ -719,6 +654,17 @@ func handleGetKnDetail(bkn interfaces.BknBackendAccess, metrics knmetrics.KnMetr
 	}
 }
 
+// renderKnDetailNotice is the localized notice for a get_kn_detail answer that carries
+// less than the level asked for.
+func renderKnDetailNotice(ctx context.Context, detail *interfaces.KnowledgeNetworkDetail, reduction interfaces.KnDetailReduction, detailLevel, branch string) string {
+	key, args := detail.KnDetailNotice(reduction, detailLevel, branch)
+	text, err := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail."+key, args)
+	if err != nil {
+		logger.Errorf("localized message rendering failed: %v", err)
+	}
+	return text
+}
+
 // knDrillArgs are the arguments for the get_object_types / get_relation_types
 // drill-down tools: a knowledge-network id plus the type ids to expand.
 type knDrillArgs struct {
@@ -731,8 +677,9 @@ type knDrillArgs struct {
 // there rather than refused: naming ids is already the precise request.
 type knObjectTypesArgs struct {
 	knDrillArgs
-	Offset int `json:"offset"`
-	Limit  int `json:"limit"`
+	Branch string `json:"branch"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
 }
 
 func (a *knDrillArgs) resolveKnID(req mcp.CallToolRequest) string {
@@ -778,15 +725,19 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 				clamped bool
 			)
 			offset, limit, clamped = interfaces.ResolveObjectTypePage(args.Offset, args.Limit)
-			page, err := bkn.ListObjectTypes(ctx, knID, offset, limit)
+			page, err := knmetrics.ObjectTypesForBranch(ctx, bkn, knID, args.Branch, offset, limit)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 			matched, totalCount = page.Entries, page.TotalCount
 			nextOffset = interfaces.NextObjectTypeOffset(offset, page.Scanned, totalCount)
+			interfaces.ShortenObjectTypeComments(matched)
 			if clamped {
-				notice = infraErr.LocalizedDetail(ctx, "ObjectTypePageLimitClamped",
-					args.Limit, interfaces.MaxObjectTypePageSize, limit)
+				localizedText, renderErr := i18n.Render(i18n.GetLanguageByCtx(ctx), "agentRetrieval.Detail.ObjectTypePageLimitClamped", map[string]any{"Arg1": args.Limit, "Arg2": interfaces.MaxObjectTypePageSize, "Arg3": limit})
+				if renderErr != nil {
+					logger.Errorf("localized message rendering failed: %v", renderErr)
+				}
+				notice = localizedText
 			}
 		} else {
 			// Prioritize the endpoint that retrieves details by id: the export view only lists object types, does not enrich the data source, and does not enrich the data source.
@@ -794,7 +745,7 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 			//
 			// Omitted IDs are not reported as missing because an omission may be an
 			// authorization filter.
-			matched, err = bkn.GetObjectTypeDetail(ctx, knID, args.IDs, true)
+			matched, err = knmetrics.ObjectTypeDetailForBranch(ctx, bkn, knID, args.Branch, args.IDs, true)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -805,7 +756,7 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 		// call per object type for a field the answer does not have -- which is what
 		// made a page of this cost a second an object type.
 		if len(args.IDs) > 0 {
-			matched, err = objectpermission.FilterObjectTypes(ctx, schemaAccess, knID, matched)
+			matched, err = objectpermission.FilterObjectTypesBranch(ctx, schemaAccess, knID, args.Branch, matched)
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
@@ -815,16 +766,31 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 
 			// Step 2 of the OT-first metric path: a metric that is not bound to a logic
 			// property is unreachable from the object type without this.
-			if err := metrics.AttachRelatedMetrics(ctx, knID, matched); err != nil {
+			if err := metrics.AttachRelatedMetrics(ctx, knID, matched, args.Branch); err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
 			}
 		}
 		// A listed page is complete for what it asked: nothing was requested by name,
 		// so nothing can be missing from it.
+		// Property declarations are search_schema's to surface (#2260).
+		interfaces.OmitPropertyDeclarations(matched)
 		complete := len(args.IDs) == 0 || len(matched) == len(args.IDs)
-		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "object", knID, schemaObjectTypeIDs(matched), matched, complete)
 		resp := &interfaces.ObjectTypesResp{KnID: knID, ObjectTypes: matched,
 			TotalCount: totalCount, NextOffset: nextOffset, Notice: notice}
+		if len(args.IDs) == 0 {
+			// Measured on what the caller reads -- the text and the structuredContent
+			// beside it -- and before the snapshot, so the evidence is the page they got.
+			if _, err := interfaces.FitObjectTypePage(resp, offset, interfaces.MaxObjectTypePageChars,
+				func(kept int) string {
+					return renderDetailNotice(ctx, "agentRetrieval.Detail.ObjectTypePageCharsCut",
+						map[string]any{"Arg1": interfaces.MaxObjectTypePageChars, "Arg2": kept})
+				},
+				func(r *interfaces.ObjectTypesResp) (int, error) { return toolResultRunes(r, format) },
+			); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "object", knID, schemaObjectTypeIDs(resp.ObjectTypes), resp.ObjectTypes, complete)
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -833,15 +799,27 @@ func handleGetObjectTypes(bkn interfaces.BknBackendAccess, metrics knmetrics.KnM
 	}
 }
 
+// knRelationTypesArgs is knDrillArgs plus what a caller without ids lists by: the
+// object types the relation types should touch, and the window. Like
+// knObjectTypesArgs, the listing inputs are ignored once ids are named.
+type knRelationTypesArgs struct {
+	knDrillArgs
+	Branch        string   `json:"branch"`
+	ObjectTypeIDs []string `json:"object_type_ids"`
+	Offset        int      `json:"offset"`
+	Limit         int      `json:"limit"`
+}
+
 // handleGetRelationTypes handles get_relation_types tool calls: return the full
-// definition (incl. mapping_rules) of the requested relation type ids.
+// definition (incl. mapping_rules) of the requested relation type ids, or, without
+// ids, one page of the relation type index.
 func handleGetRelationTypes(bkn interfaces.BknBackendAccess) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
 		if err != nil {
 			return inputValidationToolError(ctx, err.Error()), nil
 		}
-		args := &knDrillArgs{}
+		args := &knRelationTypesArgs{}
 		if err := bindArguments(req, args); err != nil {
 			return inputValidationToolError(ctx, err.Error()), nil
 		}
@@ -849,22 +827,76 @@ func handleGetRelationTypes(bkn interfaces.BknBackendAccess) func(ctx context.Co
 		if knID == "" {
 			return inputValidationToolError(ctx, "kn_id is required"), nil
 		}
-		if len(args.IDs) == 0 {
-			return inputValidationToolError(ctx, "ids is required (relation type ids from get_kn_detail)"), nil
-		}
 
-		matched, err := bkn.GetRelationTypeDetail(ctx, knID, args.IDs, true)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		// No ids means the caller has none to give: get_kn_detail answered with its
+		// navigation shell, where relation_types is null, and on a branch other than
+		// main search_schema cannot recall them either. So this lists instead of
+		// refusing, as get_object_types does (#1889).
+		var (
+			matched    []*interfaces.RelationType
+			totalCount int64
+			nextOffset *int
+			notice     string
+			offset     int
+		)
+		listing := len(args.IDs) == 0
+		if listing {
+			var limit int
+			var clamped bool
+			offset, limit, clamped = interfaces.ResolveObjectTypePage(args.Offset, args.Limit)
+			page, err := knmetrics.RelationTypesForBranch(ctx, bkn, knID, args.Branch, args.ObjectTypeIDs, offset, limit)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			matched, totalCount = page.Entries, page.TotalCount
+			nextOffset = interfaces.NextObjectTypeOffset(offset, page.Scanned, totalCount)
+			interfaces.ReduceToRelationTypeIndex(matched)
+			if clamped {
+				notice = renderDetailNotice(ctx, "agentRetrieval.Detail.RelationTypePageLimitClamped",
+					map[string]any{"Arg1": args.Limit, "Arg2": interfaces.MaxObjectTypePageSize, "Arg3": limit})
+			}
+		} else {
+			matched, err = knmetrics.RelationTypeDetailForBranch(ctx, bkn, knID, args.Branch, args.IDs, true)
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
 		}
-		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "relation", knID, schemaRelationTypeIDs(matched), matched, len(matched) == len(args.IDs))
-		resp := &interfaces.RelationTypesResp{KnID: knID, RelationTypes: matched}
+		// Relation declarations are search_schema's to surface, but for lifecycle and the fallback marking (#2285).
+		interfaces.OmitRelationDeclarations(matched)
+		resp := &interfaces.RelationTypesResp{KnID: knID, RelationTypes: matched,
+			TotalCount: totalCount, NextOffset: nextOffset, Notice: notice}
+		if listing {
+			// Measured on what the caller reads -- the text and the structuredContent
+			// beside it -- and before the snapshot, so the evidence is the page they got.
+			if _, err := interfaces.FitRelationTypePage(resp, offset, interfaces.MaxRelationTypePageChars,
+				func(kept int) string {
+					return renderDetailNotice(ctx, "agentRetrieval.Detail.RelationTypePageCharsCut",
+						map[string]any{"Arg1": interfaces.MaxRelationTypePageChars, "Arg2": kept})
+				},
+				func(r *interfaces.RelationTypesResp) (int, error) { return toolResultRunes(r, format) },
+			); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+		}
+		// A listed page is complete for what it asked: nothing was requested by name.
+		complete := listing || len(resp.RelationTypes) == len(args.IDs)
+		bkntrace.EmitSchemaSnapshotEvents(ctx, nil, "relation", knID, schemaRelationTypeIDs(resp.RelationTypes), resp.RelationTypes, complete)
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		return result, nil
 	}
+}
+
+// renderDetailNotice renders a localized notice, logging rather than failing when
+// the message cannot be rendered.
+func renderDetailNotice(ctx context.Context, key string, args map[string]any) string {
+	text, err := i18n.Render(i18n.GetLanguageByCtx(ctx), key, args)
+	if err != nil {
+		logger.Errorf("localized message rendering failed: %v", err)
+	}
+	return text
 }
 
 func schemaObjectTypeIDs(items []*interfaces.ObjectType) []string {
@@ -930,9 +962,9 @@ func bindPreciseArguments(req mcp.CallToolRequest, target any) error {
 // handleQueryMetric handles query_metric tool calls: compute one modelled metric
 // by its own definition.
 //
-// This is step 3 of the OT-first metric path and the reason run_sql is not the
-// answer for a metric: the calculation formula lives in the MetricDefinition, so
-// the caller names the metric instead of re-deriving it in SQL.
+// This is step 3 of the OT-first metric path: the calculation formula lives in
+// the MetricDefinition, so the caller names the metric instead of re-deriving
+// it in a query.
 func handleQueryMetric(service knmetrics.KnMetricsService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		format, err := GetResponseFormatFromRequest(req)
@@ -953,6 +985,32 @@ func handleQueryMetric(service knmetrics.KnMetricsService) func(ctx context.Cont
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		bkntrace.EmitQueryMetricEvents(ctx, nil, args, resp)
+		result, err := BuildMCPToolResult(metricResultWithExactValues(resp), format)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return result, nil
+	}
+}
+
+// handleDrillThroughMetric pages participants of a server-issued metric bucket.
+func handleDrillThroughMetric(service knmetrics.KnMetricsService) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		format, err := GetResponseFormatFromRequest(req)
+		if err != nil {
+			return inputValidationToolError(ctx, err.Error()), nil
+		}
+		args := &interfaces.MetricDrillThroughReq{}
+		if err := bindPreciseArguments(req, args); err != nil {
+			return inputValidationToolError(ctx, err.Error()), nil
+		}
+		if args.KnID == "" {
+			args.KnID = getKnIDFromHeader(req)
+		}
+		resp, err := service.DrillThroughMetric(ctx, args)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 		result, err := BuildMCPToolResult(resp, format)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil

@@ -29,7 +29,9 @@ it to "make it work". Without a token no tools are mounted, and a warning is
 logged rather than an empty tool set returned silently, so the failure stays
 where it can be seen."""
 
+import json
 import logging
+import re
 from contextvars import ContextVar
 from typing import Any, Optional
 
@@ -87,21 +89,58 @@ def _credential() -> Optional[str]:
 # separate sessions holding one interaction each, and they cannot be merged
 # afterwards. See adp/context-loader/.../mcp/host_lifecycle_hints.go:22.
 _HOST_CONVERSATION_KEY_HEADER = "X-OpenBKN-Host-Conversation-Key"
+_KN_VERSION_HEADER = "X-Kn-Version"
+_KN_DRAFT_REVISION_HEADER = "X-Kn-Draft-Revision"
+
+
+def profile_of(tool_refs: list) -> Optional[str]:
+    """The MCP surface an agent's Context Loader reference asks for, if any.
+
+    AgentOut.tools passes stored elements through unvalidated so listing never
+    fails on hand-edited data; anything that is not a reference is skipped.
+    """
+    for ref in tool_refs:
+        if (
+            isinstance(ref, dict)
+            and ref.get("type") == "context_loader"
+            and ref.get("profile") in ("full", "compact")
+        ):
+            return ref["profile"]
+    return None
+
+
+def mcp_url(profile: Optional[str] = None) -> str:
+    """The configured endpoint, switched to the full or compact surface on request."""
+    url = config.CONTEXT_LOADER_MCP_URL
+    if profile not in ("full", "compact"):
+        return url
+    base = re.sub(r"/mcp(-compact)?/?$", "", url)
+    return f"{base}/mcp-compact/" if profile == "compact" else f"{base}/mcp/"
 
 
 def _client(
-    authorization: str, host_conversation_key: Optional[str] = None
+    authorization: str,
+    host_conversation_key: Optional[str] = None,
+    profile: Optional[str] = None,
+    kn_version: Optional[str] = None,
+    draft_revision: Optional[int] = None,
 ) -> MultiServerMCPClient:
     headers = locale.internal_request_headers(
         {"Authorization": authorization, **observability.outbound_headers()}
     )
     if host_conversation_key:
         headers[_HOST_CONVERSATION_KEY_HEADER] = host_conversation_key
+    # The network version every read of this session uses. Scoped tool calls
+    # also carry it as an argument, which takes precedence over the header.
+    if kn_version is not None:
+        headers[_KN_VERSION_HEADER] = kn_version
+    if draft_revision is not None:
+        headers[_KN_DRAFT_REVISION_HEADER] = str(draft_revision)
     return MultiServerMCPClient(
         {
             _CONNECTION_NAME: {
                 "transport": "streamable_http",
-                "url": config.CONTEXT_LOADER_MCP_URL,
+                "url": mcp_url(profile),
                 "headers": headers,
                 "timeout": config.CONTEXT_LOADER_MCP_TIMEOUT_S,
             }
@@ -198,6 +237,9 @@ async def open_session(
     *,
     agent_name: str | None = None,
     host_conversation_key: str | None = None,
+    profile: str | None = None,
+    kn_version: str | None = None,
+    draft_revision: int | None = None,
 ) -> Optional[ContextLoaderSession]:
     """Handshake and load the tools. Returns None when the credential is missing
     or the handshake fails, and the caller decides whether that is fatal.
@@ -222,7 +264,9 @@ async def open_session(
         )
         return None
 
-    client = _client(authorization, host_conversation_key)
+    client = _client(
+        authorization, host_conversation_key, profile, kn_version, draft_revision
+    )
     try:
         tools = await client.get_tools()
     except Exception as e:
@@ -253,7 +297,27 @@ async def open_session(
         args = {"question": question or "(not provided)", "conversation_mode": "new"}
         if agent_name:
             args["agent_name"] = agent_name[:128]
-        raw = await start.coroutine(**args)
+        try:
+            raw = await start.coroutine(**args)
+        except Exception as e:
+            stale = _stale_interaction(e) if host_conversation_key else None
+            finish = by_name.get("bkn_finish_interaction")
+            if stale is None or finish is None:
+                raise
+            # A turn of this thread was cut off (a restart or a disconnect)
+            # before it could finish, and the conversation still holds it
+            # open. The caller owns the thread's only running turn, so close
+            # the leftover as cancelled and start again, once.
+            logger.warning(
+                "[ContextLoader] closing interrupted interaction %s before a new turn",
+                stale,
+            )
+            await finish.coroutine(
+                interaction_id=stale,
+                outcome="cancelled",
+                reason="the previous turn was interrupted before it finished",
+            )
+            raw = await start.coroutine(**args)
     except Exception as e:
         logger.warning(
             "[ContextLoader] bkn_start_interaction failed; skipping tool loading: %s", e
@@ -301,6 +365,23 @@ def _parse_owner(raw: Any) -> dict[str, str] | None:
     if not isinstance(delegation, str):
         return None
     return {**{key: raw[key] for key in fields}, "delegation_id": delegation}
+
+
+def _stale_interaction(error: Exception) -> Optional[str]:
+    """The open interaction id when start failed with interaction_in_progress."""
+    text = str(error)
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        body = json.loads(text[start:])
+    except ValueError:
+        return None
+    detail = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(detail, dict) or detail.get("code") != "interaction_in_progress":
+        return None
+    current = detail.get("current_interaction_id")
+    return current if isinstance(current, str) and current else None
 
 
 def _parse_ids(raw: Any) -> Optional[tuple[str, str]]:

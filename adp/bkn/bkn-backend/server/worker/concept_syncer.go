@@ -8,6 +8,8 @@ package worker
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"strings"
@@ -18,12 +20,12 @@ import (
 	"github.com/mitchellh/mapstructure"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
-	bknsdk "bkn-backend/bkn-specification/bkn"
-	"bkn-backend/common"
-	"bkn-backend/interfaces"
-	"bkn-backend/logics"
-	"bkn-backend/logics/model_factory"
-	"bkn-backend/logics/vega_backend"
+	bknsdk "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/bkn-specification/bkn"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/common"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/model_factory"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/logics/vega_backend"
 )
 
 const conceptSyncPageLimit = 1000
@@ -43,7 +45,9 @@ type ConceptSyncer struct {
 	ota        interfaces.ObjectTypeAccess
 	rta        interfaces.RelationTypeAccess
 	riskTypeA  interfaces.RiskTypeAccess
-	ma         interfaces.MetricAccess
+	// knva and db tell versioned networks apart; the syncer leaves those to the version service.
+	knva interfaces.KNVersionAccess
+	db   *sql.DB
 
 	cachedDefaultModel *interfaces.SmallModel
 }
@@ -79,7 +83,8 @@ func NewConceptSyncer(appSetting *common.AppSetting) *ConceptSyncer {
 			ota:        logics.OTA,
 			rta:        logics.RTA,
 			riskTypeA:  logics.RiskTypeAccess,
-			ma:         logics.MA,
+			knva:       logics.KNVA,
+			db:         logics.DB,
 		}
 	})
 	return cSyncer
@@ -147,9 +152,25 @@ func (cs *ConceptSyncer) handleKNs() error {
 		return err
 	}
 
+	versioned, err := cs.versionedKNIDs(ctx)
+	if err != nil {
+		logger.Errorf("Failed to list versioned knowledge networks: %v", err)
+		return err
+	}
+
 	for _, knInDB := range knsInDB {
 		need_update := false
-		knInDataset, exist := knsInDataset[knInDB.KNID]
+		knInDataset, exist := knsInDataset[knBranch{knInDB.KNID, knInDB.Branch}]
+		// Definition writes and version operations keep the concept index of every branch
+		// of a versioned network under the network lock; rebuilding it here from rows read
+		// earlier could bring back what a publish or reset removed.
+		if versioned[knInDB.KNID] {
+			if !exist {
+				logger.Warnf("Versioned knowledge network %s (%s %s) has no concept document; rebuild its index through the version service",
+					knInDB.KNName, knInDB.KNID, knInDB.Branch)
+			}
+			continue
+		}
 		if !exist {
 			need_update = true
 		} else if knInDB.UpdateTime != knInDataset.UpdateTime {
@@ -204,13 +225,7 @@ func (cs *ConceptSyncer) handleKnowledgeNetwork(ctx context.Context, kn *interfa
 		return err
 	}
 
-	_, metric_need_update, err := cs.handleMetrics(ctx, kn.KNID, kn.Branch)
-	if err != nil {
-		logger.Errorf("Failed to handle metrics %s %s: %v", kn.KNID, kn.Branch, err)
-		return err
-	}
-
-	if !need_update && !ot_need_update && !rt_need_update && !at_need_update && !cg_need_update && !rtRisk_need_update && !metric_need_update {
+	if !need_update && !ot_need_update && !rt_need_update && !at_need_update && !cg_need_update && !rtRisk_need_update {
 		logger.Debugf("Knowledge network %s (%s %s) does not need update", kn.KNName, kn.KNID, kn.Branch)
 		return nil
 	}
@@ -225,10 +240,13 @@ func (cs *ConceptSyncer) handleKnowledgeNetwork(ctx context.Context, kn *interfa
 	kn.BKNRawContent = bknsdk.SerializeBknNetwork(bknNetwork)
 
 	// Update knowledge-network details.
-	err = cs.kna.UpdateKNDetail(ctx, kn.KNID, kn.Branch, kn.BKNRawContent)
+	written, err := cs.writeKNDetail(ctx, kn)
 	if err != nil {
 		logger.Errorf("Failed to update KN detail for %s (%s %s): %v", kn.KNName, kn.KNID, kn.Branch, err)
 		return err
+	}
+	if !written {
+		return nil
 	}
 
 	err = cs.insertDatasetDataForKN(ctx, kn)
@@ -239,6 +257,69 @@ func (cs *ConceptSyncer) handleKnowledgeNetwork(ctx context.Context, kn *interfa
 
 	logger.Debugf("Generated KN detail for %s (%s %s): %s", kn.KNName, kn.KNID, kn.Branch, kn.BKNRawContent)
 	return nil
+}
+
+// versionedKNIDs returns the networks that have a version state. Without version access
+// wired in, no network is versioned.
+func (cs *ConceptSyncer) versionedKNIDs(ctx context.Context) (map[string]bool, error) {
+	versioned := map[string]bool{}
+	if cs.knva == nil {
+		return versioned, nil
+	}
+	ids, err := cs.knva.ListVersionedKNIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		versioned[id] = true
+	}
+	return versioned, nil
+}
+
+// writeKNDetail writes the network row of one branch and reports whether it did. It holds
+// the network lock and reads the version state under it, so a network whose versioning was
+// enabled after this round listed the versioned ones is not written. The lock is on the main
+// row: writing main takes it exclusively, as version operations do, since upgrading a share
+// lock on the row it then updates can deadlock with them; other branches take it in share
+// mode. A branch row that is gone is not written either.
+func (cs *ConceptSyncer) writeKNDetail(ctx context.Context, kn *interfaces.KN) (bool, error) {
+	if cs.knva == nil || cs.db == nil {
+		return true, cs.kna.UpdateKNDetail(ctx, nil, kn.KNID, kn.Branch, kn.BKNRawContent)
+	}
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := cs.knva.LockNetwork(ctx, tx, kn.KNID, kn.Branch == interfaces.MAIN_BRANCH); err != nil {
+		return false, err
+	}
+	state, err := cs.knva.GetState(ctx, tx, kn.KNID, false)
+	if err != nil {
+		return false, err
+	}
+	if state != nil {
+		logger.Infof("Knowledge network %s (%s %s) became versioned during the sync round; left to the version service",
+			kn.KNName, kn.KNID, kn.Branch)
+		return false, nil
+	}
+	if err := cs.kna.UpdateKNDetail(ctx, tx, kn.KNID, kn.Branch, kn.BKNRawContent); err != nil {
+		if errors.Is(err, common.ErrRowNotFound) {
+			logger.Infof("Knowledge network %s (%s %s) is gone; nothing to sync", kn.KNName, kn.KNID, kn.Branch)
+			return false, nil
+		}
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	committed = true
+	return true, nil
 }
 
 // handleObjectTypes gets object types for a knowledge network.
@@ -414,53 +495,6 @@ func (cs *ConceptSyncer) handleRiskTypes(ctx context.Context, knID string, branc
 	return arrRiskTypes, need_update, nil
 }
 
-// handleMetrics synchronizes metrics to the concept index, comparing database and dataset records by id and update_time like handleObjectTypes.
-func (cs *ConceptSyncer) handleMetrics(ctx context.Context, knID, branch string) ([]*interfaces.MetricDefinition, bool, error) {
-	if cs.ma == nil {
-		return nil, false, nil
-	}
-
-	logger.Debugf("Handle metrics for knowledge network %s %s", knID, branch)
-	metricsInDB, err := cs.ma.ListMetrics(ctx, interfaces.MetricsListQueryParams{
-		KNID:   knID,
-		Branch: branch,
-	})
-	if err != nil {
-		return nil, false, err
-	}
-
-	metricsInDataset, err := cs.getAllMetricsFromDatasetByKnID(ctx, knID, branch)
-	if err != nil {
-		return nil, false, err
-	}
-
-	need_update := false
-	addList := []*interfaces.MetricDefinition{}
-	for _, mInDB := range metricsInDB {
-		mInDataset, exist := metricsInDataset[mInDB.ID]
-		if !exist {
-			addList = append(addList, mInDB)
-		} else if mInDB.UpdateTime != mInDataset.UpdateTime {
-			addList = append(addList, mInDB)
-		}
-	}
-	if len(addList) > 0 {
-		logger.Debugf("Need add (%d) metrics to dataset", len(addList))
-		need_update = true
-	}
-
-	err = cs.insertDatasetDataForMetrics(ctx, addList)
-	if err != nil {
-		return nil, false, err
-	}
-
-	out := make([]*interfaces.MetricDefinition, 0, len(metricsInDB))
-	out = append(out, metricsInDB...)
-
-	logger.Debugf("Handle metrics for knowledge network %s %s done", knID, branch)
-	return out, need_update, nil
-}
-
 // handleConceptGroups gets concept groups for a knowledge network.
 func (cs *ConceptSyncer) handleConceptGroups(ctx context.Context, knID string,
 	branch string) ([]*interfaces.ConceptGroup, bool, error) {
@@ -538,7 +572,7 @@ func (cs *ConceptSyncer) insertDatasetDataForKN(ctx context.Context, kn *interfa
 	networkDoc.RelationTypes = nil
 	networkDoc.ActionTypes = nil
 	networkDoc.RiskTypes = nil
-	networkDoc.Metrics = nil
+	networkDoc.ObjectMetrics = nil
 
 	// Convert to map for dataset
 	docBytes, err := sonic.Marshal(&networkDoc)
@@ -574,6 +608,8 @@ func (cs *ConceptSyncer) insertDatasetDataForObjectTypes(ctx context.Context, ob
 		words := []string{}
 		for _, objectType := range objectTypes {
 			arr := []string{objectType.OTName}
+			// Aliases follow the name; without them the text is as before.
+			arr = append(arr, objectType.Aliases...)
 			arr = append(arr, objectType.Tags...)
 			arr = append(arr, objectType.Comment, objectType.BKNRawContent)
 			word := strings.Join(arr, "\n")
@@ -619,6 +655,11 @@ func (cs *ConceptSyncer) insertDatasetDataForObjectTypes(ctx context.Context, ob
 			return err
 		}
 
+		interfaces.IndexLifecycleStatus(doc)
+		if err := interfaces.EncodeIndexedConstraints(doc); err != nil {
+			logger.Errorf("Failed to encode data_properties constraints: %s", err.Error())
+			return err
+		}
 		// Serialize logic_properties[].parameters to JSON string
 		if logicProps, ok := doc["logic_properties"].([]any); ok {
 			for _, lp := range logicProps {
@@ -655,6 +696,8 @@ func (cs *ConceptSyncer) insertDatasetDataForActionTypes(ctx context.Context, ac
 		words := []string{}
 		for _, actionType := range actionTypes {
 			arr := []string{actionType.ATName}
+			// Aliases follow the name; without them the text is as before.
+			arr = append(arr, actionType.Aliases...)
 			arr = append(arr, actionType.Tags...)
 			arr = append(arr, actionType.Comment, actionType.BKNRawContent)
 			word := strings.Join(arr, "\n")
@@ -699,6 +742,7 @@ func (cs *ConceptSyncer) insertDatasetDataForActionTypes(ctx context.Context, ac
 			logger.Errorf("Failed to unmarshal ActionType: %s", err.Error())
 			return err
 		}
+		interfaces.IndexLifecycleStatus(doc)
 
 		// Serialize parameters to JSON string
 		if params, exists := doc["parameters"]; exists {
@@ -740,6 +784,11 @@ func (cs *ConceptSyncer) insertDatasetDataForRelationTypes(ctx context.Context, 
 		words := []string{}
 		for _, relationType := range relationTypes {
 			arr := []string{relationType.RTName}
+			// Declarations come right after the name; without them the text is what it was.
+			if relationType.ReverseName != "" {
+				arr = append(arr, relationType.ReverseName)
+			}
+			arr = append(arr, relationType.Aliases...)
 			arr = append(arr, relationType.Tags...)
 			arr = append(arr, relationType.Comment, relationType.BKNRawContent)
 			word := strings.Join(arr, "\n")
@@ -782,6 +831,11 @@ func (cs *ConceptSyncer) insertDatasetDataForRelationTypes(ctx context.Context, 
 		var doc map[string]any
 		if err := sonic.Unmarshal(docBytes, &doc); err != nil {
 			logger.Errorf("Failed to unmarshal RelationType: %s", err.Error())
+			return err
+		}
+		interfaces.IndexLifecycleStatus(doc)
+		if err := interfaces.EncodeIndexedConstraints(doc); err != nil {
+			logger.Errorf("Failed to encode relation property constraints: %s", err.Error())
 			return err
 		}
 
@@ -926,63 +980,6 @@ func (cs *ConceptSyncer) insertDatasetDataForRiskTypes(ctx context.Context, risk
 	return nil
 }
 
-func (cs *ConceptSyncer) insertDatasetDataForMetrics(ctx context.Context, metrics []*interfaces.MetricDefinition) error {
-	if len(metrics) == 0 {
-		return nil
-	}
-
-	if cs.appSetting.ServerSetting.DefaultSmallModelEnabled {
-		words := make([]string, 0, len(metrics))
-		for _, m := range metrics {
-			arr := []string{m.Name}
-			arr = append(arr, m.Tags...)
-			arr = append(arr, m.Comment, m.BKNRawContent)
-			word := strings.Join(arr, "\n")
-			words = append(words, word)
-		}
-
-		dftModel, err := cs.getDefaultModel(ctx)
-		if err != nil {
-			logger.Errorf("GetDefaultModel error: %s", err.Error())
-			return err
-		}
-		vectors, err := cs.mfs.GetVector(ctx, dftModel, words)
-		if err != nil {
-			logger.Errorf("GetVector error: %s", err.Error())
-			return err
-		}
-		if len(vectors) != len(metrics) {
-			logger.Errorf("GetVector error: expect vectors num is [%d], actual vectors num is [%d]", len(metrics), len(vectors))
-			return fmt.Errorf("GetVector error: expect vectors num is [%d], actual vectors num is [%d]", len(metrics), len(vectors))
-		}
-		for i := range metrics {
-			metrics[i].Vector = vectors[i].Vector
-		}
-	}
-
-	for _, def := range metrics {
-		docid := interfaces.GenerateConceptDocuemtnID(def.KnID, interfaces.MODULE_TYPE_METRIC, def.ID, def.Branch)
-		def.ModuleType = interfaces.MODULE_TYPE_METRIC
-
-		docBytes, err := sonic.Marshal(def)
-		if err != nil {
-			logger.Errorf("Failed to marshal MetricDefinition: %s", err.Error())
-			return err
-		}
-		var doc map[string]any
-		if err := sonic.Unmarshal(docBytes, &doc); err != nil {
-			logger.Errorf("Failed to unmarshal MetricDefinition: %s", err.Error())
-			return err
-		}
-		doc["_id"] = docid
-		if err := cs.vbs.WriteDatasetDocument(ctx, interfaces.BKN_DATASET_ID, docid, doc); err != nil {
-			logger.Errorf("WriteDatasetDocument error: %s", err.Error())
-			return err
-		}
-	}
-	return nil
-}
-
 func (cs *ConceptSyncer) queryAllDatasetEntries(ctx context.Context, filterCondition map[string]any) ([]map[string]any, error) {
 	params := &interfaces.ResourceDataQueryParams{
 		FilterCondition: filterCondition,
@@ -1003,7 +1000,10 @@ func (cs *ConceptSyncer) queryAllDatasetEntries(ctx context.Context, filterCondi
 	}
 }
 
-func (cs *ConceptSyncer) getAllKNsFromDataset(ctx context.Context) (map[string]*interfaces.KN, error) {
+// knBranch identifies one branch of a knowledge network; each has its own concept document.
+type knBranch struct{ id, branch string }
+
+func (cs *ConceptSyncer) getAllKNsFromDataset(ctx context.Context) (map[knBranch]*interfaces.KN, error) {
 	filterCondition := map[string]any{
 		"field":      "module_type",
 		"operation":  "==",
@@ -1013,18 +1013,18 @@ func (cs *ConceptSyncer) getAllKNsFromDataset(ctx context.Context) (map[string]*
 
 	entries, err := cs.queryAllDatasetEntries(ctx, filterCondition)
 	if err != nil {
-		return map[string]*interfaces.KN{}, err
+		return map[knBranch]*interfaces.KN{}, err
 	}
 
-	kns := map[string]*interfaces.KN{}
+	kns := map[knBranch]*interfaces.KN{}
 	for _, entry := range entries {
 		kn := interfaces.KN{}
 		err := mapstructure.Decode(entry, &kn)
 		if err != nil {
-			return map[string]*interfaces.KN{}, err
+			return map[knBranch]*interfaces.KN{}, err
 		}
 
-		kns[kn.KNID] = &kn
+		kns[knBranch{kn.KNID, kn.Branch}] = &kn
 	}
 
 	return kns, nil
@@ -1064,6 +1064,10 @@ func (cs *ConceptSyncer) getAllObjectTypesFromDatasetByKnID(ctx context.Context,
 
 	objectTypes := map[string]*interfaces.ObjectType{}
 	for _, entry := range entries {
+		if err := interfaces.DecodeIndexedConstraints(entry); err != nil {
+			logger.Errorf("Failed to decode data_properties constraints: %s", err.Error())
+			return map[string]*interfaces.ObjectType{}, err
+		}
 		// Deserialize logic_properties[].parameters from JSON string
 		if logicProps, ok := entry["logic_properties"].([]any); ok {
 			for _, lp := range logicProps {
@@ -1302,49 +1306,4 @@ func (cs *ConceptSyncer) getAllConceptGroupsFromDatasetByKnID(ctx context.Contex
 	}
 
 	return conceptGroups, nil
-}
-
-func (cs *ConceptSyncer) getAllMetricsFromDatasetByKnID(ctx context.Context,
-	knID string, branch string) (map[string]*interfaces.MetricDefinition, error) {
-
-	filterCondition := map[string]any{
-		"operation": "and",
-		"sub_conditions": []map[string]any{
-			{
-				"field":      "kn_id",
-				"operation":  "==",
-				"value":      knID,
-				"value_from": "const",
-			},
-			{
-				"field":      "branch",
-				"operation":  "==",
-				"value":      branch,
-				"value_from": "const",
-			},
-			{
-				"field":      "module_type",
-				"operation":  "==",
-				"value":      interfaces.MODULE_TYPE_METRIC,
-				"value_from": "const",
-			},
-		},
-	}
-
-	entries, err := cs.queryAllDatasetEntries(ctx, filterCondition)
-	if err != nil {
-		return map[string]*interfaces.MetricDefinition{}, err
-	}
-
-	metrics := map[string]*interfaces.MetricDefinition{}
-	for _, entry := range entries {
-		md := interfaces.MetricDefinition{}
-		if err := mapstructure.WeakDecode(entry, &md); err != nil {
-			return map[string]*interfaces.MetricDefinition{}, err
-		}
-		mcopy := md
-		metrics[mcopy.ID] = &mcopy
-	}
-
-	return metrics, nil
 }

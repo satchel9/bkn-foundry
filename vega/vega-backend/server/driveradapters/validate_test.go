@@ -1,5 +1,4 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in the project root for details.
@@ -325,7 +324,7 @@ func TestValidateResourceRequestDatasetSchema(t *testing.T) {
 		assert.ErrorContains(t, err, "feature name is null")
 	})
 
-	for _, dataType := range []string{interfaces.DataType_Binary, interfaces.DataType_Other} {
+	for _, dataType := range []string{interfaces.DataType_Binary, interfaces.DataType_Other, interfaces.DataType_LargeInteger} {
 		t.Run("ValidateResourceRequest rejects unsupported dataset type "+dataType, func(t *testing.T) {
 			err := ValidateResourceRequest(ctx, baseReq([]*interfaces.Property{
 				{Name: "unsupported", Type: dataType},

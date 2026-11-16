@@ -25,11 +25,13 @@ func TestAnyShareConnectorMetadata(t *testing.T) {
 	t.Run("any share connector metadata", func(t *testing.T) {
 		connector := &AnyShareConnector{}
 
-		assert.Equal(t, interfaces.ConnectorTypeAnyShare, connector.GetType())
-		assert.Equal(t, interfaces.ConnectorTypeAnyShare, connector.GetName())
+		assert.Equal(t, "anyshare", connector.GetType())
+		assert.Equal(t, "anyshare", connector.GetName())
 		assert.Equal(t, interfaces.ConnectorModeLocal, connector.GetMode())
 		assert.Equal(t, interfaces.ConnectorCategoryFileset, connector.GetCategory())
-		assert.Equal(t, []string{"token", "app_secret"}, connector.GetSensitiveFields())
+		protectedFields, metadataErr := connector.GetSensitiveFields(nil)
+		require.NoError(t, metadataErr)
+		assert.Equal(t, []string{"token", "app_secret"}, protectedFields)
 
 		assert.False(t, connector.GetEnabled())
 		connector.SetEnabled(true)
@@ -37,15 +39,15 @@ func TestAnyShareConnectorMetadata(t *testing.T) {
 
 		fields := connector.GetFieldConfig()
 		assert.Equal(t, map[string]interfaces.ConnectorFieldConfig{
-			"protocol":     {Name: "协议", Type: "string", Description: "http 或 https", Required: true, Encrypted: false},
-			"host":         {Name: "主机地址", Type: "string", Description: "AnyShare 服务主机", Required: true, Encrypted: false},
-			"port":         {Name: "端口", Type: "integer", Description: "服务端口", Required: true, Encrypted: false},
-			"auth_type":    {Name: "认证方式", Type: "integer", Description: "1=访问令牌 Token，2=AppID/AppSecret", Required: true, Encrypted: false},
-			"token":        {Name: "访问令牌", Type: "string", Description: "auth_type=1 时必填", Required: false, Encrypted: true},
-			"app_id":       {Name: "应用账户 ID", Type: "string", Description: "auth_type=2 时必填", Required: false, Encrypted: false},
-			"app_secret":   {Name: "应用密钥", Type: "string", Description: "auth_type=2 时必填", Required: false, Encrypted: true},
-			"doc_lib_type": {Name: "文档库类型", Type: "integer", Description: "1=知识库，2=文档库", Required: true, Encrypted: false},
-			"paths":        {Name: "路径列表", Type: "array", Description: "可选；按文档库名称路径解析起点，空则按文档库类型枚举", Required: false, Encrypted: false},
+			"protocol":     {Name: "Protocol", Type: "string", Description: "http or https", Required: true, Encrypted: false},
+			"host":         {Name: "Host", Type: "string", Description: "AnyShare server host", Required: true, Encrypted: false},
+			"port":         {Name: "Port", Type: "integer", Description: "Server port", Required: true, Encrypted: false},
+			"auth_type":    {Name: "Authentication type", Type: "integer", Description: "1=access token, 2=AppID/AppSecret", Required: true, Encrypted: false},
+			"token":        {Name: "Access token", Type: "string", Description: "Required when auth_type=1", Required: false, Encrypted: true},
+			"app_id":       {Name: "Application account ID", Type: "string", Description: "Required when auth_type=2", Required: false, Encrypted: false},
+			"app_secret":   {Name: "Application secret", Type: "string", Description: "Required when auth_type=2", Required: false, Encrypted: true},
+			"doc_lib_type": {Name: "Library type", Type: "integer", Description: "1=knowledge library, 2=document library", Required: true, Encrypted: false},
+			"paths":        {Name: "Paths", Type: "array", Description: "Optional starting paths resolved by library name; leave empty to enumerate libraries of the selected type", Required: false, Encrypted: false},
 		}, fields)
 		require.Contains(t, fields, "token")
 		assert.True(t, fields["token"].Encrypted)
@@ -57,6 +59,32 @@ func TestAnyShareConnectorMetadata(t *testing.T) {
 }
 
 func TestAnyShareConnectorNew(t *testing.T) {
+	t.Run("rejects weak string conversion without changing config", func(t *testing.T) {
+		for _, field := range []string{"port", "auth_type", "doc_lib_type"} {
+			t.Run(field, func(t *testing.T) {
+				cfg := interfaces.ConnectorConfig{"protocol": "https", "host": "share.example.com", "port": 443, "auth_type": 1, "doc_lib_type": 1, "token": "fixture"}
+				cfg[field] = "1"
+				instance, err := (&AnyShareConnector{}).New(cfg)
+				require.Error(t, err)
+				assert.Nil(t, instance)
+				assert.NotContains(t, err.Error(), "fixture")
+				assert.Equal(t, "1", cfg[field])
+				assert.Equal(t, "fixture", cfg["token"])
+			})
+		}
+	})
+	t.Run("fixed config fields require exact case", func(t *testing.T) {
+		cfg := interfaces.ConnectorConfig{"protocol": "https", "host": "share.example.com", "port": 443, "auth_type": 1, "doc_lib_type": 1, "Token": "case-fixture"}
+		instance, err := (&AnyShareConnector{}).New(cfg)
+		require.Error(t, err)
+		assert.Nil(t, instance)
+		cfg["token"] = "canonical-fixture"
+		cfg["Token"] = map[string]any{"ignored": true}
+		instance, err = (&AnyShareConnector{}).New(cfg)
+		require.NoError(t, err)
+		assert.Equal(t, "canonical-fixture", instance.(*AnyShareConnector).config.Token)
+		assert.Equal(t, 443, instance.(*AnyShareConnector).config.Port)
+	})
 	builder := &AnyShareConnector{}
 
 	t.Run("token config success", func(t *testing.T) {
@@ -182,6 +210,18 @@ func TestAnyShareConnectorNew(t *testing.T) {
 }
 
 func TestAnyShareConnectorConnectAndMetadata(t *testing.T) {
+	t.Run("authentication errors exclude untrusted response contents", func(t *testing.T) {
+		connector := newConnectedTestConnector()
+		connector.connected = false
+		connector.config.AuthType = authTypeAppSecret
+		connector.httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusUnauthorized, `{"error":"private-response-fixture"}`), nil
+		})}
+		err := connector.Connect(context.Background())
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "private-response-fixture")
+	})
+
 	t.Run("token auth does not call remote server", func(t *testing.T) {
 		connector := &AnyShareConnector{
 			config: &anyshareConfig{
@@ -200,7 +240,7 @@ func TestAnyShareConnectorConnectAndMetadata(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, connector.connected)
 		assert.Equal(t, "Bearer existing", connector.authHeader)
-		assert.Equal(t, interfaces.ConnectorTypeAnyShare, metadata["connector"])
+		assert.Equal(t, "anyshare", metadata["connector"])
 		assert.Equal(t, true, metadata["paths_configured"])
 	})
 
@@ -252,6 +292,10 @@ func TestAnyShareConnectorListFilesetsFromEntryDocLib(t *testing.T) {
 		assert.Equal(t, "Knowledge", filesets[0].Name)
 		assert.Equal(t, "Knowledge", filesets[0].DisplayPath)
 		assert.Len(t, filesets[0].Columns, 20)
+		for _, column := range filesets[0].Columns {
+			require.NotNil(t, column.Filterable)
+			assert.Equal(t, DefaultFilterable(column.Type), *column.Filterable)
+		}
 		assert.Equal(t, "1", filesets[0].SourceMetadata["rev"])
 	})
 }
@@ -451,4 +495,90 @@ func decodeAnyShareRequestJSON(t *testing.T, r *http.Request, out any) {
 	body, err := io.ReadAll(r.Body)
 	require.NoError(t, err)
 	require.NoError(t, sonic.Unmarshal(body, out))
+}
+
+func TestAnyShareConnectorValidateFilterability(t *testing.T) {
+	c := &AnyShareConnector{}
+	flag := func(value bool) *bool { return &value }
+	t.Run("closed or omitted flags do not inspect source metadata", func(t *testing.T) {
+		resource := &interfaces.Resource{SourceMetadata: map[string]any{"columns": "corrupt"}, SchemaDefinition: []*interfaces.Property{{Name: "closed", Filterable: flag(false)}, {Name: "legacy"}}}
+		require.NoError(t, c.ValidateFilterability(resource))
+	})
+	t.Run("trusted fileset columns override stale properties and saved flags", func(t *testing.T) {
+		for _, persisted := range []bool{false, true} {
+			t.Run(map[bool]string{false: "discovery", true: "persisted JSON"}[persisted], func(t *testing.T) {
+				resource := &interfaces.Resource{SourceMetadata: map[string]any{"columns": []interfaces.FilesetColumnMeta{{Name: "native_path", Type: interfaces.DataType_String, Filterable: flag(false)}}}, SchemaDefinition: []*interfaces.Property{{Name: "public_path", OriginalName: "native_path", OriginalType: "unsupported", Filterable: flag(true)}, {Name: "closed", Filterable: flag(false)}, {Name: "legacy"}}}
+				if persisted {
+					encoded, err := json.Marshal(resource)
+					require.NoError(t, err)
+					var stored interfaces.Resource
+					require.NoError(t, json.Unmarshal(encoded, &stored))
+					resource = &stored
+				}
+				before, err := json.Marshal(resource)
+				require.NoError(t, err)
+				require.NoError(t, c.ValidateFilterability(resource))
+				after, err := json.Marshal(resource)
+				require.NoError(t, err)
+				assert.JSONEq(t, string(before), string(after))
+			})
+		}
+	})
+	t.Run("property name binds source columns when original name is absent", func(t *testing.T) {
+		require.NoError(t, c.ValidateFilterability(&interfaces.Resource{SourceMetadata: map[string]any{"columns": []interfaces.FilesetColumnMeta{{Name: "path", Type: interfaces.DataType_String}}}, SchemaDefinition: []*interfaces.Property{{Name: "path", Filterable: flag(true)}}}))
+	})
+	t.Run("native source column types use fileset capabilities", func(t *testing.T) {
+		for _, tc := range []struct {
+			native string
+			want   bool
+		}{{"string", true}, {"integer", true}, {"boolean", true}, {"json", false}, {"binary", false}, {"vector", false}, {"datetime", false}, {"unknown", false}, {"", false}} {
+			t.Run(tc.native, func(t *testing.T) {
+				resource := &interfaces.Resource{SourceMetadata: map[string]any{"columns": []interfaces.FilesetColumnMeta{{Name: "field", Type: tc.native}}, "mapping": make(chan int)}, SchemaDefinition: []*interfaces.Property{{Name: "field", Type: interfaces.DataType_String, OriginalType: "stale", Filterable: flag(true)}}}
+				err := c.ValidateFilterability(resource)
+				if tc.want {
+					require.NoError(t, err)
+				} else {
+					var invalid *interfaces.ConditionBuildError
+					require.ErrorAs(t, err, &invalid)
+				}
+			})
+		}
+	})
+	t.Run("missing source columns cannot be fabricated from schema", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			metadata map[string]any
+		}{
+			{"missing source metadata", nil}, {"missing columns", map[string]any{"mapping": "unrelated"}},
+			{"empty columns", map[string]any{"columns": []interfaces.FilesetColumnMeta{}}},
+			{"other typed column", map[string]any{"columns": []interfaces.FilesetColumnMeta{{Name: "real", Type: "string"}}}},
+			{"other persisted column", map[string]any{"columns": []any{map[string]any{"name": "real", "type": "string"}}}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				resource := &interfaces.Resource{SourceMetadata: tc.metadata, SchemaDefinition: []*interfaces.Property{{Name: "public_field", OriginalName: "missing", OriginalType: "string", Type: interfaces.DataType_String, Attributes: map[string]any{"type": "string"}, Filterable: flag(true)}}}
+				before, err := json.Marshal(resource)
+				require.NoError(t, err)
+				err = c.ValidateFilterability(resource)
+				var invalid *interfaces.ConditionBuildError
+				require.ErrorAs(t, err, &invalid)
+				assert.Contains(t, invalid.Reason, "public_field")
+				after, err := json.Marshal(resource)
+				require.NoError(t, err)
+				assert.JSONEq(t, string(before), string(after))
+			})
+		}
+	})
+	t.Run("stored corrupt columns do not fall back to supported property types", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			raw  any
+		}{{"explicit nil", nil}, {"JSON null", json.RawMessage("null")}, {"typed nil", []interfaces.FilesetColumnMeta(nil)}, {"invalid shape", "corrupt"}, {"marshal failure", make(chan int)}} {
+			t.Run(tc.name, func(t *testing.T) {
+				err := c.ValidateFilterability(&interfaces.Resource{SourceMetadata: map[string]any{"columns": tc.raw}, SchemaDefinition: []*interfaces.Property{{Name: "path", OriginalType: interfaces.DataType_String, Filterable: flag(true)}}})
+				require.Error(t, err)
+				var invalid *interfaces.ConditionBuildError
+				assert.NotErrorAs(t, err, &invalid)
+			})
+		}
+	})
 }

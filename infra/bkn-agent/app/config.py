@@ -23,12 +23,18 @@ class Config:
         "MF_MODEL_API_PRIVATE_BASE",
         "http://mf-model-api:9898/api/private/mf-model-api/v1",
     )
+    MF_MODEL_MANAGER_PUBLIC_BASE = _env(
+        "MF_MODEL_MANAGER_PUBLIC_BASE",
+        "http://mf-model-manager:9898/api/mf-model-manager/v1",
+    )
+    HYDRA_ADMIN_BASE = _env("HYDRA_ADMIN_BASE", "http://bkn-safe-hydra-admin:4445")
+    BKN_SAFE_BASE = _env("BKN_SAFE_BASE", "http://bkn-safe:3000/api/safe/v1")
+
     DEFAULT_MODEL = _env("BKN_AGENT_DEFAULT_MODEL", "")
 
     # Possession proof for the deployment-managed provenance owner. Normal
     # internal callers keep using the established /in identity headers; the
     # fixed high-value owner additionally requires this chart-managed secret.
-    PROVENANCE_BOOTSTRAP_TOKEN = _env("BKN_PROVENANCE_BOOTSTRAP_TOKEN", "")
 
     # Operator factory (operator-integration): both the tool surface and the
     # skill surface go through its internal-v1 route (#322 moved the skill

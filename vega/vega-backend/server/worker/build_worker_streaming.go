@@ -129,7 +129,7 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 		}
 		return nil
 	}
-	if catalog.ConnectorType != interfaces.ConnectorTypeMySQL && catalog.ConnectorType != interfaces.ConnectorTypePostgreSQL {
+	if catalog.ConnectorType != "mysql" && catalog.ConnectorType != "postgresql" {
 		logger.Errorf("Streaming build only supports MySQL and PostgreSQL connectors. Unsupported connector type: %s", catalog.ConnectorType)
 		_, err = sbw.bts.InternalMarkFailed(ctx, nil, buildTaskInfo.ID, "unsupported connector type")
 		if err != nil {
@@ -325,7 +325,7 @@ func (sbw *streamingBuildWorker) executeBuild(ctx context.Context, catalog *inte
 				// Determine operation type
 				switch op {
 				case "r", "c":
-					if err := sbw.handleCreateOperation(ctx, keyMap, after, indexName, buildTaskInfo, pipeline, outputFields, resource.SchemaDefinition); err != nil {
+					if err := sbw.handleCreateOperation(ctx, keyMap, after, indexName, buildTaskInfo, pipeline, outputFields, resource.SchemaDefinition, valueMap["schema"]); err != nil {
 						if !errors.Is(err, errStreamingDocumentWrite) {
 							return err
 						}
@@ -335,7 +335,7 @@ func (sbw *streamingBuildWorker) executeBuild(ctx context.Context, catalog *inte
 					}
 				case "u":
 					// Update operation
-					if err := sbw.handleUpdateOperation(ctx, keyMap, after, indexName, buildTaskInfo, pipeline, outputFields, resource.SchemaDefinition); err != nil {
+					if err := sbw.handleUpdateOperation(ctx, keyMap, after, indexName, buildTaskInfo, pipeline, outputFields, resource.SchemaDefinition, valueMap["schema"]); err != nil {
 						logger.Errorf("Failed to handle update operation: %v", err)
 						time.Sleep(retryInterval)
 						continue
@@ -484,13 +484,13 @@ func (sbw *streamingBuildWorker) buildConnectorConfig(connectorName string, cata
 		connectorBody["config"].(map[string]any)["schema.history.internal.producer.sasl.jaas.config"] = jaasConfig
 	}
 	switch catalog.ConnectorType {
-	case interfaces.ConnectorTypeMySQL:
+	case "mysql":
 		connectorBody["config"].(map[string]any)["database.server.id"] = fmt.Sprintf("%d", getServerID(connectorName))
 		connectorBody["config"].(map[string]any)["database.server.name"] = getServerName(fmt.Sprintf("%v", catalog.ConnectorCfg["host"]))
 		connectorBody["config"].(map[string]any)["database.include.list"] = database
 		connectorBody["config"].(map[string]any)["schema.history.internal.store.only.captured.databases.ddl"] = true
 		//connectorBody["config"].(map[string]any)["schema.history.internal.store.only.captured.tables.ddl"] = true
-	case interfaces.ConnectorTypePostgreSQL:
+	case "postgresql":
 		connectorBody["config"].(map[string]any)["database.dbname"] = database
 		//connectorBody["config"].(map[string]any)["schema.include.list"] = "public" // It is generally not used. table.include.list contains schema information
 		connectorBody["config"].(map[string]any)["plugin.name"] = "pgoutput"
@@ -502,13 +502,13 @@ func (sbw *streamingBuildWorker) buildConnectorConfig(connectorName string, cata
 // streamingDatabase returns the Debezium capture database configuration for a catalog.
 func streamingDatabase(catalog *interfaces.Catalog) (string, error) {
 	switch catalog.ConnectorType {
-	case interfaces.ConnectorTypePostgreSQL:
+	case "postgresql":
 		database, ok := catalog.ConnectorCfg["database"].(string)
 		if !ok || strings.TrimSpace(database) == "" {
 			return "", fmt.Errorf("PostgreSQL streaming build requires connector_config.database")
 		}
 		return database, nil
-	case interfaces.ConnectorTypeMySQL:
+	case "mysql":
 		value, ok := catalog.ConnectorCfg["databases"]
 		if !ok {
 			return "", fmt.Errorf("MySQL streaming build requires a non-empty connector_config.databases")
@@ -545,9 +545,9 @@ func streamingDatabase(catalog *interfaces.Catalog) (string, error) {
 	}
 }
 
-func (sbw *streamingBuildWorker) handleCreateOperation(ctx context.Context, keyMap, after map[string]any, indexName string, buildTaskInfo *interfaces.BuildTask, pipeline *embeddingPipeline, outputFields []string, schema []*interfaces.Property) error {
+func (sbw *streamingBuildWorker) handleCreateOperation(ctx context.Context, keyMap, after map[string]any, indexName string, buildTaskInfo *interfaces.BuildTask, pipeline *embeddingPipeline, outputFields []string, schema []*interfaces.Property, messageSchema any) error {
 	document := filterBuildDocumentFields(after, outputFields)
-	if err := normalizeJSONDocumentFields(document, schema); err != nil {
+	if err := normalizeBuildDocumentFields(document, schema, debeziumAfterLogicalTypes(messageSchema)); err != nil {
 		return fmt.Errorf("normalize streaming document: %w", err)
 	}
 	kafkaKeyValues, err := getKafkaKeyValues(buildTaskInfo.IndexConfig.PrimaryKeyFields, keyMap)
@@ -563,14 +563,14 @@ func (sbw *streamingBuildWorker) handleCreateOperation(ctx context.Context, keyM
 			return fmt.Errorf("vectorize streaming document: %w", err)
 		}
 	}
-	if _, err := sbw.lim.IndexDocuments(ctx, indexName, map[string]map[string]any{docID: document}); err != nil {
+	if err := indexBuildDocuments(ctx, sbw.lim, indexName, map[string]map[string]any{docID: document}); err != nil {
 		return fmt.Errorf("%w: %w", errStreamingDocumentWrite, err)
 	}
 	return nil
 }
 
 // handleUpdateOperation handles update operations.
-func (sbw *streamingBuildWorker) handleUpdateOperation(ctx context.Context, keyMap, after map[string]any, indexName string, buildTaskInfo *interfaces.BuildTask, pipeline *embeddingPipeline, outputFields []string, schema []*interfaces.Property) error {
+func (sbw *streamingBuildWorker) handleUpdateOperation(ctx context.Context, keyMap, after map[string]any, indexName string, buildTaskInfo *interfaces.BuildTask, pipeline *embeddingPipeline, outputFields []string, schema []*interfaces.Property, messageSchema any) error {
 	documentIDFields := buildTaskInfo.IndexConfig.PrimaryKeyFields
 	kafkaKeyValues, err := getKafkaKeyValues(documentIDFields, keyMap)
 	if err != nil {
@@ -583,9 +583,6 @@ func (sbw *streamingBuildWorker) handleUpdateOperation(ctx context.Context, keyM
 
 	// Create updated document from the after data
 	document := filterBuildDocumentFields(after, outputFields)
-	if err := normalizeJSONDocumentFields(document, schema); err != nil {
-		return fmt.Errorf("normalize streaming document: %w", err)
-	}
 
 	newKeyValues, err := extractKeyValues(documentIDFields, document)
 	if err != nil {
@@ -595,12 +592,15 @@ func (sbw *streamingBuildWorker) handleUpdateOperation(ctx context.Context, keyM
 	if err != nil {
 		return fmt.Errorf("generate new document ID: %w", err)
 	}
+	if err := normalizeBuildDocumentFields(document, schema, debeziumAfterLogicalTypes(messageSchema)); err != nil {
+		return fmt.Errorf("normalize streaming document: %w", err)
+	}
 	if buildTaskHasEmbedding(buildTaskInfo) {
 		if err := pipeline.enrich(ctx, map[string]map[string]any{newDocID: document}, buildTaskEmbeddingConfig(buildTaskInfo)); err != nil {
 			return fmt.Errorf("vectorize updated document: %w", err)
 		}
 	}
-	_, err = sbw.lim.IndexDocuments(ctx, indexName, map[string]map[string]any{newDocID: document})
+	err = indexBuildDocuments(ctx, sbw.lim, indexName, map[string]map[string]any{newDocID: document})
 	if err != nil {
 		return fmt.Errorf("failed to update document in local index: %w", err)
 	}
@@ -676,4 +676,27 @@ func (sbw *streamingBuildWorker) buildTableName(ctx context.Context, catalog *in
 		return "", err
 	}
 	return tableConnector.BuildOriginalName(meta), nil
+}
+
+// debeziumAfterLogicalTypes 读取 after 字段的逻辑类型，避免从数字大小推断 CDC 时间单位。
+func debeziumAfterLogicalTypes(schema any) map[string]string {
+	root, _ := schema.(map[string]any)
+	fields, _ := root["fields"].([]any)
+	result := make(map[string]string)
+	for _, raw := range fields {
+		field, _ := raw.(map[string]any)
+		if field["field"] != "after" {
+			continue
+		}
+		children, _ := field["fields"].([]any)
+		for _, child := range children {
+			column, _ := child.(map[string]any)
+			name, _ := column["field"].(string)
+			logicalType, _ := column["name"].(string)
+			if name != "" && logicalType != "" {
+				result[name] = logicalType
+			}
+		}
+	}
+	return result
 }

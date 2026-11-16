@@ -79,6 +79,10 @@ type VegaResource struct {
 	LocalIndexName string `json:"index_name,omitempty"`
 	// LocalIndexStatus is the source of truth for whether the managed local index can serve index capabilities.
 	LocalIndexStatus string `json:"local_status"`
+	// RowCount is the most recently collected exact count, or a live dataset count.
+	// A missing timestamp must not be treated as a fresh measurement.
+	RowCount     *int64 `json:"row_count,omitempty"`
+	RowCountTime *int64 `json:"row_count_time,omitempty"`
 }
 
 // VegaResourceIndexConfig mirrors vega-backend's resource-level index configuration.
@@ -131,4 +135,7 @@ type ResourceDataQueryParams struct {
 	NeedTotal       bool                      `json:"need_total,omitempty"`
 	Sort            []*SortParams             `json:"sort,omitempty"`
 	OutputFields    []string                  `json:"output_fields,omitempty"`
+	// IgnoreLocalIndex reads a table resource from its data source even when
+	// vega-backend holds a local index of it.
+	IgnoreLocalIndex *bool `json:"ignore_local_index,omitempty"`
 }

@@ -60,8 +60,20 @@ func (handler *ArchiveHandler) Create(kind observabilityvo.ArchiveKind) http.Han
 			return
 		}
 		job, err := handler.service.Create(r.Context(), kind)
+		if err != nil && writeLogArchiveFailure(w, r, job, err) {
+			return
+		}
 		if err != nil {
 			switch {
+			case errors.Is(err, archivesvc.ErrArchiveBusy):
+				writeObservabilityError(w, r, http.StatusConflict, "archive_busy", "archive operation is already running")
+			case errors.Is(err, archivesvc.ErrArchivePayloadTooLarge):
+				if writeArchiveBlockage(w, r, job, err) {
+					return
+				}
+				writeObservabilityError(w, r, http.StatusConflict, "archive_incomplete_candidates", "trace archive exceeds its payload budget (100 Interactions, 8 MiB each, 10 MiB per batch); this batch was not started; earlier verified batches remain recorded")
+			case errors.Is(err, archivesvc.ErrIncompleteCandidates):
+				writeObservabilityError(w, r, http.StatusConflict, "archive_incomplete_candidates", "archive candidate batch is incomplete or unverifiable; this batch was not started; earlier batches remain recorded")
 			case errors.Is(err, archivesvc.ErrNothingToArchive):
 				writeObservabilityError(w, r, http.StatusConflict, "archive_nothing_to_do", "no eligible records are available")
 			case errors.Is(err, archivesvc.ErrCleanupRequired):
@@ -126,10 +138,73 @@ func (handler *ArchiveHandler) GetOrRetry(w http.ResponseWriter, r *http.Request
 	}
 	job, err := handler.service.RetryCleanup(r.Context(), parts[0])
 	if err != nil {
+		if writeLogArchiveFailure(w, r, job, err) {
+			return
+		}
+		if writeArchiveBlockage(w, r, job, err) {
+			return
+		}
 		writeObservabilityError(w, r, http.StatusBadRequest, "archive_retry_failed", "archive cleanup cannot be retried")
 		return
 	}
 	writeJSON(w, r, http.StatusOK, rdto.NewArchiveJob(job))
+}
+
+func writeLogArchiveFailure(w http.ResponseWriter, r *http.Request, job archivesvc.Job, err error) bool {
+	if errors.Is(err, archivesvc.ErrInvalidLogLimits) {
+		writeJSON(w, r, http.StatusServiceUnavailable, observabilityErrorEnvelope{Error: observabilityError{Code: "archive_configuration_invalid", Message: "log archive limits are invalid; ask the deployment owner to fix the configuration", RequiredAction: "fix_log_archive_configuration", RequestID: requestIDFromRequest(r), Details: struct {
+			JobID   string              `json:"archive_job_id,omitempty"`
+			Failure *archivesvc.Failure `json:"failure"`
+		}{job.ID, &archivesvc.Failure{Stage: "configuration"}}}})
+		return true
+	}
+	for _, known := range []error{archivesvc.ErrArchiveBusy, archivesvc.ErrArchivePayloadTooLarge, archivesvc.ErrIncompleteCandidates, archivesvc.ErrNothingToArchive, archivesvc.ErrCleanupRequired} {
+		if errors.Is(err, known) {
+			return false
+		}
+	}
+	var capacity *archivesvc.Failure
+	status := http.StatusInternalServerError
+	code := "archive_failed"
+	retryable := true
+	failure := capacity
+	var operation *archivesvc.OperationError
+	if !errors.Is(err, archivesvc.ErrIncompleteCandidates) && errors.As(err, &operation) {
+		failure = &archivesvc.Failure{Stage: operation.Stage}
+	}
+	if errors.As(err, &capacity) {
+		status = http.StatusConflict
+		code = "archive_capacity_exceeded"
+		retryable = false
+		failure = capacity
+	} else if job.Kind == observabilityvo.ArchiveKindLog && job.BatchProgress != nil && job.BatchProgress.Failure != nil {
+		failure = job.BatchProgress.Failure
+	}
+	if failure == nil {
+		return false
+	}
+	writeJSON(w, r, status, observabilityErrorEnvelope{Error: observabilityError{Code: code, Message: "log archive stopped; inspect the recorded stage and job before retrying", Retryable: retryable, RequiredAction: "inspect_log_archive", RequestID: requestIDFromRequest(r), Details: struct {
+		JobID   string              `json:"archive_job_id,omitempty"`
+		Failure *archivesvc.Failure `json:"failure"`
+	}{job.ID, failure}}})
+	return true
+}
+
+// Only advertise a persistent blocker after its failed job was saved. A failed
+// checkpoint write must retain the ordinary server error, without a phantom ID.
+func writeArchiveBlockage(w http.ResponseWriter, r *http.Request, job archivesvc.Job, err error) bool {
+	var blocked *archivesvc.PayloadBudgetError
+	if !errors.As(err, &blocked) || job.ID == "" || job.BatchProgress == nil || job.BatchProgress.Blocked == nil {
+		return false
+	}
+	writeJSON(w, r, http.StatusConflict, observabilityErrorEnvelope{Error: observabilityError{
+		Code: "archive_incomplete_candidates", Message: "trace archive is blocked by an oversized interaction; source retained; earlier verified batches remain recorded", RequestID: requestIDFromRequest(r), RequiredAction: "review_oversized_interaction",
+		Details: struct {
+			JobID   string                         `json:"archive_job_id"`
+			Blocked *archivesvc.PayloadBudgetError `json:"blocked"`
+		}{job.ID, job.BatchProgress.Blocked},
+	}})
+	return true
 }
 
 func (handler *ArchiveHandler) download(w http.ResponseWriter, r *http.Request, jobID string) {

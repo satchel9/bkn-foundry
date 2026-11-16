@@ -14,7 +14,17 @@ This directory contains the OpenAPI documentation for bkn-foundry services. YAML
 
 ## 🔑 Calling the APIs
 
-Published business APIs require authentication through `Authorization: Bearer <token>`. Obtain a token with one of these methods: **1. CLI login** (`openbkn auth login`, which stores the token in `~/.bkn/` and sends it automatically); **2. AppKey** (`POST /api/safe/v1/me/api-keys` issues a `bak_` key for automation); **3. device authorization flow** (an integrated application directs the user to sign in through `POST /oauth2/device/auth` without registering a client). The authentication section on the generated documentation home page contains complete examples.
+Published business APIs require authentication through `Authorization: Bearer <token>`. The accepted credential depends on the service and operation; OAuth access tokens and AppKeys are not interchangeable across all APIs.
+
+| API surface | Credential to use |
+| --- | --- |
+| BKN management REST APIs under `/api/bkn-backend/v1`, including `GET /knowledge-networks` | OAuth access token; AppKeys are not supported, including for read-only GET requests |
+| Context Loader read-only retrieval and MCP under `/api/agent-retrieval/...` | OAuth access token or a user-issued `bak_` AppKey, subject to resource permissions |
+| Other service APIs | OAuth access token; do not infer AppKey support from its availability in Context Loader |
+
+Obtain an OAuth access token through **CLI login** (`openbkn auth login`, which stores the token in `~/.bkn/` and sends and refreshes it automatically), or the **device authorization flow** (`POST /oauth2/device/auth`) for applications acting on behalf of users. For a management request from curl or another integration, use the token returned by `openbkn auth token`.
+
+For Context Loader retrieval/MCP automation, issue an AppKey through `POST /api/safe/v1/me/api-keys` using an OAuth token, or use `openbkn appkey create`. An AppKey being active in Safe establishes its validity and owner, not acceptance by every service. BKN management APIs can therefore return HTTP 401 / `Public.Unauthorized` for an active AppKey. Use OAuth for those requests rather than changing resource grants. MCP initialization success alone does not establish permission to execute tools. The authentication section on the generated documentation home page contains complete examples. The existing authentication guide limits AppKeys to read-only use; execution-operation support must be confirmed separately before relying on it.
 
 ## 🗂️ Modules
 
@@ -22,12 +32,13 @@ The order below matches the card groups on the documentation home page. It is co
 
 | Module | Directory | Coverage |
 |---|---|---|
-| 🟦 bkn-backend | [`bkn/`](bkn/) | Business knowledge networks: object types, relation types, action types, concept groups, metrics, capability bindings and import/export. **Complete** |
-| 🛡️ bkn-safe admin | [`bkn-safe-admin/`](bkn-safe-admin/) | Gateway-exposed, bearer-token-protected Enterprise security-policy management APIs. Internal decision endpoints remain under the unpublished `bkn-safe/` module. |
+| 🟦 bkn-backend | [`bkn/`](bkn/) | Business knowledge networks: object types, relation types, action types, concept groups, capability bindings, import/export, knowledge-network [events](bkn/kn-events.yaml) (event types, events, rule checks, change feed), and [Object Metrics V1](bkn/bkn-object-metrics-v1.yaml). |
+| 🛡️ bkn-safe admin | [`bkn-safe-admin/`](bkn-safe-admin/) | Gateway-exposed, bearer-token-protected Enterprise security-policy management APIs. Internal decision endpoints remain under `bkn-safe/` and are not published. |
+| 🔐 bkn-safe | [`bkn-safe/`](bkn-safe/) | Only [MCP client registration and connected clients](bkn-safe/oauth-clients.yaml) is published: RFC 7591 self-registration, listing and disconnecting your connected clients, and admin cleanup. The other files are linted but stay unpublished (see below). |
 | 🟫 context-loader | [`context-loader/`](context-loader/) | Agent context entry points: schema retrieval, instance and subgraph queries, logical properties, action execution, Skill retrieval, direct data access, and MCP. **Complete external surface**; internal `/in/v1` APIs are excluded |
-| 🟩 ontology-query | [`ontology-query/`](ontology-query/) | Ontology queries, semantic retrieval, action execution, and logs. **Complete** |
+| 🟩 ontology-query | [`ontology-query/`](ontology-query/) | Ontology queries, semantic retrieval, action execution, logs, and [Object Metrics V1](ontology-query/object-metrics-v1.yaml). |
 | 🟨 vega-backend | [`vega/`](vega/) | Data observability: catalogs, resources, connectors, build tasks, discovery tasks, and raw queries. **Complete** |
-| 🟩 execution-factory | [`execution-factory/`](execution-factory/) | Execution factory: functions, sandbox observability, import/export, operators, MCP, toolboxes, and Skills. **Complete public surface** (90 documented operations). The principal Ingress-exposed `/v1` APIs are included; the tokenless `internal-v1` surface is intentionally excluded, and the separate `/api/capabilities-lab/v1` group has 35 documented operations |
+| 🟩 execution-factory | [`execution-factory/`](execution-factory/) | Execution factory: functions, sandbox observability, import/export, MCP, toolboxes, and Skills. **Complete public surface** (76 documented operations). The principal Ingress-exposed `/v1` APIs are included; the tokenless `internal-v1` surface is intentionally excluded, and the separate `/api/capabilities-lab/v1` group has 31 documented operations |
 | 🟧 mf-model-manager | [`mf-model-manager/`](mf-model-manager/) | Model factory: large/small models, quotas, prompts, defaults and monitoring. All 46 public business route operations are covered; controller responses without a fixed response model use an open JSON schema |
 | 🟧 mf-model-api | [`mf-model-api/`](mf-model-api/) | Chat completions (JSON/SSE), reranking and both embedding aliases: all four public inference operations |
 | 🟥 agent-observability | [`agent-observability/`](agent-observability/) | BKN Trace: managed session lifecycle, business evidence, technical traces, and snapshots. Generated from Go annotations; **do not edit the YAML directly**. **Complete** |
@@ -39,21 +50,19 @@ These directories remain in the repository but are not published on the site. Th
 
 | Directory | Reason |
 | --- | --- |
-| [`bkn-safe/`](bkn-safe/) | Contains the self-service read surface plus cluster-internal authorization and managed-proxy contracts. They are linted but are not published as general external integration APIs |
 | [`sandbox-control-plane/`](sandbox-control-plane/) | Private control-plane REST contract, derived from current Pydantic models; callbacks remain cluster internal |
 | [`sandbox-executor/`](sandbox-executor/) | Private executor contract, including asynchronous submission and session dependency synchronization |
 | [`observability/`](observability/) | Contains only `observability.json`; it has no publishable YAML and would render as an empty group |
 
+A published module can also publish only some of its files with `MODFILES_<module>` in the Makefile. `bkn-safe/` uses this: only `oauth-clients.yaml` is published, while its self-service reads and cluster-internal authorization and managed-proxy contracts are linted but not published as general integration APIs.
+
 > Every new module directory must be registered in either `MODULES` or `MODULES_UNPUBLISHED`. The `make api-docs-*` targets fail otherwise, preventing documentation from being added silently without appearing on the site.
 
-### ⚠️ `/api/ontology-manager/v1` is a legacy alias
+### bkn-backend API prefixes
 
-bkn-backend registers both `/api/bkn-backend/v1` and `/api/ontology-manager/v1` as equivalent external routes. The same applies to their internal `in/v1` surfaces. The latter was retained for compatibility during the monorepo refactor in #111 and is still exposed by the Helm Ingress.
+bkn-backend serves public APIs under `/api/bkn-backend/v1` and internal APIs under `/api/bkn-backend/in/v1`.
 
-**The canonical prefix is `/api/bkn-backend/v1`**, and this documentation uses only that prefix:
-
-- all in-repository service calls use `/api/bkn-backend/v1`; none use the alias;
-- the alias remains available to avoid breaking existing clients and can be removed after external usage has been ruled out.
+The legacy `/api/ontology-manager/v1` and `/api/ontology-manager/in/v1` aliases have been retired. Clients using either alias must migrate to its `/api/bkn-backend` equivalent.
 
 ## 🔗 Shared definitions
 
@@ -61,7 +70,7 @@ bkn-backend registers both `/api/bkn-backend/v1` and `/api/ontology-manager/v1` 
 
 | File | Content |
 |---|---|
-| [`_shared/errors.yaml`](_shared/errors.yaml) | Common Go service error envelope (`rest.BaseError`: `error_code / description / solution / error_link / error_details`). Reference: `$ref: '../_shared/errors.yaml#/components/schemas/Error'` |
+| [`_shared/errors.yaml`](_shared/errors.yaml) | Common Go service error envelope (`httperrors.BaseError`: `error_code / description / solution / error_link / error_details`). Reference: `$ref: '../_shared/errors.yaml#/components/schemas/Error'` |
 | [`_shared/auth.yaml`](_shared/auth.yaml) | Authentication schemes (OAuth2 client credentials and `bak_` AppKey). Reference: `$ref: '../_shared/auth.yaml#/components/securitySchemes/OAuth2'` |
 
 > Model Factory uses its own FastAPI error envelope; chat-completion errors use the OpenAI-compatible envelope. Sandbox also has service-specific errors. See each operation rather than assuming the common Go error schema.

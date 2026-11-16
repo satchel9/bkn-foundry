@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/assert"
@@ -20,10 +21,58 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
 	vmock "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/mock"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics"
+	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/sync_checkpoint"
 )
 
 func TestBuildBatchCursorFilter(t *testing.T) {
+	t.Run("temporal checkpoint round trip", func(t *testing.T) {
+		t.Setenv("TZ", "Asia/Shanghai")
+		for _, kind := range []string{interfaces.DataType_Datetime, interfaces.DataType_Date, interfaces.DataType_Time} {
+			t.Run(kind, func(t *testing.T) {
+				field := &interfaces.Property{Name: "cursor", Type: kind, OriginalType: "timestamp without time zone"}
+				native := time.Date(2026, 10, 19, 14, 30, 0, 123456789, time.UTC)
+				original, err := buildBatchCursorFilter([]string{"cursor"}, []interfaces.KeyValue{{Key: "cursor", Value: native}})
+				require.NoError(t, err)
+				before, err := filter_condition.NewFilterCondition(context.Background(), original, map[string]*interfaces.Property{"cursor": field})
+				require.NoError(t, err)
+				mark, err := sync_checkpoint.EncodeBatch([]interfaces.KeyValue{{Key: "cursor", Value: native}})
+				require.NoError(t, err)
+				restored, err := sync_checkpoint.DecodeBatch(mark)
+				require.NoError(t, err)
+				require.NoError(t, sync_checkpoint.ValidateCursor(restored, []string{"cursor"}, []*interfaces.Property{field}))
+				resumed, err := buildBatchCursorFilter([]string{"cursor"}, restored.Cursor)
+				require.NoError(t, err)
+				after, err := filter_condition.NewFilterCondition(context.Background(), resumed, map[string]*interfaces.Property{"cursor": field})
+				require.NoError(t, err)
+				beforeValue := before.(*filter_condition.OrCond).SubConds[0].(*filter_condition.AndCond).SubConds[0].(*filter_condition.GtCond).Value
+				afterValue := after.(*filter_condition.OrCond).SubConds[0].(*filter_condition.AndCond).SubConds[0].(*filter_condition.GtCond).Value
+				assert.Equal(t, beforeValue, afterValue)
+				assert.Equal(t, native, original.SubConds[0].SubConds[0].Value)
+			})
+		}
+	})
+
+	t.Run("resumed cursor keeps source precision", func(t *testing.T) {
+		for _, kind := range []string{interfaces.DataType_Datetime, interfaces.DataType_Time} {
+			literal := "14:30:00.123456789"
+			if kind == interfaces.DataType_Datetime {
+				literal = "2026-10-19T14:30:00.123456789Z"
+			}
+			filter, err := buildBatchCursorFilter([]string{"cursor"}, []interfaces.KeyValue{{Key: "cursor", Value: literal}})
+			require.NoError(t, err)
+			cond, err := filter_condition.NewFilterCondition(context.Background(), filter, map[string]*interfaces.Property{"cursor": {Name: "cursor", Type: kind}})
+			require.NoError(t, err)
+			value := cond.(*filter_condition.OrCond).SubConds[0].(*filter_condition.AndCond).SubConds[0].(*filter_condition.GtCond).Value
+			if kind == interfaces.DataType_Datetime {
+				assert.Equal(t, 123456789, value.(time.Time).Nanosecond())
+			} else {
+				assert.Equal(t, literal, value)
+			}
+			assert.Equal(t, literal, filter.SubConds[0].SubConds[0].Value)
+		}
+	})
+
 	filter, err := buildBatchCursorFilter(
 		[]string{"customer_id", "id"},
 		[]interfaces.KeyValue{{Key: "customer_id", Value: "customer-1"}, {Key: "id", Value: 100}},
@@ -35,14 +84,14 @@ func TestBuildBatchCursorFilter(t *testing.T) {
 	assert.Equal(t, &interfaces.FilterCondCfg{
 		Operation: "and",
 		SubConds: []*interfaces.FilterCondCfg{
-			{Name: "customer_id", Operation: "gt", ValueOptCfg: interfaces.ValueOptCfg{Value: "customer-1", ValueFrom: interfaces.ValueFrom_Const}},
+			{Field: "customer_id", Operation: "gt", Value: "customer-1", ValueFrom: interfaces.ValueFrom_Const},
 		},
 	}, filter.SubConds[0])
 	assert.Equal(t, &interfaces.FilterCondCfg{
 		Operation: "and",
 		SubConds: []*interfaces.FilterCondCfg{
-			{Name: "customer_id", Operation: "==", ValueOptCfg: interfaces.ValueOptCfg{Value: "customer-1", ValueFrom: interfaces.ValueFrom_Const}},
-			{Name: "id", Operation: "gt", ValueOptCfg: interfaces.ValueOptCfg{Value: 100, ValueFrom: interfaces.ValueFrom_Const}},
+			{Field: "customer_id", Operation: "==", Value: "customer-1", ValueFrom: interfaces.ValueFrom_Const},
+			{Field: "id", Operation: "gt", Value: 100, ValueFrom: interfaces.ValueFrom_Const},
 		},
 	}, filter.SubConds[1])
 }
@@ -63,9 +112,9 @@ func TestBuildBatchCursorFilterAppendsPrimaryKeyForSameIncrementalValue(t *testi
 
 	require.Equal(t, []string{"ingested_at", "id"}, keys)
 	require.Len(t, filter.SubConds, 2)
-	assert.Equal(t, "ingested_at", filter.SubConds[1].SubConds[0].Name)
+	assert.Equal(t, "ingested_at", filter.SubConds[1].SubConds[0].Field)
 	assert.Equal(t, "==", filter.SubConds[1].SubConds[0].Operation)
-	assert.Equal(t, "id", filter.SubConds[1].SubConds[1].Name)
+	assert.Equal(t, "id", filter.SubConds[1].SubConds[1].Field)
 	assert.Equal(t, "gt", filter.SubConds[1].SubConds[1].Operation)
 	assert.Equal(t, int64(1000), filter.SubConds[1].SubConds[1].Value)
 }
@@ -118,8 +167,8 @@ func matchesStringInt64CursorFilter(t *testing.T, filter *interfaces.FilterCondC
 		require.Equal(t, "and", branch.Operation)
 		matches := true
 		for _, condition := range branch.SubConds {
-			actual, exists := row[condition.Name]
-			require.True(t, exists, "row is missing cursor field %q", condition.Name)
+			actual, exists := row[condition.Field]
+			require.True(t, exists, "row is missing cursor field %q", condition.Field)
 			switch condition.Operation {
 			case "==":
 				matches = matches && actual == condition.Value
@@ -153,7 +202,7 @@ func TestBatchCursorKeepsCompositePrimaryFieldsForResume(t *testing.T) {
 
 	require.Equal(t, []string{"updated_at", "tenant_id", "id"}, keys)
 	require.Len(t, filter.SubConds, 3)
-	assert.Equal(t, "id", filter.SubConds[2].SubConds[2].Name)
+	assert.Equal(t, "id", filter.SubConds[2].SubConds[2].Field)
 	assert.Equal(t, "gt", filter.SubConds[2].SubConds[2].Operation)
 	assert.Equal(t, int64(1000), filter.SubConds[2].SubConds[2].Value)
 }
@@ -184,6 +233,93 @@ func TestBatchBuildWorkerHandleTask(t *testing.T) {
 }
 
 func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
+	t.Run("corrupt columns fail before full rebuild index deletion or creation", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		cf := vmock.NewMockConnectorFactory(ctrl)
+		mfs := vmock.NewMockModelFactoryService(ctrl)
+		worker := &batchBuildWorker{lim: lim, cf: cf, mfs: mfs}
+		resource := &interfaces.Resource{LocalIndexName: "index", SourceMetadata: map[string]any{"columns": "invalid metadata"}, SchemaDefinition: []*interfaces.Property{{Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(12,2)"}}}
+		task := &interfaces.BuildTask{ID: "task", IndexName: "index", ExecuteType: interfaces.BuildTaskExecuteTypeFull, SyncedCount: 17}
+		err := worker.executeBuild(context.Background(), &interfaces.Catalog{ConnectorType: "mysql"}, resource, task)
+		require.Error(t, err)
+		assert.Equal(t, "index", resource.LocalIndexName)
+		assert.Empty(t, task.SyncedMark)
+		assert.EqualValues(t, 17, task.SyncedCount)
+		assert.Nil(t, resource.SchemaDefinition[0].Attributes)
+	})
+	for _, connectorType := range []string{"mysql", "mariadb", "postgresql", "sqlserver", "oracle", "doris", "hana"} {
+		t.Run("exact integer decimal write for "+connectorType, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			lim := vmock.NewMockLocalIndexManager(ctrl)
+			bts := vmock.NewMockBuildTaskService(ctrl)
+			cf := vmock.NewMockConnectorFactory(ctrl)
+			resource := &interfaces.Resource{LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_Integer}, {Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(38,0)"}}}
+			mark := `{"mode":"batch","cursor":[{"key":"id","value":8000}]}`
+			task := &interfaces.BuildTask{ID: "task", IndexName: "index", ExecuteType: interfaces.BuildTaskExecuteTypeFull, SyncedMark: mark, SyncedCount: 8000,
+				IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{PrimaryKeyFields: []string{"id"}, IncrementalFields: []string{"id"}}}}
+			lim.EXPECT().CheckIndexExist(gomock.Any(), "index").Return(true, nil)
+			connector := vmock.NewMockTableConnector(ctrl)
+			cf.EXPECT().CreateConnectorInstance(gomock.Any(), connectorType, gomock.Any()).Return(connector, nil)
+			connector.EXPECT().Connect(gomock.Any()).Return(nil)
+			connector.EXPECT().Close(gomock.Any()).Return(nil)
+			document := map[string]any{"id": int64(8001), "amount": "9007199254740993"}
+			connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Return(&interfaces.ResourceDataQueryResult{TotalCount: 1, Entries: []map[string]any{document}}, nil)
+			bts.EXPECT().InternalGetStatusByID(gomock.Any(), task.ID).Return(interfaces.BuildTaskStatusRunning, nil)
+			bts.EXPECT().InternalSetProgress(gomock.Any(), nil, task.ID, gomock.Any()).DoAndReturn(func(_ context.Context, _ *sql.Tx, _ string, progress interfaces.BuildTaskProgress) (bool, error) {
+				assert.Nil(t, progress.SyncedMark)
+				assert.Nil(t, progress.SyncedCount)
+				return true, nil
+			})
+			writeError := errors.New("index write failed")
+			lim.EXPECT().IndexDocuments(gomock.Any(), "index", gomock.Any()).DoAndReturn(func(_ context.Context, _ string, writes []interfaces.DocumentWrite) ([]interfaces.DocumentWriteResult, error) {
+				require.Len(t, writes, 1)
+				assert.Equal(t, int64(9007199254740993), writes[0].Document["amount"])
+				return nil, writeError
+			})
+			worker := &batchBuildWorker{lim: lim, bts: bts, cf: cf}
+			err := worker.executeBuild(context.Background(), &interfaces.Catalog{ConnectorType: connectorType}, resource, task)
+			require.ErrorIs(t, err, writeError)
+			assert.Equal(t, "9007199254740993", document["amount"])
+			assert.Equal(t, mark, task.SyncedMark)
+			assert.EqualValues(t, 8000, task.SyncedCount)
+		})
+	}
+
+	t.Run("invalid decimal values cannot write or advance incremental checkpoints", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		bts := vmock.NewMockBuildTaskService(ctrl)
+		cf := vmock.NewMockConnectorFactory(ctrl)
+		resource := &interfaces.Resource{LocalIndexName: "index", SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_Integer}, {Name: "amount", Type: interfaces.DataType_Decimal, OriginalType: "decimal(12,2)"}}}
+		mark := `{"mode":"batch","cursor":[{"key":"id","value":8000}]}`
+		task := &interfaces.BuildTask{ID: "task", IndexName: "index", ExecuteType: interfaces.BuildTaskExecuteTypeIncremental, SyncedMark: mark, SyncedCount: 8000,
+			IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{PrimaryKeyFields: []string{"id"}, IncrementalFields: []string{"id"}}}}
+		lim.EXPECT().CheckIndexExist(gomock.Any(), "index").Return(true, nil)
+		connector := vmock.NewMockTableConnector(ctrl)
+		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
+		connector.EXPECT().Connect(gomock.Any()).Return(nil)
+		connector.EXPECT().Close(gomock.Any()).Return(nil)
+		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Return(&interfaces.ResourceDataQueryResult{TotalCount: 1, Entries: []map[string]any{{"id": int64(8001), "amount": "1.234"}}}, nil)
+		bts.EXPECT().InternalGetStatusByID(gomock.Any(), task.ID).Return(interfaces.BuildTaskStatusRunning, nil)
+		bts.EXPECT().InternalSetProgress(gomock.Any(), nil, task.ID, gomock.Any()).DoAndReturn(func(_ context.Context, _ *sql.Tx, _ string, progress interfaces.BuildTaskProgress) (bool, error) {
+			assert.Nil(t, progress.SyncedMark)
+			assert.Nil(t, progress.SyncedCount)
+			return true, nil
+		})
+		worker := &batchBuildWorker{lim: lim, bts: bts, cf: cf}
+		err := worker.executeBuild(context.Background(), &interfaces.Catalog{ConnectorType: "mysql"}, resource, task)
+		var failure *interfaces.DecimalIndexError
+		require.ErrorAs(t, err, &failure)
+		assert.Equal(t, "amount", failure.Field)
+		assert.Equal(t, "value_out_of_range", failure.Reason)
+		docID, idErr := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: int64(8001)}})
+		require.NoError(t, idErr)
+		assert.ErrorContains(t, err, fmt.Sprintf("build document %q:", docID))
+		assert.NotContains(t, err.Error(), "1.234")
+		assert.Equal(t, mark, task.SyncedMark)
+		assert.EqualValues(t, 8000, task.SyncedCount)
+	})
 	t.Run("does not invoke model when index creation fails", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		lim := vmock.NewMockLocalIndexManager(ctrl)
@@ -253,9 +389,9 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
 		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).DoAndReturn(
-			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				assert.Equal(t, []string{"id"}, params.OutputFields)
-				return &interfaces.QueryResult{Total: 0}, nil
+				return &interfaces.ResourceDataQueryResult{TotalCount: 0}, nil
 			},
 		)
 		connector.EXPECT().Close(gomock.Any()).Return(nil)
@@ -307,13 +443,19 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 		lim.EXPECT().CheckIndexExist(gomock.Any(), "current-index").Return(true, nil)
 		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
-		payloads := []string{`{"items":[{"sku":"BOX-01","count":2}]}`, `{"items":["SENSOR-A","SENSOR-B"]}`, `{"items":[]}`, `{"items":null}`}
+		payloads := []struct{ source, stored any }{
+			{`{"items":[{"sku":"BOX-01","count":2}]}`, map[string]any{"items": []any{map[string]any{"sku": "BOX-01", "count": json.Number("2")}}}},
+			{`{"items":["SENSOR-A","SENSOR-B"]}`, map[string]any{"items": []any{"SENSOR-A", "SENSOR-B"}}},
+			{`{"items":[]}`, map[string]any{"items": []any{}}},
+			{`{"items":null}`, map[string]any{"items": nil}},
+			{"null", nil}, {nil, nil}, {`"null"`, "null"}, {`"scalar"`, "scalar"}, {`""`, ""},
+		}
 		queryCount := 0
 		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Times(73).DoAndReturn(
-			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				queryCount++
 				if queryCount == 73 {
-					return &interfaces.QueryResult{}, nil
+					return &interfaces.ResourceDataQueryResult{}, nil
 				}
 				require.NotNil(t, params.FilterCondCfg)
 				assert.Equal(t, 1000, params.Paging.Limit)
@@ -323,12 +465,12 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 				for index := range entries {
 					entries[index] = map[string]any{
 						"id":      firstID + int64(index),
-						"payload": payloads[(index+queryCount)%len(payloads)],
+						"payload": payloads[(index+queryCount)%len(payloads)].source,
 					}
 				}
-				result := &interfaces.QueryResult{Entries: entries}
+				result := &interfaces.ResourceDataQueryResult{Entries: entries}
 				if queryCount == 1 {
-					result.Total = 72000
+					result.TotalCount = 72000
 				}
 				return result, nil
 			})
@@ -342,17 +484,16 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 			})
 		indexedBatches := 0
 		lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).Times(72).DoAndReturn(
-			func(_ context.Context, _ string, documents map[string]map[string]any) ([]string, error) {
+			func(ctx context.Context, indexName string, documents []interfaces.DocumentWrite) ([]interfaces.DocumentWriteResult, error) {
 				require.Len(t, documents, 1000)
-				for _, document := range documents {
-					encoded, err := json.Marshal(document["payload"])
-					require.NoError(t, err)
+				for _, write := range documents {
+					document := write.Document
 					id := document["id"].(int64)
-					expected := payloads[(int(id-8001)%1000+indexedBatches+1)%len(payloads)]
-					assert.JSONEq(t, expected, string(encoded))
+					expected := payloads[(int(id-8001)%1000+indexedBatches+1)%len(payloads)].stored
+					assert.Equal(t, expected, document["payload"])
 				}
 				indexedBatches++
-				return nil, nil
+				return successfulIndexDocuments(ctx, indexName, documents)
 			})
 		newMark := `{"mode":"batch","cursor":[{"key":"id","value":80000}]}`
 		for range 72 {
@@ -416,9 +557,9 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
 		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).DoAndReturn(
-			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				assert.Nil(t, params.FilterCondCfg)
-				return &interfaces.QueryResult{Total: 1, Entries: []map[string]any{{"id": int64(1)}}}, nil
+				return &interfaces.ResourceDataQueryResult{TotalCount: 1, Entries: []map[string]any{{"id": int64(1)}}}, nil
 			})
 		connector.EXPECT().Close(gomock.Any()).Return(nil)
 		bts.EXPECT().InternalGetStatusByID(gomock.Any(), task.ID).Return(interfaces.BuildTaskStatusRunning, nil)
@@ -428,7 +569,7 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 				assert.EqualValues(t, 1, *progress.TotalCount)
 				return true, nil
 			})
-		lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).Return(nil, nil)
+		lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).DoAndReturn(successfulIndexDocuments)
 		mockDB.ExpectBegin()
 		txMatcher := gomock.AssignableToTypeOf(&sql.Tx{})
 		rs.EXPECT().InternalGetByID(gomock.Any(), txMatcher, resource.ID).Return(resource, nil)
@@ -473,9 +614,9 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
 		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).DoAndReturn(
-			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+			func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 				require.NotNil(t, params.FilterCondCfg)
-				return &interfaces.QueryResult{Total: 2, Entries: []map[string]any{{"id": int64(9)}, {"id": int64(10)}}}, nil
+				return &interfaces.ResourceDataQueryResult{TotalCount: 2, Entries: []map[string]any{{"id": int64(9)}, {"id": int64(10)}}}, nil
 			})
 		connector.EXPECT().Close(gomock.Any()).Return(nil)
 		bts.EXPECT().InternalGetStatusByID(gomock.Any(), task.ID).Return(interfaces.BuildTaskStatusRunning, nil)
@@ -492,7 +633,7 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 				}
 				return true, nil
 			})
-		lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).Return(nil, nil)
+		lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).DoAndReturn(successfulIndexDocuments)
 		newMark := `{"mode":"batch","cursor":[{"key":"id","value":10}]}`
 		mockDB.ExpectBegin()
 		txMatcher := gomock.AssignableToTypeOf(&sql.Tx{})
@@ -528,7 +669,7 @@ func TestBatchBuildWorkerExecuteBuild(t *testing.T) {
 		lim.EXPECT().CheckIndexExist(gomock.Any(), "current-index").Return(true, nil)
 		cf.EXPECT().CreateConnectorInstance(gomock.Any(), "mysql", gomock.Any()).Return(connector, nil)
 		connector.EXPECT().Connect(gomock.Any()).Return(nil)
-		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Return(&interfaces.QueryResult{}, nil)
+		connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Return(&interfaces.ResourceDataQueryResult{}, nil)
 		connector.EXPECT().Close(gomock.Any()).Return(nil)
 		bts.EXPECT().InternalGetStatusByID(gomock.Any(), task.ID).Return(interfaces.BuildTaskStatusRunning, nil)
 		bts.EXPECT().InternalMarkCompleted(gomock.Any(), nil, task.ID).Return(true, nil)
@@ -584,8 +725,14 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 	cf := vmock.NewMockConnectorFactory(ctrl)
 	connector := vmock.NewMockTableConnector(ctrl)
 	resource := workerTestResource()
+	filterable := false
+	for _, property := range resource.SchemaDefinition {
+		if property.Name == "id" {
+			property.Filterable = &filterable
+		}
+	}
 	resource.SchemaDefinition = append(resource.SchemaDefinition,
-		&interfaces.Property{Name: "ingested_at", Type: interfaces.DataType_Timestamp})
+		&interfaces.Property{Name: "ingested_at", Type: interfaces.DataType_Timestamp, Filterable: &filterable})
 	resource.IndexConfig.IncrementalFields = []string{"ingested_at"}
 	resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusAvailable
 	resource.LocalIndexName = "current-index"
@@ -614,8 +761,15 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 	}
 	queryCount := 0
 	connector.EXPECT().ExecuteQuery(gomock.Any(), resource, gomock.Any()).Times(2).DoAndReturn(
-		func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.QueryResult, error) {
+		func(_ context.Context, _ *interfaces.Resource, params *interfaces.ResourceDataQueryParams) (*interfaces.ResourceDataQueryResult, error) {
 			queryCount++
+			for _, property := range resource.SchemaDefinition {
+				if property.Name == "id" || property.Name == "ingested_at" {
+					require.NotNil(t, property.Filterable)
+					assert.False(t, *property.Filterable, "internal pagination must not mutate the public switch")
+				}
+			}
+			require.NotNil(t, params.ActualFilterCond)
 			require.Len(t, params.Sort, 2)
 			assert.Equal(t, "ingested_at", params.Sort[0].Field)
 			assert.Equal(t, "id", params.Sort[1].Field)
@@ -623,7 +777,7 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 			if queryCount == 2 {
 				require.Len(t, params.FilterCondCfg.SubConds, 2)
 				idCondition := params.FilterCondCfg.SubConds[1].SubConds[1]
-				assert.Equal(t, "id", idCondition.Name)
+				assert.Equal(t, "id", idCondition.Field)
 				assert.Equal(t, "gt", idCondition.Operation)
 				assert.Equal(t, int64(1020), idCondition.Value)
 			}
@@ -640,9 +794,9 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 					}
 				}
 			}
-			result := &interfaces.QueryResult{Entries: entries}
+			result := &interfaces.ResourceDataQueryResult{Entries: entries}
 			if queryCount == 1 {
-				result.Total = int64(len(sourceRows))
+				result.TotalCount = int64(len(sourceRows))
 			}
 			return result, nil
 		})
@@ -656,9 +810,9 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 		})
 	batchSizes := make([]int, 0, 2)
 	lim.EXPECT().IndexDocuments(gomock.Any(), "current-index", gomock.Any()).Times(2).DoAndReturn(
-		func(_ context.Context, _ string, documents map[string]map[string]any) ([]string, error) {
+		func(ctx context.Context, indexName string, documents []interfaces.DocumentWrite) ([]interfaces.DocumentWriteResult, error) {
 			batchSizes = append(batchSizes, len(documents))
-			return nil, nil
+			return successfulIndexDocuments(ctx, indexName, documents)
 		})
 	for range 2 {
 		mockDB.ExpectBegin()
@@ -680,6 +834,12 @@ func TestBatchBuildWorkerReadsSameIncrementalValueAcrossPages(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []int{1000, 500}, batchSizes)
+	for _, property := range resource.SchemaDefinition {
+		if property.Name == "id" || property.Name == "ingested_at" {
+			require.NotNil(t, property.Filterable)
+			assert.False(t, *property.Filterable)
+		}
+	}
 	require.NotNil(t, finalProgress.SyncedCount)
 	assert.EqualValues(t, 1500, *finalProgress.SyncedCount)
 	require.NotNil(t, finalProgress.SyncedMark)
@@ -796,6 +956,17 @@ func TestValidateTaskEmbeddingFeatures(t *testing.T) {
 }
 
 func TestValidateBuildTaskSchemaFeatures(t *testing.T) {
+	t.Run("large integer supports only keyword features", func(t *testing.T) {
+		for _, kind := range []string{interfaces.PropertyFeatureType_Keyword, interfaces.PropertyFeatureType_Fulltext, interfaces.PropertyFeatureType_Vector} {
+			schema := []*interfaces.Property{{Name: "wide", Type: interfaces.DataType_LargeInteger, OriginalType: "LARGEINT", Features: []interfaces.PropertyFeature{{FeatureName: kind, FeatureType: kind, IsDefault: true}}}}
+			err := validateBuildTaskSchemaFeatures(interfaces.ResourceCategoryTable, schema)
+			if kind == interfaces.PropertyFeatureType_Keyword {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "does not support feature type")
+			}
+		}
+	})
 	tests := []struct {
 		name     string
 		category string

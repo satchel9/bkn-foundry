@@ -10,7 +10,7 @@
 package mock_interfaces
 
 import (
-	interfaces "bkn-backend/interfaces"
+	interfaces "github.com/openbkn-ai/bkn-foundry/adp/bkn/bkn-backend/server/interfaces"
 	context "context"
 	sql "database/sql"
 	reflect "reflect"
@@ -323,4 +323,18 @@ func (m *MockObjectTypeService) ValidateObjectTypes(ctx context.Context, knID, b
 func (mr *MockObjectTypeServiceMockRecorder) ValidateObjectTypes(ctx, knID, branch, objectTypes, strictMode, batch, mode any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateObjectTypes", reflect.TypeOf((*MockObjectTypeService)(nil).ValidateObjectTypes), ctx, knID, branch, objectTypes, strictMode, batch, mode)
+}
+
+// CheckOverwriteDeclarations mocks base method.
+func (m *MockObjectTypeService) CheckOverwriteDeclarations(ctx context.Context, knID, branch string, objectTypes []*interfaces.ObjectType, mode string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CheckOverwriteDeclarations", ctx, knID, branch, objectTypes, mode)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CheckOverwriteDeclarations indicates an expected call of CheckOverwriteDeclarations.
+func (mr *MockObjectTypeServiceMockRecorder) CheckOverwriteDeclarations(ctx, knID, branch, objectTypes, mode any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CheckOverwriteDeclarations", reflect.TypeOf((*MockObjectTypeService)(nil).CheckOverwriteDeclarations), ctx, knID, branch, objectTypes, mode)
 }

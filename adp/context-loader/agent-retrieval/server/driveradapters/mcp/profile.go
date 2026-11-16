@@ -51,7 +51,7 @@ func (p mcpProfile) filter(_ context.Context, tools []mcp.Tool) []mcp.Tool {
 	out := make([]mcp.Tool, 0, len(tools))
 	for _, tool := range tools {
 		if p.published != nil {
-			if _, ok := p.published[tool.Name]; !ok {
+			if _, ok := p.published[tool.Name]; !ok && isBusinessTool(tool.Name) {
 				continue
 			}
 		}
@@ -92,6 +92,12 @@ var compactProfileTools = []string{
 	toolKeySearchInstance,
 	toolKeyQueryObjectInstance,
 	toolKeyQueryMetric,
+	toolKeyDrillThroughMetric,
+	// Aggregation, ranking and multi-hop questions are the common case; behind
+	// the gateway they cost three calls each, and hosts that only pass
+	// network-scoped tools cannot reach them at all.
+	toolKeyRunCypher,
+	toolKeyQueryInstanceSubgraph,
 }
 
 // compactProfile is /mcp-compact: a small fixed tool list for hosts that load
@@ -136,7 +142,7 @@ func BuildCompactMCPInfoForLocale(endpoint, localeName string) (*MCPInfo, error)
 	}
 	tools := make([]MCPToolInfo, 0, len(compactProfile.published))
 	for _, tool := range info.Tools {
-		if _, ok := compactProfile.published[tool.Name]; ok {
+		if _, ok := compactProfile.published[tool.Name]; ok || !isBusinessTool(tool.Name) {
 			tools = append(tools, compactInfoView(tool))
 		}
 	}

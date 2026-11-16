@@ -4,6 +4,7 @@ import datetime
 from fastapi import APIRouter, Body, Request, Query
 from app.controller.llm_controller import *
 from app.interfaces.logics import LLMUsedOpenAI
+from app.utils.operation_audit import operation_audit_request
 from app.utils.common import get_user_info
 from app.utils.observability.observability_log import get_logger
 
@@ -27,25 +28,30 @@ async def health_alive():
 @llm_route.post("/llm/add")
 async def add_llm(request: Request, model_para: dict = Body(...)):
     userId, language, role = await get_user_info(request)
-    return await add_model(model_para, userId, language, role)
+    return await add_model(model_para, userId, language, role, audit_request=operation_audit_request(request))
 
 
 @llm_route.post("/llm/delete")
 async def remove_llm(request: Request, model_ids: dict = Body(...)):
     userId, language, role = await get_user_info(request)
-    return await remove_model(model_ids, userId, language, role)
+    return await remove_model(model_ids, userId, language, role, audit_request=operation_audit_request(request))
 
 
 @llm_route.post("/llm/test")
 async def test_llm_(request: Request, model_config: dict = Body(...)):
     userId, language, role = await get_user_info(request)
+    model_id = model_config.get("model_id")
+    if not await permission_manager.check_single_permission(
+            user_id=userId, resource_id=model_id if model_id and model_id != "-" else "*",
+            operations="execute", resource_type="large_model", role=role):
+        return JSONResponse(status_code=403, content=NotPermissionError)
     return await test_model(model_config, userId, language)
 
 
 @llm_route.post("/llm/edit")
 async def edit_llm(request: Request, model_para: dict = Body(...)):
     userId, language, role = await get_user_info(request)
-    return await edit_model(model_para, userId, language, role)
+    return await edit_model(model_para, userId, language, role, audit_request=operation_audit_request(request))
 
 
 @llm_route.get("/llm/list")
@@ -162,7 +168,7 @@ async def monitor_llm(request: Request, model_id):
 @llm_route.post("/llm/default/edit")
 async def edit_default_llm(request: Request, model_para: dict = Body(...)):
     userId, language, role = await get_user_info(request)
-    return await edit_default_model(model_para, userId, language, role)
+    return await edit_default_model(model_para, userId, language, role, audit_request=operation_audit_request(request))
 
 
 @llm_route.get("/llm/monitor/overview")

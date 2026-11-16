@@ -68,3 +68,79 @@ func TestMigrateKeepsLegacyOperationsGrantable(t *testing.T) {
 		t.Fatalf("legacy operation derived_to_operation_id = %q, want empty", operation.DerivedToOperationID)
 	}
 }
+
+func TestResourceIdentifierColumnWidths(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		model any
+		field string
+		want  int
+	}{
+		{&model.ProxyGrantSource{}, "ResourceID", 257},
+		{&model.ProxyGrantPolicy{}, "ResourceID", 257},
+		{&model.ProxyGrantAuditLog{}, "ResourceID", 257},
+		{&model.AuthorizationGrant{}, "Object", 322},
+		{&model.PermissionRequest{}, "ResourceID", 257},
+		{&model.ResourceParent{}, "ResourceID", 257},
+		{&model.AuthzDecision{}, "ResourceID", 257},
+	}
+	for _, test := range tests {
+		statement := &gorm.Statement{DB: db}
+		if err := statement.Parse(test.model); err != nil {
+			t.Fatal(err)
+		}
+		field := statement.Schema.LookUpField(test.field)
+		if field == nil || field.Size != test.want {
+			t.Errorf("%T.%s size = %v, want %d", test.model, test.field, field, test.want)
+		}
+	}
+}
+
+func TestMigrateAddsDepartmentMembershipIndexToLegacyTable(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := db.Exec(`CREATE TABLE user_departments (
+ user_id TEXT NOT NULL, department_id TEXT NOT NULL,
+ PRIMARY KEY (user_id, department_id))`).Error; err != nil {
+		t.Fatal(err)
+	}
+	membership := model.UserDepartment{UserID: "existing-user", DepartmentID: "existing-department"}
+	if err := db.Create(&membership).Error; err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := Migrate(db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var columns []struct{ Name string }
+	if err := db.Raw("PRAGMA index_info(idx_user_departments_department_id)").Scan(&columns).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(columns) != 1 || columns[0].Name != "department_id" {
+		t.Fatalf("missing department-first index after upgrade: %+v", columns)
+	}
+	var saved []model.UserDepartment
+	if err := db.Find(&saved).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 1 || saved[0] != membership {
+		t.Fatalf("migration changed existing memberships: %+v", saved)
+	}
+	if err := db.Create(&membership).Error; err == nil {
+		t.Fatal("migration lost composite primary-key uniqueness")
+	}
+}

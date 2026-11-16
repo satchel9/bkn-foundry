@@ -6,16 +6,18 @@ package action_scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
 	"strings"
 
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 
-	oerrors "ontology-query/errors"
-	"ontology-query/interfaces"
+	oerrors "github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/errors"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/interfaces"
+	"github.com/openbkn-ai/bkn-foundry/adp/bkn/ontology-query/server/logics"
 )
 
 func (s *actionSchedulerService) authorizeActionType(ctx context.Context, knID string,
@@ -70,6 +72,28 @@ func (s *actionSchedulerService) resolveActionPermissionRequirements(ctx context
 		},
 	}
 	objectTypeIDs := []string{actionType.ObjectTypeID}
+	if cfg := actionType.OperationConfig; cfg != nil && cfg.Type == "relation" {
+		if err := validateActionResourceID(knID, cfg.RelationTypeID); err != nil {
+			return nil, actionPermissionInvalid(ctx, err.Error())
+		}
+		relation, exists, err := s.omAccess.GetRelationType(ctx, knID, interfaces.MAIN_BRANCH, cfg.RelationTypeID)
+		if err != nil {
+			if versionErr, ok := logics.KNVersionError(ctx, err); ok {
+				return nil, versionErr
+			}
+			return nil, actionPermissionUnavailable(ctx, err)
+		}
+		if !exists {
+			return nil, actionPermissionInvalid(ctx, "relation type does not exist")
+		}
+		objectTypeIDs = append(objectTypeIDs, relation.SourceObjectTypeID, relation.TargetObjectTypeID)
+		requirements = append(requirements, interfaces.PermissionRequirement{
+			ResourceType: interfaces.PermissionResourceTypeRelationType,
+			ResourceID:   knID + "/" + cfg.RelationTypeID,
+			Operation:    interfaces.PermissionOperationViewDetail,
+		})
+	}
+
 	if actionType.Affect != nil {
 		objectTypeIDs = append(objectTypeIDs, actionType.Affect.ObjectTypeID)
 	}
@@ -91,10 +115,13 @@ func (s *actionSchedulerService) resolveActionPermissionRequirements(ctx context
 		}
 		objectType, exists, err := s.omAccess.GetObjectType(ctx, knID, interfaces.MAIN_BRANCH, objectTypeID)
 		if err != nil {
+			if versionErr, ok := logics.KNVersionError(ctx, err); ok {
+				return nil, versionErr
+			}
 			return nil, actionPermissionUnavailable(ctx, err)
 		}
 		if !exists {
-			return nil, rest.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
+			return nil, httperrors.NewHTTPError(ctx, http.StatusNotFound, oerrors.OntologyQuery_ObjectType_ObjectTypeNotFound)
 		}
 		if objectType.KNID != "" && objectType.KNID != knID {
 			return nil, actionPermissionInvalid(ctx, "object type belongs to another knowledge network")
@@ -251,11 +278,16 @@ func validateStandaloneActionResourceID(resourceID string) error {
 }
 
 func actionPermissionInvalid(ctx context.Context, detail string) error {
-	return rest.NewHTTPError(ctx, http.StatusBadRequest,
+	return httperrors.NewHTTPError(ctx, http.StatusBadRequest,
 		oerrors.OntologyQuery_ActionExecution_InvalidParameter).WithErrorDetails(detail)
 }
 
 func actionPermissionUnavailable(ctx context.Context, err error) error {
-	return rest.NewHTTPError(ctx, http.StatusServiceUnavailable,
+	var downstream *httperrors.HTTPError
+	if errors.As(err, &downstream) &&
+		(downstream.HTTPCode == http.StatusUnauthorized || downstream.HTTPCode == http.StatusForbidden) {
+		return downstream
+	}
+	return httperrors.NewHTTPError(ctx, http.StatusServiceUnavailable,
 		oerrors.OntologyQuery_InternalError_CheckPermissionFailed).WithErrorDetails(err.Error())
 }

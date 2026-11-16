@@ -22,9 +22,10 @@ import (
 	"time"
 
 	"github.com/bytedance/sonic"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/i18n"
+
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/infra/common"
 	"github.com/openbkn-ai/bkn-foundry/adp/context-loader/agent-retrieval/server/interfaces"
-	sharedrest "github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 const (
@@ -41,6 +42,9 @@ const (
 var (
 	ErrFeatureNotInstalled      = errors.New("BKN Trace Core URL is not configured")
 	ErrMissingFinishCorrelation = errors.New("current request and OTel trace context are required")
+	// ErrInvalidLifecycleResponse is restricted to a successful HTTP response
+	// that did not contain a valid lifecycle acknowledgement.
+	ErrInvalidLifecycleResponse = errors.New("invalid lifecycle success response")
 	// ErrEvidenceArtifactURLNotConfigured means BKN_TRACE_ARTIFACT_ENDPOINT is
 	// unset. The endpoint is configured on its own and is never derived from
 	// BKN_TRACE_EVIDENCE_INGEST_URL. Starting an interaction tolerates its
@@ -464,12 +468,31 @@ func (c *LifecycleClient) StartOperationAttempt(
 	return result, apiErr, err
 }
 
-func (c *LifecycleClient) finishAttempt(
+type preparedFinishAttempt struct {
+	path string
+	body json.RawMessage
+}
+
+func (c *LifecycleClient) finishAttempt(ctx context.Context, input FinishAttemptInput, action, evidenceDurability string) (OperationResult, *APIError, error) {
+	prepared, err := c.prepareFinishAttempt(ctx, input, action, evidenceDurability)
+	if err != nil {
+		return OperationResult{}, nil, err
+	}
+	return c.submitFinishAttempt(ctx, prepared)
+}
+
+func (c *LifecycleClient) submitFinishAttempt(ctx context.Context, prepared preparedFinishAttempt) (OperationResult, *APIError, error) {
+	var result OperationResult
+	apiErr, err := c.do(ctx, http.MethodPost, prepared.path, prepared.body, &result)
+	return result, apiErr, err
+}
+
+func (c *LifecycleClient) prepareFinishAttempt(
 	ctx context.Context,
 	input FinishAttemptInput,
 	action string,
 	evidenceDurability string,
-) (OperationResult, *APIError, error) {
+) (preparedFinishAttempt, error) {
 	body := map[string]any{
 		"receipt_id":          input.ReceiptID,
 		"evidence_durability": evidenceDurability, "retryable": input.Retryable,
@@ -500,13 +523,13 @@ func (c *LifecycleClient) finishAttempt(
 			body["artifact_refs"] = input.ArtifactRefs
 		}
 	}
-	var result OperationResult
 	path := "/operations/" + url.PathEscape(input.OperationID) + "/attempts/" +
 		strconv.FormatUint(uint64(input.Attempt), 10) + ":" + action
-	apiErr, err := c.do(ctx, http.MethodPost, path, body, &result)
-	return result, apiErr, err
+	raw, err := sonic.Marshal(body)
+	return preparedFinishAttempt{path: path, body: json.RawMessage(raw)}, err
 }
 
+//nolint:unused // Intentionally retained.
 func boundedJSONPayload(raw json.RawMessage) PayloadEnvelope {
 	payload, _, _ := boundedJSONPayloadWithWriter(context.Background(), nil, raw)
 	return payload
@@ -585,7 +608,7 @@ func (c *LifecycleClient) do(
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(sharedrest.AcceptLanguageHeader, sharedrest.GetLanguageByCtx(ctx))
+	req.Header.Set(i18n.AcceptLanguageHeader, string(i18n.GetLanguageByCtx(ctx)))
 	if err := setTrustedLifecycleHeaders(ctx, req.Header); err != nil {
 		return &APIError{
 			Code: "permission_denied", Message: err.Error(),
@@ -599,11 +622,18 @@ func (c *LifecycleClient) do(
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var envelope errorEnvelope
-		if err := sonic.ConfigDefault.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil {
+		if err := sonic.ConfigDefault.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&envelope); err != nil || envelope.Error.Code == "" {
 			if resp.StatusCode >= http.StatusInternalServerError {
 				return &APIError{HTTPStatus: resp.StatusCode, Code: "trace_core_unavailable", Message: "Trace Core returned an unavailable response", Retryable: true}, nil
 			}
-			return nil, fmt.Errorf("decode lifecycle error response: %w", err)
+			failure := &APIError{HTTPStatus: resp.StatusCode, Code: "lifecycle_request_rejected", Message: "Trace Core rejected the lifecycle request", RequiredAction: "contact_platform_operator"}
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				failure.Code, failure.RequiredAction = "permission_denied", "request_authorization"
+			case http.StatusTooManyRequests:
+				failure.Code, failure.RequiredAction, failure.Retryable = "rate_limited", "retry_later", true
+			}
+			return failure, nil
 		}
 		envelope.Error.HTTPStatus = resp.StatusCode
 		return &envelope.Error, nil
@@ -612,7 +642,7 @@ func (c *LifecycleClient) do(
 		return nil, nil
 	}
 	if err := common.DecodePreciseJSON(io.LimitReader(resp.Body, 1<<20), target); err != nil {
-		return nil, fmt.Errorf("decode lifecycle response: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidLifecycleResponse, err)
 	}
 	if interaction, ok := target.(*Interaction); ok {
 		c.rememberLease(ctx, *interaction)

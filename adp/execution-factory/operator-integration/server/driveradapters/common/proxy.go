@@ -67,8 +67,8 @@ func NewUnifiedProxyHandler() UnifiedProxyHandler {
 
 // FunctionExecute function execution.
 //
-// This interface executes any code submitted by the caller in the sandbox, so the public interface requires the caller to hold execute on the operator type.
-// Permissions (see #345). There has been no authorization determination on the public face before, and any account holding a valid token - including those with empty permission sets.
+// This interface executes any code submitted by the caller in the sandbox, so the public interface requires the caller to hold execute on the function type
+// (see #345). There has been no authorization determination on the public face before, and any account holding a valid token - including those with empty permission sets.
 // Account - you can use this to gain code execution capabilities in the sandbox.
 func (h *unifiedProxyHandler) FunctionExecute(c *gin.Context) {
 	var err error
@@ -78,7 +78,7 @@ func (h *unifiedProxyHandler) FunctionExecute(c *gin.Context) {
 		return
 	}
 	req := &interfaces.FunctionProxyExecuteCodeReq{}
-	if err = c.ShouldBindJSON(req); err != nil {
+	if err = utils.BindPreciseJSON(c, req); err != nil {
 		err = errors.NewHTTPError(c.Request.Context(), http.StatusBadRequest, errors.ErrExtDebugParamsInvalid,
 			fmt.Sprintf("invalid request body, err: %v", err))
 		rest.ReplyError(c, err)
@@ -245,8 +245,8 @@ func buildFunctionProxyExecutionEnv(c *gin.Context, version string) (map[string]
 // invoking user's live token out of its own environment.
 //
 // Whether a credential may be forwarded at all is decided upstream, where the
-// call is known: functionRuntimeHeaders forwards it on a direct Toolbox call
-// only inside a managed Interaction, and on ontology-query's trusted proxy call
+// call is known: functionRuntimeHeaders forwards the authenticated credential on direct Toolbox
+// debug/execute calls without requiring an Interaction, and on ontology-query's trusted proxy call
 // (logic properties and actions, which a Studio trial evaluates outside any
 // Interaction) without one. This route only receives what that gate let through,
 // so a token alone is enough here. The Interaction ids are written only as a
@@ -315,8 +315,18 @@ func replyFunctionExecutionResult(c *gin.Context, resp *interfaces.ExecuteCodeRe
 		if timeout > 0 {
 			detail = fmt.Sprintf("%s after %d seconds", detail, timeout)
 		}
-		rest.ReplyError(c, errors.DefaultHTTPError(c.Request.Context(), http.StatusGatewayTimeout,
-			detail))
+		executionErr := errors.DefaultHTTPError(c.Request.Context(), http.StatusGatewayTimeout, detail)
+		executionErr.Metadata = map[string]any{"reason": "execution_timeout", "stage": "execution"}
+		if timeout > 0 {
+			executionErr.Metadata["timeout_seconds"] = timeout
+		}
+		if common.IsValidExecutionCorrelationID(resp.ID) {
+			executionErr.Metadata["execution_id"] = resp.ID
+		}
+		if common.IsValidExecutionCorrelationID(resp.SessionID) {
+			executionErr.Metadata["session_id"] = resp.SessionID
+		}
+		rest.ReplyError(c, executionErr)
 		return
 	}
 	rest.ReplyOK(c, http.StatusOK, newFunctionExecuteResp(resp))
@@ -380,7 +390,7 @@ func (h *unifiedProxyHandler) FunctionExecuteProxy(c *gin.Context) {
 	}
 	// Read request body.
 	event := map[string]any{}
-	if err = c.ShouldBindJSON(&event); err != nil {
+	if err = utils.BindPreciseJSON(c, &event); err != nil {
 		err = errors.NewHTTPError(c.Request.Context(), http.StatusBadRequest, errors.ErrExtDebugParamsInvalid,
 			fmt.Sprintf("invalid request body, err: %v", err))
 		rest.ReplyError(c, err)
@@ -410,6 +420,14 @@ func (h *unifiedProxyHandler) FunctionExecuteProxy(c *gin.Context) {
 
 	// Execute function.
 	scriptType := metadata.GetScriptType()
+	if scriptType == string(interfaces.ScriptTypeCypher) {
+		// A Cypher function has no code for the sandbox; the toolbox service runs
+		// its statement in bkn-backend as the caller.
+		err = errors.DefaultHTTPError(c.Request.Context(), http.StatusBadRequest,
+			fmt.Sprintf("function %s is a cypher function; run it through its toolbox", req.Version))
+		rest.ReplyError(c, err)
+		return
+	}
 	if scriptType != string(interfaces.ScriptTypePython) {
 		err = errors.DefaultHTTPError(c.Request.Context(), http.StatusBadRequest, fmt.Sprintf("script_type %s not supported", scriptType))
 		rest.ReplyError(c, err)
@@ -449,6 +467,12 @@ func (h *unifiedProxyHandler) FunctionExecuteProxy(c *gin.Context) {
 		return
 	}
 	h.Logger.Infof("FunctionExecuteProxy response summary: %v", summarizeExecutionResponse(resp))
+	// Use the same local code value passed to ExecuteCode, rather than a later
+	// metadata lookup: the registered version can be edited during execution.
+	if resp.Status != "timeout" {
+		c.Header(interfaces.FunctionVersionHeader, req.Version)
+		c.Header(interfaces.FunctionCodeHashHeader, fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(execReq.Code))))
+	}
 	replyFunctionExecutionResult(c, resp, execReq.Timeout)
 }
 

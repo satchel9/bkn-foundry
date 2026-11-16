@@ -6,15 +6,17 @@ name: release-infra-sandbox
 #     避免跨工作流首次推送竞态（base 必须先存在 GHCR，templates 才能 FROM）。
 
 on:
+  # A new release branch has no service-path diff; build the complete release set.
+  create:
   push:
     tags:
       - 'v*'
     branches: ['**']
     paths:
       - 'infra/sandbox/**'
-      # 沙箱镜像里的 BKN 能力面由这里的工具面渲染而来。改了它而不重新生成产物，
-      # 镜像就会带着过期的签名发出去——所以这条路径也要触发本工作流。
-      - 'adp/context-loader/agent-retrieval/server/driveradapters/mcp/**'
+      # MCP 工具面只通过签入的 runtime/sandbox_sdk/_bkn_tools.py 进入镜像（已在
+      # infra/sandbox/** 内）；MCP 行为改动随 agent-retrieval 发布，与沙箱镜像无关。
+      # 产物漂移由 ci-adp-context-loader 在 PR 阶段拦截，这里不再监听 mcp 目录。
       - '.github/workflows/release-infra-sandbox.yml'
       - '.github/workflows/reusable-*.yml'
       # 版本冻结提交（release/<x.y.z> 分支）触发全量重建
@@ -31,12 +33,14 @@ permissions:
 
 jobs:
   version:
+    if: (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.created && startsWith(github.ref_name, 'release/'))
     uses: ./.github/workflows/reusable-version.yml
 
   # 沙箱镜像里的 BKN 能力面是签入产物，由 context-loader 的渲染器生成。产物签入
   # 就得有人盯着它别过期：漂了只在调用失败时才暴露，而那时错误里看不出根因。
   bkn-tools:
-    runs-on: ubuntu-latest
+    if: (github.event_name != 'create' || (github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/'))) && !(github.event_name == 'push' && github.ref_type == 'branch' && github.event.created && startsWith(github.ref_name, 'release/'))
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -63,7 +67,7 @@ jobs:
       context: '.'
       image-name: sandbox-python-executor-base
       version: v1
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
   build-multi-language-base:
     needs: [version, verify, build-python-base]
@@ -75,7 +79,7 @@ jobs:
       context: '.'
       image-name: sandbox-multi-executor-base
       version: v1
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
       build-args: |
         BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/sandbox-python-executor-base:v1
 
@@ -90,7 +94,7 @@ jobs:
       context: '.'
       image-name: sandbox-control-plane
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
   build-web:
     needs: [version, verify]
@@ -102,7 +106,7 @@ jobs:
       context: '.'
       image-name: sandbox-web
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
   build-template-python-basic:
     needs: [bkn-tools, version, verify, build-python-base]
@@ -114,7 +118,7 @@ jobs:
       context: '.'
       image-name: sandbox-template-python-basic
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
       build-args: |
         BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/sandbox-python-executor-base:v1
         PREINSTALL_COMMON=true
@@ -129,7 +133,7 @@ jobs:
       context: '.'
       image-name: sandbox-template-multi-language
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
       build-args: |
         BASE_IMAGE=ghcr.io/${{ github.repository_owner }}/sandbox-multi-executor-base:v1
 
@@ -142,7 +146,7 @@ jobs:
       chart-path: .
       chart-name: sandbox
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
   chart-sandbox-standalone:
     needs: [version, verify, build-control-plane, build-web, build-template-python-basic, build-template-multi-language]
@@ -152,4 +156,4 @@ jobs:
       chart-path: .
       chart-name: sandbox-standalone
       version: ${{ needs.version.outputs.version }}
-      publish: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+      publish: ${{ github.event_name == 'push' || github.event_name == 'create' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}

@@ -14,6 +14,196 @@ Typical ingress prefix:
 
 **Related modules:** platform-wide logging and metrics pipelines (feed-ingester integration).
 
+See [resource and Agent / Trace capacity planning](bkn-trace-resources.md) for workload sizing and acceptance boundaries.
+
+For retained 0.2.0 installations, see [Evidence enablement and explanation acceptance](bkn-trace-evidence-enablement.md), including topic-record preservation and explicit regeneration after repair.
+
+## Function actions with capture disabled
+
+Disabling Trace/Evidence capture does not remove the managed lifecycle needed
+by a Function action's SDK queries. An authenticated, authorized asynchronous
+Function action still creates its own real Conversation and Interaction and
+uses the original caller's runtime credential. Under disabled capture it does
+not register a Function Operation or supply a fabricated parent Operation ID;
+the SDK keeps the two lifecycle IDs, and normal query authorization still applies.
+Success and failure both finish the owned Interaction. Cancellation and semantic
+refusals remain execution gates. Trace infrastructure failure is a separate
+degraded state and must not be interpreted as a confirmed disabled policy.
+
+## Community and EE API boundary
+
+Community exposes authorized recorded facts and technical Trace reads. Native
+enterprise provenance requires the target Trace service to contain and assemble
+the EE implementation, pass runtime entitlement, and authorize the current
+identity's record scope. All paths below use `/api/agent-observability/v1`:
+
+| Endpoint | Scope |
+| --- | --- |
+| `GET /interactions/{id}`, `GET /interactions/{id}/operations` | Core recorded facts |
+| `GET /interactions/{id}/business-graph` | Authorized projection of Core's recorded assembly revision; not native EE detail or explanations |
+| `GET /traces`, `GET /traces/{trace_id}` | Core technical execution reads |
+| `GET /business-provenance/conversations`, `GET /business-provenance/interactions` | EE business search |
+| `GET /business-provenance/interactions/{id}` | EE native business-resolution detail |
+| `GET /business-provenance/interactions/{id}/explanations` | Read-only EE explanation lookup: `ready` or `not_generated` |
+
+Community does not mount these EE routes; this boundary already exists in 0.2.0.
+A plain 404 alone cannot identify a missing record, missing license, or gateway
+fault: the EE availability gate can return the same plain 404. Core's structured
+`resource_not_disclosed` means the requested record cannot be disclosed in the
+current scope. A successful Core read does not establish access to an EE route.
+
+Another EE service, a certificate, or an administrator role does not establish
+that the target Trace image contains the EE implementation. Clients should keep
+authorized basic facts visible and report the enterprise view as unavailable or
+undisclosed. Explanation GET does not generate content; generation is a separate,
+explicit EE POST, never an implicit panel-open or availability probe. Nonempty
+enterprise acceptance needs existing real records and actual authorization;
+`completed` or nonempty Operations cannot substitute for a `ready` explanation.
+
+The former trace/request Evidence Chain, Business Graph, and Evidence Node paths
+are not part of the currently mounted enterprise read contract. See the
+[module README](../../../bkn-trace/agent-observability/README.md#community-与-ee-读取边界2517)
+for the complete boundary and diagnostic guidance.
+
+## Technical Trace page availability
+
+For ordinary `GET /traces` pages without content, root-service or root-tool filters, MariaDB continues to select authorized IDs, order, total and cursor. When OpenSearch returns successfully but omits a selected Trace, the service batch-reads only the missing page IDs from canonical receipt metadata (at most 200 IDs, with a three-second fallback deadline). Status, timing and canonical root/error metadata use the authorized Trace lifetime. Missing Span statistics use `span_count_status=unavailable`; their numeric placeholder must not be displayed as a measured zero.
+
+This does not change the page's completeness state merely because Span statistics are unavailable. Existing projection truncation remains explicit. Shared-network discovery, content/root filters and exact-ID detail reads retain their existing paths. OpenSearch request failures, SQL fallback failures and timeouts return the retryable `SUMMARY_DEPENDENCY_UNAVAILABLE` error; missing canonical records still fail explicitly. Page reads do not write projections, replay dead letters or certify that historical projections have recovered.
+
+## Managed Interaction completion limits
+
+With durable answer handoff enabled, Core commits the answer task and business
+completion in one SQL transaction. `execution_status=completed` releases the
+conversation for its next turn; `evidence_status=assembling` means evidence is
+still being delivered. A lost response is not a completion acknowledgement:
+retry the same finish idempotently, without repeating business tools.
+
+Question artifacts at MCP start retain their synchronous, best-effort path.
+Their I/O shares the existing one-second Trace pre budget with lifecycle calls;
+the per-upload timeout and retries do not each receive a fresh pre budget.
+If capture fails after start commits, the response preserves the authoritative
+Interaction ID and reports `lifecycle_recorded=true`, evidence `recorded=false`
+and `continue_business_without_trace_retry`. An artifact-endpoint outage is
+reported as `evidence_store_unavailable`; this identifies the failed capture
+path, not a diagnosis of the underlying storage service. Lifecycle Core outages
+retain `trace_core_unavailable`. Explicitly unconfigured ingest authentication
+is an operator defect and is not retried. No artifact reference is fabricated,
+and this question path has no durable background recovery guarantee.
+
+### Interaction finish acknowledgement
+
+Finish preparation retains the one-second observation budget. The authoritative
+Interaction terminal POST/replay uses a separate total budget: 5000 ms by default,
+configured by `observability.lifecycle.finish_timeout_ms` or
+`BKN_TRACE_INTERACTION_FINISH_TIMEOUT_MS` (1–30000 ms; invalid values use 5000).
+At most three identical POSTs, including backoff, share that budget. Authorized
+submission can finish within it after caller disconnect; tool-attempt receipt
+finalization and Core's Interaction lease rules do not change.
+
+A finish response confirms success only when Core returns the matching Interaction
+ID and requested terminal status. A timeout, exhausted transient failures or invalid
+ACK returns MCP `isError=true`, `interaction_finish_unconfirmed`,
+`required_action=retry_same_finish`, plus stage, cause and request correlation.
+HTTP 200 alone is not an acknowledgement. Retry the original finish with the same
+Interaction/outcome/answer; do not repeat business actions. Replaying the same POST
+lets Core validate the committed closure, rather than treating a status-only GET as
+proof that a different answer was accepted. Domain refusals, including an already
+abandoned Interaction, remain errors and are never overwritten.
+
+No durable client-side retry queue is added. Persistent Core failure or process exit
+can still leave an unaccepted finish active until lease expiry; the product does not
+claim eventual completion without Core acceptance or fabricate a terminal state.
+This change does not identify the historical 8081 timeout's storage/CPU root cause.
+
+### Scheduling and time budgets
+
+Each Core instance uses one shared projection-worker slot. It claims one ready
+task when that slot is free, consumes ready work continuously, and polls again
+after the configured interval only when empty or after a worker error. The
+default 1s interval is not a one-task-per-second throughput limit. A slow answer
+still delays later evidence tasks in that slot; a deferred retry does not keep
+the slot occupied. Other projection handlers retain their existing behavior.
+Answer claims commit metadata and the lease without reading the body. The body
+is then read under the same answer-task deadline as delivery, fenced by the
+current lease. A body-read timeout follows normal counted retries and backoff,
+allowing later ready tasks to proceed; exhausted attempts use the existing DLQ.
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `core.projection.leaseIOTimeout` | `2s` | SQL metadata/lease claim I/O deadline |
+| `core.projection.answerTaskIOTimeout` | `10s` | One answer attempt, including SQL body loading, sequential storage calls and SQL settlement |
+| `core.projection.answerAckIOTimeout` | `2s` | Independent result/retry/dead-letter recording deadline |
+| `core.projection.lockDuration` | `30s` | Outbox task lease; separate from the business Interaction lease |
+
+All durations must be positive. Claim + answer + ACK + a 1s safety margin must
+be strictly shorter than the lease; invalid startup configuration is rejected.
+The default total is 15s inside a 30s lease. Increasing the lease alone does not
+increase throughput and delays recovery after a crash. Timeouts bound I/O;
+they are not end-to-end latency guarantees under CPU, database or storage load.
+These answer deadlines do not redefine the runtime limits of enterprise or
+revision-input handlers sharing the worker.
+If another registered handler needs longer execution, its requirements must
+also fit the shared lease; this change does not add lease renewal. An explicitly
+configured startup projection rebuild completes before normal worker consumption.
+The business Interaction's existing lease and renewal rules are unchanged;
+background evidence delivery does not keep a completed Interaction active.
+
+### Size and admission
+
+- A complete encoded answer artifact is at most **16 MiB**, including metadata;
+  this is not a 16 MiB plain-text allowance. Its owner/task wrapper also consumes
+  space. The task limit is 16 MiB + 64 KiB.
+  The managed-finish request envelope is bounded to 17 MiB, including when new
+  admissions are off so an already committed full-body request can replay.
+  Other lifecycle endpoints retain their existing 2 MiB body limit.
+- Core checks the encoded task and protocol allowance against
+  `max_allowed_packet` on the inserting SQL transaction. A database configured
+  for 16 MiB cannot be assumed to accept a full 16 MiB artifact plus its wrapper.
+  An insufficient budget returns a non-retryable storage-limit error and rolls
+  back finish. The operator must resolve the limit before retrying the original
+  finish; the product does not silently truncate answers.
+  The current SQL check reserves 4 KiB for protocol/fixed values and separately
+  counts task metadata; the effective limit is the smallest applicable budget.
+- The durable handoff requires the default prepared-statement path; leave
+  `interpolateParams` absent or false in the Core DSN. Enabling durable handoff
+  with client-side SQL interpolation is rejected because SQL escaping changes
+  the wire-size budget.
+- New capture requires a known, permitting server policy. A disabled policy
+  uses the existing server-owned closure reason without staging new content;
+  an unknown policy is not treated as disabled. Already committed replay and
+  accepted background work do not become new capture admissions.
+  A disabled handoff gate rejects new answer tasks with an operator configuration
+  action; rewriting the answer or automatically retrying cannot enable the feature.
+
+### Assembly, backlog and recovery
+
+The default assembly deadline is **5 minutes**. A periodic check can record
+partial evidence after it expires; this is not a promise of complete evidence
+within five minutes. Late delivery can create a subsequent evidence revision
+without changing the completed business outcome.
+
+Automatic retries default to 10 attempts and a 24h retry-age boundary. Neither
+is a retention limit: dead-letter content is retained, and lease reclamations
+are not the same as counted delivery failures. Accepted tasks survive process
+restarts. Successful delivery releases the outbox answer body only after the
+artifact is acknowledged and SQL evidence state is settled; pending/dead/DLQ
+content remains recoverable. Delivered answers rely on the artifact store.
+
+There is no global pending-byte quota or certified fixed QPS. Budget unfinished
+body storage as arrival rate × average encoded task size × outage duration;
+dead-letter copying can approximately double that body storage. Leave room for
+existing data, undo, indexes and configured logs. For example, 1 MiB tasks at
+one per second accumulate about 3.52 GiB of bodies in one hour without delivery.
+Capacity and waiting time also depend on other work sharing SQL and the worker.
+Shared CPU, SQL and storage pressure can also affect list/detail response times.
+Per-task/claim byte limits do not bound process-wide memory or request concurrency.
+
+Both durable-answer gates default off. Upgrade all Core workers before enabling
+Core and then Context Loader. Before reverting Core binaries, reconcile accepted
+work and retain compatible workers and database packet settings. Never repeat
+completed business work to fill an evidence gap.
+
 ## 💻 CLI
 
 `openbkn agent trace` takes a **conversation id** (from chat output or `openbkn agent sessions <agent_key>`).
@@ -134,7 +324,7 @@ openbkn agent trace conv-xyz789 --pretty
 | --- | --- |
 | `agent` | Top-level agent turn (root span) |
 | `retrieval` | Context retrieval from BKN / knowledge network |
-| `tool` | Tool or operator invocation via Execution Factory |
+| `tool` | Tool invocation via Execution Factory |
 | `llm` | LLM inference call (prompt → completion) |
 | `memory` | Memory read/write operations |
 | `policy` | Policy evaluation (permission checks, guardrails) |
@@ -241,3 +431,68 @@ curl -sk -X POST "https://<access-address>/api/agent-observability/v1/traces/sea
 curl -sk "https://<access-address>/api/agent-observability/v1/health" \
   -H "Authorization: Bearer $(openbkn token)"
 ```
+
+## Projection retry and audited dead-letter recovery
+
+Recognized search-projection connection/DNS failures, response truncation,
+timeouts and HTTP 408/425/429/5xx use the existing **24-hour recovery window**
+instead of stopping after ten attempts. Exponential backoff and jitter remain
+bounded at 256 seconds, with a one-second floor except at the final deadline.
+A failed attempt at the window boundary becomes dead. HTTP 409 still acknowledges
+an older version as superseded. Permanent errors remain immediately terminal;
+unknown errors and artifact/revision/enterprise handlers retain their existing
+attempt and age limits. Missing creation time retains the attempt bound.
+
+The window starts at original creation time. An explicit audited replay grants
+recognized search-dependency failures a new finite window from recorded replay
+time. It preserves creation time, payload, aggregate version, document ID and
+previous audit history. It does not repair invalid input or requeue historical
+dead tasks automatically. Adding OpenSearch resources alone does not requeue them.
+
+`failure_class` retains the terminal policy reason; `last_error_code` retains a
+safe dependency code such as `opensearch_http_503`. Historical codes are not
+rewritten. Failure logs include task/object/event IDs, attempt, safe kind, HTTP
+status and the intended decision. Retry logs occur on attempts 1, 2, 4, 8, ...;
+terminal decisions are always logged. Payloads, response bodies, credentials and
+lease tokens are omitted. A decision log does not prove SQL settlement committed.
+
+| Metric | Meaning |
+| --- | --- |
+| `bkn_trace_projection_attempt_errors_total` | Failed attempts, excluding parent cancellation and lost leases |
+| `bkn_trace_projection_retries_total` | Confirmed retry settlements |
+| `bkn_trace_projection_dead_total` | Confirmed dead settlements |
+
+The previous worker-level error metric retains its meaning. Replay-time metadata
+is read only after an old recoverable failure, through the existing unique DLQ
+source key with an I/O deadline. Healthy claiming and delivery add no lookup.
+
+### Preview and replay one explicit ID
+
+The command is included in the service binary and uses the existing Core MariaDB
+configuration/Secret. Replace `123` with a reviewed DLQ ID:
+
+```sh
+/app/agent-observability projection-dlq --id 123
+/app/agent-observability projection-dlq --id 123 --apply \
+  --operator "operator-name" --reason "dependency repaired" \
+  --repair-version "repair-version"
+```
+
+Default execution previews metadata as JSON without writing or exposing payloads.
+It accepts one ID, has a 30-second overall deadline and starts no server, worker,
+migration or rebuild. Apply requires all three audit fields. The operator is the
+accountable name supplied by the executor, not an OAuth-resolved identity;
+existing database/container execution permissions control access.
+
+Apply reuses `ReplayProjectionDLQ` row locking, dead-state revalidation and atomic
+audit/requeue. Missing, ambiguous, non-projection and already replayed entries are
+rejected. Artifact persistence, revision input and enterprise provenance handler
+tasks are excluded: their recovery has separate lifecycle and grant/token rules.
+A task that becomes dead again requires another explicit replay and audit entry.
+
+`action=replay_queued` confirms the transaction, not OpenSearch delivery;
+`observed` is the pre-action snapshot. Verify subsequent delivered/dead state and
+the authorized target query. Superseded versions must not replace newer documents.
+If output is interrupted, preview the same ID before retrying. Duplicate apply
+cannot silently add duplicate audits. Repair the dependency/input first; do not
+substitute direct status UPDATEs or a full index rebuild for audited replay.

@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/httperrors"
 	verrors "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -72,7 +72,7 @@ func TestValidateResourceDataQueryParams(t *testing.T) {
 
 		require.NoError(t, err)
 		require.NotNil(t, params.FilterCondCfg)
-		assert.Equal(t, "name", params.FilterCondCfg.Name)
+		assert.Equal(t, "name", params.FilterCondCfg.Field)
 	})
 
 	t.Run("normalizes precise before interval for connectors", func(t *testing.T) {
@@ -88,7 +88,7 @@ func TestValidateResourceDataQueryParams(t *testing.T) {
 
 		require.NoError(t, ValidateResourceDataQueryParams(ctx, &params))
 		require.NotNil(t, params.FilterCondCfg)
-		assert.Equal(t, float64(30), params.FilterCondCfg.Value.([]any)[0])
+		assert.Equal(t, int64(30), params.FilterCondCfg.Value.([]any)[0])
 	})
 
 	t.Run("accepts initial cursor paging and a cursor-only continuation", func(t *testing.T) {
@@ -262,7 +262,7 @@ func TestValidateFilterCondCfg(t *testing.T) {
 		cfg := &interfaces.FilterCondCfg{
 			Operation: filter_condition.OperationAnd,
 			SubConds: []*interfaces.FilterCondCfg{
-				{Name: "name", Operation: filter_condition.OperationEqual, ValueOptCfg: interfaces.ValueOptCfg{Value: "alice"}},
+				{Field: "name", Operation: filter_condition.OperationEqual, Value: "alice"},
 			},
 		}
 
@@ -271,12 +271,12 @@ func TestValidateFilterCondCfg(t *testing.T) {
 	})
 
 	t.Run("rejects unsupported value source before querying", func(t *testing.T) {
-		cfg := &interfaces.FilterCondCfg{Name: "age", Operation: filter_condition.OperationGt,
-			ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: "unknown", Value: 1}}
-		var httpErr *rest.HTTPError
+		cfg := &interfaces.FilterCondCfg{Field: "age", Operation: filter_condition.OperationGt,
+			ValueFrom: "unknown", Value: 1}
+		var httpErr *httperrors.HTTPError
 		require.ErrorAs(t, validateFilterCondCfg(ctx, cfg), &httpErr)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Equal(t, verrors.VegaBackend_InvalidParameter_FilterConditionValueFrom, httpErr.BaseError.ErrorCode)
+		assert.Equal(t, verrors.VegaBackend_InvalidParameter_FilterConditionValueFrom, httpErr.ErrorCode)
 	})
 }
 
@@ -324,6 +324,22 @@ func TestValidateAggregateParams(t *testing.T) {
 		require.NoError(t, validateAggregateParams(ctx, params))
 	})
 
+	t.Run("only count accepts a wildcard property", func(t *testing.T) {
+		for _, aggr := range []string{"count_distinct", "sum", "avg", "min", "max"} {
+			t.Run(aggr, func(t *testing.T) {
+				params := &interfaces.ResourceDataQueryParams{Aggregation: &interfaces.Aggregation{Property: "*", Aggr: aggr}}
+				err := ValidateResourceDataQueryParams(ctx, params)
+				var httpErr *httperrors.HTTPError
+				require.ErrorAs(t, err, &httpErr)
+				assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+				assert.Equal(t, verrors.VegaBackend_InvalidParameter_Aggregation, httpErr.ErrorCode)
+				assert.ErrorContains(t, err, "only supports count")
+			})
+		}
+		require.NoError(t, ValidateResourceDataQueryParams(ctx, &interfaces.ResourceDataQueryParams{
+			Aggregation: &interfaces.Aggregation{Property: "*", Aggr: "count"},
+		}))
+	})
 	t.Run("returns errors for invalid aggregate options", func(t *testing.T) {
 		tests := []struct {
 			name   string
@@ -343,6 +359,86 @@ func TestValidateAggregateParams(t *testing.T) {
 			t.Run(tt.name, func(t *testing.T) {
 				require.Error(t, validateAggregateParams(ctx, tt.params))
 			})
+		}
+	})
+
+	t.Run("validates HAVING array values before query execution", func(t *testing.T) {
+		for _, operation := range []string{"in", "not_in", "range", "out_range"} {
+			for _, tc := range []struct {
+				name  string
+				value any
+				valid bool
+			}{
+				{"scalar", 1, false},
+				{"string", "1,2", false},
+				{"object", map[string]any{"value": 1}, false},
+				{"null", nil, false},
+				{"nil array", []any(nil), false},
+				{"empty array", []any{}, false},
+				{"empty string array", []string{}, false},
+				{"one element", []any{1}, operation == "in" || operation == "not_in"},
+				{"two elements", []any{1, 2}, true},
+				{"two strings", []string{"1", "2"}, true},
+				{"three elements", []any{1, 2, 3}, operation == "in" || operation == "not_in"},
+			} {
+				t.Run(operation+"/"+tc.name, func(t *testing.T) {
+					params := &interfaces.ResourceDataQueryParams{Having: &interfaces.HavingClause{Field: "count(*)", Operation: operation, Value: tc.value}}
+					err := ValidateResourceDataQueryParams(ctx, params)
+					if tc.valid {
+						require.NoError(t, err)
+						assert.Equal(t, tc.value, params.Having.Value)
+						return
+					}
+					var httpErr *httperrors.HTTPError
+					require.ErrorAs(t, err, &httpErr)
+					assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+					assert.Equal(t, verrors.VegaBackend_InvalidParameter_Having, httpErr.ErrorCode)
+				})
+			}
+		}
+	})
+
+	t.Run("HAVING comparisons require scalar JSON values", func(t *testing.T) {
+		for _, operation := range []string{"==", "!=", ">", ">=", "<", "<="} {
+			for _, tc := range []struct {
+				name, value string
+				valid       bool
+			}{
+				{"array", `[1,2]`, false},
+				{"empty array", `[]`, false},
+				{"object", `{"value":1}`, false},
+				{"empty object", `{}`, false},
+				{"null", `null`, false},
+				{"zero", `0`, true},
+				{"negative number", `-1.5`, true},
+				{"precise integer", `170141183460469231731687303715884105727`, true},
+				{"string", `"09"`, true},
+				{"boolean", `false`, true},
+			} {
+				t.Run(operation+"/"+tc.name, func(t *testing.T) {
+					var params interfaces.ResourceDataQueryParams
+					payload := `{"having":{"field":"count(*)","operation":"` + operation + `","value":` + tc.value + `}}`
+					require.NoError(t, common.UnmarshalPreciseJSON([]byte(payload), &params))
+					err := ValidateResourceDataQueryParams(ctx, &params)
+					if tc.valid {
+						require.NoError(t, err)
+						return
+					}
+					var httpErr *httperrors.HTTPError
+					require.ErrorAs(t, err, &httpErr)
+					assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+					assert.Equal(t, verrors.VegaBackend_InvalidParameter_Having, httpErr.ErrorCode)
+				})
+			}
+		}
+	})
+	t.Run("HAVING comparisons reject typed string arrays", func(t *testing.T) {
+		for _, value := range []any{[]string{"1", "2"}, []string(nil), []string{}} {
+			err := ValidateResourceDataQueryParams(ctx, &interfaces.ResourceDataQueryParams{Having: &interfaces.HavingClause{Field: "count(*)", Operation: "==", Value: value}})
+			var httpErr *httperrors.HTTPError
+			require.ErrorAs(t, err, &httpErr)
+			assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+			assert.Equal(t, verrors.VegaBackend_InvalidParameter_Having, httpErr.ErrorCode)
 		}
 	})
 

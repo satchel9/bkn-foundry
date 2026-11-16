@@ -14,71 +14,63 @@ import (
 	"strings"
 	"time"
 
-	sq "github.com/Masterminds/squirrel"
-
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/common"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces"
+	sb "github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/interfaces/sqlbuilder"
 	"github.com/openbkn-ai/bkn-foundry/vega/vega-backend/server/logics/filter_condition"
 )
 
-var Special = strings.NewReplacer(`\`, `\\\\`, `'`, `\'`, `%`, `\%`, `_`, `\_`)
-
-// ConvertFilterCondition dispatches a filter condition to its SQL converter.
-func (c *MariaDBConnector) ConvertFilterCondition(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
-
+// ConvertFilterCondition 将已验证的条件转换为类型化节点；MariaDB/MySQL 共用此入口。
+func (c *MariaDBConnector) ConvertFilterCondition(condition interfaces.FilterCondition,
+	properties []*interfaces.Property, columns map[string]interfaces.TableColumnMeta) (sb.SqlNode, error) {
 	switch condition.GetOperation() {
 	case filter_condition.OperationAnd:
-		return c.ConvertFilterConditionAnd(condition)
+		return c.ConvertFilterConditionAnd(condition, properties, columns)
 	case filter_condition.OperationOr:
-		return c.ConvertFilterConditionOr(condition)
+		return c.ConvertFilterConditionOr(condition, properties, columns)
 	default:
 		return c.ConvertFilterConditionWithOpr(condition)
 	}
 }
 
 // ConvertFilterConditionAnd combines converted child conditions with AND.
-func (c *MariaDBConnector) ConvertFilterConditionAnd(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
-
+func (c *MariaDBConnector) ConvertFilterConditionAnd(condition interfaces.FilterCondition,
+	properties []*interfaces.Property, columns map[string]interfaces.TableColumnMeta) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.AndCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.AndCond")
 	}
-
-	convertedConds := sq.And{}
+	convertedConds := sb.And{}
 	for _, subCond := range cond.SubConds {
-		convertedCond, err := c.ConvertFilterCondition(subCond)
+		convertedCond, err := c.ConvertFilterCondition(subCond, properties, columns)
 		if err != nil {
 			return nil, err
 		}
 		convertedConds = append(convertedConds, convertedCond)
 	}
-
-	return convertedConds, nil
+	return &convertedConds, nil
 }
 
 // ConvertFilterConditionOr combines converted child conditions with OR.
-func (c *MariaDBConnector) ConvertFilterConditionOr(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
-
+func (c *MariaDBConnector) ConvertFilterConditionOr(condition interfaces.FilterCondition,
+	properties []*interfaces.Property, columns map[string]interfaces.TableColumnMeta) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.OrCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.OrCond")
 	}
-
-	convertedConds := sq.Or{}
+	convertedConds := sb.Or{}
 	for _, subCond := range cond.SubConds {
-		convertedCond, err := c.ConvertFilterCondition(subCond)
+		convertedCond, err := c.ConvertFilterCondition(subCond, properties, columns)
 		if err != nil {
 			return nil, err
 		}
 		convertedConds = append(convertedConds, convertedCond)
 	}
-
-	return convertedConds, nil
+	return &convertedConds, nil
 }
 
 // ConvertFilterConditionWithOpr dispatches a non-composite filter operation to its SQL converter.
-func (c *MariaDBConnector) ConvertFilterConditionWithOpr(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
-
+func (c *MariaDBConnector) ConvertFilterConditionWithOpr(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	switch condition.GetOperation() {
 	case filter_condition.OperationEqual, filter_condition.OperationEqual2:
 		return c.ConvertFilterConditionEqual(condition)
@@ -137,539 +129,486 @@ func (c *MariaDBConnector) ConvertFilterConditionWithOpr(condition interfaces.Fi
 	case filter_condition.OperationCurrent:
 		return c.ConvertFilterConditionCurrent(condition)
 	default:
-		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), filter_condition.QueryChannelSQL)
+		cause := fmt.Errorf("the sql query channel does not support this operation")
+		switch condition.GetOperation() {
+		case filter_condition.OperationMatch, filter_condition.OperationMatchPhrase, filter_condition.OperationMultiMatch:
+			cause = fmt.Errorf("the sql query channel does not support this operation; full-text operations need a local index on the resource: build one, or use like/not_like/contain/prefix/regex on this channel")
+		case filter_condition.OperationKnnVector:
+			cause = fmt.Errorf("the sql query channel does not support this operation; vector search needs a local index with a vector feature on the field: build one first")
+		}
+		return nil, interfaces.NewUnsupportedOperationError(condition.GetOperation(), cause)
 	}
 }
 
 // ConvertFilterConditionEqual builds an equality predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionEqual(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionEqual(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.EqualCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.EqualCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, "=", cond.Value)
-		}
-		return sq.Eq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " = " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, "=")
 }
 
 // ConvertFilterConditionNotEqual builds an inequality predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionNotEqual(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotEqual(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotEqualCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotEqualCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, "<>", cond.Value)
-		}
-		return sq.NotEq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " <> " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, "<>")
 }
 
 // ConvertFilterConditionGt builds a greater-than predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionGt(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionGt(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.GtCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.GtCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, ">", cond.Value)
-		}
-		return sq.Gt{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " > " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, ">")
 }
 
 // ConvertFilterConditionGte builds a greater-than-or-equal predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionGte(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionGte(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.GteCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.GteCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, ">=", cond.Value)
-		}
-		return sq.GtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " >= " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, ">=")
 }
 
 // ConvertFilterConditionLt builds a less-than predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionLt(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionLt(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.LtCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.LtCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, "<", cond.Value)
-		}
-		return sq.Lt{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " < " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, "<")
 }
 
 // ConvertFilterConditionLte builds a less-than-or-equal predicate for a constant or another field.
-func (c *MariaDBConnector) ConvertFilterConditionLte(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionLte(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.LteCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.LteCond")
 	}
 
-	switch cond.Cfg.ValueFrom {
-	case interfaces.ValueFrom_Const:
-		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return dateCompareExpr(cond.Lfield, "<=", cond.Value)
-		}
-		return sq.LtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
-	case interfaces.ValueFrom_Field:
-		return sq.Expr(mariadbQuotedColumn(cond.Lfield) + " <= " + mariadbQuotedColumn(cond.Rfield)), nil
-	default:
-		return nil, fmt.Errorf("value_from %s is not supported", cond.Cfg.ValueFrom)
-	}
+	return sqlComparison(cond.Lfield, cond.Rfield, cond.Value, "<=")
 }
 
 // ConvertFilterConditionIn builds a predicate matching one of the supplied values.
-func (c *MariaDBConnector) ConvertFilterConditionIn(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionIn(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.InCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.InCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		return dateSetExpr(cond.Lfield, "IN", cond.Value)
-	}
-
-	return sq.Eq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
+	return sqlSetCondition(sqlResourceColumn(cond.Lfield), cond.Lfield, cond.Value, false)
 }
 
 // ConvertFilterConditionNotIn builds a predicate excluding the supplied values.
-func (c *MariaDBConnector) ConvertFilterConditionNotIn(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotIn(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotInCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotInCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		return dateSetExpr(cond.Lfield, "NOT IN", cond.Value)
-	}
-
-	return sq.NotEq{mariadbQuotedColumn(cond.Lfield): cond.Value}, nil
+	return sqlSetCondition(sqlResourceColumn(cond.Lfield), cond.Lfield, cond.Value, true)
 }
 
-// ConvertFilterConditionLike builds a substring LIKE predicate with escaped input.
-func (c *MariaDBConnector) ConvertFilterConditionLike(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+// ConvertFilterConditionLike 将完整 SQL LIKE 模式作为绑定参数，显式指定转义字符。
+func (c *MariaDBConnector) ConvertFilterConditionLike(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.LikeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.LikeCond")
 	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [like] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	if err := filter_condition.ValidateLikePattern(filter_condition.OperationLike, cond.Value); err != nil {
+		return nil, err
 	}
-
-	vStr := "%" + Special.Replace(cond.Value) + "%"
-	return sq.Like{mariadbQuotedColumn(cond.Lfield): vStr}, nil
+	escape := "\\"
+	return &sb.Like{
+		Expr:    sqlResourceColumn(cond.Lfield),
+		Pattern: &sb.Param{Value: cond.Value},
+		Escape:  &escape,
+	}, nil
 }
 
-// ConvertFilterConditionNotLike builds a negated substring LIKE predicate with escaped input.
-func (c *MariaDBConnector) ConvertFilterConditionNotLike(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+// ConvertFilterConditionNotLike 沿用 SQL NOT LIKE 的模式及 NULL 三值语义。
+func (c *MariaDBConnector) ConvertFilterConditionNotLike(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotLikeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotLikeCond")
 	}
-
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_like] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	if err := filter_condition.ValidateLikePattern(filter_condition.OperationNotLike, cond.Value); err != nil {
+		return nil, err
 	}
-
-	vStr := "%" + Special.Replace(cond.Value) + "%"
-	return sq.NotLike{mariadbQuotedColumn(cond.Lfield): vStr}, nil
+	escape := "\\"
+	return &sb.Like{
+		Expr:    sqlResourceColumn(cond.Lfield),
+		Pattern: &sb.Param{Value: cond.Value},
+		Escape:  &escape,
+		Negated: true,
+	}, nil
 }
 
 // ConvertFilterConditionRegex builds a regular-expression predicate.
-func (c *MariaDBConnector) ConvertFilterConditionRegex(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionRegex(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.RegexCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.RegexCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [regex] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	return sq.Expr(mariadbQuotedColumn(cond.Lfield)+" REGEXP ?", cond.Value), nil
+	return &sb.Regex{Expr: sqlResourceColumn(cond.Lfield), Pattern: &sb.Param{Value: cond.Value}}, nil
 }
 
 // ConvertFilterConditionContain requires every supplied item to occur in a comma-separated field.
-func (c *MariaDBConnector) ConvertFilterConditionContain(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionContain(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.ContainCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.ContainCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [contain] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	exprs := make(sq.And, 0, len(cond.Value))
-	column := mariadbQuotedColumn(cond.Lfield)
-	for _, value := range cond.Value {
-		exprs = append(exprs, sq.Expr("FIND_IN_SET(?, "+column+") > 0", value))
-	}
-	return exprs, nil
+	return sqlCSVCondition(cond.Lfield, cond.Value, false), nil
 }
 
 // ConvertFilterConditionNotContain matches when a supplied item is absent from a comma-separated field.
-func (c *MariaDBConnector) ConvertFilterConditionNotContain(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotContain(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotContainCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotContainCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_contain] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	exprs := make(sq.Or, 0, len(cond.Value))
-	column := mariadbQuotedColumn(cond.Lfield)
-	for _, value := range cond.Value {
-		exprs = append(exprs, sq.Expr("FIND_IN_SET(?, "+column+") = 0", value))
-	}
-	return exprs, nil
+	return sqlCSVCondition(cond.Lfield, cond.Value, true), nil
 }
 
-// ConvertFilterConditionRange builds an inclusive lower-and-upper-bound predicate.
-func (c *MariaDBConnector) ConvertFilterConditionRange(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+// ConvertFilterConditionRange builds inclusive lower and upper bounds joined with AND.
+func (c *MariaDBConnector) ConvertFilterConditionRange(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.RangeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.RangeCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [range] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	if len(cond.Value) != 2 {
-		return nil, fmt.Errorf("range condition requires exactly 2 values")
-	}
-
-	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		lower, err := dateCompareExpr(cond.Lfield, ">=", cond.Value[0])
-		if err != nil {
-			return nil, err
-		}
-		upper, err := dateCompareExpr(cond.Lfield, "<=", cond.Value[1])
-		if err != nil {
-			return nil, err
-		}
-		return sq.And{lower, upper}, nil
-	}
-
-	return sq.And{
-		sq.GtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value[0]},
-		sq.LtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value[1]},
-	}, nil
+	return sqlRangeCondition(sqlResourceColumn(cond.Lfield), cond.Lfield, cond.Value, false)
 }
 
-// ConvertFilterConditionOutRange builds a predicate outside the supplied bounds.
-func (c *MariaDBConnector) ConvertFilterConditionOutRange(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+// ConvertFilterConditionOutRange builds exclusive outer bounds joined with OR.
+func (c *MariaDBConnector) ConvertFilterConditionOutRange(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.OutRangeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.OutRangeCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [out_range] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	if len(cond.Value) != 2 {
-		return nil, fmt.Errorf("out_range condition requires exactly 2 values")
-	}
-
-	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		lower, err := dateCompareExpr(cond.Lfield, "<", cond.Value[0])
-		if err != nil {
-			return nil, err
-		}
-		upper, err := dateCompareExpr(cond.Lfield, ">", cond.Value[1])
-		if err != nil {
-			return nil, err
-		}
-		return sq.Or{lower, upper}, nil
-	}
-
-	return sq.Or{
-		sq.Lt{mariadbQuotedColumn(cond.Lfield): cond.Value[0]},
-		sq.Gt{mariadbQuotedColumn(cond.Lfield): cond.Value[1]},
-	}, nil
+	return sqlRangeCondition(sqlResourceColumn(cond.Lfield), cond.Lfield, cond.Value, true)
 }
 
 // ConvertFilterConditionBetween builds an inclusive predicate between two values.
-func (c *MariaDBConnector) ConvertFilterConditionBetween(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionBetween(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.BetweenCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.BetweenCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [between] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	if len(cond.Value) != 2 {
-		return nil, fmt.Errorf("between condition requires exactly 2 values")
-	}
-
-	// Check if the field is of time type. If it is, convert the long type value to a timestamp
-	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		lower, err := dateCompareExpr(cond.Lfield, ">=", cond.Value[0])
-		if err != nil {
-			return nil, err
-		}
-		upper, err := dateCompareExpr(cond.Lfield, "<=", cond.Value[1])
-		if err != nil {
-			return nil, err
-		}
-		return sq.And{lower, upper}, nil
-	}
-
-	// For non-time type fields, parameterized queries can be directly used
-	return sq.And{
-		sq.GtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value[0]},
-		sq.LtOrEq{mariadbQuotedColumn(cond.Lfield): cond.Value[1]},
-	}, nil
+	return sqlRangeCondition(sqlResourceColumn(cond.Lfield), cond.Lfield, cond.Value, false)
 }
 
 // ConvertFilterConditionNull builds an IS NULL predicate.
-func (c *MariaDBConnector) ConvertFilterConditionNull(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNull(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NullCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NullCond")
 	}
 
-	return sq.Eq{mariadbQuotedColumn(cond.Lfield): nil}, nil
+	return &sb.IsNull{Expr: sqlResourceColumn(cond.Lfield), Negated: false}, nil
 }
 
 // ConvertFilterConditionNotNull builds an IS NOT NULL predicate.
-func (c *MariaDBConnector) ConvertFilterConditionNotNull(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotNull(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotNullCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotNullCond")
 	}
 
-	return sq.NotEq{mariadbQuotedColumn(cond.Lfield): nil}, nil
+	return &sb.IsNull{Expr: sqlResourceColumn(cond.Lfield), Negated: true}, nil
 }
 
 // ConvertFilterConditionEmpty matches an empty string.
-func (c *MariaDBConnector) ConvertFilterConditionEmpty(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionEmpty(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.EmptyCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.EmptyCond")
 	}
 
-	return sq.Eq{mariadbQuotedColumn(cond.Lfield): ""}, nil
+	return &sb.Eq{Left: sqlResourceColumn(cond.Lfield), Right: &sb.Literal{Value: ""}}, nil
 }
 
 // ConvertFilterConditionNotEmpty excludes empty strings.
-func (c *MariaDBConnector) ConvertFilterConditionNotEmpty(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotEmpty(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotEmptyCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotEmptyCond")
 	}
 
-	return sq.NotEq{mariadbQuotedColumn(cond.Lfield): ""}, nil
+	return &sb.NotEq{Left: sqlResourceColumn(cond.Lfield), Right: &sb.Literal{Value: ""}}, nil
 }
 
 // ConvertFilterConditionPrefix builds a prefix LIKE predicate with escaped input.
-func (c *MariaDBConnector) ConvertFilterConditionPrefix(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionPrefix(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.PrefixCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.PrefixCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [prefix] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	vStr := Special.Replace(cond.Value) + "%"
-	return sq.Like{mariadbQuotedColumn(cond.Lfield): vStr}, nil
+	return sqlPrefixCondition(cond.Lfield, cond.Value, false), nil
 }
 
 // ConvertFilterConditionNotPrefix builds a negated prefix LIKE predicate with escaped input.
-func (c *MariaDBConnector) ConvertFilterConditionNotPrefix(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotPrefix(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotPrefixCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotPrefixCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [not_prefix] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	vStr := Special.Replace(cond.Value) + "%"
-	return sq.NotLike{mariadbQuotedColumn(cond.Lfield): vStr}, nil
+	return sqlPrefixCondition(cond.Lfield, cond.Value, true), nil
 }
 
 // ConvertFilterConditionExist matches non-NULL field values.
-func (c *MariaDBConnector) ConvertFilterConditionExist(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionExist(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.ExistCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.ExistCond")
 	}
 
-	return sq.NotEq{mariadbQuotedColumn(cond.Lfield): nil}, nil
+	return &sb.IsNull{Expr: sqlResourceColumn(cond.Lfield), Negated: true}, nil
 }
 
 // ConvertFilterConditionNotExist matches NULL field values.
-func (c *MariaDBConnector) ConvertFilterConditionNotExist(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionNotExist(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.NotExistCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.NotExistCond")
 	}
 
-	return sq.Eq{mariadbQuotedColumn(cond.Lfield): nil}, nil
+	return &sb.IsNull{Expr: sqlResourceColumn(cond.Lfield), Negated: false}, nil
 }
 
 // ConvertFilterConditionTrue matches a true Boolean or nonzero TINYINT(1) value.
-func (c *MariaDBConnector) ConvertFilterConditionTrue(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionTrue(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.TrueCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.TrueCond")
 	}
 
-	if cond.Lfield.Type == interfaces.DataType_Boolean {
-		return sq.Eq{mariadbQuotedColumn(cond.Lfield): true}, nil
-	}
-
-	if !isNumericBoolean(cond.Lfield) {
-		return nil, fmt.Errorf("mariadb true condition requires BOOLEAN or TINYINT(1): %s", cond.Lfield.Name)
-	}
-
-	return sq.NotEq{mariadbQuotedColumn(cond.Lfield): 0}, nil
+	return sqlBooleanCondition(cond.Lfield, true)
 }
 
 // ConvertFilterConditionFalse matches a false Boolean or zero TINYINT(1) value.
-func (c *MariaDBConnector) ConvertFilterConditionFalse(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionFalse(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.FalseCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.FalseCond")
 	}
 
-	if cond.Lfield.Type == interfaces.DataType_Boolean {
-		return sq.Eq{mariadbQuotedColumn(cond.Lfield): false}, nil
-	}
-
-	if !isNumericBoolean(cond.Lfield) {
-		return nil, fmt.Errorf("mariadb false condition requires BOOLEAN or TINYINT(1): %s", cond.Lfield.Name)
-	}
-
-	return sq.Eq{mariadbQuotedColumn(cond.Lfield): 0}, nil
+	return sqlBooleanCondition(cond.Lfield, false)
 }
 
 // ConvertFilterConditionBefore matches values before the specified interval relative to now.
-func (c *MariaDBConnector) ConvertFilterConditionBefore(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionBefore(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.BeforeCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.BeforeCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [before] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	if len(cond.Value) != 2 {
-		return nil, fmt.Errorf("before condition requires exactly 2 values")
-	}
-
-	interval, ok := common.NumberAsFloat64(cond.Value[0])
-	if !ok {
-		return nil, fmt.Errorf("condition [before] interval value should be a number")
+	interval, ok := common.NumberAsInt64(cond.Value[0])
+	if !ok || interval <= 0 {
+		return nil, interfaces.NewConditionBuildError("before interval must be a positive integer")
 	}
 	unit, ok := cond.Value[1].(string)
-	if !ok {
-		return nil, fmt.Errorf("condition [before] unit value should be a string")
+	if !ok || !calendarUnit(unit) {
+		return nil, interfaces.NewConditionBuildError("invalid before unit")
 	}
-
-	return sq.Expr(mariadbQuotedColumn(cond.Lfield)+" < DATE_SUB(NOW(), INTERVAL ? "+unit+")", int(interval)), nil
+	return &sb.Lt{Left: sqlResourceColumn(cond.Lfield), Right: &sb.Function{Name: "DATE_SUB", Args: []sb.SqlNode{&sb.Function{Name: "NOW"}, &sb.Interval{Value: &sb.Param{Value: interval}, Unit: sb.IntervalUnit(unit)}}}}, nil
 }
 
 // ConvertFilterConditionCurrent matches values in the current calendar interval.
-func (c *MariaDBConnector) ConvertFilterConditionCurrent(condition interfaces.FilterCondition) (sq.Sqlizer, error) {
+func (c *MariaDBConnector) ConvertFilterConditionCurrent(condition interfaces.FilterCondition) (sb.SqlNode, error) {
 	cond, ok := condition.(*filter_condition.CurrentCond)
 	if !ok {
 		return nil, fmt.Errorf("condition is not *filter_condition.CurrentCond")
 	}
 
-	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
-		return nil, fmt.Errorf("condition [current] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
-	}
-
-	col := mariadbQuotedColumn(cond.Lfield)
-	var dateFormat string
+	format := ""
 	switch cond.Value {
 	case filter_condition.CurrentYear:
-		dateFormat = "%Y"
+		format = "%Y"
 	case filter_condition.CurrentMonth:
-		dateFormat = "%Y-%m"
+		format = "%Y-%m"
 	case filter_condition.CurrentWeek:
-		dateFormat = "%Y-%u"
+		format = "%x-%v"
 	case filter_condition.CurrentDay:
-		dateFormat = "%Y-%m-%d"
+		format = "%Y-%m-%d"
 	case filter_condition.CurrentHour:
-		dateFormat = "%Y-%m-%d %H"
+		format = "%Y-%m-%d %H"
 	case filter_condition.CurrentMinute:
-		dateFormat = "%Y-%m-%d %H:%i"
+		format = "%Y-%m-%d %H:%i"
 	default:
-		return nil, fmt.Errorf("condition [current] unsupported format: %s", cond.Value)
+		return nil, interfaces.NewConditionBuildError("unsupported current interval")
 	}
-
-	return sq.Expr("DATE_FORMAT(" + col + ", '" + dateFormat + "') = DATE_FORMAT(NOW(), '" + dateFormat + "')"), nil
+	return &sb.Eq{Left: sqlDateFormat(sqlResourceColumn(cond.Lfield), format), Right: sqlDateFormat(&sb.Function{Name: "NOW"}, format)}, nil
 }
 
-// isNumericBoolean recognizes the numeric type stored for BOOL aliases.
+// sqlResourceColumn 将资源字段原名作为完整的单列标识符，不从点号猜测来源限定。
+func sqlResourceColumn(field *interfaces.Property) sb.SqlNode {
+	return &sb.Column{Name: mariadbOriginalName(field)}
+}
+
+// sqlColumnName 表示完整列名或结果别名；限定引用由 Column.Qualifier 单独表达。
+func sqlColumnName(name string) sb.SqlNode {
+	return &sb.Column{Name: name}
+}
+
+func sqlComparison(field, rightField *interfaces.Property, value any, op string) (sb.SqlNode, error) {
+	left := sqlResourceColumn(field)
+	if rightField != nil {
+		return sqlComparisonNode(left, sqlResourceColumn(rightField), op)
+	}
+	if value == nil && (op == "=" || op == "<>") {
+		return &sb.IsNull{Expr: left, Negated: op == "<>"}, nil
+	}
+	right, err := sqlConditionValue(field, value)
+	if err != nil {
+		return nil, err
+	}
+	return sqlComparisonNode(left, right, op)
+}
+
+func sqlComparisonNode(left, right sb.SqlNode, op string) (sb.SqlNode, error) {
+	switch op {
+	case "=", "==":
+		return &sb.Eq{Left: left, Right: right}, nil
+	case "<>", "!=":
+		return &sb.NotEq{Left: left, Right: right}, nil
+	case ">":
+		return &sb.Gt{Left: left, Right: right}, nil
+	case ">=":
+		return &sb.GtOrEq{Left: left, Right: right}, nil
+	case "<":
+		return &sb.Lt{Left: left, Right: right}, nil
+	case "<=":
+		return &sb.LtOrEq{Left: left, Right: right}, nil
+	default:
+		return nil, interfaces.NewConditionBuildError("unsupported comparison operation")
+	}
+}
+
+func sqlConditionValue(field *interfaces.Property, value any) (sb.SqlNode, error) {
+	if field == nil || !interfaces.DataType_IsDate(field.Type) {
+		return &sb.Param{Value: value}, nil
+	}
+	if field.Type != interfaces.DataType_Timestamp {
+		parsed, err := filter_condition.ParseTemporalValue(field.Type, value, common.ServerTimeZone())
+		if err != nil {
+			return nil, err
+		}
+		return &sb.Param{Value: parsed}, nil
+	}
+	if err := validateDateValue(field, value); err != nil {
+		return nil, err
+	}
+	normalized := normalizeTimestampValue(value)
+	if _, native := normalized.(time.Time); native {
+		return &sb.Param{Value: normalized}, nil
+	}
+	return &sb.Function{Name: "FROM_UNIXTIME", Args: []sb.SqlNode{&sb.Arithmetic{Left: &sb.Param{Value: normalized}, Op: sb.Divide, Right: &sb.Literal{Value: 1000}}}}, nil
+}
+
+func sqlSetCondition(expr sb.SqlNode, field *interfaces.Property, values []any, negated bool) (sb.SqlNode, error) {
+	if len(values) == 0 {
+		if negated {
+			return &sb.And{}, nil
+		}
+		return &sb.Or{}, nil
+	}
+	nodes := make([]sb.SqlNode, 0, len(values))
+	for _, value := range values {
+		node, err := sqlConditionValue(field, value)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, node)
+	}
+	return &sb.In{Expr: expr, Values: nodes, Negated: negated}, nil
+}
+
+func sqlRangeCondition(expr sb.SqlNode, field *interfaces.Property, values []any, outside bool) (sb.SqlNode, error) {
+	if len(values) != 2 {
+		return nil, interfaces.NewConditionBuildError("range requires two values")
+	}
+	lower, err := sqlConditionValue(field, values[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert range lower bound: %w", err)
+	}
+	upper, err := sqlConditionValue(field, values[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert range upper bound: %w", err)
+	}
+	if outside {
+		return &sb.Or{&sb.Lt{Left: expr, Right: lower}, &sb.Gt{Left: expr, Right: upper}}, nil
+	}
+	return &sb.And{&sb.GtOrEq{Left: expr, Right: lower}, &sb.LtOrEq{Left: expr, Right: upper}}, nil
+}
+
+func sqlPrefixCondition(field *interfaces.Property, value string, negated bool) sb.SqlNode {
+	pattern := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(value) + "%"
+	escape := "!"
+	return &sb.Like{Expr: sqlResourceColumn(field), Pattern: &sb.Param{Value: pattern}, Escape: &escape, Negated: negated}
+}
+
+func sqlCSVCondition(field *interfaces.Property, values []any, negated bool) sb.SqlNode {
+	nodes := make([]sb.SqlNode, 0, len(values))
+	for _, value := range values {
+		found := &sb.Function{Name: "FIND_IN_SET", Args: []sb.SqlNode{&sb.Param{Value: value}, sqlResourceColumn(field)}}
+		var node sb.SqlNode = &sb.Gt{Left: found, Right: &sb.Literal{Value: 0}}
+		if negated {
+			node = &sb.Eq{Left: found, Right: &sb.Literal{Value: 0}}
+		}
+		nodes = append(nodes, node)
+	}
+	if negated {
+		result := sb.Or(nodes)
+		return &result
+	}
+	result := sb.And(nodes)
+	return &result
+}
+
+func sqlBooleanCondition(field *interfaces.Property, value bool) (sb.SqlNode, error) {
+	if field.Type == interfaces.DataType_Boolean {
+		return &sb.Eq{Left: sqlResourceColumn(field), Right: &sb.Literal{Value: value}}, nil
+	}
+	if !isNumericBoolean(field) {
+		return nil, interfaces.NewConditionBuildError("boolean condition requires BOOLEAN or TINYINT(1)")
+	}
+	if value {
+		return &sb.NotEq{Left: sqlResourceColumn(field), Right: &sb.Literal{Value: 0}}, nil
+	}
+	return &sb.Eq{Left: sqlResourceColumn(field), Right: &sb.Literal{Value: 0}}, nil
+}
+
+func sqlDateFormat(expr sb.SqlNode, format string) sb.SqlNode {
+	return &sb.Function{Name: "DATE_FORMAT", Args: []sb.SqlNode{expr, &sb.Literal{Value: format}}}
+}
+
+// isNumericBoolean recognizes integer-mapped TINYINT(1) fields for Boolean predicates.
 func isNumericBoolean(field *interfaces.Property) bool {
 	return field.Type == interfaces.DataType_Integer && strings.EqualFold(strings.TrimSpace(field.OriginalType), "tinyint(1)")
 }
 
-// normalizeTimestampValue normalizes supported timestamp values for bound SQL parameters.
+// normalizeTimestampValue converts numeric epoch milliseconds and RFC3339 text for SQL binding.
+// time.Time values and other representations are preserved.
 func normalizeTimestampValue(value any) any {
 	switch v := value.(type) {
 	case json.Number:
@@ -707,31 +646,15 @@ func normalizeTimestampValue(value any) any {
 	}
 }
 
-// dateValueExpr selects a placeholder expression for a MariaDB date or time value.
-func dateValueExpr(field *interfaces.Property, value any) string {
-	if field.Type == interfaces.DataType_Time {
-		return "?"
-	}
-	if _, ok := value.(time.Time); ok {
-		return "?"
-	}
-	if value, ok := value.(string); ok {
-		if _, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
-			return "?"
-		}
-	}
-	return "FROM_UNIXTIME(?/1000)"
-}
-
-// validateDateValue checks that a value is compatible with the field's date or time type.
+// validateDateValue checks supported date and time value representations.
+// TIME requires a string; other date types accept epoch milliseconds, RFC3339 text, or time.Time.
 func validateDateValue(field *interfaces.Property, value any) error {
-	if value == nil {
-		return nil
+	if field.Type == interfaces.DataType_Date || field.Type == interfaces.DataType_Time {
+		_, err := filter_condition.ParseTemporalValue(field.Type, value, common.ServerTimeZone())
+		return err
 	}
-	if field.Type == interfaces.DataType_Time {
-		if _, ok := value.(string); !ok {
-			return fmt.Errorf("MariaDB time field %q requires a time string, got %T", field.Name, value)
-		}
+
+	if value == nil {
 		return nil
 	}
 
@@ -761,30 +684,13 @@ func validateDateValue(field *interfaces.Property, value any) error {
 	}
 }
 
-// dateCompareExpr builds a comparison against a bound date or time value.
-func dateCompareExpr(field *interfaces.Property, op string, value any) (sq.Sqlizer, error) {
-	if err := validateDateValue(field, value); err != nil {
-		return nil, err
+// calendarUnit allows MariaDB base interval units to enter SQL syntax.
+// Composite units require string quantities and are outside the positive-integer contract.
+func calendarUnit(unit string) bool {
+	switch strings.ToLower(unit) {
+	case "microsecond", "second", "minute", "hour", "day", "week", "month", "quarter", "year":
+		return true
+	default:
+		return false
 	}
-	return sq.Expr(
-		mariadbQuotedColumn(field)+" "+op+" "+dateValueExpr(field, value),
-		normalizeTimestampValue(value),
-	), nil
-}
-
-// dateSetExpr builds an IN or NOT IN expression for bound date or time values.
-func dateSetExpr(field *interfaces.Property, op string, values []any) (sq.Sqlizer, error) {
-	valueExprs := make([]string, len(values))
-	args := make([]any, len(values))
-	for i, value := range values {
-		if err := validateDateValue(field, value); err != nil {
-			return nil, err
-		}
-		valueExprs[i] = dateValueExpr(field, value)
-		args[i] = normalizeTimestampValue(value)
-	}
-	return sq.Expr(
-		mariadbQuotedColumn(field)+" "+op+" ("+strings.Join(valueExprs, ", ")+")",
-		args...,
-	), nil
 }

@@ -1,7 +1,7 @@
 ---
 openapi: 3.0.3
 info:
-  title: 沙箱观测
+  title: 执行工厂 · 沙箱观测 API
   description: |
     沙箱运行时的**只读**观测面：健康、会话池、会话列表与详情。Studio 的沙箱运行时页
     就是靠这四个接口渲染的。
@@ -212,7 +212,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+                $ref: '../_shared/errors.yaml#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -229,19 +229,19 @@ components:
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     Forbidden:
       description: 非超管调用
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
     InternalError:
       description: 服务内部错误，或沙箱控制面不可达
       content:
         application/json:
           schema:
-            $ref: '../_shared/errors.yaml#/components/schemas/ErrorCompact'
+            $ref: '../_shared/errors.yaml#/components/schemas/Error'
 
   schemas:
     SessionStatus:
